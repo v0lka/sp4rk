@@ -290,10 +290,18 @@ func walkSymlinkComponents(absPath, workspace string) []SymlinkTraversal {
 	// Start reconstruction from the volume prefix so Windows drive-letter
 	// paths (e.g. "C:") and UNC roots are rebuilt correctly. SplitPathComponents
 	// already stripped the volume, so the first part is a real component.
-	// On Unix filepath.VolumeName returns "" and we fall back to the root "/".
-	current := filepath.VolumeName(cleaned)
-	if current == "" {
+	//
+	// On Windows filepath.VolumeName returns "C:" — the *relative* current-dir-
+	// on-C form, NOT the absolute "C:\". Without a separator, filepath.Join
+	// would produce "C:Users" instead of "C:\Users". Append the separator to
+	// make the drive path absolute. On Unix filepath.VolumeName returns "" and
+	// we fall back to the root "/".
+	vol := filepath.VolumeName(cleaned)
+	var current string
+	if vol == "" {
 		current = string(filepath.Separator)
+	} else {
+		current = vol + string(filepath.Separator)
 	}
 	for i, part := range parts {
 		if part == "" {
