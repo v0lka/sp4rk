@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.3"
+
+      - name: Install system dependencies
+        # build-essential provides gcc, which is required for cgo: the
+        # embedding package depends on onnxruntime_go (a cgo library).
+        # ripgrep is required by the ripgrep builtin tests.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config ripgrep
+
+      - name: Install golangci-lint
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+
+      - name: Lint (Go)
+        run: golangci-lint run
+
+      - name: Test (Go)
+        run: go test ./...
+
+      - name: Build
+        run: make build
+
+  macos:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.3"
+
+      - name: Install system dependencies
+        # macOS ships clang, satisfying the cgo requirement. ripgrep is
+        # required by the ripgrep builtin tests.
+        run: brew install ripgrep
+
+      - name: Install golangci-lint
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+
+      - name: Lint (Go)
+        run: golangci-lint run
+
+      - name: Test (Go)
+        run: go test ./...
+
+      - name: Build
+        run: make build
+
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.3"
+
+      - name: Install system dependencies
+        # The windows-2022 image ships gcc 14.2.0, satisfying the cgo
+        # requirement for the embedding package. ripgrep is required by the
+        # ripgrep builtin tests (choco places rg.exe on the existing PATH).
+        run: choco install ripgrep -y --no-progress
+
+      - name: Install golangci-lint
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+
+      - name: Lint (Go)
+        run: golangci-lint run
+
+      - name: Test (Go)
+        run: go test ./...
+
+      - name: Build
+        # `make` is not guaranteed on Windows runners; invoke `go build`
+        # directly, which is exactly what the Makefile `build` target does.
+        run: go build ./...
