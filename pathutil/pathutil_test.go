@@ -131,14 +131,17 @@ func TestIsWithinPath_DifferentVolumes(t *testing.T) {
 }
 
 func TestSplitPathComponents_Absolute(t *testing.T) {
-	result := SplitPathComponents("/home/user/file.txt")
+	// Build the path with the OS separator so it is genuinely absolute on
+	// every platform (Windows needs a drive letter, handled by VolumeName).
+	abs := filepath.Join(string(filepath.Separator), "home", "user", "file.txt")
+	result := SplitPathComponents(abs)
 	if len(result) != 3 || result[0] != "home" || result[1] != "user" || result[2] != "file.txt" {
 		t.Errorf("got %v, want [home user file.txt]", result)
 	}
 }
 
 func TestSplitPathComponents_Root(t *testing.T) {
-	result := SplitPathComponents("/")
+	result := SplitPathComponents(string(filepath.Separator))
 	if len(result) != 0 {
 		t.Errorf("root path should yield empty slice, got %v", result)
 	}
@@ -180,8 +183,12 @@ func TestResolveExistingPrefix_PartialExist(t *testing.T) {
 }
 
 func TestResolveExistingPrefix_NoneExist(t *testing.T) {
-	result := ResolveExistingPrefix("/nonexistent/root/path/file.txt")
-	if result != "/nonexistent/root/path/file.txt" {
+	input := "/nonexistent/root/path/file.txt"
+	result := ResolveExistingPrefix(input)
+	// A completely non-existent path is returned unchanged modulo separator
+	// normalization (Windows uses '\'). Compare on a normalized form so the
+	// test is portable.
+	if filepath.ToSlash(result) != input {
 		t.Errorf("completely non-existent path should be unchanged: got %q", result)
 	}
 }

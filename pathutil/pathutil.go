@@ -30,29 +30,32 @@ func IsWithinPath(parent, child string) (bool, error) {
 		return false, err
 	}
 	// rel == "." means same path (child is within parent).
-	// rel == ".." or rel starting with "../" means child escapes above parent.
-	// Note: strings.HasPrefix(rel, "..") alone is incorrect — it would also
-	// reject legitimate children whose name begins with ".." (e.g. "..foo").
 	if rel == "." {
 		return true, nil
 	}
-	return rel != ".." && !strings.HasPrefix(rel, "../"), nil
+	// rel == ".." or rel starting with ".." + separator means child escapes
+	// above parent. Use filepath.Separator so this works on Windows, where
+	// filepath.Rel returns backslash-separated paths (e.g. "..\dir") — a
+	// hard-coded "../" prefix check would miss those escapes.
+	// Note: strings.HasPrefix(rel, "..") alone is incorrect — it would also
+	// reject legitimate children whose name begins with ".." (e.g. "..foo").
+	parentPrefix := ".." + string(filepath.Separator)
+	return rel != ".." && !strings.HasPrefix(rel, parentPrefix), nil
 }
 
 // SplitPathComponents splits a cleaned absolute path into non-empty components,
-// stripping the root separator. For example:
+// stripping the root separator and any volume prefix. For example:
 //
-//	"/home/user/file.txt" → ["home", "user", "file.txt"]
-//	"/"                   → []
+//	"/home/user/file.txt"           → ["home", "user", "file.txt"]
+//	"C:\Users\file.txt"             → ["Users", "file.txt"]   (Windows)
+//	"/"                             → []
 func SplitPathComponents(absPath string) []string {
-	sep := string(filepath.Separator)
-	parts := strings.Split(absPath, sep)
-	// Remove leading empty string from split of absolute path
-	// (e.g., "/a/b" → ["", "a", "b"]).
-	if len(parts) > 0 && parts[0] == "" {
-		parts = parts[1:]
-	}
-	// Filter empty parts.
+	// Strip the volume prefix (e.g. "C:" on Windows, "\\server\share" for a
+	// UNC path) so it is not mistaken for a path component. On Unix the volume
+	// is always empty, so this is a no-op there.
+	vol := filepath.VolumeName(absPath)
+	rest := absPath[len(vol):]
+	parts := strings.Split(rest, string(filepath.Separator))
 	var result []string
 	for _, part := range parts {
 		if part != "" {

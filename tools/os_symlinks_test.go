@@ -1,8 +1,17 @@
 package tools
 
-import "testing"
+import (
+	"runtime"
+	"testing"
+)
 
 func TestIsWellKnownOSSymlink_MacOS(t *testing.T) {
+	// macOS-only: /etc etc. resolve to /private/* and only exist as symlinks
+	// on Darwin. filepath.Clean("/etc") is "\etc" on Windows (not in the map),
+	// so these assertions are platform-specific.
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS-specific well-known symlinks")
+	}
 	for _, p := range []string{"/etc", "/tmp", "/var", "/cores"} {
 		if !IsWellKnownOSSymlink(p) {
 			t.Errorf("expected %q to be a well-known OS symlink", p)
@@ -18,6 +27,10 @@ func TestIsWellKnownOSSymlink_MacOS(t *testing.T) {
 }
 
 func TestIsWellKnownOSSymlink_LinuxUsrMerge(t *testing.T) {
+	// Linux-only: the /usr merge symlinks only exist on merged-usr distros.
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux-specific /usr merge symlinks")
+	}
 	for _, p := range []string{"/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32"} {
 		if !IsWellKnownOSSymlink(p) {
 			t.Errorf("expected %q to be a well-known OS symlink", p)
@@ -26,6 +39,10 @@ func TestIsWellKnownOSSymlink_LinuxUsrMerge(t *testing.T) {
 }
 
 func TestIsWellKnownOSSymlink_LinuxRunMigration(t *testing.T) {
+	// Linux-only: the /run tmpfs migration symlinks.
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux-specific /run migration symlinks")
+	}
 	for _, p := range []string{"/var/run", "/var/lock"} {
 		if !IsWellKnownOSSymlink(p) {
 			t.Errorf("expected %q to be a well-known OS symlink", p)
@@ -74,6 +91,11 @@ func TestIsWellKnownOSSymlink_TargetLookup(t *testing.T) {
 }
 
 func TestIsOSLevelSymlink_WellKnown(t *testing.T) {
+	// /tmp → /private/tmp is a macOS well-known symlink. On other platforms
+	// it is not in the well-known map, so the assertion is Darwin-specific.
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS-specific /tmp well-known symlink")
+	}
 	if !IsOSLevelSymlink("/tmp") {
 		t.Error("well-known /tmp should be OS-level even without roots")
 	}

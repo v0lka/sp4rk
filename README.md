@@ -1,6 +1,11 @@
 # sp4rk Agent SDK
 
-A standalone Go framework for building AI agent systems with Plan & Execute orchestration, tool integration, and multi-provider LLM support.
+> [!WARNING]
+> **Early Alpha Stage** — This project is under active development and not yet stable.
+> Features, APIs, and internal parts may change without notice.
+> Use at your own risk. Do not rely on it for production or critical workflows.
+
+A standalone Go SDK for building AI agent systems with Plan & Execute orchestration, tool integration, and multi-provider LLM support.
 
 ## Quick start
 

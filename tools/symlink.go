@@ -287,7 +287,14 @@ func walkSymlinkComponents(absPath, workspace string) []SymlinkTraversal {
 	}
 
 	var traversals []SymlinkTraversal
-	current := string(filepath.Separator) // start from /
+	// Start reconstruction from the volume prefix so Windows drive-letter
+	// paths (e.g. "C:") and UNC roots are rebuilt correctly. SplitPathComponents
+	// already stripped the volume, so the first part is a real component.
+	// On Unix filepath.VolumeName returns "" and we fall back to the root "/".
+	current := filepath.VolumeName(cleaned)
+	if current == "" {
+		current = string(filepath.Separator)
+	}
 	for i, part := range parts {
 		if part == "" {
 			continue

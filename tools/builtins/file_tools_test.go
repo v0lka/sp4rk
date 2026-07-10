@@ -1702,7 +1702,11 @@ func TestReadFileTool_Execute_OutsideSessionRoots(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := tools.WithWorkspacePath(context.Background(), ws)
-	result, err := tool.Execute(ctx, json.RawMessage(`{"path":"`+target+`"}`))
+	// Build the JSON with json.Marshal so Windows backslash paths
+	// (e.g. C:\Users) are properly escaped — string concatenation would
+	// produce invalid JSON escape sequences (\U) on Windows.
+	input, _ := json.Marshal(map[string]string{"path": target})
+	result, err := tool.Execute(ctx, input)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

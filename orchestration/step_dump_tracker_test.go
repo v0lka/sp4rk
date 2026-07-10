@@ -54,6 +54,9 @@ func TestStepDumpTracker_OpenAndClose(t *testing.T) {
 func TestStepDumpTracker_IdempotentOpen(t *testing.T) {
 	dir := t.TempDir()
 	tracker := NewStepDumpTracker(dir)
+	// Close tracked files so Windows can remove the temp dir (open files are
+	// locked on Windows, unlike Unix where they can be unlinked while open).
+	t.Cleanup(func() { _ = tracker.CloseAll() })
 
 	w1 := tracker.OpenStepDump("step-1")
 	w2 := tracker.OpenStepDump("step-1")
@@ -91,6 +94,9 @@ func TestStepDumpTracker_OpenAfterClose(t *testing.T) {
 func TestStepDumpTracker_ConcurrentOpen(t *testing.T) {
 	dir := t.TempDir()
 	tracker := NewStepDumpTracker(dir)
+	// Close tracked files so Windows can remove the temp dir (open files are
+	// locked on Windows, unlike Unix where they can be unlinked while open).
+	t.Cleanup(func() { _ = tracker.CloseAll() })
 
 	const goroutines = 10
 	var wg sync.WaitGroup

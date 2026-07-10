@@ -5,19 +5,39 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"testing"
 
 	"github.com/v0lka/sp4rk/pathutil"
 )
 
+// osAbsPath joins an OS-absolute root (the system temp dir) with the given
+// relative components, returning a genuinely absolute path on every platform.
+// Several path-extraction tests need OS-absolute fixtures (a leading "/" is
+// NOT absolute on Windows) so that resolvePathCandidate returns the path
+// unchanged instead of joining it with the workspace. Because these fixtures
+// are real OS paths, the tests behave identically on macOS and Windows.
+func osAbsPath(parts ...string) string {
+	all := make([]string, 0, len(parts)+1)
+	all = append(all, os.TempDir())
+	all = append(all, parts...)
+	return filepath.Join(all...)
+}
+
 // ── extractAllPathsFromJSON tests ─────────────────────────────────────────
 
 func TestExtractAllPathsFromJSON_Absolute(t *testing.T) {
-	input := json.RawMessage(`{"file_path": "/workspace/file.txt"}`)
-	paths := extractAllPathsFromJSON(input, "/workspace")
-	if len(paths) != 1 || paths[0] != "/workspace/file.txt" {
-		t.Fatalf("expected [/workspace/file.txt], got %v", paths)
+	// Use a genuinely OS-absolute path so it is returned unchanged (a leading
+	// "/" is not absolute on Windows, where it would otherwise be joined with
+	// the workspace and doubled).
+	file := osAbsPath("workspace", "file.txt")
+	ws := osAbsPath("workspace")
+	input, _ := json.Marshal(map[string]string{"file_path": file})
+	paths := extractAllPathsFromJSON(input, ws)
+	want := filepath.Clean(file)
+	if len(paths) != 1 || paths[0] != want {
+		t.Fatalf("expected [%s], got %v", want, paths)
 	}
 }
 
@@ -71,10 +91,14 @@ func TestExtractAllPathsFromJSON_SkipFileURL(t *testing.T) {
 }
 
 func TestExtractAllPathsFromJSON_Deduplicate(t *testing.T) {
-	input := json.RawMessage(`{"a": "/workspace/x", "b": "/workspace/x"}`)
-	paths := extractAllPathsFromJSON(input, "/workspace")
-	if len(paths) != 1 || paths[0] != "/workspace/x" {
-		t.Fatalf("expected deduplicated [/workspace/x], got %v", paths)
+	// OS-absolute fixtures so the paths are returned unchanged on every OS.
+	x := osAbsPath("workspace", "x")
+	ws := osAbsPath("workspace")
+	input, _ := json.Marshal(map[string]string{"a": x, "b": x})
+	paths := extractAllPathsFromJSON(input, ws)
+	want := filepath.Clean(x)
+	if len(paths) != 1 || paths[0] != want {
+		t.Fatalf("expected deduplicated [%s], got %v", want, paths)
 	}
 }
 
@@ -109,12 +133,18 @@ func TestExtractAllPathsFromJSON_DotDotTraversal(t *testing.T) {
 // ── extractBashPaths tests ────────────────────────────────────────────────
 
 func TestExtractBashPaths_Simple(t *testing.T) {
-	paths, suspicious := extractBashPaths("cat /etc/hosts", "/tmp", "/workspace")
+	// OS-absolute target outside the working directory, written with forward
+	// slashes (bash convention) via ToSlash so Windows backslashes are not
+	// treated as shell escapes by the parser.
+	target := osAbsPath("etc", "hosts")
+	cmd := "cat " + filepath.ToSlash(target)
+	paths, suspicious := extractBashPaths(cmd, osAbsPath("wd"), osAbsPath("ws"))
 	if suspicious {
 		t.Fatal("expected not suspicious")
 	}
-	if len(paths) != 1 || paths[0] != "/etc/hosts" {
-		t.Fatalf("expected [/etc/hosts], got %v", paths)
+	want := filepath.Clean(target)
+	if len(paths) != 1 || paths[0] != want {
+		t.Fatalf("expected [%s], got %v", want, paths)
 	}
 }
 
@@ -151,25 +181,33 @@ func TestExtractBashPaths_RelativeFallback(t *testing.T) {
 }
 
 func TestExtractBashPaths_VariableExpansion(t *testing.T) {
-	paths, suspicious := extractBashPaths("cat $HOME/.config", "/tmp", "/workspace")
+	// ${HOME} (braced) delimits the variable from the following path and is
+	// detected as unexpandable; the trailing OS-absolute literal is extracted
+	// and the result is marked suspicious.
+	suffix := osAbsPath("lit", ".config")
+	cmd := "cat ${HOME}" + filepath.ToSlash(suffix)
+	paths, suspicious := extractBashPaths(cmd, osAbsPath("wd"), osAbsPath("ws"))
 	if !suspicious {
 		t.Fatal("expected suspicious flag for $var")
 	}
-	// $HOME in $HOME/.config is unexpandable, but the literal "/.config"
-	// is visible — it"s extracted and marked suspicious
-	if len(paths) != 1 || paths[0] != "/.config" {
-		t.Fatalf("expected [/.config] from literal parts, got %v", paths)
+	want := filepath.Clean(suffix)
+	if len(paths) != 1 || paths[0] != want {
+		t.Fatalf("expected [%s] from literal parts, got %v", want, paths)
 	}
 }
 
 func TestExtractBashPaths_VariableExpansionInPath(t *testing.T) {
-	paths, suspicious := extractBashPaths("cat $HOME/path/to/file", "/tmp", "/workspace")
+	// ${HOME} delimits the variable; the trailing literal path is extracted
+	// and the result is marked suspicious.
+	suffix := osAbsPath("path", "to", "file")
+	cmd := "cat ${HOME}" + filepath.ToSlash(suffix)
+	paths, suspicious := extractBashPaths(cmd, osAbsPath("wd"), osAbsPath("ws"))
 	if !suspicious {
 		t.Fatal("expected suspicious flag for $var")
 	}
-	// Literal "/path/to/file" is visible in the word; marked suspicious
-	if len(paths) != 1 || paths[0] != "/path/to/file" {
-		t.Fatalf("expected [/path/to/file] from literal parts, got %v", paths)
+	want := filepath.Clean(suffix)
+	if len(paths) != 1 || paths[0] != want {
+		t.Fatalf("expected [%s] from literal parts, got %v", want, paths)
 	}
 }
 
@@ -184,39 +222,48 @@ func TestExtractBashPaths_CommandSubstitution(t *testing.T) {
 }
 
 func TestExtractBashPaths_QuotedStrings(t *testing.T) {
-	paths, suspicious := extractBashPaths(`cat "/etc/passwd"`, "", "/workspace")
+	target := osAbsPath("etc", "passwd")
+	cmd := `cat "` + filepath.ToSlash(target) + `"`
+	paths, suspicious := extractBashPaths(cmd, osAbsPath("wd"), osAbsPath("ws"))
 	if suspicious {
 		t.Fatal("expected not suspicious")
 	}
-	if len(paths) != 1 || paths[0] != "/etc/passwd" {
-		t.Fatalf("expected [/etc/passwd], got %v", paths)
+	want := filepath.Clean(target)
+	if len(paths) != 1 || paths[0] != want {
+		t.Fatalf("expected [%s], got %v", want, paths)
 	}
 }
 
 func TestExtractBashPaths_Redirects(t *testing.T) {
-	paths, suspicious := extractBashPaths("echo hi > /tmp/out.txt", "", "/workspace")
+	target := osAbsPath("out.txt")
+	cmd := "echo hi > " + filepath.ToSlash(target)
+	paths, suspicious := extractBashPaths(cmd, osAbsPath("wd"), osAbsPath("ws"))
 	if suspicious {
 		t.Fatal("expected not suspicious")
 	}
+	want := filepath.Clean(target)
 	found := false
 	for _, p := range paths {
-		if p == "/tmp/out.txt" {
+		if p == want {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Fatalf("expected redirect target /tmp/out.txt in paths, got %v", paths)
+		t.Fatalf("expected redirect target %s in paths, got %v", want, paths)
 	}
 }
 
 func TestExtractBashPaths_ChainedCommands(t *testing.T) {
-	paths, suspicious := extractBashPaths("cd /a && ls /b", "", "/workspace")
+	a := osAbsPath("a")
+	b := osAbsPath("b")
+	cmd := "cd " + filepath.ToSlash(a) + " && ls " + filepath.ToSlash(b)
+	paths, suspicious := extractBashPaths(cmd, osAbsPath("wd"), osAbsPath("ws"))
 	if suspicious {
 		t.Fatal("expected not suspicious")
 	}
 	sort.Strings(paths)
-	expected := []string{"/a", "/b"}
+	expected := []string{filepath.Clean(a), filepath.Clean(b)}
 	sort.Strings(expected)
 	if len(paths) != 2 || paths[0] != expected[0] || paths[1] != expected[1] {
 		t.Fatalf("expected %v, got %v", expected, paths)
@@ -224,22 +271,27 @@ func TestExtractBashPaths_ChainedCommands(t *testing.T) {
 }
 
 func TestExtractBashPaths_QuotedWithSpaces(t *testing.T) {
-	paths, suspicious := extractBashPaths(`cp "/tmp/my file.txt" "/tmp/dst/"`, "", "/workspace")
+	src := osAbsPath("my file.txt") // contains a space
+	dst := osAbsPath("dst")
+	cmd := `cp "` + filepath.ToSlash(src) + `" "` + filepath.ToSlash(dst) + `/"`
+	paths, suspicious := extractBashPaths(cmd, osAbsPath("wd"), osAbsPath("ws"))
 	if suspicious {
 		t.Fatal("expected not suspicious")
 	}
+	wantSrc := filepath.Clean(src)
+	wantDst := filepath.Clean(dst)
 	foundSrc := false
 	foundDst := false
 	for _, p := range paths {
-		if p == "/tmp/my file.txt" {
+		if p == wantSrc {
 			foundSrc = true
 		}
-		if p == "/tmp/dst" {
+		if p == wantDst {
 			foundDst = true
 		}
 	}
 	if !foundSrc || !foundDst {
-		t.Fatalf("expected /tmp/my file.txt and /tmp/dst, got %v", paths)
+		t.Fatalf("expected %s and %s, got %v", wantSrc, wantDst, paths)
 	}
 }
 
@@ -283,16 +335,25 @@ func TestExtractBashPaths_ProcSubst(t *testing.T) {
 }
 
 func TestExtractBashPaths_SingleQuotes(t *testing.T) {
-	paths, suspicious := extractBashPaths("cat '/etc/hosts'", "", "/workspace")
+	target := osAbsPath("etc", "hosts")
+	cmd := "cat '" + filepath.ToSlash(target) + "'"
+	paths, suspicious := extractBashPaths(cmd, osAbsPath("wd"), osAbsPath("ws"))
 	if suspicious {
 		t.Fatal("expected not suspicious")
 	}
-	if len(paths) != 1 || paths[0] != "/etc/hosts" {
-		t.Fatalf("expected [/etc/hosts], got %v", paths)
+	want := filepath.Clean(target)
+	if len(paths) != 1 || paths[0] != want {
+		t.Fatalf("expected [%s], got %v", want, paths)
 	}
 }
 
 func TestExtractBashPaths_EscapedSpaces(t *testing.T) {
+	// Backslash-escaped spaces are POSIX shell semantics. On Windows '\' is a
+	// path separator, so filepath.Clean would mangle the preserved escape and
+	// the assertion is not meaningful there.
+	if runtime.GOOS == "windows" {
+		t.Skip("backslash-escaped spaces are POSIX shell semantics")
+	}
 	paths, suspicious := extractBashPaths(`cat /tmp/my\ file.txt`, "", "/workspace")
 	if suspicious {
 		t.Fatal("expected not suspicious")
@@ -434,8 +495,10 @@ func TestDetectSymlinks_BashExecWithSymlink(t *testing.T) {
 	symlinkPath := filepath.Join(dir, "link")
 	_ = os.Symlink(realDir, symlinkPath)
 
-	// Command targets a file through the symlink
-	command := "cat " + filepath.Join(symlinkPath, "file.txt")
+	// Command targets a file through the symlink. Use forward slashes (bash
+	// convention) via ToSlash so Windows backslashes are not treated as shell
+	// escapes by the parser.
+	command := "cat " + filepath.ToSlash(filepath.Join(symlinkPath, "file.txt"))
 	input, _ := json.Marshal(map[string]string{"command": command, "working_directory": dir})
 
 	ctx := WithWorkspacePath(context.Background(), dir)

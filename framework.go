@@ -52,6 +52,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"sync"
 	"time"
 
@@ -347,7 +348,7 @@ func New(cfg Config) (*Framework, error) {
 			DefaultWorkDir:  cfg.MCP.DefaultWorkDir,
 			SchemaSanitizer: pm.SanitizeSchema,
 		}
-		gw, gwErr := mcp.StartGateway(context.Background(), mcpCfg, fw.tools, func(s string) string { return s }, logger)
+		gw, gwErr := mcp.StartGateway(context.Background(), mcpCfg, fw.tools, os.ExpandEnv, logger)
 		if gwErr != nil {
 			logger.Warn("MCP gateway startup failed", "error", gwErr)
 		}
