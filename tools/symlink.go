@@ -3,10 +3,14 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"syscall"
 
 	"mvdan.cc/sh/v3/syntax"
 
@@ -27,7 +31,23 @@ type SymlinkTraversal struct {
 // and checks each for symlinks. Returns traversals partitioned by whether
 // the resolved target is inside or outside the workspace, plus a suspicious
 // flag for bash_exec commands with unexpandable tokens.
-func DetectSymlinksInToolInput(ctx context.Context, toolName string, input json.RawMessage) (
+//
+// schema is the tool's JSON input schema, used to identify which properties
+// carry filesystem paths. When path fields are recognizable, only those fields
+// are scanned for symlinks, so content payloads (edit_file old_string/new_string,
+// write_file content) are never mistaken for paths. When no schema is available
+// or no path-like field is recognized, detection falls back to scanning all
+// strings to preserve coverage for unconventional tools.
+//
+// Path fields are recognized by naming convention (see pathFieldExactNames and
+// pathFieldSuffixes): exact names such as path, file, dir, cwd, root,
+// working_directory, dest; or suffixes _path, _dir, _file, _filepath, _root.
+// When a schema declares a recognized path field alongside other string-typed
+// fields whose names do NOT follow the convention, those non-path fields are
+// excluded from scanning and the omission is logged (slog.Default, Warn level)
+// so it is observable rather than silent. To ensure a path-carrying parameter
+// is scanned, name it with one of the recognized names or suffixes.
+func DetectSymlinksInToolInput(ctx context.Context, toolName string, input, schema json.RawMessage) (
 	inside []SymlinkTraversal,
 	outside []SymlinkTraversal,
 	suspicious bool,
@@ -40,7 +60,30 @@ func DetectSymlinksInToolInput(ctx context.Context, toolName string, input json.
 		return inside, outside, unexpandable
 	}
 
-	paths := extractAllPathsFromJSON(input, workspace)
+	pathFields := pathFieldNamesFromSchema(schema)
+	var paths []string
+	if len(pathFields) > 0 {
+		// Field-aware: scan only declared path fields. Content fields are
+		// structurally excluded from symlink scanning.
+		if others := unrecognizedStringFieldNames(schema, pathFields); len(others) > 0 {
+			// The allowlist narrows scanning to recognized path-field names.
+			// String-typed fields that are NOT recognized (e.g. an MCP tool
+			// parameter named "target" or "source") may carry paths under a
+			// non-conventional name and will NOT be scanned. Log the omission
+			// so it is observable rather than silent; detection does not
+			// escalate on those fields.
+			slog.Warn("symlink detection narrowed by path-field allowlist; non-path string fields not scanned",
+				"tool", toolName,
+				"scanned_path_fields", sortedFieldNames(pathFields),
+				"unscanned_string_fields", others)
+		}
+		paths = extractPathsFromFields(input, pathFields, workspace)
+	} else {
+		// No schema or no recognizable path field — fall back to scanning all
+		// strings so detection still works for tools whose schema does not
+		// follow the path-naming convention.
+		paths = extractAllPathsFromJSON(input, workspace)
+	}
 	inside, outside = checkPathsForSymlinks(paths, workspace)
 	return inside, outside, false
 }
@@ -77,12 +120,186 @@ func extractAllPathsFromJSON(input json.RawMessage, workspace string) []string {
 	return paths
 }
 
+// pathFieldNamesFromSchema inspects a tool's JSON Schema and returns the set
+// of property names that carry filesystem paths (as opposed to content,
+// patterns, or other string payloads). Scanning is then confined to these
+// fields, so content fields (edit_file old_string/new_string, write_file
+// content, ...) are never mistaken for paths.
+//
+// A property is a path field when it is string-typed (or has no explicit type)
+// and its lowercased name exactly matches a known name (path, file, dir,
+// directory, filepath, filename, cwd, root, working_directory, workdir, dest,
+// destination) or ends with one of (_path, _dir, _directory, _file, _filepath,
+// _root). This deliberately excludes content/pattern fields like content,
+// old_string, new_string, command, pattern, file_pattern.
+func pathFieldNamesFromSchema(schema json.RawMessage) map[string]bool {
+	fields := make(map[string]bool)
+	if len(schema) == 0 {
+		return fields
+	}
+	var s struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+	}
+	if err := json.Unmarshal(schema, &s); err != nil {
+		return fields
+	}
+	for name, raw := range s.Properties {
+		if isPathFieldProperty(name, raw) {
+			fields[name] = true
+		}
+	}
+	return fields
+}
+
+// isStringTypedProperty reports whether a schema property is string-typed, or
+// has no explicit type (treated as string for path-field purposes since some
+// schemas omit "type"). looksLikePath still filters non-path values at
+// extraction time.
+func isStringTypedProperty(raw json.RawMessage) bool {
+	var prop struct {
+		Type string `json:"type"`
+	}
+	_ = json.Unmarshal(raw, &prop)
+	return prop.Type == "" || prop.Type == "string"
+}
+
+// isPathFieldProperty reports whether a schema property is a path field: a
+// string-typed (or untyped) property whose name follows path-naming
+// conventions. Non-string types are never path fields.
+func isPathFieldProperty(name string, raw json.RawMessage) bool {
+	return isStringTypedProperty(raw) && isPathFieldName(name)
+}
+
+// pathFieldExactNames and pathFieldSuffixes define the naming convention for
+// path-carrying properties. They are intentionally conservative to avoid
+// matching content fields.
+var (
+	pathFieldExactNames = map[string]bool{
+		"path": true, "file": true, "dir": true, "directory": true,
+		"filepath": true, "filename": true, "cwd": true, "root": true,
+		"working_directory": true, "workdir": true,
+		"dest": true, "destination": true,
+	}
+	pathFieldSuffixes = []string{"_path", "_dir", "_directory", "_file", "_filepath", "_root"}
+)
+
+func isPathFieldName(name string) bool {
+	lower := strings.ToLower(name)
+	if pathFieldExactNames[lower] {
+		return true
+	}
+	for _, suf := range pathFieldSuffixes {
+		if strings.HasSuffix(lower, suf) {
+			return true
+		}
+	}
+	return false
+}
+
+// unrecognizedStringFieldNames returns the string-typed property names in the
+// schema that are NOT recognized as path fields. When a schema declares path
+// fields alongside such fields, the latter are excluded from symlink scanning
+// (the allowlist confines scanning to recognized path-field names). Callers
+// log the result so the omission is observable rather than silent. The result
+// is sorted for deterministic logging.
+func unrecognizedStringFieldNames(schema json.RawMessage, recognized map[string]bool) []string {
+	if len(schema) == 0 {
+		return nil
+	}
+	var s struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+	}
+	if err := json.Unmarshal(schema, &s); err != nil {
+		return nil
+	}
+	var others []string
+	for name, raw := range s.Properties {
+		if recognized[name] {
+			continue
+		}
+		if isStringTypedProperty(raw) && !isPathFieldName(name) {
+			others = append(others, name)
+		}
+	}
+	sort.Strings(others)
+	return others
+}
+
+// sortedFieldNames returns the keys of m sorted, for deterministic log output.
+func sortedFieldNames(m map[string]bool) []string {
+	names := make([]string, 0, len(m))
+	for name := range m {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// extractPathsFromFields extracts path-like strings only from the named fields
+// of a JSON tool input. Unlike extractAllPathsFromJSON (which scans every
+// string), this confines scanning to declared path fields so content payloads
+// are never mistaken for paths. Each field's value is recursed (handling a
+// string or an array of paths); relative paths are resolved against workspace.
+func extractPathsFromFields(input json.RawMessage, fields map[string]bool, workspace string) []string {
+	if len(fields) == 0 {
+		return nil
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(input, &parsed); err != nil {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	var paths []string
+	for name := range fields {
+		val, ok := parsed[name]
+		if !ok {
+			continue
+		}
+		for _, s := range ExtractJSONStrings(val) {
+			if !looksLikePath(s) {
+				continue
+			}
+			resolved := resolvePathCandidate(s, workspace)
+			if resolved == "" {
+				continue
+			}
+			cleaned := filepath.Clean(resolved)
+			if _, ok := seen[cleaned]; ok {
+				continue
+			}
+			seen[cleaned] = struct{}{}
+			paths = append(paths, cleaned)
+		}
+	}
+	return paths
+}
+
 // looksLikePath returns true if a string resembles a filesystem path
 // (contains a path separator and is not a URL). Recognizes both POSIX-style
 // ("/") and Windows-style paths (drive letters like "C:\" or "D:/", and
 // UNC paths starting with "\\\\").
+//
+// To avoid false positives, strings that are obviously content rather than
+// paths are rejected: those containing control characters (newlines, tabs, or
+// any byte below 0x20 / 0x7f) and those exceeding maxPathCandidateLen.
+// Legitimate filesystem paths never contain control characters.
+// maxPathCandidateLen is a conservative upper bound for a path candidate.
+// Real filesystem paths are bounded by PATH_MAX (4096 on Linux, 1024 on
+// macOS). Strings longer than this are almost certainly content (e.g. a code
+// blob) mistakenly treated as a path, not a real path.
+const maxPathCandidateLen = 4096
+
 func looksLikePath(s string) bool {
 	if s == "" || s == "." || s == ".." {
+		return false
+	}
+	if len(s) > maxPathCandidateLen {
+		return false
+	}
+	if hasControlChar(s) {
+		// Newlines, tabs, and other control characters never appear in a real
+		// filesystem path; their presence signals content (e.g. a code
+		// snippet from edit_file old_string/new_string) rather than a path.
 		return false
 	}
 	hasSeparator := strings.Contains(s, "/") ||
@@ -99,6 +316,20 @@ func looksLikePath(s string) bool {
 		}
 	}
 	return true
+}
+
+// hasControlChar reports whether s contains an ASCII control character
+// (bytes < 0x20, including newline and tab, or 0x7f DEL). Legitimate
+// filesystem paths never contain control characters. Iterating bytes is safe:
+// UTF-8 continuation and leading bytes are all >= 0x80, so no multibyte rune
+// is misclassified as a control character.
+func hasControlChar(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c < 0x20 || c == 0x7f {
+			return true
+		}
+	}
+	return false
 }
 
 // looksLikeWindowsDriveLetter reports whether s starts with a drive-letter
@@ -275,6 +506,11 @@ func checkPathsForSymlinks(paths []string, workspace string) (inside, outside []
 // confirmation. To avoid over-prompting, Lstat failures are only escalated
 // when the unreadable component lies within the workspace — unreadable
 // paths outside the workspace are already gated by containment/judge checks.
+//
+// Invalid-path errors (ENAMETOOLONG, ENOTDIR, EINVAL) are NOT escalated: they
+// mean the candidate string is not a valid filesystem path (e.g. a code blob
+// longer than NAME_MAX that was mistakenly treated as a path), so there is
+// definitely no symlink there. Escalating on them caused false prompts.
 func walkSymlinkComponents(absPath, workspace string) []SymlinkTraversal {
 	if absPath == "" {
 		return nil
@@ -314,10 +550,20 @@ func walkSymlinkComponents(absPath, workspace string) []SymlinkTraversal {
 			if os.IsNotExist(err) {
 				break // path doesn't exist — no further components to check
 			}
-			// Permission or other error (e.g., ELOOP) — cannot determine
-			// whether this component is a symlink. Escalate only when the
-			// component lies within the workspace; unreadable paths outside
-			// the workspace are gated by containment checks elsewhere.
+			if isInvalidPathError(err) {
+				// The component is not a valid filesystem path — e.g.
+				// ENAMETOOLONG when a string mistaken for a path (a code
+				// blob) was joined onto the workspace, or ENOTDIR/EINVAL for
+				// a malformed component. Such a candidate cannot be a symlink,
+				// so stop the walk without escalating. Escalating here caused
+				// false "symlink escapes workspace" prompts on edit_file
+				// inputs whose old_string/new_string contain "/".
+				break
+			}
+			// Permission error (EACCES) or ELOOP — cannot determine whether
+			// this component is a symlink. Escalate only when the component
+			// lies within the workspace; unreadable paths outside the
+			// workspace are gated by containment checks elsewhere.
 			if workspace != "" {
 				if within, werr := pathutil.IsWithinPath(workspace, current); werr == nil && within {
 					traversals = append(traversals, SymlinkTraversal{
@@ -393,6 +639,32 @@ func walkSymlinkComponents(absPath, workspace string) []SymlinkTraversal {
 	}
 
 	return traversals
+}
+
+// isInvalidPathError reports whether err indicates the candidate is not a
+// valid filesystem path, rather than a genuine unreadable symlink. These
+// errors arise when a string mistakenly treated as a path violates filesystem
+// naming limits — e.g. ENAMETOOLONG when a code snippet longer than NAME_MAX
+// is joined onto the workspace, or ENOTDIR/EINVAL for a malformed component.
+// Such a candidate cannot be a symlink, so callers stop the walk instead of
+// escalating (which would otherwise produce a false confirmation prompt).
+//
+// Only these specific "the path itself is invalid" errors are recognized.
+// Permission errors (EACCES) and symlink loops (ELOOP) still escalate.
+func isInvalidPathError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.ENAMETOOLONG) {
+		return true
+	}
+	if errors.Is(err, syscall.ENOTDIR) {
+		return true
+	}
+	if errors.Is(err, syscall.EINVAL) {
+		return true
+	}
+	return false
 }
 
 // FormatSymlinkReasoning formats symlink traversals into a human-readable

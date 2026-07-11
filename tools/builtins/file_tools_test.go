@@ -2340,3 +2340,149 @@ func TestIsPathInSessionRoots_NoRoots(t *testing.T) {
 		t.Error("expected false when no roots configured")
 	}
 }
+
+// --- Optional-path read judge (glob, ripgrep) ---
+
+// TestGlobTool_Judge_OptionalPath verifies that glob — whose `path` parameter
+// is optional and defaults to the workspace root — auto-approves when `path`
+// is omitted (the safest case), instead of escalating with "cannot determine
+// target path".
+func TestGlobTool_Judge_OptionalPath(t *testing.T) {
+	tool := NewGlobTool()
+
+	t.Run("omitted path defaults to workspace and auto-allows", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		ctx := tools.WithWorkspacePath(context.Background(), tmpDir)
+
+		input, _ := json.Marshal(map[string]string{
+			"pattern": "frontend/src/hooks/events/*.test.ts",
+			// no "path" — should default to workspace
+		})
+
+		allow, reasoning := tool.Judge(ctx, input)
+		if !allow {
+			t.Errorf("expected allow=true for omitted path (workspace default), got reasoning: %s", reasoning)
+		}
+	})
+
+	t.Run("explicit path inside workspace auto-allows", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		subDir := filepath.Join(tmpDir, "src")
+		_ = os.MkdirAll(subDir, 0o755)
+		ctx := tools.WithWorkspacePath(context.Background(), tmpDir)
+
+		input, _ := json.Marshal(map[string]string{
+			"pattern": "**/*.ts",
+			"path":    subDir,
+		})
+
+		allow, reasoning := tool.Judge(ctx, input)
+		if !allow {
+			t.Errorf("expected allow=true for path inside workspace, got reasoning: %s", reasoning)
+		}
+	})
+
+	t.Run("explicit path outside workspace escalates", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		otherDir := t.TempDir()
+		ctx := tools.WithWorkspacePath(context.Background(), tmpDir)
+
+		input, _ := json.Marshal(map[string]string{
+			"pattern": "**/*.ts",
+			"path":    otherDir,
+		})
+
+		allow, _ := tool.Judge(ctx, input)
+		if allow {
+			t.Error("expected allow=false for path outside workspace")
+		}
+	})
+
+	t.Run("omitted path with no workspace fails closed", func(t *testing.T) {
+		input, _ := json.Marshal(map[string]string{
+			"pattern": "**/*.ts",
+		})
+
+		allow, reasoning := tool.Judge(context.Background(), input)
+		if allow {
+			t.Error("expected allow=false when no workspace and no path")
+		}
+		if reasoning != "cannot determine target path" {
+			t.Errorf("expected 'cannot determine target path', got: %s", reasoning)
+		}
+	})
+}
+
+// TestRipgrepTool_Judge_OptionalPath verifies ripgrep — whose `path` parameter
+// is optional and defaults to the workspace root — auto-approves when `path`
+// is omitted.
+func TestRipgrepTool_Judge_OptionalPath(t *testing.T) {
+	tool := NewRipgrepTool()
+
+	t.Run("omitted path defaults to workspace and auto-allows", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		ctx := tools.WithWorkspacePath(context.Background(), tmpDir)
+
+		input, _ := json.Marshal(map[string]string{
+			"pattern": "foo",
+		})
+
+		allow, reasoning := tool.Judge(ctx, input)
+		if !allow {
+			t.Errorf("expected allow=true for omitted path (workspace default), got reasoning: %s", reasoning)
+		}
+	})
+
+	t.Run("explicit path outside workspace escalates", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		otherDir := t.TempDir()
+		ctx := tools.WithWorkspacePath(context.Background(), tmpDir)
+
+		input, _ := json.Marshal(map[string]string{
+			"pattern": "foo",
+			"path":    otherDir,
+		})
+
+		allow, _ := tool.Judge(ctx, input)
+		if allow {
+			t.Error("expected allow=false for path outside workspace")
+		}
+	})
+}
+
+// TestReadFileTool_Judge_RequiredPathFailsClosed confirms read_file — whose
+// `path` is required — still fails closed on an empty path (no behavior
+// change from the optional-path fix).
+func TestReadFileTool_Judge_RequiredPathFailsClosed(t *testing.T) {
+	tool := NewReadFileTool()
+	tmpDir := t.TempDir()
+	ctx := tools.WithWorkspacePath(context.Background(), tmpDir)
+
+	input, _ := json.Marshal(map[string]string{}) // no path
+
+	allow, reasoning := tool.Judge(ctx, input)
+	if allow {
+		t.Error("expected allow=false for empty required path")
+	}
+	if reasoning != "cannot determine target path" {
+		t.Errorf("expected 'cannot determine target path', got: %s", reasoning)
+	}
+}
+
+// TestListDirectoryTool_Judge_RequiredPathFailsClosed confirms list_directory
+// — whose `path` is required — still fails closed on an empty path.
+func TestListDirectoryTool_Judge_RequiredPathFailsClosed(t *testing.T) {
+	tool := NewListDirectoryTool()
+	tmpDir := t.TempDir()
+	ctx := tools.WithWorkspacePath(context.Background(), tmpDir)
+
+	input, _ := json.Marshal(map[string]string{}) // no path
+
+	allow, reasoning := tool.Judge(ctx, input)
+	if allow {
+		t.Error("expected allow=false for empty required path")
+	}
+	if reasoning != "cannot determine target path" {
+		t.Errorf("expected 'cannot determine target path', got: %s", reasoning)
+	}
+}

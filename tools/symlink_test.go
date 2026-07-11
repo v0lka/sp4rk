@@ -1,12 +1,15 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/v0lka/sp4rk/pathutil"
@@ -502,7 +505,7 @@ func TestDetectSymlinks_BashExecWithSymlink(t *testing.T) {
 	input, _ := json.Marshal(map[string]string{"command": command, "working_directory": dir})
 
 	ctx := WithWorkspacePath(context.Background(), dir)
-	inside, outside, suspicious := DetectSymlinksInToolInput(ctx, "bash_exec", input)
+	inside, outside, suspicious := DetectSymlinksInToolInput(ctx, "bash_exec", input, nil)
 
 	if suspicious {
 		t.Fatal("expected not suspicious")
@@ -518,7 +521,7 @@ func TestDetectSymlinks_BashExecClean(t *testing.T) {
 	input, _ := json.Marshal(map[string]string{"command": command})
 
 	ctx := WithWorkspacePath(context.Background(), dir)
-	inside, outside, suspicious := DetectSymlinksInToolInput(ctx, "bash_exec", input)
+	inside, outside, suspicious := DetectSymlinksInToolInput(ctx, "bash_exec", input, nil)
 
 	if suspicious {
 		t.Fatal("expected not suspicious")
@@ -532,7 +535,7 @@ func TestDetectSymlinks_BashExecSuspicious(t *testing.T) {
 	input, _ := json.Marshal(map[string]string{"command": "cat $HOME/file"})
 
 	ctx := context.Background()
-	inside, outside, suspicious := DetectSymlinksInToolInput(ctx, "bash_exec", input)
+	inside, outside, suspicious := DetectSymlinksInToolInput(ctx, "bash_exec", input, nil)
 
 	if !suspicious {
 		t.Fatal("expected suspicious for $var expansion")
@@ -551,9 +554,10 @@ func TestDetectSymlinks_StructuredWithSymlink(t *testing.T) {
 
 	nestedPath := filepath.Join(symlinkPath, "file.txt")
 	input, _ := json.Marshal(map[string]string{"file_path": nestedPath})
+	schema := json.RawMessage(`{"type":"object","properties":{"file_path":{"type":"string"}}}`)
 
 	ctx := WithWorkspacePath(context.Background(), dir)
-	inside, outside, suspicious := DetectSymlinksInToolInput(ctx, "write_file", input)
+	inside, outside, suspicious := DetectSymlinksInToolInput(ctx, "write_file", input, schema)
 
 	if suspicious {
 		t.Fatal("expected not suspicious for structured tool")
@@ -570,8 +574,9 @@ func TestDetectSymlinks_StructuredClean(t *testing.T) {
 	_ = os.WriteFile(normalPath, []byte("x"), 0o644)
 
 	input, _ := json.Marshal(map[string]string{"file_path": normalPath})
+	schema := json.RawMessage(`{"type":"object","properties":{"file_path":{"type":"string"}}}`)
 	ctx := WithWorkspacePath(context.Background(), dir)
-	inside, outside, suspicious := DetectSymlinksInToolInput(ctx, "read_file", input)
+	inside, outside, suspicious := DetectSymlinksInToolInput(ctx, "read_file", input, schema)
 
 	if suspicious {
 		t.Fatal("expected not suspicious")
@@ -736,6 +741,53 @@ func TestLooksLikePath_NonPath(t *testing.T) {
 	}
 }
 
+func TestLooksLikePath_MultilineAndControlChars(t *testing.T) {
+	// The Case 2 reproduction: an edit_file old_string snippet (multiline Go
+	// code containing "/") must not be treated as a path.
+	codeSnippet := "\t\tif err := rows.Scan(&info.ID); err != nil {\n\t\t\t// path/to/something\n\t\t}"
+	if looksLikePath(codeSnippet) {
+		t.Error("multiline code snippet should not look like a path")
+	}
+
+	if looksLikePath("foo/bar\nbaz") {
+		t.Error("string with newline should not look like a path")
+	}
+	if looksLikePath("foo/bar\tbaz") {
+		t.Error("string with tab should not look like a path")
+	}
+	if looksLikePath("foo/bar\rbaz") {
+		t.Error("string with carriage return should not look like a path")
+	}
+	if looksLikePath("foo/bar\x00baz") {
+		t.Error("string with NUL should not look like a path")
+	}
+}
+
+func TestLooksLikePath_TooLong(t *testing.T) {
+	long := "/" + strings.Repeat("a", maxPathCandidateLen)
+	if looksLikePath(long) {
+		t.Error("string exceeding maxPathCandidateLen should not look like a path")
+	}
+}
+
+func TestLooksLikePath_NormalPathsStillAccepted(t *testing.T) {
+	cases := []string{
+		"src/a.go",
+		"/Users/x/y",
+		"./relative/path",
+		"dir/subdir/file.txt",
+	}
+	for _, c := range cases {
+		if !looksLikePath(c) {
+			t.Errorf("expected looksLikePath=true for normal path %q", c)
+		}
+	}
+	// URLs are still rejected.
+	if looksLikePath("https://example.com/a/b") {
+		t.Error("URL should not look like a (local) path")
+	}
+}
+
 // ── looksLikeWindowsDriveLetter tests ────────────────────────────────────
 
 func TestLooksLikeWindowsDriveLetter_Short(t *testing.T) {
@@ -855,4 +907,323 @@ func containsSub(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+// ── invalid-path error handling (ENAMETOOLONG etc.) ──────────────────────
+
+// TestIsInvalidPathError verifies the helper classifies only invalid-path
+// errors (ENAMETOOLONG, ENOTDIR, EINVAL) as invalid, leaving ENOENT and
+// permission errors to the escalation path.
+func TestIsInvalidPathError(t *testing.T) {
+	t.Run("nil", func(t *testing.T) {
+		if isInvalidPathError(nil) {
+			t.Error("expected false for nil")
+		}
+	})
+
+	t.Run("ENAMETOOLONG from real Lstat", func(t *testing.T) {
+		// A single component longer than NAME_MAX (255) yields ENAMETOOLONG.
+		ws := t.TempDir()
+		long := filepath.Join(ws, strings.Repeat("a", 300))
+		_, err := os.Lstat(long)
+		if err == nil {
+			t.Skip("could not produce ENAMETOOLONG on this platform")
+		}
+		if !isInvalidPathError(err) {
+			t.Errorf("expected isInvalidPathError=true for %v", err)
+		}
+	})
+
+	t.Run("ENOENT is not invalid", func(t *testing.T) {
+		_, err := os.Lstat(filepath.Join(t.TempDir(), "nope"))
+		if err == nil {
+			t.Fatal("expected an error")
+		}
+		if isInvalidPathError(err) {
+			t.Errorf("expected isInvalidPathError=false for ENOENT %v", err)
+		}
+	})
+}
+
+// TestCheckPathsForSymlinks_LongComponentNoEscalation reproduces Case 2: a
+// string mistaken for a path (a code blob) joined onto the workspace produces
+// a single component exceeding NAME_MAX. os.Lstat returns ENAMETOOLONG, which
+// must NOT be escalated as an "unresolvable symlink outside workspace".
+func TestCheckPathsForSymlinks_LongComponentNoEscalation(t *testing.T) {
+	ws := t.TempDir()
+	// A 300-byte component — longer than NAME_MAX (255). This mimics a code
+	// snippet (e.g. an edit_file old_string) glued onto the workspace root.
+	candidate := filepath.Join(ws, strings.Repeat("a", 300))
+
+	inside, outside := checkPathsForSymlinks([]string{candidate}, ws)
+	if len(inside) != 0 || len(outside) != 0 {
+		t.Fatalf("expected no traversals for over-long component, got inside=%v outside=%v", inside, outside)
+	}
+}
+
+// TestIsInvalidPathError_PermissionNotInvalid is a positive control: a real
+// permission error (EACCES) must NOT be classified as an invalid-path error,
+// so it is never short-circuited by the new early-break and still reaches the
+// unchanged escalation branch (fail-closed for unreadable symlinks).
+//
+// Note: a full end-to-end "permission-denied component escalates" test is not
+// portable here because t.TempDir() lives under macOS /var → /private/var,
+// and an unreadable subdir makes pathutil.IsWithinPath unable to resolve the
+// candidate's prefix, returning within=false regardless of this change. The
+// escalation branch itself is byte-for-byte unchanged; this assertion proves
+// the new invalid-path short-circuit cannot swallow permission errors.
+func TestIsInvalidPathError_PermissionNotInvalid(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permission test is meaningless when running as root")
+	}
+	ws := t.TempDir()
+	secret := filepath.Join(ws, "secret")
+	if err := os.Mkdir(secret, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(secret, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(secret, 0o700) })
+
+	_, err := os.Lstat(filepath.Join(secret, "hidden"))
+	if err == nil {
+		t.Skip("could not produce a permission error on this platform")
+	}
+	if isInvalidPathError(err) {
+		t.Errorf("expected isInvalidPathError=false for permission error %v", err)
+	}
+}
+
+// ── field-aware path extraction (schema-driven) ──────────────────────────
+
+func TestPathFieldNamesFromSchema(t *testing.T) {
+	globSchema := json.RawMessage(`{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"type":{"type":"string","enum":["files","dirs","all"]}}}`)
+	editSchema := json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"}},"required":["path","old_string","new_string"]}`)
+	writeSchema := json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}}}`)
+	mcpSchema := json.RawMessage(`{"type":"object","properties":{"file_path":{"type":"string"},"query":{"type":"string"}}}`)
+	noneSchema := json.RawMessage(`{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer"}}}`)
+
+	t.Run("glob: only path, not pattern/type", func(t *testing.T) {
+		f := pathFieldNamesFromSchema(globSchema)
+		if !f["path"] {
+			t.Error("expected 'path' recognized")
+		}
+		if f["pattern"] || f["type"] {
+			t.Error("pattern/type must not be recognized as path fields")
+		}
+	})
+
+	t.Run("edit_file: path only, not old_string/new_string", func(t *testing.T) {
+		f := pathFieldNamesFromSchema(editSchema)
+		if !f["path"] {
+			t.Error("expected 'path' recognized")
+		}
+		if f["old_string"] || f["new_string"] {
+			t.Error("content fields must not be recognized as path fields")
+		}
+	})
+
+	t.Run("write_file: path only, not content", func(t *testing.T) {
+		f := pathFieldNamesFromSchema(writeSchema)
+		if !f["path"] {
+			t.Error("expected 'path' recognized")
+		}
+		if f["content"] {
+			t.Error("content must not be recognized as a path field")
+		}
+	})
+
+	t.Run("MCP-style file_path suffix recognized", func(t *testing.T) {
+		f := pathFieldNamesFromSchema(mcpSchema)
+		if !f["file_path"] {
+			t.Error("expected 'file_path' recognized via _path suffix")
+		}
+		if f["query"] {
+			t.Error("'query' must not be recognized as a path field")
+		}
+	})
+
+	t.Run("no path field -> empty", func(t *testing.T) {
+		f := pathFieldNamesFromSchema(noneSchema)
+		if len(f) != 0 {
+			t.Errorf("expected no path fields, got %v", f)
+		}
+	})
+
+	t.Run("empty schema -> empty", func(t *testing.T) {
+		if len(pathFieldNamesFromSchema(nil)) != 0 {
+			t.Error("expected empty for nil schema")
+		}
+	})
+}
+
+// TestDetectSymlinks_FieldAwareExcludesContent verifies that a symlink-escaping
+// path placed in a CONTENT field (edit_file old_string) is NOT scanned, while
+// the same path in the `path` field IS detected. This is the structural fix
+// for Case 2.
+func TestDetectSymlinks_FieldAwareExcludesContent(t *testing.T) {
+	ws := t.TempDir()
+	outside := t.TempDir() // a directory outside the workspace
+
+	// A symlink inside the workspace that escapes to `outside`.
+	linkInWS := filepath.Join(ws, "escape")
+	if err := os.Symlink(outside, linkInWS); err != nil {
+		t.Fatal(err)
+	}
+	pathThroughLink := filepath.Join(linkInWS, "target.txt")
+
+	editSchema := json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"}}}`)
+	ctx := WithWorkspacePath(context.Background(), ws)
+
+	t.Run("symlink-escape via path field IS detected", func(t *testing.T) {
+		input, _ := json.Marshal(map[string]string{
+			"path":       pathThroughLink,
+			"old_string": "x",
+			"new_string": "y",
+		})
+		_, outsideTrav, _ := DetectSymlinksInToolInput(ctx, "edit_file", input, editSchema)
+		if len(outsideTrav) == 0 {
+			t.Fatal("expected symlink escape detected via 'path' field")
+		}
+	})
+
+	t.Run("symlink-escape in old_string is NOT scanned", func(t *testing.T) {
+		normalFile := filepath.Join(ws, "normal.txt")
+		_ = os.WriteFile(normalFile, []byte("x"), 0o644)
+		input, _ := json.Marshal(map[string]string{
+			"path":       normalFile,
+			"old_string": "// see " + pathThroughLink + " for details",
+			"new_string": "y",
+		})
+		insideTrav, outsideTrav, _ := DetectSymlinksInToolInput(ctx, "edit_file", input, editSchema)
+		if len(insideTrav)+len(outsideTrav) != 0 {
+			t.Fatalf("expected content field (old_string) NOT scanned, got inside=%v outside=%v", insideTrav, outsideTrav)
+		}
+	})
+}
+
+// TestDetectSymlinks_NoPathFieldFallsBack verifies that a tool whose schema has
+// no recognizable path field falls back to scanning all strings (preserving
+// detection for unconventional tools / no regression).
+func TestDetectSymlinks_NoPathFieldFallsBack(t *testing.T) {
+	ws := t.TempDir()
+	realDir := filepath.Join(ws, "real")
+	_ = os.MkdirAll(realDir, 0o755)
+	link := filepath.Join(ws, "link")
+	_ = os.Symlink(realDir, link)
+
+	// Schema with only a non-path string field "payload".
+	schema := json.RawMessage(`{"type":"object","properties":{"payload":{"type":"string"}}}`)
+	input, _ := json.Marshal(map[string]string{"payload": filepath.Join(link, "f.txt")})
+	ctx := WithWorkspacePath(context.Background(), ws)
+
+	insideTrav, _, _ := DetectSymlinksInToolInput(ctx, "some_tool", input, schema)
+	if len(insideTrav) == 0 {
+		t.Fatal("expected fallback scan to detect the symlink inside the workspace")
+	}
+}
+
+// TestDetectSymlinks_MixedFieldsLogsOmission verifies the path-field allowlist
+// log/skip behavior: when a schema declares a recognized path field alongside
+// unrecognized string fields, scanning is narrowed to the recognized field and
+// a warning is logged naming the fields that are NOT scanned — so the omission
+// is observable rather than silent.
+func TestDetectSymlinks_MixedFieldsLogsOmission(t *testing.T) {
+	ws := t.TempDir()
+	outside := t.TempDir() // a directory outside the workspace
+
+	// A symlink inside the workspace that escapes to `outside`.
+	linkInWS := filepath.Join(ws, "escape")
+	if err := os.Symlink(outside, linkInWS); err != nil {
+		t.Fatal(err)
+	}
+
+	// Capture slog output — DetectSymlinksInToolInput logs via slog.Default.
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	// Schema with a recognized `path` field AND an unrecognized `target` field.
+	schema := json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"},"target":{"type":"string"}}}`)
+
+	// A path through the symlink in the RECOGNIZED field — must be detected.
+	detected := filepath.Join(linkInWS, "a.txt")
+	// A path through the symlink in the UNRECOGNIZED field — must NOT be scanned.
+	dropped := filepath.Join(linkInWS, "b.txt")
+
+	input, _ := json.Marshal(map[string]string{
+		"path":   detected,
+		"target": dropped,
+	})
+	ctx := WithWorkspacePath(context.Background(), ws)
+
+	_, outsideTrav, _ := DetectSymlinksInToolInput(ctx, "some_tool", input, schema)
+	// Only the recognized field is scanned, so exactly one traversal (the path
+	// through `linkInWS/a.txt`); the `target` value is dropped, not scanned.
+	if len(outsideTrav) != 1 {
+		t.Fatalf("DetectSymlinksInToolInput outside = %d traversals, want 1 (recognized field only): %v",
+			len(outsideTrav), outsideTrav)
+	}
+	if outsideTrav[0].OriginalPath != detected {
+		t.Errorf("outsideTrav[0].OriginalPath = %q, want %q (the recognized 'path' field)",
+			outsideTrav[0].OriginalPath, detected)
+	}
+
+	// The omission must be logged, not silent.
+	logged := buf.String()
+	if !strings.Contains(logged, "some_tool") {
+		t.Errorf("expected warning to reference the tool name 'some_tool'; got:\n%s", logged)
+	}
+	if !strings.Contains(logged, "target") {
+		t.Errorf("expected warning to name the unscanned field 'target'; got:\n%s", logged)
+	}
+	if !strings.Contains(logged, "path") {
+		t.Errorf("expected warning to list the scanned path field 'path'; got:\n%s", logged)
+	}
+}
+
+// TestCheckPathsForSymlinks_SymlinkBeforeENOTDIR guards the component-walk
+// ordering invariant: a symlink component is detected (via Lstat+ModeSymlink)
+// at its own prefix BEFORE an ENOTDIR can occur on a deeper component (a
+// symlink pointing to a regular file, followed by a subpath). The recorded
+// symlink traversal must NOT be erased by the trailing ENOTDIR, which
+// isInvalidPathError stops on rather than escalating. A future refactor that
+// reorders the walk would break this and fail the test.
+func TestCheckPathsForSymlinks_SymlinkBeforeENOTDIR(t *testing.T) {
+	ws := t.TempDir()
+
+	// A regular file inside the workspace.
+	regularFile := filepath.Join(ws, "regular.txt")
+	if err := os.WriteFile(regularFile, []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A symlink inside the workspace pointing to the regular file.
+	link := filepath.Join(ws, "link")
+	if err := os.Symlink(regularFile, link); err != nil {
+		t.Fatal(err)
+	}
+
+	// A path that traverses the symlink then continues into a subpath of a
+	// regular file — os.Lstat on this final component yields ENOTDIR.
+	throughLink := filepath.Join(link, "subpath")
+
+	inside, outside := checkPathsForSymlinks([]string{throughLink}, ws)
+	got := append([]SymlinkTraversal(nil), inside...)
+	got = append(got, outside...)
+	if len(got) != 1 {
+		t.Fatalf("checkPathsForSymlinks(%q) = %d traversal(s), want exactly 1 (the symlink at %s reported before the trailing ENOTDIR): %+v",
+			throughLink, len(got), link, got)
+	}
+	if got[0].SymlinkAt != link {
+		t.Errorf("traversal SymlinkAt = %q, want %q", got[0].SymlinkAt, link)
+	}
+	// The trailing ENOTDIR (on <link>/subpath) must NOT escalate: the symlink
+	// itself was resolved by the time the walk reached the bad component, so
+	// the recorded traversal is resolved, not Unresolvable.
+	if got[0].Unresolvable {
+		t.Errorf("traversal is Unresolvable=true; the trailing ENOTDIR must not erase or escalate the already-resolved symlink")
+	}
 }

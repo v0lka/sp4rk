@@ -263,14 +263,22 @@ type SymlinkTraversal struct {
 ### DetectSymlinksInToolInput
 
 ```go
-func DetectSymlinksInToolInput(ctx context.Context, toolName string, input json.RawMessage) (
+func DetectSymlinksInToolInput(ctx context.Context, toolName string, input, schema json.RawMessage) (
     inside []SymlinkTraversal,
     outside []SymlinkTraversal,
-    err error,
+    suspicious bool,
 )
 ```
 
 Extracts path-like tokens from the tool input (via the [path extraction helpers](#path-extraction-helpers)), resolves each to an absolute path, walks its symlink components, and partitions the traversals into `inside` (target stays within the workspace/temp dir) and `outside` (target escapes). The caller decides whether `outside` traversals warrant a confirmation gate.
+
+`schema` is the tool's JSON input schema and drives **field-aware** extraction. When the schema declares recognizable path fields, only those fields are scanned, so content payloads (`edit_file` `old_string`/`new_string`, `write_file` `content`) are never mistaken for paths. When no schema is supplied (`nil`) or no path field is recognized, detection falls back to scanning **every** string value, preserving coverage for unconventional tools (pass the tool's real schema to gain the false-positive reduction). Obtain the schema from the `ToolDescriptor.InputSchema` / MCP tool metadata.
+
+**Path-field naming convention.** A property is treated as a path field when it is string-typed (or untyped) and its name matches an exact name (`path`, `file`, `dir`, `directory`, `filepath`, `filename`, `cwd`, `root`, `working_directory`, `workdir`, `dest`, `destination`) or ends with a suffix (`_path`, `_dir`, `_directory`, `_file`, `_filepath`, `_root`). When a schema declares a recognized path field alongside *other* string-typed fields whose names do not follow the convention, those non-path fields are excluded from scanning and the omission is logged (`slog.Default`, Warn level) so it is observable rather than silent. To ensure a path-carrying parameter is scanned, name it with one of the recognized names/suffixes.
+
+`suspicious` is set for `bash_exec` commands containing unresolved shell expansions (`$var`, `$(cmd)`, `` `cmd` ``, process substitution) that may hide additional paths; for other tools it is always `false`.
+
+**Candidate filtering.** The path-extraction helpers apply `looksLikePath`, which rejects strings that are obviously content rather than paths: strings containing control characters (bytes below `0x20` or `0x7f`, which never appear in a real path) and strings longer than `maxPathCandidateLen` (4096, a conservative `PATH_MAX` bound). URLs with a scheme (`http://`, `file://`, …) are also filtered. During the component walk, invalid-path errors (`ENAMETOOLONG`, `ENOTDIR`, `EINVAL` — e.g. a code blob longer than `NAME_MAX` mistakenly joined onto the workspace) stop the walk **without** escalating, since such a candidate cannot be a symlink. Permission errors (`EACCES`) and symlink loops (`ELOOP`) still escalate.
 
 ### OS-level symlink classification
 

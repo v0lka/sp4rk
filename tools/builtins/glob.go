@@ -56,9 +56,11 @@ type GlobInput struct {
 }
 
 // Judge checks whether the glob targets a path inside the session roots.
-// Paths outside workspace/temp require user confirmation.
+// The `path` parameter is optional and defaults to the workspace root, so an
+// omitted `path` is the safest case and auto-approves. Paths outside
+// workspace/temp require user confirmation.
 func (t *GlobTool) Judge(ctx context.Context, input json.RawMessage) (allowed bool, reason string) {
-	return judgeReadInSessionRoots(ctx, input)
+	return judgeReadInSessionRootsOptionalPath(ctx, input)
 }
 
 // Execute runs the glob pattern search and returns matching file paths.
