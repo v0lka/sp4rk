@@ -670,6 +670,11 @@ func walkSymlinkComponents(absPath, workspace string) []SymlinkTraversal {
 //
 // Only these specific "the path itself is invalid" errors are recognized.
 // Permission errors (EACCES) and symlink loops (ELOOP) still escalate.
+//
+// On Windows the POSIX errnos above are invented values
+// (APPLICATION_ERROR+offset, see zerrors_windows.go) that never match the raw
+// system codes os.Lstat returns, so isInvalidPathErrorOS recognizes the
+// Windows equivalents (ERROR_INVALID_NAME, ERROR_FILENAME_EXCED_RANGE) there.
 func isInvalidPathError(err error) bool {
 	if err == nil {
 		return false
@@ -683,7 +688,7 @@ func isInvalidPathError(err error) bool {
 	if errors.Is(err, syscall.EINVAL) {
 		return true
 	}
-	return false
+	return isInvalidPathErrorOS(err)
 }
 
 // FormatSymlinkReasoning formats symlink traversals into a human-readable
