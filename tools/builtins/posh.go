@@ -149,7 +149,7 @@ func (t *PoshExecTool) Execute(ctx context.Context, input json.RawMessage) (tool
 		workDir = tools.WorkspacePathFrom(ctx)
 	}
 	if workDir != "" {
-		if err := validateWorkDir(workDir, tools.WorkspacePathFrom(ctx), tools.TempDirFrom(ctx)); err != nil {
+		if err := validateWorkDir(workDir, tools.SessionRoots(ctx)); err != nil {
 			return tools.ToolResult{
 				Content: fmt.Sprintf("working_directory rejected: %v", err),
 				IsError: true,

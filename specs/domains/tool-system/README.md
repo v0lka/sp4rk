@@ -8,7 +8,7 @@ Provides the tool abstraction for the agent: a single `Tool` interface, a thread
 
 - `github.com/v0lka/sp4rk/tools` — `Tool` interface, `BaseTool`, `ToolResult`, `ToolPolicy`, `ToolJudger`, `ToolDescriptor`, `ToolRegistry`, `ParamManager`
 - `github.com/v0lka/sp4rk/tools` (registry) — `Register`/`RegisterWithSource`/`RegisterWithSourceCategory`, `Execute` (fail-closed policy enforcement), `List`/`ListFiltered`, MCP shadowing protection
-- `github.com/v0lka/sp4rk/tools` (context helpers) — `WithWorkspacePath`, `WithTempDir`, `WithTaskContext`
+- `github.com/v0lka/sp4rk/tools` (context helpers) — `WithWorkspacePath`, `WithTempDir`, `WithAllowedRoots`, `SessionRoots`, `WithTaskContext`. `SessionRoots` returns the deduplicated union of workspace + temp + additional allowed roots consulted by every path-containment check.
 - `github.com/v0lka/sp4rk/tools/builtins` — built-in tool catalog
 - `github.com/v0lka/sp4rk/tools/mcp` — MCP gateway (dynamic tool discovery/proxying)
 - `github.com/v0lka/sp4rk/security` — untrusted-content wrapping for tool output

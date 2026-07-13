@@ -91,27 +91,26 @@ func validateResolvedPath(resolved string) error {
 	return nil
 }
 
-// isPathInSessionRoots reports whether absPath is contained within the session
-// workspace or the session temp directory. Both roots are treated as equal
-// peers: any operation permitted inside the workspace is permitted inside the
-// temp directory and vice versa. Symlinks are resolved through the longest
-// existing prefix so that OS-level symlinks (e.g., macOS /tmp → /private/tmp)
-// do not cause false negatives.
+// isPathInSessionRoots reports whether absPath is contained within any of the
+// session roots: the workspace, the temp directory, and any additional allowed
+// roots. All roots are treated as equal peers: any operation permitted inside
+// the workspace is permitted inside the temp directory and allowed roots, and
+// vice versa. Symlinks are resolved through the longest existing prefix so
+// that OS-level symlinks (e.g., macOS /tmp → /private/tmp) do not cause false
+// negatives.
 func isPathInSessionRoots(ctx context.Context, absPath string) bool {
-	if ok := isPathInRoot(ctx, absPath, tools.WorkspacePathFrom); ok {
-		return true
-	}
-	if ok := isPathInRoot(ctx, absPath, tools.TempDirFrom); ok {
-		return true
+	for _, root := range tools.SessionRoots(ctx) {
+		if isPathInRootStr(absPath, root) {
+			return true
+		}
 	}
 	return false
 }
 
-// isPathInRoot is a helper for isPathInSessionRoots that checks absPath against
-// a single root extracted from ctx by rootFn. Returns false when the root is
-// empty or unresolvable, or when absPath is not contained within it.
-func isPathInRoot(ctx context.Context, absPath string, rootFn func(context.Context) string) bool {
-	root := rootFn(ctx)
+// isPathInRootStr reports whether absPath is contained within the single root
+// string. Returns false when the root is empty or unresolvable, or when
+// absPath is not contained within it.
+func isPathInRootStr(absPath, root string) bool {
 	if root == "" {
 		return false
 	}
@@ -124,8 +123,8 @@ func isPathInRoot(ctx context.Context, absPath string, rootFn func(context.Conte
 }
 
 // formatOutsideRootsError returns a descriptive error for a path that falls
-// outside both session roots. Used by Judge helpers when escalating to user
+// outside all session roots. Used by Judge helpers when escalating to user
 // confirmation.
 func formatOutsideRootsError(absPath string) error {
-	return fmt.Errorf("path is outside the session workspace and temp directory: %s", absPath)
+	return fmt.Errorf("path is outside the session roots: %s", absPath)
 }

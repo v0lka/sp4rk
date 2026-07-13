@@ -881,14 +881,14 @@ func TestCheckPathsForSymlinks_NoSymlinks(t *testing.T) {
 	_ = os.MkdirAll(filepath.Dir(normalPath), 0o755)
 	_ = os.WriteFile(normalPath, []byte("hello"), 0o644)
 
-	inside, outside := checkPathsForSymlinks([]string{normalPath}, dir)
+	inside, outside := checkPathsForSymlinks([]string{normalPath}, []string{dir})
 	if len(inside) != 0 || len(outside) != 0 {
 		t.Fatalf("expected no traversals, got inside=%d outside=%d", len(inside), len(outside))
 	}
 }
 
 func TestCheckPathsForSymlinks_Empty(t *testing.T) {
-	inside, outside := checkPathsForSymlinks(nil, "/ws")
+	inside, outside := checkPathsForSymlinks(nil, []string{"/ws"})
 	if len(inside) != 0 || len(outside) != 0 {
 		t.Fatalf("expected no traversals for empty input, got inside=%d outside=%d", len(inside), len(outside))
 	}
@@ -955,9 +955,75 @@ func TestCheckPathsForSymlinks_LongComponentNoEscalation(t *testing.T) {
 	// snippet (e.g. an edit_file old_string) glued onto the workspace root.
 	candidate := filepath.Join(ws, strings.Repeat("a", 300))
 
-	inside, outside := checkPathsForSymlinks([]string{candidate}, ws)
+	inside, outside := checkPathsForSymlinks([]string{candidate}, []string{ws})
 	if len(inside) != 0 || len(outside) != 0 {
 		t.Fatalf("expected no traversals for over-long component, got inside=%v outside=%v", inside, outside)
+	}
+}
+
+// TestCheckPathsForSymlinks_AllowedRootClassifiedInside proves that a symlink
+// traversal whose resolved target lies inside an additional allowed root is
+// classified as 'inside' (treated identically to the workspace and temp dir).
+// Without the allowed root, the same traversal would be 'outside'.
+func TestCheckPathsForSymlinks_AllowedRootClassifiedInside(t *testing.T) {
+	ws := t.TempDir()
+	auxRoot := t.TempDir()
+
+	// Target directory lives inside the allowed (auxiliary) root.
+	targetDir := filepath.Join(auxRoot, "real")
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Symlink lives inside the workspace but points into the allowed root.
+	link := filepath.Join(ws, "link")
+	if err := os.Symlink(targetDir, link); err != nil {
+		t.Fatal(err)
+	}
+	throughLink := filepath.Join(link, "file.txt")
+
+	// With only the workspace root, the resolved target escapes → outside.
+	inside, outside := checkPathsForSymlinks([]string{throughLink}, []string{ws})
+	if len(inside) != 0 || len(outside) == 0 {
+		t.Fatalf("expected traversal outside with workspace-only roots, got inside=%d outside=%d",
+			len(inside), len(outside))
+	}
+
+	// With the allowed root added, the resolved target is contained → inside.
+	inside, outside = checkPathsForSymlinks([]string{throughLink}, []string{ws, auxRoot})
+	if len(inside) == 0 || len(outside) != 0 {
+		t.Fatalf("expected traversal inside with allowed root, got inside=%d outside=%d",
+			len(inside), len(outside))
+	}
+}
+
+// TestDetectSymlinks_AllowedRootClassifiedInside proves the end-to-end
+// DetectSymlinksInToolInput path also honors allowed roots from the context.
+func TestDetectSymlinks_AllowedRootClassifiedInside(t *testing.T) {
+	ws := t.TempDir()
+	auxRoot := t.TempDir()
+
+	targetDir := filepath.Join(auxRoot, "real")
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(ws, "link")
+	if err := os.Symlink(targetDir, link); err != nil {
+		t.Fatal(err)
+	}
+
+	input, _ := json.Marshal(map[string]string{"path": filepath.Join(link, "file.txt")})
+	schema := json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"}}}`)
+
+	// With the allowed root in context, the traversal is 'inside'.
+	ctx := WithWorkspacePath(context.Background(), ws)
+	ctx = WithAllowedRoots(ctx, []string{auxRoot})
+	inside, outside, suspicious := DetectSymlinksInToolInput(ctx, "write_file", input, schema)
+	if suspicious {
+		t.Fatal("expected not suspicious")
+	}
+	if len(inside) == 0 || len(outside) != 0 {
+		t.Fatalf("expected traversal inside allowed root, got inside=%d outside=%d",
+			len(inside), len(outside))
 	}
 }
 
@@ -1210,7 +1276,7 @@ func TestCheckPathsForSymlinks_SymlinkBeforeENOTDIR(t *testing.T) {
 	// regular file — os.Lstat on this final component yields ENOTDIR.
 	throughLink := filepath.Join(link, "subpath")
 
-	inside, outside := checkPathsForSymlinks([]string{throughLink}, ws)
+	inside, outside := checkPathsForSymlinks([]string{throughLink}, []string{ws})
 	got := append([]SymlinkTraversal(nil), inside...)
 	got = append(got, outside...)
 	if len(got) != 1 {

@@ -139,6 +139,52 @@ func TempDirFrom(ctx context.Context) string {
 	return ""
 }
 
+// allowedRootsKey is the context key for additional containment roots
+// (auxiliary working directories) that are treated as peers of the workspace
+// and temp directory by every path-containment check. Roots must be absolute.
+type allowedRootsKey struct{}
+
+// WithAllowedRoots attaches additional containment roots (auxiliary working
+// directories) to the context. Operations inside any of these roots are
+// treated the same as the workspace and temp directory (auto-allow in the
+// judge fast-path, no confirmation for path-local AlwaysAllow tools). Roots
+// must be absolute paths.
+func WithAllowedRoots(ctx context.Context, roots []string) context.Context {
+	return context.WithValue(ctx, allowedRootsKey{}, roots)
+}
+
+// AllowedRootsFrom extracts the additional containment roots. Returns nil if none set.
+func AllowedRootsFrom(ctx context.Context) []string {
+	if v, ok := ctx.Value(allowedRootsKey{}).([]string); ok {
+		return v
+	}
+	return nil
+}
+
+// SessionRoots returns the deduplicated, non-empty union of the workspace
+// path, the temp directory, and any additional allowed roots. This is the
+// canonical list consulted by ALL path-containment checks.
+func SessionRoots(ctx context.Context) []string {
+	seen := make(map[string]struct{})
+	var roots []string
+	add := func(r string) {
+		if r == "" {
+			return
+		}
+		if _, ok := seen[r]; ok {
+			return
+		}
+		seen[r] = struct{}{}
+		roots = append(roots, r)
+	}
+	add(WorkspacePathFrom(ctx))
+	add(TempDirFrom(ctx))
+	for _, r := range AllowedRootsFrom(ctx) {
+		add(r)
+	}
+	return roots
+}
+
 // taskContextKey is the context key for passing task context through Go's context.Context.
 type taskContextKey struct{}
 

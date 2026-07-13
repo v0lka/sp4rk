@@ -1452,8 +1452,8 @@ func TestRipgrepTool_Judge_InsideWorkspace(t *testing.T) {
 // ── validateWorkDir tests ──────────────────────────────────────────────────
 
 func TestValidateWorkDir_EmptyWorkspace(t *testing.T) {
-	// Empty workspace → any directory accepted.
-	err := validateWorkDir("/anywhere", "", "")
+	// Empty roots → any directory accepted.
+	err := validateWorkDir("/anywhere", nil)
 	if err != nil {
 		t.Errorf("expected nil error when no workspace, got: %v", err)
 	}
@@ -1465,7 +1465,7 @@ func TestValidateWorkDir_InsideWorkspace(t *testing.T) {
 	if err := os.Mkdir(subDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	err := validateWorkDir(subDir, tmpDir, "")
+	err := validateWorkDir(subDir, []string{tmpDir})
 	if err != nil {
 		t.Errorf("expected nil error for inside workspace, got: %v", err)
 	}
@@ -1475,7 +1475,7 @@ func TestValidateWorkDir_OutsideWorkspace(t *testing.T) {
 	tmpDir := t.TempDir()
 	// Use a path that is clearly outside workspace and NOT inside the system temp dir.
 	// We use /dev because it's a real directory on Unix that is not under /tmp.
-	err := validateWorkDir("/dev", tmpDir, "")
+	err := validateWorkDir("/dev", []string{tmpDir})
 	if err == nil {
 		t.Error("expected error for outside workspace")
 	}
@@ -1489,7 +1489,7 @@ func TestValidateWorkDir_InsideTempDir(t *testing.T) {
 	}
 	// Temp dir from context (different from workspace) should still allow.
 	ws := t.TempDir()
-	err := validateWorkDir(subDir, ws, tmpDir)
+	err := validateWorkDir(subDir, []string{ws, tmpDir})
 	if err != nil {
 		t.Errorf("expected nil error for inside temp dir, got: %v", err)
 	}
@@ -1499,7 +1499,7 @@ func TestValidateWorkDir_InsideSystemTemp(t *testing.T) {
 	// System temp dir should always be allowed.
 	tmpDir := os.TempDir()
 	ws := t.TempDir()
-	err := validateWorkDir(tmpDir, ws, "")
+	err := validateWorkDir(tmpDir, []string{ws})
 	if err != nil {
 		t.Errorf("expected nil error for system temp dir, got: %v", err)
 	}
@@ -2338,6 +2338,41 @@ func TestIsPathInSessionRoots_NoRoots(t *testing.T) {
 	ctx := context.Background()
 	if isPathInSessionRoots(ctx, "/some/path") {
 		t.Error("expected false when no roots configured")
+	}
+}
+
+// TestIsPathInSessionRoots_AllowedRoot proves a path inside an additional
+// allowed root (auxiliary working directory) is treated identically to the
+// workspace and temp directory.
+func TestIsPathInSessionRoots_AllowedRoot(t *testing.T) {
+	ws := t.TempDir()
+	allowedRoot := t.TempDir()
+	ctx := tools.WithWorkspacePath(context.Background(), ws)
+	ctx = tools.WithAllowedRoots(ctx, []string{allowedRoot})
+	target := filepath.Join(allowedRoot, "subdir", "file.txt")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !isPathInSessionRoots(ctx, target) {
+		t.Error("expected path inside allowed root to be in session roots")
+	}
+}
+
+// TestValidateWorkDir_InsideAllowedRoot proves validateWorkDir accepts a
+// working directory inside an additional allowed root.
+func TestValidateWorkDir_InsideAllowedRoot(t *testing.T) {
+	ws := t.TempDir()
+	allowedRoot := t.TempDir()
+	subDir := filepath.Join(allowedRoot, "build")
+	if err := os.Mkdir(subDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	roots := []string{ws, allowedRoot}
+	if err := validateWorkDir(subDir, roots); err != nil {
+		t.Errorf("expected nil error for inside allowed root, got: %v", err)
 	}
 }
 

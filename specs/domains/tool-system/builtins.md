@@ -51,7 +51,7 @@ A tool's output is **untrusted** when it may carry adversarial content (web, MCP
 
 ### File tools
 
-File tools resolve paths via context helpers (`WorkspacePathFrom`/`TempDirFrom`). Relative paths are joined with the workspace root and must stay within it; absolute paths are symlink-resolved and returned regardless of containment (containment is a policy concern, not a parse failure). `read_file` uses `ReadFileRange` for O(1)-memory streaming of line ranges and is file-backed in the `ToolResultCache` (zero content bytes stored; fragments streamed from disk on demand). Binary files (null bytes in the leading window) are detected and rejected.
+File tools resolve paths via context helpers (`WorkspacePathFrom`/`TempDirFrom`). Relative paths are joined with the workspace root and must stay within it; absolute paths are symlink-resolved and returned regardless of containment (containment is a policy concern, not a parse failure). Containment checks consult `SessionRoots(ctx)` — the union of workspace, temp directory, and any additional roots attached via `WithAllowedRoots` — so all roots are equal peers for path-locality auto-approval, judge fast-paths, symlink classification, and shell working-directory validation (`AllPathsInSessionRoots`, `isPathInSessionRoots`, `validateWorkDir`). `read_file` uses `ReadFileRange` for O(1)-memory streaming of line ranges and is file-backed in the `ToolResultCache` (zero content bytes stored; fragments streamed from disk on demand). Binary files (null bytes in the leading window) are detected and rejected.
 
 ### Web search providers
 

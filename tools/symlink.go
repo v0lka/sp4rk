@@ -53,10 +53,11 @@ func DetectSymlinksInToolInput(ctx context.Context, toolName string, input, sche
 	suspicious bool,
 ) {
 	workspace := WorkspacePathFrom(ctx)
+	roots := SessionRoots(ctx)
 
 	if toolName == "bash_exec" {
 		paths, unexpandable := extractBashPathsFromInput(input, workspace)
-		inside, outside = checkPathsForSymlinks(paths, workspace)
+		inside, outside = checkPathsForSymlinks(paths, roots)
 		return inside, outside, unexpandable
 	}
 
@@ -84,7 +85,7 @@ func DetectSymlinksInToolInput(ctx context.Context, toolName string, input, sche
 		// follow the path-naming convention.
 		paths = extractAllPathsFromJSON(input, workspace)
 	}
-	inside, outside = checkPathsForSymlinks(paths, workspace)
+	inside, outside = checkPathsForSymlinks(paths, roots)
 	return inside, outside, false
 }
 
@@ -463,11 +464,23 @@ func wordLiteral(w *syntax.Word) string {
 }
 
 // checkPathsForSymlinks walks each path component-by-component looking for
-// symlinks. Returns traversals partitioned by workspace containment.
-// OS-level symlinks (those above or at the workspace root, e.g., macOS
-// /var → /private/var) are skipped — they are mapping infrastructure,
-// not security-relevant traversals.
-func checkPathsForSymlinks(paths []string, workspace string) (inside, outside []SymlinkTraversal) {
+// symlinks. Returns traversals partitioned by session-root containment: a
+// traversal whose fully resolved target lies within ANY root is classified as
+// 'inside'. OS-level symlinks (those above or at the workspace root, e.g.
+// macOS /var → /private/var) are skipped — they are mapping infrastructure,
+// not security-relevant traversals. roots is the union of workspace, temp dir
+// and allowed roots (from tools.SessionRoots); the primary root (first element,
+// the workspace) is passed to walkSymlinkComponents for OS-level symlink
+// detection and fail-closed escalation scope.
+func checkPathsForSymlinks(paths, roots []string) (inside, outside []SymlinkTraversal) {
+	// The workspace (first session root, when present) is used for OS-level
+	// symlink detection (IsOSLevelSymlink) and for the fail-closed escalation
+	// scope in walkSymlinkComponents. Relative-path resolution is unaffected:
+	// paths arriving here are already absolute.
+	var workspace string
+	if len(roots) > 0 {
+		workspace = roots[0]
+	}
 	for _, p := range paths {
 		for _, t := range walkSymlinkComponents(p, workspace) {
 			if t.Unresolvable {
@@ -478,8 +491,14 @@ func checkPathsForSymlinks(paths []string, workspace string) (inside, outside []
 				continue
 			}
 			ok := false
-			if workspace != "" {
-				ok, _ = pathutil.IsWithinPath(workspace, t.FullResolved)
+			for _, root := range roots {
+				if root == "" {
+					continue
+				}
+				if within, _ := pathutil.IsWithinPath(root, t.FullResolved); within {
+					ok = true
+					break
+				}
 			}
 			t.OutsideWorkspace = !ok
 			if t.OutsideWorkspace {

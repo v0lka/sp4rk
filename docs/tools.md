@@ -168,12 +168,17 @@ ws := tools.WorkspacePathFrom(ctx) // "" if not set
 ctx = tools.WithTempDir(ctx, tmpDir)
 tmp := tools.TempDirFrom(ctx)
 
+// Additional allowed roots — auxiliary working directories treated as equal
+// peers of the workspace and temp dir by every path-containment check.
+ctx = tools.WithAllowedRoots(ctx, []string{"/aux/work", "/aux/cache"})
+roots := tools.SessionRoots(ctx) // deduplicated union of workspace + temp + allowed roots
+
 // Task context — the current task description.
 ctx = tools.WithTaskContext(ctx, taskDesc)
 desc := tools.TaskContextFrom(ctx)
 ```
 
-Built-in file tools retrieve the workspace path via `WorkspacePathFrom(ctx)`, so always attach it before executing tasks that touch the filesystem.
+Built-in file tools retrieve the workspace path via `WorkspacePathFrom(ctx)`, so always attach it before executing tasks that touch the filesystem. Path-locality checks — the `ToolJudge` fast-path, symlink classification, and shell working-directory validation — consult `SessionRoots(ctx)`, so any auxiliary working directory must be attached via `WithAllowedRoots` to be treated as an equal peer of the workspace and temp directory.
 
 ### Filtering tools by profile
 

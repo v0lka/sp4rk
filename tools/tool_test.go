@@ -108,6 +108,65 @@ func TestWithTaskContext(t *testing.T) {
 	}
 }
 
+func TestWithAllowedRoots(t *testing.T) {
+	ctx := context.Background()
+	if got := AllowedRootsFrom(ctx); got != nil {
+		t.Fatalf("expected nil, got %v", got)
+	}
+	roots := []string{"/aux/work", "/aux/cache"}
+	ctx = WithAllowedRoots(ctx, roots)
+	got := AllowedRootsFrom(ctx)
+	if len(got) != 2 || got[0] != "/aux/work" || got[1] != "/aux/cache" {
+		t.Fatalf("expected %v, got %v", roots, got)
+	}
+}
+
+func TestSessionRoots(t *testing.T) {
+	t.Run("empty context returns nil", func(t *testing.T) {
+		if got := SessionRoots(context.Background()); got != nil {
+			t.Fatalf("expected nil, got %v", got)
+		}
+	})
+
+	t.Run("union and dedup with stable order", func(t *testing.T) {
+		ctx := context.Background()
+		ctx = WithWorkspacePath(ctx, "/ws")
+		ctx = WithTempDir(ctx, "/tmp/session")
+		ctx = WithAllowedRoots(ctx, []string{"/aux/work", "/aux/cache"})
+
+		got := SessionRoots(ctx)
+		want := []string{"/ws", "/tmp/session", "/aux/work", "/aux/cache"}
+		if len(got) != len(want) {
+			t.Fatalf("expected %d roots, got %d (%v)", len(want), len(got), got)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("root[%d] = %q, want %q", i, got[i], want[i])
+			}
+		}
+	})
+
+	t.Run("deduplicates workspace repeated as allowed root", func(t *testing.T) {
+		ctx := context.Background()
+		ctx = WithWorkspacePath(ctx, "/ws")
+		ctx = WithAllowedRoots(ctx, []string{"/ws", "/aux"})
+		got := SessionRoots(ctx)
+		if len(got) != 2 || got[0] != "/ws" || got[1] != "/aux" {
+			t.Fatalf("expected deduped [/ws /aux], got %v", got)
+		}
+	})
+
+	t.Run("empty roots are dropped", func(t *testing.T) {
+		ctx := context.Background()
+		ctx = WithWorkspacePath(ctx, "/ws")
+		ctx = WithAllowedRoots(ctx, []string{"", "/aux"})
+		got := SessionRoots(ctx)
+		if len(got) != 2 || got[0] != "/ws" || got[1] != "/aux" {
+			t.Fatalf("expected [/ws /aux] (empty dropped), got %v", got)
+		}
+	})
+}
+
 func TestToolPolicyConstants(t *testing.T) {
 	// Verify iota ordering
 	if PolicyAlwaysAllow != 0 {

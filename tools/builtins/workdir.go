@@ -7,29 +7,28 @@ import (
 	"github.com/v0lka/sp4rk/pathutil"
 )
 
-// validateWorkDir checks that dir is within the workspace root or a temp
-// directory. If workspaceRoot is empty, any directory is accepted (no
-// workspace context means no containment is possible). ctxTempDir is the
-// per-request temp dir from context (may be empty).
+// validateWorkDir checks that dir is within a session root (workspace, temp
+// directory, or any additional allowed root) or the system temp directory.
+// If roots is empty, any directory is accepted (no workspace context means no
+// containment is possible). Callers should build roots via
+// tools.SessionRoots(ctx), which already includes the workspace and temp dir.
 //
 // Containment is evaluated through pathutil.IsWithinPath (symlink-resolved)
 // rather than inline prefix checks, per the project's centralized path API.
 //
 // Shared by all shell-execution tools (bash_exec on Unix, posh_exec on
 // Windows) so it must build on every platform.
-func validateWorkDir(dir, workspaceRoot, ctxTempDir string) error {
-	if workspaceRoot == "" {
+func validateWorkDir(dir string, roots []string) error {
+	if len(roots) == 0 {
 		return nil // no workspace context — cannot enforce containment
 	}
 
-	// Allow workspace root or subdirectory.
-	if ok, _ := pathutil.IsWithinPath(workspaceRoot, dir); ok {
-		return nil
-	}
-
-	// Allow context-provided temp directory.
-	if ctxTempDir != "" {
-		if ok, _ := pathutil.IsWithinPath(ctxTempDir, dir); ok {
+	// Allow any session root (workspace, temp directory, allowed roots).
+	for _, root := range roots {
+		if root == "" {
+			continue
+		}
+		if ok, _ := pathutil.IsWithinPath(root, dir); ok {
 			return nil
 		}
 	}
@@ -39,5 +38,5 @@ func validateWorkDir(dir, workspaceRoot, ctxTempDir string) error {
 		return nil
 	}
 
-	return fmt.Errorf("path %q is outside workspace (%s) and temp directory", dir, workspaceRoot)
+	return fmt.Errorf("path %q is outside the session roots and temp directory", dir)
 }

