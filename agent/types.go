@@ -154,6 +154,17 @@ type StepLimitResponse string
 const (
 	// StepLimitAllowOnce grants exactly one additional iteration.
 	StepLimitAllowOnce StepLimitResponse = "allow_once"
+	// StepLimitAllowMore grants a full batch of additional iterations equal to
+	// the agent's configured step budget (maxSteps), letting execution run for
+	// another complete round beyond the current limit.
+	//
+	// This budget extension applies only at the step-limit boundary. When a
+	// circuit breaker (truncation, repeated or identical tool calls, fruitless
+	// results, or parse errors) reaches the limit instead, AllowMore is treated
+	// as a reprieve equivalent to StepLimitAllowOnce: the breaker's consecutive
+	// counter is reset so the loop can continue within its remaining budget, but
+	// no additional iterations are granted.
+	StepLimitAllowMore StepLimitResponse = "allow_more"
 	// StepLimitAllowAlways removes the step limit for the remainder of this execution.
 	StepLimitAllowAlways StepLimitResponse = "allow_always"
 	// StepLimitDeny terminates execution (current behavior).

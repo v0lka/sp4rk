@@ -88,21 +88,23 @@ return &agent.HITLToolDecision{
 
 ## StepLimitResponse
 
-`StepLimitResponse` represents the user's decision when the agent's step limit is reached. Three constants are defined:
+`StepLimitResponse` represents the user's decision when the agent's step limit is reached. Four constants are defined:
 
 ```go
 type StepLimitResponse string
 
 const (
-    StepLimitAllowOnce  StepLimitResponse = "allow_once"
+    StepLimitAllowOnce   StepLimitResponse = "allow_once"
+    StepLimitAllowMore   StepLimitResponse = "allow_more"
     StepLimitAllowAlways StepLimitResponse = "allow_always"
-    StepLimitDeny       StepLimitResponse = "deny"
+    StepLimitDeny        StepLimitResponse = "deny"
 )
 ```
 
 | Constant | Behavior |
 |----------|----------|
 | `StepLimitAllowOnce` | Grants exactly one additional iteration. The handler will be consulted again if the limit is reached once more. |
+| `StepLimitAllowMore` | Grants a full batch of additional iterations equal to the configured step budget (`maxSteps`). Inside a circuit breaker, it acts as a reprieve equivalent to `StepLimitAllowOnce` — the breaker's consecutive counter is reset so the loop continues within its remaining budget, but no extra iterations are granted. |
 | `StepLimitAllowAlways` | Removes the step limit for the remainder of this execution. The agent runs until it finishes or a circuit breaker fires. |
 | `StepLimitDeny` | Terminates execution. The executor returns with `Finished: false`. |
 

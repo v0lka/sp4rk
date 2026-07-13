@@ -1630,6 +1630,74 @@ func TestStepLimit_AllowOnce(t *testing.T) {
 	}
 }
 
+func TestStepLimit_AllowMore(t *testing.T) {
+	// Create executor with maxSteps=3 (N=3).
+	// HITL returns StepLimitAllowMore on the first boundary, then StepLimitDeny.
+	// AllowMore must grant a full batch of N additional iterations.
+	mockLLM := &mockLLMCaller{
+		responses: []*llm.ChatResponse{
+			llmResponseWithToolCall("searching 1", "search", json.RawMessage(`{"q":"t1"}`)),
+			llmResponseWithToolCall("searching 2", "search", json.RawMessage(`{"q":"t2"}`)),
+			llmResponseWithToolCall("searching 3", "search", json.RawMessage(`{"q":"t3"}`)),
+			llmResponseWithToolCall("searching 4", "search", json.RawMessage(`{"q":"t4"}`)),
+			llmResponseWithToolCall("searching 5", "search", json.RawMessage(`{"q":"t5"}`)),
+			llmResponseWithToolCall("searching 6", "search", json.RawMessage(`{"q":"t6"}`)),
+		},
+	}
+	mockTools := newMockToolExecutor()
+	cm := newMockContextManager()
+
+	callbackCallCount := 0
+
+	exec := newExecutorDefaultHITL(mockLLM, mockTools, &mockTokenCounter{}, 3, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+	exec.SetHITLHandler(&testStepLimitAdapter{fn: func(ctx context.Context, currentStep int, maxSteps int, reason string) (StepLimitResponse, error) {
+		callbackCallCount++
+		if callbackCallCount == 1 {
+			return StepLimitAllowMore, nil
+		}
+		return StepLimitDeny, nil
+	}})
+
+	result, err := exec.Run(context.Background(), []tools.ToolDescriptor{
+		{Name: "search", Description: "search", Source: "core"},
+	}, cm)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// AllowMore granted 3 more iterations, so the boundary fires twice (at step 4 and step 7).
+	if callbackCallCount != 2 {
+		t.Errorf("expected callback to be called exactly twice, got %d", callbackCallCount)
+	}
+
+	if result.Finished {
+		t.Error("expected Finished=false when step limit callback returns deny on second call")
+	}
+
+	// 3 original + 3 granted by AllowMore = 6 tool call steps.
+	toolCallSteps := 0
+	for _, s := range result.Steps {
+		if s.Action.Name != "" {
+			toolCallSteps++
+		}
+	}
+	if toolCallSteps != 6 {
+		t.Errorf("expected 6 tool call steps (3 + 3 granted), got %d", toolCallSteps)
+	}
+
+	// Verify the AllowMore nudge was injected with the configured budget (3).
+	foundNudge := false
+	for _, s := range result.Steps {
+		if strings.Contains(s.UserNudge, "granted you 3 additional tool call iterations") {
+			foundNudge = true
+			break
+		}
+	}
+	if !foundNudge {
+		t.Error("expected AllowMore nudge to be injected with the configured budget")
+	}
+}
+
 func TestStepLimit_AllowAlways(t *testing.T) {
 	// Create executor with maxSteps=2
 	// Set HITLHandler.OnStepLimit that returns StepLimitAllowAlways

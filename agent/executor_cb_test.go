@@ -806,6 +806,70 @@ func TestCheckParseErrors_Abort_StepLimitAllowOnce(t *testing.T) {
 	_ = obs
 }
 
+func TestCheckParseErrors_Abort_StepLimitAllowMore(t *testing.T) {
+	cfg := CircuitBreakerConfig{
+		RepeatNudgeThreshold:         3,
+		RepeatAbortThreshold:         4,
+		TruncationAbortThreshold:     3,
+		ParseErrorAbortThreshold:     3,
+		FruitlessNudgeThreshold:      50,
+		FruitlessAbortThreshold:      60,
+		FruitlessMaxResultLen:        32,
+		SameToolRepeatNudgeThreshold: 50,
+		SameToolRepeatAbortThreshold: 60,
+		SameToolResultSizeDelta:      64,
+	}
+	exec := newExecutorDefaultHITL(&mockLLMCaller{}, newMockToolExecutor(), &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, cfg)
+	exec.emitter = &NoopEvents{}
+	exec.consecutiveParseErrorCount = 2
+	exec.consecutiveParseErrorTool = "create_file"
+	exec.SetHITLHandler(&testStepLimitAdapter{fn: func(ctx context.Context, stepNum, effectiveMaxSteps int, reason string) (StepLimitResponse, error) {
+		return StepLimitAllowMore, nil
+	}})
+
+	state := &runState{effectiveMaxSteps: 10}
+	cw := newMockContextManager()
+
+	_, act, result, _ := exec.checkParseErrors(
+		context.Background(),
+		llm.ToolCall{Name: "create_file"},
+		0, "failed to parse input: bad json",
+		tools.ToolResult{Content: "failed to parse input: bad json", IsError: true},
+		state,
+		cw,
+	)
+	if result != nil {
+		t.Error("expected nil result when StepLimitAllowMore grants a reprieve")
+	}
+	if act != actionBreak {
+		t.Errorf("expected actionBreak, got %v", act)
+	}
+	if !state.circuitBreakerTriggered {
+		t.Error("circuitBreakerTriggered should be true")
+	}
+	// In a circuit breaker, AllowMore is a reprieve equivalent to AllowOnce:
+	// the consecutive counter is reset, but no additional iterations are granted.
+	if exec.consecutiveParseErrorCount != 0 {
+		t.Errorf("consecutiveParseErrorCount = %d, want 0 (counter reset)", exec.consecutiveParseErrorCount)
+	}
+	if state.effectiveMaxSteps != 10 {
+		t.Errorf("effectiveMaxSteps = %d, want 10 (no budget extension in circuit breakers)", state.effectiveMaxSteps)
+	}
+	// The AllowMore nudge must branch away from the AllowOnce "ONE more chance" wording.
+	foundAllowMoreNudge := false
+	for _, s := range state.allSteps {
+		if strings.Contains(s.UserNudge, "let you continue") {
+			foundAllowMoreNudge = true
+		}
+		if strings.Contains(s.UserNudge, "ONE more chance") {
+			t.Errorf("AllowMore nudge should not reuse AllowOnce wording, got %q", s.UserNudge)
+		}
+	}
+	if !foundAllowMoreNudge {
+		t.Error("expected AllowMore ('let you continue') nudge to be injected")
+	}
+}
+
 // --- applyPerToolTruncation ---
 
 func TestApplyPerToolTruncation_NilConfig(t *testing.T) {

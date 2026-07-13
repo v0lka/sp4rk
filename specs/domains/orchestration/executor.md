@@ -55,7 +55,7 @@ The loop terminates when `finish` is called (`Finished: true`) or the budget is 
 | Fruitless | Consecutive minimal-result calls | `HITLHandler.OnStepLimit` |
 | Same tool | Same tool with varied args but similar results | `HITLHandler.OnStepLimit` |
 
-On an abort, `HITLHandler.OnStepLimit` is invoked with the trigger reason and the same three options as the step limit: **AllowOnce** (reset + nudge), **AllowAlways** (disable that breaker + nudge), **Deny** (stop). If `HITLHandler` is nil, the executor aborts immediately (headless/test behavior).
+On an abort, `HITLHandler.OnStepLimit` is invoked with the trigger reason and the same four options as the step limit: **AllowOnce** (reset the breaker's consecutive counter + nudge), **AllowMore** (at the step-limit boundary, grants a full batch of `maxSteps` additional iterations; inside a circuit breaker, a reprieve equivalent to AllowOnce — resets the counter so the loop continues within its remaining budget, but grants no extra iterations), **AllowAlways** (disable that breaker + nudge), **Deny** (stop). If `HITLHandler` is nil, the executor aborts immediately (headless/test behavior).
 
 ### Mutation gate
 

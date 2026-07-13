@@ -71,6 +71,22 @@ func (e *Executor) handleStepLimitBoundary(ctx context.Context, state *runState,
 		}
 		state.allSteps = append(state.allSteps, nudgeStep)
 		cw.AddStep(nudgeStep)
+	case StepLimitAllowMore:
+		// Grant a full batch of iterations equal to the configured step budget.
+		grant := e.maxSteps
+		if grant < 1 {
+			grant = 1
+		}
+		state.effectiveMaxSteps += grant
+		// Inject nudge for LLM
+		nudgeStep := Step{
+			UserNudge: fmt.Sprintf(
+				"[System] The user granted you %d additional tool call iterations. "+
+					"Continue making progress on your task. The user may deny further extensions if you exceed this budget.",
+				grant),
+		}
+		state.allSteps = append(state.allSteps, nudgeStep)
+		cw.AddStep(nudgeStep)
 	case StepLimitAllowAlways:
 		state.unlimitedSteps = true
 		// Inject nudge for LLM
@@ -395,10 +411,14 @@ func (e *Executor) handleTruncationStopReason(ctx context.Context, resp *llm.Cha
 		slResp, slErr := e.hitl.OnStepLimit(ctx, state.stepNum, state.effectiveMaxSteps, abortReason)
 		if slErr == nil {
 			switch slResp {
-			case StepLimitAllowOnce:
+			case StepLimitAllowOnce, StepLimitAllowMore:
 				e.consecutiveTruncationCount = 0
+				reprieve := "granted you ONE more chance"
+				if slResp == StepLimitAllowMore {
+					reprieve = "let you continue"
+				}
 				nudgeStep := Step{
-					UserNudge: "[System] The user acknowledged the truncation circuit breaker and granted you ONE more chance. " +
+					UserNudge: "[System] The user acknowledged the truncation circuit breaker and " + reprieve + ". " +
 						"You MUST use smaller operations to avoid hitting the output token limit.",
 				}
 				state.allSteps = append(state.allSteps, nudgeStep)
@@ -1126,10 +1146,14 @@ func (e *Executor) checkRepeatIdenticalTool(
 		slResp, slErr := e.hitl.OnStepLimit(ctx, state.stepNum, state.effectiveMaxSteps, abortReason)
 		if slErr == nil {
 			switch slResp {
-			case StepLimitAllowOnce:
+			case StepLimitAllowOnce, StepLimitAllowMore:
 				e.consecutiveRepeatCount = 0
+				reprieve := "granted you ONE more chance"
+				if slResp == StepLimitAllowMore {
+					reprieve = "let you continue"
+				}
 				nudgeStep := Step{
-					UserNudge: "[System] The user acknowledged the circuit breaker and granted you ONE more chance. " +
+					UserNudge: "[System] The user acknowledged the circuit breaker and " + reprieve + ". " +
 						"You MUST change your approach immediately — do NOT repeat the same tool call.",
 				}
 				state.allSteps = append(state.allSteps, nudgeStep)
@@ -1228,11 +1252,15 @@ func (e *Executor) checkFruitlessResult(
 		slResp, slErr := e.hitl.OnStepLimit(ctx, state.stepNum, state.effectiveMaxSteps, abortReason)
 		if slErr == nil {
 			switch slResp {
-			case StepLimitAllowOnce:
+			case StepLimitAllowOnce, StepLimitAllowMore:
 				e.consecutiveFruitlessCount = 0
 				e.fruitlessNudgeAttempted = false
+				reprieve := "granted you ONE more chance"
+				if slResp == StepLimitAllowMore {
+					reprieve = "let you continue"
+				}
 				nudgeStep := Step{
-					UserNudge: "[System] The user acknowledged the fruitless-results circuit breaker and granted you ONE more chance. " +
+					UserNudge: "[System] The user acknowledged the fruitless-results circuit breaker and " + reprieve + ". " +
 						"Try a fundamentally different approach to find the information you need.",
 				}
 				state.allSteps = append(state.allSteps, nudgeStep)
@@ -1331,11 +1359,15 @@ func (e *Executor) checkSameToolRepetition(
 		slResp, slErr := e.hitl.OnStepLimit(ctx, state.stepNum, state.effectiveMaxSteps, abortReason)
 		if slErr == nil {
 			switch slResp {
-			case StepLimitAllowOnce:
+			case StepLimitAllowOnce, StepLimitAllowMore:
 				e.sameToolConsecutiveCount = 0
 				e.sameToolNudgeAttempted = false
+				reprieve := "granted you ONE more chance"
+				if slResp == StepLimitAllowMore {
+					reprieve = "let you continue"
+				}
 				nudgeStep := Step{
-					UserNudge: "[System] The user acknowledged the same-tool circuit breaker and granted you ONE more chance. " +
+					UserNudge: "[System] The user acknowledged the same-tool circuit breaker and " + reprieve + ". " +
 						"Try a completely different tool or approach instead of repeating the same tool.",
 				}
 				state.allSteps = append(state.allSteps, nudgeStep)
@@ -1409,10 +1441,14 @@ func (e *Executor) checkParseErrors(
 			slResp, slErr := e.hitl.OnStepLimit(ctx, state.stepNum, state.effectiveMaxSteps, abortReason)
 			if slErr == nil {
 				switch slResp {
-				case StepLimitAllowOnce:
+				case StepLimitAllowOnce, StepLimitAllowMore:
 					e.consecutiveParseErrorCount = 0
+					reprieve := "granted you ONE more chance"
+					if slResp == StepLimitAllowMore {
+						reprieve = "let you continue"
+					}
 					nudgeStep := Step{
-						UserNudge: "[System] The user acknowledged the parse-error circuit breaker and granted you ONE more chance. " +
+						UserNudge: "[System] The user acknowledged the parse-error circuit breaker and " + reprieve + ". " +
 							"You MUST fix your tool call arguments — they are malformed. Try a simpler approach.",
 					}
 					state.allSteps = append(state.allSteps, nudgeStep)

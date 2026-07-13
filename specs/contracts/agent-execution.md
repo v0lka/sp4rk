@@ -20,7 +20,7 @@ The host application consumes the agent execution types from `github.com/v0lka/s
 | `CompactionStrategy` | agent | Implemented by host / SDK strategies | Compresses step history into a compact `[]llm.Message` within a token budget |
 | `Step` | agent | Consumed by host | Single ReAct iteration record (thought, reasoning, action `llm.ToolCall`, observation, error/untrusted flags, cache hash) |
 | `ExecutorResult` | agent | Consumed by host | Executor output: final string, the full `[]Step` trajectory, and a `Finished` flag |
-| `StepLimitResponse` | agent | Consumed by host | `allow_once` / `allow_always` / `deny` returned from `OnStepLimit` |
+| `StepLimitResponse` | agent | Consumed by host | `allow_once` / `allow_more` / `allow_always` / `deny` returned from `OnStepLimit` |
 | `HITLToolDecision` | agent | Consumed by host | `{Allow bool; ModifiedInput json.RawMessage; Reason string}` returned from `OnToolCall` |
 | `CircuitBreakerConfig` | agent | Provided by host config | Circuit-breaker thresholds (repeat/truncation/parse-error/fruitless abort) protecting the loop |
 

@@ -111,15 +111,16 @@ return &agent.HITLToolDecision{
 ```go
 func (h *ConfirmingHITL) OnStepLimit(_ context.Context, currentStep, maxSteps int, reason string) (agent.StepLimitResponse, error) {
     // Ask the user if they want to grant one more step
-    return agent.StepLimitAllowOnce, nil  // or StepLimitDeny / StepLimitAllowAlways
+    return agent.StepLimitAllowOnce, nil  // or StepLimitDeny / StepLimitAllowMore / StepLimitAllowAlways
 }
 ```
 
-Three possible responses:
+Four possible responses:
 
 | Response              | Effect                                           |
 |-----------------------|--------------------------------------------------|
 | `StepLimitAllowOnce`  | Grant exactly one more iteration                 |
+| `StepLimitAllowMore`  | Grant a full batch of iterations (the configured `MaxSteps`); inside a circuit breaker, a reprieve equivalent to `AllowOnce` |
 | `StepLimitAllowAlways`| Remove the step limit for the rest of execution  |
 | `StepLimitDeny`       | Stop execution (the default `NoopHITLHandler` behaviour) |
 
