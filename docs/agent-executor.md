@@ -56,6 +56,7 @@ Available options:
 | `WithToolResultBudget(b ToolResultBudget)` | Stage 2 token-based truncation. Defaults to `DefaultToolResultBudget()` when unset. |
 | `WithCircuitBreaker(c CircuitBreakerConfig)` | Loop-protection thresholds. Defaults to `DefaultCircuitBreakerConfig()` when unset. |
 | `WithHITL(h HITLHandler)` | Human-in-the-loop hooks (nil → `NoopHITLHandler`). |
+| `WithResumeSteps(steps []Step)` | Seeds prior ReAct steps so `Run` resumes from a checkpoint instead of starting fresh. The step counter starts at `len(steps)+1` and the full trajectory (seeded plus new steps) syncs to the `TrajectoryStore`. The resumed steps count against `maxSteps`; the caller must seed the `ContextManager` with the same steps (e.g. via `memory.ContextWindow.SeedSteps`). Nil/empty (or omitted) is the default fresh-start behavior. |
 
 A minimal construction using the SDK defaults:
 

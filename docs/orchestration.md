@@ -94,6 +94,7 @@ type ConductorConfig struct {
     PreWarningPercent int
     NonCacheableTools []string
     ConversationHistory []llm.Message
+    ResumeSteps         []agent.Step
 }
 ```
 
@@ -117,6 +118,7 @@ type ConductorConfig struct {
 | `PreWarningPercent` | Context-fill percentage that triggers a pre-compaction `store_fact` nudge. `0` disables it. |
 | `NonCacheableTools` | Additional tool names whose results must not be cached (e.g. meta-tools whose output is inherently volatile). Extends the SDK-provided defaults. |
 | `ConversationHistory` | Prior user/assistant exchanges from the session. When non-empty, the Conductor injects it into the `ContextManager` so the LLM sees the dialogue leading up to the current message. Without this, a follow-up like "implement variant a" has no referent. |
+| `ResumeSteps` | Prior ReAct steps to resume from a checkpoint instead of starting fresh. When non-empty, `Run` seeds the `ContextManager` (via its `StepSeedable` capability) and the `Executor` (via `agent.WithResumeSteps`) with a defensive copy, so the step counter continues from `len(steps)+1` and the full trajectory syncs to the `TrajectoryStore`. The steps count against `MaxSteps`, not in addition to it. Requires a `StepSeedable` `ContextManager`; `Run` fails fast otherwise. Nil/empty (the default) is fully backward-compatible. |
 
 ### NewConductor
 
@@ -171,7 +173,7 @@ Launches the Conductor's single ReAct loop for one task.
 
 An `*ExecutionResult` whose `Status` is `ExecutionStatusSuccess`, `ExecutionStatusPartial` (the loop ended without finishing), or `ExecutionStatusFailed` (an error occurred). The returned `Blackboard` is the same instance passed in, now populated with any reflections recorded during the run.
 
-`Run` returns an error only when the context factory or system prompt factory is missing, or when the underlying executor returns an error. A non-nil error is still accompanied by a non-nil `*ExecutionResult` carrying best-effort output.
+`Run` returns an error only when the context factory or system prompt factory is missing, when `ResumeSteps` is set but the `ContextManager` does not implement `StepSeedable`, or when the underlying executor returns an error. A non-nil error is still accompanied by a non-nil `*ExecutionResult` carrying best-effort output.
 
 ```go
 result, err := conductor.Run(ctx, step.Description, bb, availableTools, events, "sliding_window")
@@ -312,7 +314,7 @@ Creates a `ContextManager` for a new task step. `pruningOverrides`, when provide
 
 ### Optional ContextManager capabilities
 
-The Conductor type-asserts the `ContextManager` returned by the factory against three named capability interfaces and uses them when implemented (the SDK's `memory.ContextWindow` implements all three):
+The Conductor type-asserts the `ContextManager` returned by the factory against four named capability interfaces and uses them when implemented (the SDK's `memory.ContextWindow` implements all four):
 
 ```go
 // Receives the formatted task content (the user message).
@@ -332,9 +334,16 @@ type ConversationAware interface {
 type TrackerProvider interface {
     ContextTracker() *llm.ContextTokenTracker
 }
+
+// Receives prior ReAct steps to resume from a checkpoint. Asserted (and
+// required) only when ConductorConfig.ResumeSteps is set; Run fails fast if
+// the ContextManager does not implement it.
+type StepSeedable interface {
+    SeedSteps(steps []agent.Step)
+}
 ```
 
-A custom `ContextManager` that does not implement these interfaces still works — the corresponding features (task content injection, prior-conversation rendering, tracker correction) are simply skipped.
+A custom `ContextManager` that does not implement these interfaces still works — the corresponding features (task content injection, prior-conversation rendering, tracker correction) are simply skipped. The exception is `StepSeedable`: when `ResumeSteps` is set, the `ContextManager` **must** implement it or `Run` returns an error before the loop starts.
 
 ### PruningOverride
 

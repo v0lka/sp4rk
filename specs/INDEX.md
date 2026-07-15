@@ -15,6 +15,7 @@
 | Plan generation, DAG, replan                                  | [domains/orchestration/planner.md](domains/orchestration/planner.md)            |
 | Failure analysis, retry/replan/abort                          | [domains/orchestration/reflector.md](domains/orchestration/reflector.md)        |
 | Subagent delegation, parallel steps                           | [domains/orchestration/subagents.md](domains/orchestration/subagents.md)        |
+| Resuming execution from a checkpoint (ResumeSteps, SeedSteps) | [domains/orchestration/conductor.md](domains/orchestration/conductor.md), [domains/orchestration/executor.md](domains/orchestration/executor.md), [domains/memory/README.md](domains/memory/README.md) |
 | Tool registry, execution pipeline                             | [domains/tool-system/README.md](domains/tool-system/README.md)                  |
 | Adding/modifying built-in tools                               | [domains/tool-system/builtins.md](domains/tool-system/builtins.md)              |
 | MCP servers, dynamic tools                                    | [domains/tool-system/mcp-gateway.md](domains/tool-system/mcp-gateway.md)        |

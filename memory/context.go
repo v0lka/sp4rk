@@ -299,6 +299,43 @@ func (cw *ContextWindow) AddStep(step sdkagent.Step) {
 	cw.tracker.AddDelta(stepText)
 }
 
+// SeedSteps sets the step history directly, bypassing AddStep's per-step
+// tracker delta. It performs a wholesale replacement of the window contents:
+// the step history, compaction state, and token tracker are all reset, then
+// the cumulative token delta is recalculated for the seeded batch so fill
+// accounting stays approximately correct until the next CorrectTokenCount
+// correction from the API.
+//
+// SeedSteps is used to resume an executor from a checkpoint: the seeded
+// steps appear in BuildPrompt as proper assistant+tool messages, and a
+// resumed executor's step counter continues from len(steps) instead of
+// starting fresh. Any prior compaction state (compactedMessages/
+// compactedThroughIndex) is cleared because the seeded history replaces the
+// window contents wholesale.
+//
+// Passing nil or an empty slice clears any existing step history.
+func (cw *ContextWindow) SeedSteps(steps []sdkagent.Step) {
+	cw.steps = steps
+	cw.compactedMessages = nil
+	cw.compactedThroughIndex = 0
+	// Reset the tracker so the wholesale replacement is reflected in fill
+	// accounting. Without Reset the seeded steps' token delta would pile on
+	// top of whatever the tracker already held, inflating FillPercent and
+	// deflating AvailableTokens until the next CorrectTokenCount. On a
+	// freshly-created window the tracker is already zero, so this is a
+	// no-op there.
+	cw.tracker.Reset()
+	// Recalculate the tracker delta for the whole batch using the same
+	// per-step estimate AddStep applies. On a freshly-created window the
+	// tracker starts at zero, so pendingDelta converges on the seeded
+	// history's token estimate; the next CorrectTokenCount call reconciles
+	// it with the API-reported actual.
+	for _, step := range steps {
+		stepText := fmt.Sprintf("%s %s %s %s", step.Thought, step.Action.Name, string(step.Action.Input), step.Observation)
+		cw.tracker.AddDelta(stepText)
+	}
+}
+
 // SetStrategy changes the compaction strategy.
 func (cw *ContextWindow) SetStrategy(s sdkagent.CompactionStrategy) {
 	cw.strategy = s

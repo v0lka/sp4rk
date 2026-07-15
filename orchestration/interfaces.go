@@ -79,6 +79,16 @@ type TrackerProvider interface {
 	ContextTracker() *llm.ContextTokenTracker
 }
 
+// StepSeedable is an optional capability interface for ContextManager
+// implementations that can be seeded with pre-existing ReAct steps. The
+// Conductor type-asserts the ContextManager against this interface and calls
+// SeedSteps when ResumeSteps is configured, letting a resumed executor
+// continue from where it left off instead of starting fresh. sp4rk's
+// memory.ContextWindow implements it.
+type StepSeedable interface {
+	SeedSteps(steps []agent.Step)
+}
+
 // ContextManagerFactory creates a ContextManager for a new task step.
 // pruningOverrides, when provided, override the global pruning configuration
 // with step-specific KeepLastN and ProtectedTools values.

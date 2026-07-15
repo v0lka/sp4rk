@@ -6,7 +6,7 @@ Manages the agent's working memory during execution: a managed representation of
 
 ## Key Files
 
-- `github.com/v0lka/sp4rk/memory` — `ContextWindow`, `ContextWindowConfig`, `NewContextWindow`, `BuildPrompt`/`AddStep`/`Compact`/`CheckFill`
+- `github.com/v0lka/sp4rk/memory` — `ContextWindow`, `ContextWindowConfig`, `NewContextWindow`, `BuildPrompt`/`AddStep`/`SeedSteps`/`Compact`/`CheckFill`
 - `github.com/v0lka/sp4rk/memory` (compaction) — `CompactionStrategy` implementations (`SlidingWindowStrategy`, `SummarizationStrategy`, `HierarchicalStrategy`), `NewCompactionStrategy` factory, `CompactionConfig`, `CompactionDeps`
 - `github.com/v0lka/sp4rk/memory` — `CompactionThresholds`, `ToolOutputPruning`, `HistoryMutation`
 - `github.com/v0lka/sp4rk/security` — untrusted-content wrapping for tool output
@@ -75,6 +75,7 @@ When `InjectionDefenseEnabled` is `true`, tool outputs from untrusted sources (f
 - History mutation and pruning run first in message construction; outputs already replaced by a cache reference or step-status eviction text are not overwritten by the pruning placeholder.
 - Entire response groups are protected if any step in the group is protected (prevents malformed assistant/tool message pairs).
 - Each step/subagent has its own `ContextManager` (no sharing between parallel steps).
+- `SeedSteps` wholesale-replaces the step history: it clears compaction state and recalculates the token-tracker delta for the batch, so fill accounting stays correct until the next `CorrectTokenCount`.
 
 ## Configuration
 
@@ -105,7 +106,7 @@ When `InjectionDefenseEnabled` is `true`, tool outputs from untrusted sources (f
 - **Custom thresholds / pruning**: override compaction trigger percentages and `KeepLastN`/`ProtectedTools`.
 - **Alternative token counter**: swap the `llm.TokenCounter` implementation; the `ContextTokenTracker` corrects estimates with API-reported actuals.
 - **Per-step pruning overrides**: `PruningOverride` (carried through `ContextManagerFactory`) lets a step supply its own `KeepLastN`/`ProtectedTools`.
-- **Optional `ContextManager` capabilities**: `TaskAware` (`SetTask`), `ConversationAware` (`SetPriorConversation`), `TrackerProvider` (`ContextTracker`) are type-asserted by the Conductor and wired when implemented.
+- **Optional `ContextManager` capabilities**: `TaskAware` (`SetTask`), `ConversationAware` (`SetPriorConversation`), `TrackerProvider` (`ContextTracker`), and `StepSeedable` (`SeedSteps`) are type-asserted by the Conductor and wired when implemented. `SeedSteps` wholesale-replaces the step history and clears compaction state, enabling resume from a checkpoint; it is required when the Conductor's `ResumeSteps` is set.
 
 ## Related Specs
 

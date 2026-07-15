@@ -45,6 +45,7 @@ type ConductorConfig struct {
     PreWarningPercent   int
     NonCacheableTools   []string
     ConversationHistory []llm.Message
+    ResumeSteps         []agent.Step
 }
 
 // Shared, thread-safe container for all task state.
@@ -126,7 +127,7 @@ The Conductor is the only top-level execution entry point this domain exposes. D
 - The Conductor's `finish`-join guard rejects `finish` while a `PendingDelegations` registry (injected via `WithDelegationRegistry`) reports pending async work.
 - The blackboard is created once per first request and restored for continuations via a `Checkpointer`.
 - The `finish` tool is always available in every run (appended automatically if absent).
-- A `ContextManager` returned by the factory that implements `TaskAware`/`ConversationAware`/`TrackerProvider` gets the corresponding capabilities wired; otherwise they are safely skipped.
+- A `ContextManager` returned by the factory that implements `TaskAware`/`ConversationAware`/`TrackerProvider`/`StepSeedable` gets the corresponding capabilities wired; otherwise they are safely skipped, except `StepSeedable` which is required when `ResumeSteps` is set (else `Run` fails fast).
 
 ## Configuration
 
@@ -138,6 +139,7 @@ The Conductor is the only top-level execution entry point this domain exposes. D
 | `ReasoningEffort` | `""` | Reasoning effort passed to reasoning-capable models. |
 | `PreWarningPercent` | `0` (disabled) | Context-fill percentage that triggers a pre-compaction `store_fact` nudge. |
 | `CircuitBreaker` | `DefaultCircuitBreakerConfig()` | Loop-protection thresholds (see [executor.md](executor.md)). |
+| `ResumeSteps` | `nil` | Prior ReAct steps to resume from a checkpoint. When non-empty, `Run` seeds the `ContextManager` (via `StepSeedable`) and the `Executor` (via `WithResumeSteps`); the steps count against `MaxSteps`. Requires a `StepSeedable` `ContextManager` (see [conductor.md](conductor.md)). |
 | `ContextFactory` / `SystemPrompt` | required | Both must be non-nil or `Run` returns an error. |
 | `ModelRegistry` | optional | Resolves model metadata; an unknown model falls back to a usable metadata (`ContextWindow=128000`, `OutputLimit=4096`). |
 

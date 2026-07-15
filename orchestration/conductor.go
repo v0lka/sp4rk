@@ -46,6 +46,26 @@ type ConductorConfig struct {
 	// current message. Without this, a follow-up like "implement variant a"
 	// has no referent — the Conductor only sees the current message.
 	ConversationHistory []llm.Message
+
+	// ResumeSteps holds pre-existing ReAct steps used to resume an execution
+	// from a checkpoint instead of starting fresh. When non-empty, the
+	// Conductor seeds the ContextManager (via its StepSeedable capability)
+	// and the Executor (via WithResumeSteps) with these steps so the step
+	// counter continues from len(steps)+1 and the full trajectory is synced
+	// to the TrajectoryStore. Zero-value (nil/empty) is the default
+	// fresh-start behavior and is fully backward-compatible.
+	//
+	// Budget: the resumed steps are counted against the shared MaxSteps
+	// budget, not in addition to it. The executor's loop runs until
+	// stepNum <= MaxSteps+1, so a meaningful resume needs MaxSteps
+	// meaningfully larger than len(ResumeSteps); when len(ResumeSteps) >=
+	// MaxSteps the resumed loop has little or no room for new steps (and may
+	// immediately hit the step-limit boundary).
+	//
+	// The ContextManager produced by ContextFactory MUST implement
+	// StepSeedable when ResumeSteps is non-empty, otherwise Run fails fast
+	// with an error (the steps could not be seeded into the prompt).
+	ResumeSteps []agent.Step
 }
 
 // Conductor runs a single Executor.Run that owns a task end-to-end.
@@ -143,6 +163,34 @@ func (c *Conductor) Run(
 		}
 	}
 
+	// Resume from a checkpoint: seed both the ContextManager (so the seeded
+	// steps appear in BuildPrompt as assistant+tool messages) and the
+	// Executor (so the step counter continues from len(steps)+1 and the full
+	// trajectory syncs) with a single defensive copy of the resume steps.
+	//
+	// The copy is made once here rather than at each consumer boundary: it
+	// decouples the caller's slice and, because it has cap == len, the first
+	// append in either consumer reallocates into a private backing array, so
+	// the ContextManager's steps and the Executor's allSteps never alias each
+	// other (or the caller) even though they start from the same copy.
+	var resume []agent.Step
+	if len(c.cfg.ResumeSteps) > 0 {
+		sscm, ok := cm.(StepSeedable)
+		if !ok {
+			// Fail fast: without StepSeedable the seeded steps would not
+			// reach BuildPrompt, yet the executor would still continue the
+			// step counter from len(steps)+1 — an incoherent resume that is
+			// silent and hard to debug. Require the capability explicitly.
+			return nil, fmt.Errorf(
+				"conductor: ResumeSteps configured (%d steps) but ContextManager %T does not implement StepSeedable; "+
+					"the resumed steps could not be seeded into the prompt",
+				len(c.cfg.ResumeSteps), cm,
+			)
+		}
+		resume = append([]agent.Step(nil), c.cfg.ResumeSteps...)
+		sscm.SeedSteps(resume)
+	}
+
 	// Build the executor caller: wire context tracker correction if the
 	// context manager exposes one (TrackerProvider) and the caller supports
 	// tracker injection.
@@ -160,15 +208,25 @@ func (c *Conductor) Run(
 	// executor, because finish is handled inline by the executor and never
 	// reaches tools.Execute(). The callback checks for pending async
 	// delegations and rejects finish with a nudge when any are still running.
-	executor := agent.NewExecutor(
-		caller,
-		c.cfg.Tools,
-		c.cfg.MaxSteps,
+	execOpts := []agent.Option{
 		agent.WithTokenCounter(c.cfg.TokenCounter),
 		agent.WithEvents(events),
 		agent.WithToolResultBudget(c.cfg.ToolResultBudget),
 		agent.WithCircuitBreaker(c.cfg.CircuitBreaker),
 		agent.WithHITL(c.cfg.HITLHandler),
+	}
+	// Seed the executor's run state with the resumed steps so the step
+	// counter continues from len(steps)+1 and the full trajectory syncs to
+	// the TrajectoryStore. Pairs with the ContextManager seeding above; both
+	// consume the same defensive copy held in `resume`.
+	if len(c.cfg.ResumeSteps) > 0 {
+		execOpts = append(execOpts, agent.WithResumeSteps(resume))
+	}
+	executor := agent.NewExecutor(
+		caller,
+		c.cfg.Tools,
+		c.cfg.MaxSteps,
+		execOpts...,
 	)
 	// Read reasoning effort under the read lock so a concurrent
 	// SetReasoningEffort call cannot race with this snapshot.

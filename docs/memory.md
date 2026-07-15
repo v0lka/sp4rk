@@ -52,6 +52,7 @@ cw := memory.NewContextWindow(memory.ContextWindowConfig{
 | --- | --- |
 | `BuildPrompt() []llm.Message` | Assembles the full prompt in priority order: system message(s) → prior conversation → task content → plan content → step history. |
 | `AddStep(step)` | Appends a step to the history and updates the token tracker with an approximate delta. |
+| `SeedSteps(steps)` | Wholesale-replaces the step history (clearing compaction state and recalculating the tracker delta for the batch). Used to resume from a checkpoint so the seeded steps render in `BuildPrompt` as assistant+tool messages; nil/empty clears the history. `ContextWindow` also satisfies the `orchestration.StepSeedable` capability interface the Conductor asserts when `ResumeSteps` is set. |
 | `Compact(ctx) *CompactionResult` | Compresses the step history using the configured strategy. Returns before/after fill percentages, or `nil` if no compaction occurred. |
 | `SetStrategy(s)` | Changes the compaction strategy. |
 | `CheckFill() FillCheck` | Returns the current fill status: `"ok"`, `"compact"`, `"warning"`, `"emergency"`, or `"reject"`. |

@@ -21,7 +21,7 @@ The Executor is **not safe for concurrent use on a single instance** — `Run` m
 func NewExecutor(llmRouter LLMCaller, toolRegistry ToolExecutor, maxSteps int, opts ...Option) *Executor
 ```
 
-The event emitter and the HITL handler are **nil-safe** — `nil` is replaced with `NoopEvents` and `NoopHITLHandler`. Options: `WithTokenCounter`, `WithEvents`, `WithSuppressAssistantEvents` (hides streaming events for sub-steps), `WithToolResultBudget` (defaults to `DefaultToolResultBudget()`), `WithCircuitBreaker` (defaults to `DefaultCircuitBreakerConfig()`), `WithHITL`.
+The event emitter and the HITL handler are **nil-safe** — `nil` is replaced with `NoopEvents` and `NoopHITLHandler`. Options: `WithTokenCounter`, `WithEvents`, `WithSuppressAssistantEvents` (hides streaming events for sub-steps), `WithToolResultBudget` (defaults to `DefaultToolResultBudget()`), `WithCircuitBreaker` (defaults to `DefaultCircuitBreakerConfig()`), `WithHITL`, `WithResumeSteps` (seeds prior ReAct steps to resume from a checkpoint; see [Resume from a checkpoint](#resume-from-a-checkpoint)).
 
 ### Run
 
@@ -79,6 +79,14 @@ When the LLM returns no tool calls, the executor decides whether to accept an im
 
 `SetFinishGuard(func(ctx) error)` lets a caller block premature completion. It is a **hard gate**: every `finish` call re-invokes the guard, and a non-nil error rejects `finish` with a nudge and retries the action every time — finish is never auto-accepted while the guard still errors. (Contrast the mutation and checklist gates, which are soft: after one nudge attempt each, finish is accepted regardless.) This is how the Conductor's pending-delegations join check is expressed.
 
+### Resume from a checkpoint
+
+`WithResumeSteps(steps []Step)` seeds the executor with pre-existing ReAct steps so `Run` continues from where it left off instead of starting fresh. When non-empty, `Run` seeds `state.allSteps` with them before the loop: the step counter starts at `len(steps)+1`, and the trajectory synced to the `TrajectoryStore` on every iteration includes the seeded steps (so tools such as a reflector see the complete history). The caller is responsible for seeding the `ContextManager` with the same steps (e.g. via `memory.ContextWindow.SeedSteps`) so they are rendered as assistant+tool messages in `BuildPrompt` — the executor itself does not push resumed steps into the context manager.
+
+Budget: the resumed steps are counted against the shared `maxSteps` budget, not in addition to it. The loop runs until `stepNum <= maxSteps+1`, so a meaningful resume needs `maxSteps` meaningfully larger than `len(steps)`; otherwise the resumed loop has little or no room for new steps.
+
+A zero value (nil/empty steps, or the option omitted) restores the default fresh-start behavior: the loop starts at step 1 with no seeded history.
+
 ### Tool result cache & two-stage truncation
 
 Every cacheable tool result is stored in `ToolResultCache` (keyed by `SHA256(toolName + "\x00" + content)`) before truncation:
@@ -103,6 +111,7 @@ The `batch` tool lets the model dispatch multiple tool calls in one turn. It is 
 
 - The `finish` tool is always available in every run (appended automatically if absent).
 - A single `Executor` instance is never used concurrently — parallel callers create one per step.
+- When `WithResumeSteps` supplies prior steps, the step counter starts at `len(steps)+1` and the full trajectory (seeded plus new steps) is synced to the `TrajectoryStore`; the resumed steps are counted against the shared `maxSteps` budget.
 - When `mutationRequired` is set, finish without a prior successful mutating tool is rejected (nudge then `Finished: false`).
 - Both checklist sub-gates are soft: after one nudge attempt, finish is accepted regardless.
 - Tool results from untrusted sources are wrapped in `<untrusted-content>` tags before becoming an LLM message (when injection defense is enabled on the `ContextManager`).

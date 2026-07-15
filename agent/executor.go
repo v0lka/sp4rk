@@ -271,6 +271,15 @@ type Executor struct {
 	// async delegations.
 	finishGuard func(ctx context.Context) error
 
+	// resumeSteps holds pre-existing ReAct steps used to resume an executor
+	// from a checkpoint. When non-empty, Run seeds the run state with these
+	// steps so the step counter continues from len(steps)+1 and the full
+	// trajectory (seeded + new steps) is synced to the TrajectoryStore. The
+	// caller is responsible for seeding the ContextManager with the same steps
+	// (e.g. via memory.ContextWindow.SeedSteps) so they appear in BuildPrompt.
+	// Zero-value (nil/empty) restores the default fresh-start behavior.
+	resumeSteps []Step
+
 	logger *slog.Logger
 }
 
@@ -285,6 +294,7 @@ type executorOptions struct {
 	toolResultBudget        ToolResultBudget
 	circuitBreaker          CircuitBreakerConfig
 	hitl                    HITLHandler
+	resumeSteps             []Step
 }
 
 // Option configures an Executor created by NewExecutor. Only types from this
@@ -301,6 +311,7 @@ var (
 	_ Option = toolResultBudgetOption{}
 	_ Option = circuitBreakerOption{}
 	_ Option = hitlOption{}
+	_ Option = resumeStepsOption{}
 )
 
 type tokenCounterOption struct{ Counter llm.TokenCounter }
@@ -360,6 +371,30 @@ func (o hitlOption) apply(opts *executorOptions) { opts.hitl = o.Handler }
 // NoopHITLHandler.
 func WithHITL(handler HITLHandler) Option { return hitlOption{Handler: handler} }
 
+type resumeStepsOption struct{ Steps []Step }
+
+func (o resumeStepsOption) apply(opts *executorOptions) { opts.resumeSteps = o.Steps }
+
+// WithResumeSteps seeds the executor with pre-existing ReAct steps so that Run
+// continues from where it left off instead of starting fresh. The step counter
+// starts at len(steps)+1 and the full trajectory (seeded plus new steps) is
+// synced to the TrajectoryStore so tools such as reflect see the complete
+// history.
+//
+// The caller is responsible for seeding the ContextManager with the same steps
+// (e.g. via memory.ContextWindow.SeedSteps) so they are rendered as assistant
+// +tool messages in BuildPrompt — the executor itself does not push the
+// resumed steps into the context manager. Pass nil or an empty slice (or omit
+// the option) to restore the default fresh-start behavior.
+//
+// Budget: the resumed steps are counted against the shared maxSteps budget,
+// not in addition to it. The loop runs until stepNum <= maxSteps+1, so a
+// meaningful resume needs maxSteps meaningfully larger than len(steps);
+// otherwise the resumed loop may have little or no room for new steps.
+func WithResumeSteps(steps []Step) Option {
+	return resumeStepsOption{Steps: steps}
+}
+
 // NewExecutor creates a new Executor.
 //
 // llmRouter, toolRegistry, and maxSteps are required. Optional configuration
@@ -393,6 +428,7 @@ func NewExecutor(llmRouter LLMCaller, toolRegistry ToolExecutor, maxSteps int, o
 		hitl:                    o.hitl,
 		checklistGateEnabled:    true,
 		nonCacheableTools:       copyNonCacheableTools(defaultNonCacheableTools),
+		resumeSteps:             o.resumeSteps,
 	}
 }
 
@@ -720,7 +756,17 @@ func (e *Executor) Run(ctx context.Context, taskTools []tools.ToolDescriptor, cw
 		}
 	}
 
-	for state.stepNum = 1; state.unlimitedSteps || state.stepNum <= state.effectiveMaxSteps+1; state.stepNum++ {
+	// Seed prior steps when resuming, so the step counter continues from
+	// where it left off and the TrajectoryStore sync includes the full
+	// trajectory (seeded plus new steps). startStep is the first step number
+	// the resumed loop should execute; it defaults to 1 (fresh start).
+	startStep := 1
+	if len(e.resumeSteps) > 0 {
+		state.allSteps = e.resumeSteps
+		startStep = len(e.resumeSteps) + 1
+	}
+
+	for state.stepNum = startStep; state.unlimitedSteps || state.stepNum <= state.effectiveMaxSteps+1; state.stepNum++ {
 		// Sync trajectory to the store so tools (e.g. reflect) can access it.
 		if ts := TrajectoryStoreFrom(ctx); ts != nil {
 			ts.Sync(state.allSteps)
