@@ -39,7 +39,7 @@ Everything starts with [`sp4rk.Config`](../framework.go), passed to [`sp4rk.New`
 | `HITL` | `agent.HITLHandler` | Optional human-in-the-loop hooks. `nil` uses defaults: allow all tool calls, deny step extensions. |
 | `ConfirmFunc` | `tools.ConfirmFunc` | Confirmation callback for tools whose effective policy is `PolicyUserConfirm` (file writers, `bash_exec`, MCP tools). **The registry is fail-closed:** with no `ConfirmFunc`, such tools are denied instead of executing silently. See [tools.md](tools.md#policy-enforcement-in-execute-fail-closed). |
 | `Checkpointer` | `orchestration.Checkpointer` | Optional blackboard state persistence. `nil` means no checkpointing. |
-| `OnBlackboardChanged` | `func(changeType string)` | Optional callback invoked after every successful blackboard write (plan, step result, fact, reflection). `nil` means no notifications. |
+| `OnBlackboardChanged` | `func(changeType string)` | Optional callback invoked after every successful blackboard write (plan, step result, fact, attachment, reflection). `nil` means no notifications. |
 | `Logger` | `*slog.Logger` | Optional structured logger. Uses `slog.Default()` if `nil`. |
 
 ### LLMConfig

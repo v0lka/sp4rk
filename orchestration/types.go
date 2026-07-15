@@ -115,3 +115,17 @@ type Fact struct {
 	Content  string   `json:"content"`  // the fact text
 	Author   string   `json:"author"`   // step ID that wrote it
 }
+
+// Attachment represents a user-attached file that has been converted to
+// markdown and is available to agents as read-only context. The IDs are
+// surfaced to the model in the user message attachment list; agents read the
+// markdown content via the read_attachment tool.
+type Attachment struct {
+	ID              string    `json:"id"`
+	OriginalName    string    `json:"original_name"`
+	OriginalPath    string    `json:"original_path"`
+	Format          string    `json:"format"` // normalized extension without dot, e.g. "pdf"
+	SizeBytes       int64     `json:"size_bytes"`
+	MarkdownContent string    `json:"markdown_content"`
+	AttachedAt      time.Time `json:"attached_at"`
+}

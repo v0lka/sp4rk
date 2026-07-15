@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/v0lka/sp4rk/agent"
 	"github.com/v0lka/sp4rk/strutil"
@@ -21,8 +22,9 @@ type MapBlackboard struct {
 	stepResults   map[string]StepResult
 	reflections   []Reflection
 	finalResult   string
-	maxSummaryLen int    // char-based limit for summaries (0 = use default 500)
-	facts         []Fact // keyword-tagged facts for inter-step communication
+	maxSummaryLen int          // char-based limit for summaries (0 = use default 500)
+	facts         []Fact       // keyword-tagged facts for inter-step communication
+	attachments   []Attachment // user-attached files converted to markdown
 }
 
 // MapBlackboardOption configures a MapBlackboard.
@@ -297,6 +299,86 @@ func (b *MapBlackboard) SetFacts(facts []Fact) {
 		copied[i] = Fact{Keywords: kwCopy, Content: f.Content, Author: f.Author}
 	}
 	b.facts = copied
+}
+
+// ---------------------------------------------------------------------------
+// Attachment memory
+// ---------------------------------------------------------------------------
+
+// AddAttachment appends an attachment. If AttachedAt is zero, it is set to the
+// current time. If an attachment with the same ID already exists, it is
+// replaced (replace-on-conflict semantics).
+func (b *MapBlackboard) AddAttachment(a Attachment) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if a.AttachedAt.IsZero() {
+		a.AttachedAt = time.Now()
+	}
+	for i, existing := range b.attachments {
+		if existing.ID == a.ID {
+			b.attachments[i] = a
+			return
+		}
+	}
+	b.attachments = append(b.attachments, a)
+}
+
+// GetAttachments returns a defensive copy of all stored attachments.
+func (b *MapBlackboard) GetAttachments() []Attachment {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if len(b.attachments) == 0 {
+		return nil
+	}
+	out := make([]Attachment, len(b.attachments))
+	copy(out, b.attachments)
+	return out
+}
+
+// GetAttachment returns a defensive copy of the attachment with the given ID.
+func (b *MapBlackboard) GetAttachment(id string) (Attachment, bool) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	for _, a := range b.attachments {
+		if a.ID == id {
+			return a, true
+		}
+	}
+	return Attachment{}, false
+}
+
+// RemoveAttachment removes the attachment with the given ID. Returns true if an
+// attachment was removed, false if no attachment with that ID existed.
+func (b *MapBlackboard) RemoveAttachment(id string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for i, a := range b.attachments {
+		if a.ID == id {
+			// Shift elements down, then zero the now-dead trailing slot so the
+			// removed Attachment (which may hold a large MarkdownContent) is
+			// eligible for GC instead of being retained by the backing array.
+			copy(b.attachments[i:], b.attachments[i+1:])
+			b.attachments[len(b.attachments)-1] = Attachment{}
+			b.attachments = b.attachments[:len(b.attachments)-1]
+			return true
+		}
+	}
+	return false
+}
+
+// SetAttachments replaces the attachments slice. Used by persistence
+// restoration. Defensively copies the input slice so the caller can mutate its
+// own slice afterwards without racing with reads against the blackboard.
+func (b *MapBlackboard) SetAttachments(attachments []Attachment) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if attachments == nil {
+		b.attachments = nil
+		return
+	}
+	copied := make([]Attachment, len(attachments))
+	copy(copied, attachments)
+	b.attachments = copied
 }
 
 // ---------------------------------------------------------------------------

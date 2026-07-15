@@ -6,8 +6,8 @@ The structured, thread-safe container for all shared task state: the original re
 
 ## Key Files
 
-- `github.com/v0lka/sp4rk/orchestration` — `Blackboard` interface, `MapBlackboard` (reference in-memory implementation), `Plan`, `StepResult`, `Reflection`, `Fact`, `BlackboardEntry`, `CompletedStep`
-- `github.com/v0lka/sp4rk/orchestration` (adapters) — `NewStepOutputStore`, `NewFactStore`, `NewFinalResultStore` (Blackboard → `agent.*Store` interfaces consumed by built-in tools)
+- `github.com/v0lka/sp4rk/orchestration` — `Blackboard` interface, `MapBlackboard` (reference in-memory implementation), `Plan`, `StepResult`, `Reflection`, `Fact`, `Attachment`, `BlackboardEntry`, `CompletedStep`
+- `github.com/v0lka/sp4rk/orchestration` (adapters) — `NewStepOutputStore`, `NewFactStore`, `NewAttachmentStore`, `NewFinalResultStore` (Blackboard → `agent.*Store` interfaces consumed by built-in tools)
 - `github.com/v0lka/sp4rk/orchestration` (persistence) — `Checkpointer`, `CheckpointedBlackboard`, `RestoreBlackboard`
 - `github.com/v0lka/sp4rk/agent` — `Step`
 
@@ -33,6 +33,10 @@ type Blackboard interface {
     StoreFact(fact Fact)
     SearchFacts(keywords []string) []Fact
     GetFacts() []Fact
+    AddAttachment(a Attachment)
+    GetAttachments() []Attachment
+    GetAttachment(id string) (Attachment, bool)
+    RemoveAttachment(id string) bool
 }
 ```
 
@@ -54,9 +58,31 @@ type Fact struct {
 - `SearchFacts(keywords)` returns facts where at least one keyword matches (case-insensitive), **sorted by number of matching keywords descending** — most relevant first.
 - `GetFacts()` returns a defensive copy of all facts.
 
+### Attachment memory
+
+Attachments are user-attached files converted to markdown and surfaced to agents as read-only context. Host applications add them before a run; the agent reads the converted content via the `read_attachment` tool (the IDs are listed in the user message). Like facts, attachments live on the blackboard and survive checkpoints.
+
+```go
+type Attachment struct {
+    ID              string    // stable identifier surfaced in the user message attachment list
+    OriginalName    string
+    OriginalPath    string
+    Format          string    // normalized extension without the dot, e.g. "pdf"
+    SizeBytes       int64
+    MarkdownContent string    // converted content read by the read_attachment tool
+    AttachedAt      time.Time
+}
+```
+
+- `AddAttachment(a)` appends an attachment. When `AttachedAt` is zero it is set to the current time. When an attachment with the same `ID` already exists it is **replaced** (replace-on-conflict semantics) rather than duplicated.
+- `GetAttachments()` returns a defensive copy of all attachments (`nil` when none are stored).
+- `GetAttachment(id)` returns a defensive copy of the attachment with that `ID` (`Attachment{}, false` when absent).
+- `RemoveAttachment(id)` removes the attachment with that `ID` and returns whether anything was removed. The dead trailing slot is zeroed so a removed attachment (which may hold a large `MarkdownContent`) is eligible for garbage collection.
+- `SetAttachments(attachments)` replaces the whole slice (used by persistence restoration) and defensively copies the input.
+
 ### MapBlackboard
 
-`NewMapBlackboard(opts ...MapBlackboardOption)` is the reference thread-safe, map-backed implementation — the default for in-memory tasks. `WithMaxSummaryLen(n)` caps auto-generated step summaries (default `500` characters; first paragraph up to `n` chars, `...` when truncated). It also exposes `SetStepResultRaw` and `SetFacts`, used by the persistence layer to hydrate state without regenerating summaries.
+`NewMapBlackboard(opts ...MapBlackboardOption)` is the reference thread-safe, map-backed implementation — the default for in-memory tasks. `WithMaxSummaryLen(n)` caps auto-generated step summaries (default `500` characters; first paragraph up to `n` chars, `...` when truncated). It also exposes `SetStepResultRaw`, `SetFacts`, and `SetAttachments`, used by the persistence layer to hydrate state without regenerating summaries.
 
 ### Adapters
 
@@ -66,6 +92,7 @@ Three small adapters wrap a `Blackboard` as the `agent.*Store` interfaces consum
 | ------- | ------- | ------------- |
 | `NewStepOutputStore` | successful step outputs (only error-free steps), deterministic step-ID order | `read_step_output` / `list_step_outputs` |
 | `NewFactStore` | fact memory | `store_fact` / `search_facts` |
+| `NewAttachmentStore` | user-attached files converted to markdown | `read_attachment` |
 | `NewFinalResultStore` | the prior task's final result | `read_final_result` (recovery for continuation agents) |
 
 ### Persistence
@@ -99,6 +126,9 @@ type Checkpointer interface {
 - All `Blackboard` methods are safe for concurrent use.
 - Read methods return defensive copies.
 - `SearchFacts` results are ranked by number of matching keywords (descending).
+- `AddAttachment` replaces an existing attachment with the same ID; no two stored attachments ever share an ID.
+- Attachment reads return defensive copies; `GetAttachments` returns `nil` when no attachments are stored.
+- `RemoveAttachment` zeroes the removed slot so a removed attachment's `MarkdownContent` is eligible for garbage collection.
 - A `StepResult`'s `Steps` trajectory is immutable once stored.
 - `CheckpointedBlackboard` persistence is best-effort and never blocks the agent on a slow backend.
 - `Shutdown()` is idempotent and always closes the persistence worker.

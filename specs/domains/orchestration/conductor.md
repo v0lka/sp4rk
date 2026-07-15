@@ -8,7 +8,7 @@ The SDK-level single-loop task owner: a `Conductor` runs **one ReAct loop** that
 
 - `github.com/v0lka/sp4rk/orchestration` — `Conductor`, `ConductorConfig`, `NewConductor`, `Conductor.Run`, `WithDelegationRegistry`, `PendingDelegations`
 - `github.com/v0lka/sp4rk/agent` — `Executor.Run` (the ReAct loop the Conductor launches), `LLMCaller`, `ToolExecutor`, `Events`, `HITLHandler`
-- `github.com/v0lka/sp4rk/orchestration` (adapters) — `NewStepOutputStore`, `NewFactStore`, `NewFinalResultStore` (Blackboard → `agent.*Store`)
+- `github.com/v0lka/sp4rk/orchestration` (adapters) — `NewStepOutputStore`, `NewFactStore`, `NewAttachmentStore`, `NewFinalResultStore` (Blackboard → `agent.*Store`)
 - `github.com/v0lka/sp4rk/llm` — `ModelRegistry`, `TokenCounter`, `Message`
 - `github.com/v0lka/sp4rk/memory` — `ContextManager` returned by `ContextManagerFactory`
 
@@ -35,6 +35,7 @@ conductor.Run(ctx, message, bb, availableTools, events, compactionStrategy)
 ├─ 3. Inject blackboard-backed stores into ctx:
 │      ├─ StepOutputStore  (read_step_output / list_step_outputs)
 │      ├─ FactStore        (store_fact / search_facts)
+│      ├─ AttachmentStore  (read_attachment)
 │      └─ FinalResultStore (read_final_result)
 │
 ├─ 4. When ResumeSteps is set, seed the ContextManager (via StepSeedable) and the
@@ -98,7 +99,7 @@ Budget: the resumed steps count against the shared `MaxSteps` budget, not in add
 ## Invariants
 
 - Exactly one `Executor.Run` instance is active per Conductor run.
-- `Conductor.Run` injects the three blackboard-backed store adapters into `ctx` before launching the executor.
+- `Conductor.Run` injects the four blackboard-backed store adapters into `ctx` before launching the executor.
 - The returned `*ExecutionResult` is always non-nil (even when the error is non-nil).
 - The returned `Blackboard` is the same instance passed in.
 - When a `PendingDelegations` registry is in `ctx`, `finish` is rejected while it reports pending async work.

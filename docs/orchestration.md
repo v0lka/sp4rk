@@ -60,7 +60,7 @@ import "github.com/v0lka/sp4rk/orchestration"
 
 ## Conductor
 
-The `Conductor` is the SDK-level primitive that runs a **single ReAct loop** owning one task end-to-end. It wraps the lower-level `agent.Executor` and wires in the blackboard-backed stores (step outputs, facts, final result) so that built-in tools such as `read_step_output`, `store_fact`, `search_facts`, and `read_final_result` can access shared state during execution.
+The `Conductor` is the SDK-level primitive that runs a **single ReAct loop** owning one task end-to-end. It wraps the lower-level `agent.Executor` and wires in the blackboard-backed stores (step outputs, facts, attachments, final result) so that built-in tools such as `read_step_output`, `store_fact`, `search_facts`, `read_attachment`, and `read_final_result` can access shared state during execution.
 
 A Conductor is reusable across steps: the system prompt factory receives the step description at `Run` time, so the same instance adapts to each step it executes.
 
@@ -164,7 +164,7 @@ Launches the Conductor's single ReAct loop for one task.
 | --- | --- |
 | `ctx` | Context. The caller may inject a `PendingDelegations` registry via `WithDelegationRegistry` to enable the finish-join guard. |
 | `message` | The task description for this run (typically a plan step's `Description`). |
-| `bb` | The blackboard holding shared task state. The Conductor injects `StepOutputStore`, `FactStore`, and `FinalResultStore` adapters derived from it into `ctx`. |
+| `bb` | The blackboard holding shared task state. The Conductor injects `StepOutputStore`, `FactStore`, `AttachmentStore`, and `FinalResultStore` adapters derived from it into `ctx`. |
 | `availableTools` | Tool descriptors the executor may call. |
 | `events` | Event sink for observing the ReAct loop. May be `nil`; a `NoopEvents` instance is used in that case. |
 | `compactionStrategy` | Context compaction strategy: `"sliding_window"`, `"summarization"`, or `"hierarchical"`. Empty defaults to `"sliding_window"`. |
@@ -773,7 +773,7 @@ All persistence calls are **best-effort**: errors are logged but do not propagat
 
 **Lifecycle methods**
 
-- `SetOnChanged(fn func(changeType string))` — optional callback invoked after every successful write. `changeType` is `"plan"`, `"step_result"`, `"fact"`, `"reflection"`, etc.
+- `SetOnChanged(fn func(changeType string))` — optional callback invoked after every successful write. `changeType` is `"plan"`, `"step_result"`, `"fact"`, `"attachment"`, `"reflection"`, etc.
 - `SetPersistContext(ctx context.Context)` — sets the context used for persistence operations (carries cancellation/tracing). Defaults to `context.Background()`.
 - `Shutdown()` — closes the persistence channel and waits for the worker to finish. Safe to call multiple times. **Always call this** when the blackboard is no longer needed to prevent goroutine leaks.
 - `ID() string` — returns the checkpoint identifier.
@@ -851,16 +851,18 @@ The conductor typically feeds each step's writer into the executor context via [
 
 ## Adapters
 
-The package provides three small adapters that wrap a `Blackboard` as the `agent.*Store` interfaces consumed by built-in tools. The Conductor injects these into the context automatically, but they are also useful standalone.
+The package provides four small adapters that wrap a `Blackboard` as the `agent.*Store` interfaces consumed by built-in tools. The Conductor injects these into the context automatically, but they are also useful standalone.
 
 ```go
 func NewStepOutputStore(bb Blackboard) agent.StepOutputStore
 func NewFactStore(bb Blackboard) agent.FactStore
+func NewAttachmentStore(bb Blackboard) agent.AttachmentStore
 func NewFinalResultStore(bb Blackboard) agent.FinalResultStore
 ```
 
 - `NewStepOutputStore` exposes successful step outputs to the `read_step_output` tool. Only steps that completed without error are visible; outputs are listed in deterministic (step-ID) order.
 - `NewFactStore` exposes fact memory to the `store_fact` / `search_facts` tools.
+- `NewAttachmentStore` exposes user-attached files (converted to markdown) to the `read_attachment` tool. Host applications add attachments to the blackboard before a run; the attachment IDs are surfaced in the user message.
 - `NewFinalResultStore` exposes the prior task's final result to the `read_final_result` tool — useful for continuation agents when the conversation history alone is insufficient (e.g. after a restart, or when the result was too large to inject verbatim).
 
 ---

@@ -490,7 +490,7 @@ The executor reads several optional values from the context. These are injected 
 | `WithStepTodoUpdateFunc(ctx, fn)` / `StepTodoUpdateFuncFromContext(ctx)` | Callback for checklist/to-do updates. |
 | `WithDumpWriter(ctx, w)` / `DumpWriterFromContext(ctx)` | Injects an `io.Writer` for LLM request/response dumps. |
 
-Additional stores for inter-step communication live in the `agent` package: `StepOutputStore`, `FactStore`, and `FinalResultStore`, each with a `With*`/`*FromContext` pair. See [Subagents](subagents.md) for how these are wired during parallel plan execution.
+Additional stores for inter-step communication and user-provided context live in the `agent` package: `StepOutputStore`, `FactStore`, `AttachmentStore`, and `FinalResultStore`, each with a `With*`/`*FromContext` pair. `AttachmentStore` is read-only access to user-attached files (converted to markdown). See [Subagents](subagents.md) for how these are wired during parallel plan execution.
 
 ## LLM debugging callers
 

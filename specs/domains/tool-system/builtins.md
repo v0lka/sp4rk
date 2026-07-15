@@ -8,7 +8,7 @@ The SDK ships a catalog of filesystem, search, web, execution, and agent-infrast
 
 - `github.com/v0lka/sp4rk/tools/builtins` — built-in tool implementations, `file_reader.go` (`ReadFileRange`, streaming O(1)-memory line reader), `limits.go` (per-tool truncation limit types)
 - `github.com/v0lka/sp4rk/tools/builtins` (web search) — `web_search/` provider abstraction (brave, duckduckgo, exa, tavily)
-- `github.com/v0lka/sp4rk/tools/builtins` (blackboard-backed) — `read_step_output`, `list_step_outputs`, `read_final_result`, `tool_result_read`, `update_checklist`
+- `github.com/v0lka/sp4rk/tools/builtins` (blackboard-backed) — `read_step_output`, `list_step_outputs`, `read_final_result`, `read_attachment`, `tool_result_read`, `update_checklist`
 - `github.com/v0lka/sp4rk/agent` — `FinishTool`
 - `github.com/v0lka/sp4rk/skills` — `ReadSkillResourceTool`
 
@@ -37,6 +37,7 @@ The SDK ships a catalog of filesystem, search, web, execution, and agent-infrast
 | `read_step_output` | Agent | `always_allow` | no | Read a specific completed step's output (blackboard-backed). |
 | `list_step_outputs` | Agent | `always_allow` | no | List completed step outputs. |
 | `read_final_result` | Agent | `always_allow` | no | Read the prior task's final result (continuation recovery). |
+| `read_attachment` | Agent | `always_allow` | no | Read the markdown content of a user-attached file by ID (blackboard-backed). |
 | `update_checklist` | Agent | `always_allow` | no | Update a step/sub-task checklist; validates Markdown checkboxes. |
 | `store_fact` | Agent | `always_allow` | no | Store a keyword-tagged fact to the blackboard. |
 | `search_facts` | Agent | `always_allow` | no | Search blackboard facts by keyword. |
@@ -59,7 +60,7 @@ File tools resolve paths via context helpers (`WorkspacePathFrom`/`TempDirFrom`)
 
 ### Agent-infrastructure tools
 
-Blackboard-backed tools (`read_step_output`, `list_step_outputs`, `read_final_result`, `store_fact`, `search_facts`) read/write shared state through the `agent.*Store` adapters the [Conductor](../orchestration/conductor.md) injects (see [../memory/blackboard.md](../memory/blackboard.md)). `update_checklist` validates Markdown checkboxes and emits to-do updates via a context-injected callback; `read_step_output` is likewise context-aware. `tool_result_read` validates cache coherence on every read (file mtime+size for file tools; TTL for MCP tools).
+Blackboard-backed tools (`read_step_output`, `list_step_outputs`, `read_final_result`, `read_attachment`, `store_fact`, `search_facts`) read and write shared blackboard state through the `agent.*Store` adapters the [Conductor](../orchestration/conductor.md) injects (see [../memory/blackboard.md](../memory/blackboard.md)). `read_attachment` reads a user-attached file's converted markdown from the `AttachmentStore` by ID (the IDs are listed in the user message). `update_checklist` validates Markdown checkboxes and emits to-do updates via a context-injected callback; `read_step_output` is likewise context-aware. `tool_result_read` validates cache coherence on every read (file mtime+size for file tools; TTL for MCP tools).
 
 ## Error Handling
 

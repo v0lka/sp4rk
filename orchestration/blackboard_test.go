@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestBlackboard_OriginalRequest(t *testing.T) {
@@ -391,5 +392,157 @@ func TestBlackboard_SearchFacts_EmptyStore(t *testing.T) {
 	results := bb.SearchFacts([]string{"auth"})
 	if results != nil {
 		t.Fatalf("expected nil for empty store, got %v", results)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Attachment memory
+// ---------------------------------------------------------------------------
+
+func TestBlackboard_AddAttachment_Retrievable(t *testing.T) {
+	bb := NewMapBlackboard()
+
+	bb.AddAttachment(Attachment{ID: "att_1", OriginalName: "report.pdf", Format: "pdf", MarkdownContent: "# Report"})
+
+	all := bb.GetAttachments()
+	if len(all) != 1 {
+		t.Fatalf("expected 1 attachment, got %d", len(all))
+	}
+	if all[0].MarkdownContent != "# Report" {
+		t.Fatalf("unexpected markdown content: %q", all[0].MarkdownContent)
+	}
+	if all[0].OriginalName != "report.pdf" {
+		t.Fatalf("unexpected original name: %q", all[0].OriginalName)
+	}
+}
+
+func TestBlackboard_AddAttachment_GeneratesAttachedAt(t *testing.T) {
+	bb := NewMapBlackboard()
+
+	bb.AddAttachment(Attachment{ID: "att_1", OriginalName: "doc.md", Format: "md", MarkdownContent: "x"})
+
+	att, ok := bb.GetAttachment("att_1")
+	if !ok {
+		t.Fatal("expected attachment to be retrievable")
+	}
+	if att.AttachedAt.IsZero() {
+		t.Fatal("expected AttachedAt to be auto-generated when zero")
+	}
+}
+
+func TestBlackboard_AddAttachment_PreservesAttachedAt(t *testing.T) {
+	bb := NewMapBlackboard()
+	ts := time.Date(2025, 1, 2, 3, 4, 5, 0, time.UTC)
+
+	bb.AddAttachment(Attachment{ID: "att_1", OriginalName: "doc.md", Format: "md", MarkdownContent: "x", AttachedAt: ts})
+
+	att, ok := bb.GetAttachment("att_1")
+	if !ok {
+		t.Fatal("expected attachment to be retrievable")
+	}
+	if !att.AttachedAt.Equal(ts) {
+		t.Fatalf("expected AttachedAt preserved, got %v want %v", att.AttachedAt, ts)
+	}
+}
+
+func TestBlackboard_AddAttachment_ReplacesExistingID(t *testing.T) {
+	bb := NewMapBlackboard()
+
+	bb.AddAttachment(Attachment{ID: "att_1", OriginalName: "v1.pdf", Format: "pdf", MarkdownContent: "v1"})
+	bb.AddAttachment(Attachment{ID: "att_1", OriginalName: "v2.pdf", Format: "pdf", MarkdownContent: "v2"})
+
+	all := bb.GetAttachments()
+	if len(all) != 1 {
+		t.Fatalf("expected replace-on-conflict to keep 1 attachment, got %d", len(all))
+	}
+	if all[0].OriginalName != "v2.pdf" {
+		t.Fatalf("expected replaced content, got %q", all[0].OriginalName)
+	}
+}
+
+func TestBlackboard_GetAttachment_NotFound(t *testing.T) {
+	bb := NewMapBlackboard()
+
+	bb.AddAttachment(Attachment{ID: "att_1", OriginalName: "doc.md", Format: "md", MarkdownContent: "x"})
+
+	_, ok := bb.GetAttachment("nonexistent")
+	if ok {
+		t.Fatal("expected ok=false for unknown attachment id")
+	}
+}
+
+func TestBlackboard_GetAttachments_Empty(t *testing.T) {
+	bb := NewMapBlackboard()
+
+	all := bb.GetAttachments()
+	if all != nil {
+		t.Fatalf("expected nil for empty attachments, got %v", all)
+	}
+}
+
+func TestBlackboard_RemoveAttachment(t *testing.T) {
+	bb := NewMapBlackboard()
+
+	bb.AddAttachment(Attachment{ID: "att_1", OriginalName: "doc.md", Format: "md", MarkdownContent: "x"})
+	bb.AddAttachment(Attachment{ID: "att_2", OriginalName: "doc2.md", Format: "md", MarkdownContent: "y"})
+
+	removed := bb.RemoveAttachment("att_1")
+	if !removed {
+		t.Fatal("expected removed=true for existing id")
+	}
+	if len(bb.GetAttachments()) != 1 {
+		t.Fatalf("expected 1 attachment after removal, got %d", len(bb.GetAttachments()))
+	}
+
+	removedAgain := bb.RemoveAttachment("att_1")
+	if removedAgain {
+		t.Fatal("expected removed=false for already-removed id")
+	}
+}
+
+func TestBlackboard_RemoveAttachment_NotFound(t *testing.T) {
+	bb := NewMapBlackboard()
+
+	if bb.RemoveAttachment("nope") {
+		t.Fatal("expected false when removing non-existent attachment")
+	}
+}
+
+func TestBlackboard_GetAttachments_DefensiveCopy(t *testing.T) {
+	bb := NewMapBlackboard()
+
+	bb.AddAttachment(Attachment{ID: "att_1", OriginalName: "doc.md", Format: "md", MarkdownContent: "original"})
+
+	snapshot := bb.GetAttachments()
+	snapshot[0].MarkdownContent = "mutated"
+
+	// The blackboard's internal copy must be unaffected.
+	att, ok := bb.GetAttachment("att_1")
+	if !ok {
+		t.Fatal("expected attachment retrievable")
+	}
+	if att.MarkdownContent != "original" {
+		t.Fatalf("defensive copy broken: internal state mutated to %q", att.MarkdownContent)
+	}
+}
+
+func TestBlackboard_GetAttachment_DefensiveCopy(t *testing.T) {
+	bb := NewMapBlackboard()
+
+	bb.AddAttachment(Attachment{ID: "att_1", OriginalName: "doc.md", Format: "md", MarkdownContent: "original"})
+
+	att, ok := bb.GetAttachment("att_1")
+	if !ok {
+		t.Fatal("expected attachment retrievable")
+	}
+	att.MarkdownContent = "mutated"
+
+	// A second read must return the original, unaffected value.
+	att2, ok := bb.GetAttachment("att_1")
+	if !ok {
+		t.Fatal("expected attachment retrievable")
+	}
+	if att2.MarkdownContent != "original" {
+		t.Fatalf("defensive copy broken: internal state mutated to %q", att2.MarkdownContent)
 	}
 }

@@ -260,14 +260,15 @@ func (c *Conductor) Run(
 		return nil
 	})
 
-	// Inject step output store + fact store + final result store so tools
-	// (read_step_output, read_final_result, store_fact, search_facts) can
-	// access the blackboard. The final result store exposes the prior task's
-	// outcome to a continuation agent when the conversation history alone is
-	// insufficient (e.g. after a restart, or when the result was too large
-	// to inject verbatim).
+	// Inject step output store + fact store + attachment store + final result
+	// store so tools (read_step_output, read_final_result, store_fact,
+	// search_facts, read_attachment) can access the blackboard. The final
+	// result store exposes the prior task's outcome to a continuation agent
+	// when the conversation history alone is insufficient (e.g. after a
+	// restart, or when the result was too large to inject verbatim).
 	ctx = agent.WithStepOutputStore(ctx, NewStepOutputStore(bb))
 	ctx = agent.WithFactStore(ctx, NewFactStore(bb))
+	ctx = agent.WithAttachmentStore(ctx, NewAttachmentStore(bb))
 	ctx = agent.WithFinalResultStore(ctx, NewFinalResultStore(bb))
 
 	result, err := executor.Run(ctx, availableTools, cm)

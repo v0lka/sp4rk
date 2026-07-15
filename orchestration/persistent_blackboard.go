@@ -156,6 +156,28 @@ func (pb *CheckpointedBlackboard) StoreFact(fact Fact) {
 	pb.notifyChanged("fact")
 }
 
+// AddAttachment appends an attachment and persists a checkpoint.
+func (pb *CheckpointedBlackboard) AddAttachment(a Attachment) {
+	pb.MapBlackboard.AddAttachment(a)
+	pb.persistSafe("add_attachment", func(ctx context.Context) error {
+		return pb.checkpointer.SaveCheckpoint(ctx, pb.id, pb.MapBlackboard)
+	})
+	pb.notifyChanged("attachment")
+}
+
+// RemoveAttachment removes an attachment and persists a checkpoint if an
+// attachment was actually removed.
+func (pb *CheckpointedBlackboard) RemoveAttachment(id string) bool {
+	removed := pb.MapBlackboard.RemoveAttachment(id)
+	if removed {
+		pb.persistSafe("remove_attachment", func(ctx context.Context) error {
+			return pb.checkpointer.SaveCheckpoint(ctx, pb.id, pb.MapBlackboard)
+		})
+		pb.notifyChanged("attachment")
+	}
+	return removed
+}
+
 // SetFinalResult sets the final result and persists a checkpoint.
 func (pb *CheckpointedBlackboard) SetFinalResult(result string) {
 	pb.MapBlackboard.SetFinalResult(result)
@@ -308,6 +330,9 @@ func RestoreBlackboard(ctx context.Context, id string, cp Checkpointer, logger *
 	}
 	if facts := restored.GetFacts(); len(facts) > 0 {
 		mb.SetFacts(facts)
+	}
+	if attachments := restored.GetAttachments(); len(attachments) > 0 {
+		mb.SetAttachments(attachments)
 	}
 	if finalResult := restored.GetFinalResult(); finalResult != "" {
 		mb.SetFinalResult(finalResult)

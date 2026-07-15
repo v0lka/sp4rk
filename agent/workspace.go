@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -74,6 +75,43 @@ func WithFactStore(ctx context.Context, fs FactStore) context.Context {
 func FactStoreFromContext(ctx context.Context) FactStore {
 	fs, _ := ctx.Value(factStoreKey).(FactStore)
 	return fs
+}
+
+// ---------------------------------------------------------------------------
+// AttachmentStore — read-only access to user-attached files
+// ---------------------------------------------------------------------------
+
+// AttachmentStore provides read-only access to user-attached files that have
+// been converted to markdown. This is a minimal interface to avoid circular
+// imports with orchestration.
+type AttachmentStore interface {
+	GetAttachments() []AttachmentEntry
+	GetAttachment(id string) (AttachmentEntry, bool)
+}
+
+// AttachmentEntry represents a user-attached file returned by the store.
+type AttachmentEntry struct {
+	ID              string
+	OriginalName    string
+	Format          string
+	SizeBytes       int64
+	MarkdownContent string
+	AttachedAt      time.Time
+}
+
+type attachmentStoreKeyType struct{}
+
+var attachmentStoreKey = attachmentStoreKeyType{}
+
+// WithAttachmentStore returns a context carrying the given AttachmentStore.
+func WithAttachmentStore(ctx context.Context, store AttachmentStore) context.Context {
+	return context.WithValue(ctx, attachmentStoreKey, store)
+}
+
+// AttachmentStoreFromContext returns the AttachmentStore from context, or nil.
+func AttachmentStoreFromContext(ctx context.Context) AttachmentStore {
+	store, _ := ctx.Value(attachmentStoreKey).(AttachmentStore)
+	return store
 }
 
 // ---------------------------------------------------------------------------

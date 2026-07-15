@@ -58,6 +58,7 @@ var defaultNonCacheableTools = map[string]struct{}{
 	"read_step_output":  {},
 	"list_step_outputs": {},
 	"read_final_result": {},
+	"read_attachment":   {},
 	"store_fact":        {},
 	"search_facts":      {},
 	"update_checklist":  {},

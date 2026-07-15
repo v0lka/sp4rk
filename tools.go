@@ -75,6 +75,7 @@ func AllBuiltinTools() []tools.Tool {
 		builtins.NewReadStepOutputTool(),
 		builtins.NewListStepOutputsTool(),
 		builtins.NewReadFinalResultTool(),
+		builtins.NewReadAttachmentTool(),
 	}
 }
 

@@ -34,6 +34,12 @@ func (m *mockBlackboardForFinalResult) StoreFact(Fact)                  {}
 func (m *mockBlackboardForFinalResult) SearchFacts([]string) []Fact     { return nil }
 func (m *mockBlackboardForFinalResult) GetFacts() []Fact                { return nil }
 func (m *mockBlackboardForFinalResult) SetFacts([]Fact)                 {}
+func (m *mockBlackboardForFinalResult) AddAttachment(Attachment)        {}
+func (m *mockBlackboardForFinalResult) GetAttachments() []Attachment    { return nil }
+func (m *mockBlackboardForFinalResult) GetAttachment(string) (Attachment, bool) {
+	return Attachment{}, false
+}
+func (m *mockBlackboardForFinalResult) RemoveAttachment(string) bool { return false }
 
 func TestNewFinalResultStore_WithResult(t *testing.T) {
 	bb := &mockBlackboardForFinalResult{finalResult: "task completed: variants a, b, c"}

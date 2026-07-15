@@ -66,6 +66,10 @@ type Blackboard interface {
     StoreFact(fact Fact)
     SearchFacts(keywords []string) []Fact
     GetFacts() []Fact
+    AddAttachment(a Attachment)
+    GetAttachments() []Attachment
+    GetAttachment(id string) (Attachment, bool)
+    RemoveAttachment(id string) bool
 }
 
 // A DAG of execution steps.
@@ -120,7 +124,7 @@ The Conductor is the only top-level execution entry point this domain exposes. D
 ## Invariants
 
 - Exactly one Conductor `Executor.Run` instance owns a given task from start to finish.
-- `Conductor.Run` injects `StepOutputStore`, `FactStore`, and `FinalResultStore` adapters derived from the blackboard into `ctx`, so blackboard-backed tools read shared state.
+- `Conductor.Run` injects `StepOutputStore`, `FactStore`, `AttachmentStore`, and `FinalResultStore` adapters derived from the blackboard into `ctx`, so blackboard-backed tools read shared state.
 - Routing always produces a valid domain from `{"code", "research", "general", "mixed"}` after validation.
 - Complexity is always clamped to `[1, 5]`.
 - `ExecutionResult.Status` is the typed success contract: callers consult it instead of parsing `Output`.

@@ -129,4 +129,10 @@ type Blackboard interface {
 	StoreFact(fact Fact)
 	SearchFacts(keywords []string) []Fact
 	GetFacts() []Fact
+
+	// Attachment memory (user-attached files converted to markdown)
+	AddAttachment(a Attachment)
+	GetAttachments() []Attachment
+	GetAttachment(id string) (Attachment, bool)
+	RemoveAttachment(id string) bool
 }

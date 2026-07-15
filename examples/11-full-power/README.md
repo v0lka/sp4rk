@@ -140,7 +140,7 @@ OnBlackboardChanged: func(changeType string) {
 }
 ```
 
-Fires after every successful blackboard write (`plan`, `step_result`, `fact`, `reflection`). Useful for UI integration or audit logging.
+Fires after every successful blackboard write (`plan`, `step_result`, `fact`, `attachment`, `reflection`). Useful for UI integration or audit logging.
 
 #### Compaction configuration
 
