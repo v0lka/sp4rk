@@ -8,6 +8,7 @@ The ReAct loop primitive (Thought → Action → Observation) with circuit break
 
 - `github.com/v0lka/sp4rk/agent` — `Executor`, `NewExecutor`, `Executor.Run`, `ExecutorResult`, `Step`, `FinishTool`, `CircuitBreakerConfig`, `ToolResultBudget`, `ToolResultCache`, `DetectToolCallSyntaxInContent`, configuration setters (`Set*`), context helpers
 - `github.com/v0lka/sp4rk/agent` (executor internals) — single-call dispatch, batch meta-tool interception, implicit-finish handling, mutation/checklist gate logic
+- `github.com/v0lka/sp4rk/agent` (checklist helpers) — shared Markdown-checkbox parsing (`ParseTodoLine`, `ParseTodoItems`, `TodoItem`) used by both the executor (checklist diffing) and the `update_checklist` tool
 - `github.com/v0lka/sp4rk/agent` — `ContextManager` / `CompactionStrategy` / `FillCheck` interfaces, `LLMCaller`, `ToolExecutor`, `Events`, `HITLHandler`
 - `github.com/v0lka/sp4rk/tools/builtins` — `batch` meta-tool descriptor (intercepted at the executor, never executed directly)
 
@@ -63,10 +64,19 @@ When `SetMutationRequired(true)` is set, the finish call is intercepted before c
 
 ### Checklist gate
 
-Enabled by default (`SetChecklistGateEnabled`, default `true`); it activates only when an `update_checklist` tool is present in the run's tool set. Two soft sub-gates, each one nudge attempt before finish is accepted:
+Enabled by default (`SetChecklistGateEnabled`, default `true`); it activates only when an `update_checklist` tool is present in the run's tool set. It spans four mechanisms — two finish-time soft sub-gates and two proactive mid-step nudges — all aimed at keeping checklist progress visible throughout a step rather than batched near the end.
 
-- **Missing-checklist**: a non-trivial step (more than a configurable productive-call threshold) with no successful `update_checklist` call → inject a missing-checklist nudge, retry.
+A **productive call** is any tool call except the empty-Action nudges, the `finish` terminator, and `update_checklist` (a bookkeeping call, not task progress). The productive-call count drives the trivial-step test and the staleness counter below, so a checklist update — successful or not — never inflates either.
+
+Finish-time sub-gates (each one nudge attempt before finish is accepted):
+
+- **Missing-checklist**: a non-trivial step (more than `checklistTrivialThreshold`, 2, productive calls) with no successful `update_checklist` call → inject a missing-checklist nudge, retry.
 - **Unchecked-items**: the last successful checklist has unchecked items → inject an unchecked-items nudge, retry.
+
+Proactive mid-step nudges (run after tool execution, before compaction, while the step is still in progress):
+
+- **Staleness nudge**: once a checklist exists, if the agent makes `checklistStalenessThreshold` (3) or more productive calls since its last successful `update_checklist`, a nudge is injected prompting an immediate incremental update. The counter resets after each successful update, and the nudge is capped at `checklistStaleNudgeCap` (2) injections per step to avoid nudge fatigue. Emits an `ExecutorDiagnostic` with event `checklist_stale_nudge`.
+- **Batching detection**: after each successful `update_checklist`, the new checklist is diffed against the previous one by item text. Marking more than one previously-unchecked item complete in a single call appends a correction suffix to that call's observation; marking exactly one earns brief positive reinforcement. The first update (initialization) is exempt. Emits an `ExecutorDiagnostic` with event `checklist_batched_update` when a batch is detected.
 
 ### Implicit finish & failure-mode detection
 

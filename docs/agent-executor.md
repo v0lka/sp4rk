@@ -213,6 +213,24 @@ var params struct {
 
 **Why it is required:** an LLM that simply stops emitting tool calls has not necessarily completed the task — it may have hit a failure mode (e.g. printing tool-call syntax as text). The executor treats a text-only response as an *implicit finish* and injects a nudge demanding an explicit `finish` call. Only an actual `finish` tool call is accepted as completion (subject to the finish guard and mutation/checklist gates).
 
+## Checklist gate
+
+When an `update_checklist` tool is present, the checklist gate nudges the model to keep its progress checklist current. It is enabled by default (`SetChecklistGateEnabled`, default `true`) and combines finish-time sub-gates with proactive mid-step nudges.
+
+A **productive call** counts real work: any tool call except the empty-Action nudges, `finish`, and `update_checklist` itself (a bookkeeping call). The productive-call count drives the trivial-step test and the staleness counter, so updating the checklist never inflates either.
+
+Finish-time sub-gates (each one nudge attempt before finish is accepted):
+
+- **Missing-checklist** — a non-trivial step (more than `checklistTrivialThreshold`, 2, productive calls) that never called `update_checklist` successfully → a nudge is injected and the call retried.
+- **Unchecked-items** — the last successful checklist still has unchecked items → a nudge is injected and the call retried.
+
+Proactive mid-step nudges (run after tool execution, before compaction):
+
+- **Staleness nudge** — once a checklist exists, if the model makes `checklistStalenessThreshold` (3) or more productive calls since its last successful `update_checklist`, a nudge prompts an immediate incremental update. The counter resets after each update and the nudge is capped at `checklistStaleNudgeCap` (2) per step. Fired as an `ExecutorDiagnostic` with event `checklist_stale_nudge`.
+- **Batching detection** — after each successful `update_checklist`, the new checklist is diffed against the previous one. Checking more than one previously-unchecked item at once appends a correction to that call's observation; checking exactly one earns brief positive reinforcement. The first (initialization) update is exempt. Batches fire an `ExecutorDiagnostic` with event `checklist_batched_update`.
+
+These nudges steer the model toward updating the checklist incrementally — one item at a time, right after completing each sub-task — so progress stays visible throughout the step.
+
 ## Circuit breakers
 
 `CircuitBreakerConfig` holds thresholds that protect the executor from unproductive infinite loops. When a threshold is crossed, the executor injects a nudge (a corrective system message) and, if the behavior persists, aborts the loop with `Finished: false`.

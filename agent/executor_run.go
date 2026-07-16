@@ -43,6 +43,7 @@ type runState struct {
 	circuitBreakerTriggered   bool
 	responseGroup             int64
 	checklistAvailable        bool
+	checklistStaleNudgeCount  int
 }
 
 // handleStepLimitBoundary handles the step-limit boundary logic (when stepNum > effectiveMaxSteps).
@@ -213,16 +214,30 @@ func (e *Executor) hasChecklistUpdate(state *runState) bool {
 	return false
 }
 
-// countProductiveToolCalls returns the number of tool calls (excluding finish,
-// nudges, and meta-steps without an Action) executed so far. Used to determine
-// whether a step is trivial enough to skip the checklist gate.
+// isProductiveCall reports whether a step's tool call counts as productive
+// work. It excludes nudges (empty-Action steps), the finish terminator, and
+// update_checklist (a bookkeeping/meta call rather than task progress). The
+// trivial-step gate and the staleness counter share this single definition so
+// that a checklist update — successful or not — never inflates "productive"
+// work.
+func isProductiveCall(name string) bool {
+	switch name {
+	case "", "finish", "update_checklist":
+		return false
+	default:
+		return true
+	}
+}
+
+// countProductiveToolCalls returns the number of productive tool calls
+// (see isProductiveCall) executed so far. Used to determine whether a step is
+// trivial enough to skip the checklist gate.
 func (e *Executor) countProductiveToolCalls(state *runState) int {
 	count := 0
 	for _, s := range state.allSteps {
-		if s.Action.Name == "" || s.Action.Name == "finish" {
-			continue
+		if isProductiveCall(s.Action.Name) {
+			count++
 		}
-		count++
 	}
 	return count
 }
@@ -245,6 +260,123 @@ func (e *Executor) lastChecklistUnchecked(state *runState) int {
 		return 0
 	}
 	return 0
+}
+
+// lastChecklistUpdateIndex returns the index in state.allSteps of the most
+// recent successful update_checklist step, or -1 if there is none. It is used
+// to measure how stale the checklist is (productive calls since the last
+// update) and to locate the previous checklist when diffing for batched
+// updates.
+func (e *Executor) lastChecklistUpdateIndex(state *runState) int {
+	for i := len(state.allSteps) - 1; i >= 0; i-- {
+		s := state.allSteps[i]
+		if s.Action.Name == "update_checklist" && !s.IsError {
+			return i
+		}
+	}
+	return -1
+}
+
+// productiveCallsSinceLastChecklistUpdate counts productive tool calls
+// (see isProductiveCall) made after the most recent successful
+// update_checklist, so an update resets the staleness counter to zero. When no
+// checklist update has happened yet it counts over all steps; callers gate on
+// hasChecklistUpdate before relying on the post-update window.
+func (e *Executor) productiveCallsSinceLastChecklistUpdate(state *runState) int {
+	startIdx := e.lastChecklistUpdateIndex(state) + 1
+	count := 0
+	for i := startIdx; i < len(state.allSteps); i++ {
+		if isProductiveCall(state.allSteps[i].Action.Name) {
+			count++
+		}
+	}
+	return count
+}
+
+// handleChecklistStalenessNudge injects a proactive mid-step nudge when the
+// agent has gone too long without updating its checklist. It re-arms after
+// each update_checklist (the counter is "calls since last update") and is
+// capped at checklistStaleNudgeCap per step to avoid nudge fatigue. Only runs
+// once a checklist exists (hasChecklistUpdate) and only when the gate is
+// enabled and the tool is available.
+func (e *Executor) handleChecklistStalenessNudge(state *runState, cw ContextManager) {
+	if !e.checklistGateEnabled || !state.checklistAvailable || !e.hasChecklistUpdate(state) {
+		return
+	}
+	if state.checklistStaleNudgeCount >= checklistStaleNudgeCap {
+		return
+	}
+	sinceUpdate := e.productiveCallsSinceLastChecklistUpdate(state)
+	if sinceUpdate < checklistStalenessThreshold {
+		return
+	}
+	state.checklistStaleNudgeCount++
+	nudgeStep := Step{
+		UserNudge: fmt.Sprintf(executorChecklistStaleNudge, sinceUpdate),
+	}
+	state.allSteps = append(state.allSteps, nudgeStep)
+	cw.AddStep(nudgeStep)
+	e.emitter.ExecutorDiagnostic(state.stepNum, "checklist_stale_nudge", map[string]any{
+		"calls_since_update": sinceUpdate,
+		"nudge_count":        state.checklistStaleNudgeCount,
+	})
+}
+
+// checklistItemsFromInput parses the todo_list field from an update_checklist
+// tool-call JSON input and returns its items. Returns nil on any parse error.
+func checklistItemsFromInput(input json.RawMessage) []TodoItem {
+	var params struct {
+		TodoList string `json:"todo_list"`
+	}
+	if err := json.Unmarshal(input, &params); err != nil {
+		return nil
+	}
+	return ParseTodoItems(params.TodoList)
+}
+
+// checklistBatchingSuffix inspects the just-completed update_checklist call
+// (input is its raw JSON input) against the previous checklist in state and
+// returns an LLM-facing suffix that either reinforces a single-item update or
+// warns about a batched multi-item update. It returns "" when this is the first
+// update for the step or no items transitioned from unchecked to checked.
+//
+// newlyChecked counts only items that were unchecked in the previous list and
+// are checked now (set-diff by text), so adding genuinely new pre-checked items
+// does not trigger a false-positive warning. The current update_checklist step
+// is not appended to allSteps yet, so lastChecklistUpdateIndex returns the
+// previous update (or -1 when this is the initialization call).
+func (e *Executor) checklistBatchingSuffix(state *runState, input json.RawMessage) string {
+	prevIdx := e.lastChecklistUpdateIndex(state)
+	if prevIdx < 0 {
+		return "" // first update — initialization, never a batch
+	}
+	prevItems := checklistItemsFromInput(state.allSteps[prevIdx].Action.Input)
+	currItems := checklistItemsFromInput(input)
+	if len(currItems) == 0 {
+		return ""
+	}
+	prevPresent := make(map[string]bool, len(prevItems))
+	prevChecked := make(map[string]bool, len(prevItems))
+	for _, it := range prevItems {
+		prevPresent[it.Text] = true
+		prevChecked[it.Text] = it.Checked
+	}
+	newlyChecked := 0
+	for _, it := range currItems {
+		if it.Checked && prevPresent[it.Text] && !prevChecked[it.Text] {
+			newlyChecked++
+		}
+	}
+	if newlyChecked <= 0 {
+		return ""
+	}
+	if newlyChecked == 1 {
+		return checklistBatchPositiveSuffix
+	}
+	e.emitter.ExecutorDiagnostic(state.stepNum, "checklist_batched_update", map[string]any{
+		"newly_checked": newlyChecked,
+	})
+	return fmt.Sprintf(checklistBatchWarningFmt, newlyChecked)
 }
 
 // handleImplicitFinish handles the "no tool calls" branches: syntax-nudge → finish-nudge → implicit finish.
@@ -789,6 +921,19 @@ func (e *Executor) processSingleToolCall(
 					"vulnerable_count": len(vulnerable),
 				})
 			}
+		}
+	}
+
+	// Checklist batching detector: when an update_checklist call marks more
+	// than one previously-unchecked item complete at once (and it is not the
+	// first update for the step), append a correction to the observation;
+	// exactly one newly-checked item earns brief reinforcement. Like the
+	// pre-compaction nudge this is appended AFTER ToolResult emission and is
+	// for LLM context only (it does not appear as a separate frontend message).
+	if e.checklistGateEnabled && state.checklistAvailable &&
+		action.Name == "update_checklist" && !result.IsError {
+		if suffix := e.checklistBatchingSuffix(state, action.Input); suffix != "" {
+			observation += "\n\n" + suffix
 		}
 	}
 

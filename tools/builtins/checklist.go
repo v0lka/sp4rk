@@ -11,12 +11,9 @@ import (
 	"github.com/v0lka/sp4rk/tools"
 )
 
-const toolUpdateChecklistDescription = "Update the checklist for the current step (or for the task as a whole if there is no declared plan). Call this as your FIRST tool call to initialize the checklist, and again after completing each item (mark it as '- [x]'). Use ONLY ASCII checkboxes: '- [ ]' for unchecked, '- [x]' for checked. No nested lists, no Unicode checkboxes. When executing a declared plan inline (as the Conductor), pass step_id to associate the checklist with a specific plan step. Omit step_id for a standalone checklist (no declared plan) or when running as a delegated subagent (the step ID is inferred from the execution context)."
+const toolUpdateChecklistDescription = "Update the checklist for the current step (or for the task as a whole if there is no declared plan). Call this as your FIRST tool call to initialize the checklist, and again after completing each item (mark it as '- [x]'). Update ONE item at a time: call update_checklist again immediately after completing each single sub-task, not several at once — batch-checking multiple items in one call is discouraged, because progress must stay visible incrementally throughout the step. Use ONLY ASCII checkboxes: '- [ ]' for unchecked, '- [x]' for checked. No nested lists, no Unicode checkboxes. When executing a declared plan inline (as the Conductor), pass step_id to associate the checklist with a specific plan step. Omit step_id for a standalone checklist (no declared plan) or when running as a delegated subagent (the step ID is inferred from the execution context)."
 
 var (
-	// Strict regex: line must start with "- [ ] " or "- [x] " followed by text.
-	// Must NOT start with whitespace (no nesting).
-	validTodoLineRe = regexp.MustCompile(`^- \[([ x])\] (.+)$`)
 	// Detects lines that look like they intend to be list items but don't match the strict format.
 	looseListLineRe = regexp.MustCompile(`^\s*- `)
 )
@@ -82,20 +79,19 @@ func parseAndValidateTodoList(input string) todoParseResult {
 			continue
 		}
 
-		// Check if it matches the strict format
-		matches := validTodoLineRe.FindStringSubmatch(trimmed)
-		if matches == nil {
-			if looseListLineRe.MatchString(trimmed) {
-				errors = append(errors, fmt.Sprintf("line %d: invalid checkbox format (must be exactly '- [ ] ' or '- [x] ')", i+1))
-			} else {
-				errors = append(errors, fmt.Sprintf("line %d: each non-empty line must be a checkbox item starting with '- [ ] ' or '- [x] '", i+1))
-			}
+		// Delegate strict item parsing to the shared agent helper. It applies
+		// the same regex the executor uses when diffing checklists.
+		if item, ok := agent.ParseTodoLine(trimmed); ok {
+			items = append(items, item)
 			continue
 		}
 
-		checked := matches[1] == "x"
-		text := matches[2]
-		items = append(items, agent.TodoItem{Text: text, Checked: checked})
+		// Not a valid checkbox line — report a specific, actionable error.
+		if looseListLineRe.MatchString(trimmed) {
+			errors = append(errors, fmt.Sprintf("line %d: invalid checkbox format (must be exactly '- [ ] ' or '- [x] ')", i+1))
+		} else {
+			errors = append(errors, fmt.Sprintf("line %d: each non-empty line must be a checkbox item starting with '- [ ] ' or '- [x] '", i+1))
+		}
 	}
 
 	if nonEmptyCount == 0 {

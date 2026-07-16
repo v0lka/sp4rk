@@ -117,10 +117,38 @@ const executorChecklistUncheckedNudge = "[System] Your last checklist has %d unc
 var checklistDoneRe = regexp.MustCompile(`(\d+)/(\d+)\s+done`)
 
 // checklistTrivialThreshold is the maximum number of productive tool calls
-// (excluding finish and nudges) a step may have before the checklist gate
-// activates. Steps at or below this threshold are considered trivial and do
-// not require a checklist.
+// (excluding finish, nudges, and update_checklist — see isProductiveCall) a
+// step may have before the checklist gate activates. Steps at or below this
+// threshold are considered trivial and do not require a checklist.
 const checklistTrivialThreshold = 2
+
+// checklistStalenessThreshold is the number of productive tool calls (excluding
+// finish, update_checklist, and nudges) the agent may make after its most
+// recent successful update_checklist before a staleness nudge is injected
+// mid-step, prompting it to mark progress incrementally rather than batching
+// many checks near the end.
+const checklistStalenessThreshold = 3
+
+// checklistStaleNudgeCap bounds the number of staleness nudges injected during a
+// single step. The nudge re-arms after each update_checklist, but without a cap
+// a very long step would be flooded with reminders (nudge fatigue), which makes
+// the model ignore them. Two nudges per step keeps the signal rare but weighty.
+const checklistStaleNudgeCap = 2
+
+// executorChecklistStaleNudge is injected mid-step when the agent has made
+// several productive tool calls since its last update_checklist. It prompts the
+// agent to mark any completed sub-task now and to keep updates incremental (one
+// item per call) so progress stays visible throughout the step.
+const executorChecklistStaleNudge = "[System] You have made %d tool calls since your last update_checklist. If you have completed any sub-task in that time, call update_checklist now to mark it done. Update ONE item at a time (do not batch several items in a single call) so your progress stays visible to the user throughout the step."
+
+// checklistBatchPositiveSuffix reinforces a single incremental checklist update
+// (exactly one previously-unchecked item newly checked).
+const checklistBatchPositiveSuffix = "[System] Good — one item marked complete. Keep updating the checklist right after each piece of work, one item at a time."
+
+// checklistBatchWarningFmt is appended to an update_checklist tool result when
+// the call marked several previously-unchecked items complete at once. It names
+// the count so the model understands the magnitude of the batch.
+const checklistBatchWarningFmt = "[System] You just marked %d items complete in a single update_checklist call. Update the checklist incrementally — one item per call, immediately after completing each sub-task — so progress stays visible throughout the step. Do not batch multiple items in one call."
 
 // wrapUpActiveLookback is the number of recent tool-call steps examined by the
 // wrap-up nudge to detect active progress (successful mutating calls). When a
@@ -845,6 +873,10 @@ func (e *Executor) Run(ctx context.Context, taskTools []tools.ToolDescriptor, cw
 		}
 
 		e.handleWrapUpNudge(state, cw)
+
+		// Checklist staleness nudge: prompt incremental checklist updates mid-step
+		// so progress stays visible and items are not batched near the end.
+		e.handleChecklistStalenessNudge(state, cw)
 
 		if compactAction, compactErr := e.handleCompactionAfterStep(ctx, cw, state); compactErr != nil {
 			return nil, compactErr

@@ -262,12 +262,12 @@ func TestCountProductiveToolCalls(t *testing.T) {
 			{Action: llm.ToolCall{Name: "read_file"}},
 			{Action: llm.ToolCall{Name: "read_file"}},
 		}, want: 3},
-		{name: "mix including finish and nudge", steps: []Step{
+		{name: "mix including finish, nudge, and update_checklist", steps: []Step{
 			{Action: llm.ToolCall{Name: "read_file"}},
 			{UserNudge: "nudge"},
 			{Action: llm.ToolCall{Name: "update_checklist"}},
 			{Action: llm.ToolCall{Name: "finish"}},
-		}, want: 2},
+		}, want: 1}, // only read_file is productive; update_checklist is bookkeeping
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
