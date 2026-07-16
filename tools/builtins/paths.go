@@ -63,6 +63,21 @@ func resolvePath(ctx context.Context, path string) string {
 	return resolved
 }
 
+// ResolvePath is the exported form of resolvePath. It resolves a file path
+// against the session roots (workspace and temp directory, treated as equal
+// peers), replicating exactly the logic used by the built-in
+// read_file/write_file/edit_file tools — including symlink resolution of the
+// workspace root (so OS-level symlinks such as macOS /tmp → /private/tmp do
+// not cause false negatives on containment).
+//
+// External packages that wrap a built-in tool (e.g. c0wrk's
+// document-converting read_file wrapper) should call this instead of
+// re-implementing the resolution, so path handling and containment checks stay
+// consistent with the inner tools. See resolvePath for the full contract.
+func ResolvePath(ctx context.Context, path string) string {
+	return resolvePath(ctx, path)
+}
+
 // resolveWorkspaceRoot resolves symlinks on a session root path (workspace or
 // temp directory). Falls back to the unresolved clean path when the directory
 // doesn't exist yet (e.g., brand-new No Project session workspace).
