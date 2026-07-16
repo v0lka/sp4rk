@@ -91,6 +91,18 @@ type ToolJudger interface {
 }
 ```
 
+### ContentBackedReader (optional)
+
+A read tool whose output is a **transformed representation** of the file (decoded, decrypted, or format-converted) rather than its raw bytes may optionally implement `ContentBackedReader`. When `IsContentBacked` reports `true` for a given input, the executor caches the result **in memory** (`CacheModeContentBacked`) instead of treating the file on disk as the cache backing store (`CacheModeDefault`, which `read_file` uses by default). The file-coherence metadata (path + mtime + size) is still attached, so source-file changes are detected — but `tool_result_read` paginates the transformed content rather than re-reading raw bytes from disk.
+
+The decision is **per-input**, so one tool can return raw bytes for some files (plain text) and a transformed view for others (binary documents). Implementations must be cheap and side-effect free — the executor consults `IsContentBacked` on the caching hot path for every `read_file` result.
+
+```go
+type ContentBackedReader interface {
+    IsContentBacked(ctx context.Context, input json.RawMessage) bool
+}
+```
+
 ## ToolDescriptor
 
 `ToolDescriptor` is metadata-only (no execution capability) used by the Planner and Executor to reason about available tools without holding live `Tool` references:
@@ -128,6 +140,7 @@ registry := tools.NewToolRegistry()
 | `Execute(ctx, name, input)` | Look up and execute a tool **with fail-closed policy enforcement** (see below). |
 | `GetToolSource(name)` | Return a tool's source (`"core"` or its source tag); `""` if not found. |
 | `IsToolUntrusted(name)` | `true` if the tool's `IsUntrusted()` is true **or** its source category is MCP. |
+| `CacheStrategy(ctx, name, input)` | Reports the cache mode for a tool's result: `CacheModeDefault` (existing heuristic, `read_file` is file-backed) or `CacheModeContentBacked` (result cached in memory). A read tool opts into the latter by implementing the optional `ContentBackedReader`. |
 | `SetConfirmFunc(fn)` | Install the confirmation callback consulted for `PolicyUserConfirm` tools and judge-escalated calls. |
 | `SetPolicyOverride(name, policy)` / `ClearPolicyOverride(name)` | Explicitly override (or restore) a tool's effective policy. |
 | `SetParamManager(pm)` | Install a `ParamManager` for execution-time parameter injection. |

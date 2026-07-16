@@ -228,7 +228,7 @@ The SDK is built around small, focused interfaces that let you swap implementati
 | Interface | Package | Purpose |
 | --- | --- | --- |
 | `LLMCaller` | `agent` | What the `Executor` needs from the LLM layer: `Call(ctx, ChatRequest) (*ChatResponse, error)`. The `llm.Router` satisfies it. |
-| `ToolExecutor` | `agent` | What the `Executor` needs from the tools layer: `Execute`, `GetToolSource`, `IsToolUntrusted`. The `tools.ToolRegistry` satisfies it. |
+| `ToolExecutor` | `agent` | What the `Executor` needs from the tools layer: `Execute`, `GetToolSource`, `IsToolUntrusted`, `CacheStrategy`. The `tools.ToolRegistry` satisfies it. |
 | `ContextManager` | `agent` | Manages the LLM context window: `BuildPrompt`, `AddStep`, `Compact`, `CheckFill`, `FillPercent`, `AvailableTokens`. The `memory.ContextWindow` satisfies it. |
 | `CompactionStrategy` | `agent` | Compresses step history: `Compact(ctx, steps, budgetTokens) []llm.Message`. Implementations: sliding, summary, hierarchical. |
 | `HITLHandler` | `agent` | Human-in-the-loop hooks: `OnToolCall` (confirm/modify/reject) and `OnStepLimit` (grant or deny more steps). |

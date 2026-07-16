@@ -706,7 +706,10 @@ func formatFileBackedNudge(hash string) string {
 // Returns ToolCacheMeta with FilePath/FileMtime/FileSize set for file tools,
 // and IsMCP set for MCP-sourced tools. For read_file, FileBacked is set to
 // true so the cache entry references the file on disk instead of storing
-// content in memory.
+// content in memory — unless the tool opts into content-backed caching via
+// tools.ContentBackedReader (e.g. a read wrapper that returns a transformed
+// view of the file), in which case FileBacked stays false but the file
+// coherence metadata is still attached.
 func (e *Executor) buildCacheMeta(ctx context.Context, toolName string, input json.RawMessage) ToolCacheMeta {
 	var meta ToolCacheMeta
 
@@ -742,7 +745,13 @@ func (e *Executor) buildCacheMeta(ctx context.Context, toolName string, input js
 				// read_file uses the file on disk as its cache backing store.
 				// write_file and edit_file produce new content that must be
 				// cached in memory (they are mutation tools, not reads).
-				if toolName == tools.ToolReadFile {
+				// A read wrapper that returns a transformed view of the file
+				// (tools.CacheModeContentBacked, via ContentBackedReader)
+				// overrides this: the result is cached in memory, but the file
+				// coherence metadata above is kept so the executor can still
+				// detect source-file changes.
+				if toolName == tools.ToolReadFile &&
+					e.tools.CacheStrategy(ctx, toolName, input) != tools.CacheModeContentBacked {
 					meta.FileBacked = true
 				}
 			}

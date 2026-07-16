@@ -66,7 +66,9 @@ ToolRegistry.Execute(ctx, name, input)
       └─ PolicyUserConfirm  → consult ConfirmFunc; DENIED (fail-closed) if none configured
 ```
 
-The executor calls the registry through the narrow `ToolExecutor` interface (`Execute`, `GetToolSource`, `IsToolUntrusted`). `GetToolSource` returns `"core"` or the MCP server name; `IsToolUntrusted` reports whether a tool's output is from an untrusted source (`tool.IsUntrusted()` true **or** MCP source category) — driving the `<untrusted-content>` wrapping of observations.
+The executor calls the registry through the narrow `ToolExecutor` interface (`Execute`, `GetToolSource`, `IsToolUntrusted`, `CacheStrategy`). `GetToolSource` returns `"core"` or the MCP server name; `IsToolUntrusted` reports whether a tool's output is from an untrusted source (`tool.IsUntrusted()` true **or** MCP source category) — driving the `<untrusted-content>` wrapping of observations. `CacheStrategy(ctx, name, input)` reports the cache mode the executor should use for a tool's result; a read tool opts into content-backed caching by implementing the optional `ContentBackedReader` interface, otherwise `CacheModeDefault` keeps the existing file-backed heuristic.
+
+> **Breaking change (cache_mode):** `CacheStrategy` is a required method on the exported `agent.ToolExecutor` interface. External implementors (custom registries, wrappers, mocks) must add it — returning `tools.CacheModeDefault` preserves prior behavior. On the `Tool` side the capability remains optional via `ContentBackedReader`.
 
 ## Invariants
 
@@ -94,6 +96,7 @@ Stage 1 truncation limits are configured per tool on the executor (see [../orche
 ## Extension Points
 
 - **New built-in tool**: embed `tools.BaseTool`, implement `Execute`, optionally implement `ToolJudger`, set `Untrusted: true` for external-output tools, and register. See [builtins.md](builtins.md).
+- **Transformed read view (content-backed cache)**: a read tool that returns a transformed/decoded representation of a file (not its raw bytes) implements `tools.ContentBackedReader` (`IsContentBacked(ctx, input) bool`). When it reports `true` for an input, `ToolRegistry.CacheStrategy` returns `CacheModeContentBacked`, so the executor caches the result in memory while still attaching file coherence metadata (path+mtime+size). The decision is per-input, so the same tool can stay file-backed for plain text and content-backed for transformed formats.
 - **Custom policy enforcement layer**: hosts may wrap the registry and shadow `Execute` (calling `tool.Execute` directly after their own checks); the SDK-level enforcement only applies to calls routed through `ToolRegistry.Execute`.
 - **`ParamManager`**: transform tool input at execution time (e.g. inject a `project` parameter into MCP tools); share one instance with the MCP gateway so schema sanitization and injection agree on the auto-injected parameter set.
 - **MCP servers**: add external tools without writing Go code per server. See [mcp-gateway.md](mcp-gateway.md).

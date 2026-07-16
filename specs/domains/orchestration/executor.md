@@ -106,6 +106,8 @@ Every cacheable tool result is stored in `ToolResultCache` (keyed by `SHA256(too
 
 Cache behaviours: identical content from different tools gets different hashes; dedup of repeated identical calls; file coherence for file-based tools (`read_file`/`write_file`/`edit_file`) via path+mtime+size; MCP-sourced entries expire after a TTL while non-MCP entries never expire; meta-tools (`finish`, `tool_result_read`, `store_fact`, …) are excluded by default and additional names can be added via `AddNonCacheableTools`.
 
+Cache mode selection: `read_file` is file-backed by default (streamed from disk) while mutation tools are content-backed. A read tool opts into content-backed caching when `agent.ToolExecutor.CacheStrategy` returns `tools.CacheModeContentBacked` (the tool implements `tools.ContentBackedReader`); the file coherence metadata (path+mtime+size) is still attached so source-file changes are detected, but the result is stored in memory and `tool_result_read` paginates it rather than re-reading raw bytes from disk.
+
 ### Batch meta-tool
 
 The `batch` tool lets the model dispatch multiple tool calls in one turn. It is intercepted by the executor before reaching the registry; its own `Execute()` returns an error. Sub-calls go through the full policy + truncation + caching pipeline, are emitted with a `(batched)` suffix, and per-sub-call errors do not abort the batch.

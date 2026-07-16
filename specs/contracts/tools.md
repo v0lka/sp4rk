@@ -17,6 +17,8 @@ The host application consumes the tool types from `github.com/v0lka/sp4rk/tools`
 | `ToolDescriptor` | tools | Consumed by planner/executor | Tool metadata (name, description, schema, source, source category) with no execution |
 | `ToolRegistry` | tools | Constructed by host | Thread-safe tool store and the single execution choke point; satisfies `agent.ToolExecutor` |
 | `ToolJudger` | tools | Optionally implemented by a tool | Tool-specific safety heuristic: `Judge(ctx, input)(allow bool, reasoning string)` |
+| `ContentBackedReader` | tools | Optionally implemented by a read tool | Per-input opt-in to content-backed caching: `IsContentBacked(ctx, input) bool` for read tools returning a transformed/decoded view of a file |
+| `CacheMode` | tools | Returned by `ToolRegistry.CacheStrategy` | Cache mode enum: `CacheModeDefault` (keep the file-backed heuristic), `CacheModeContentBacked` (cache the result in memory) |
 | `ConfirmFunc` | tools | Implemented by host | Confirmation callback consulted for `PolicyUserConfirm` and judge-escalated calls |
 | `ConfirmationRequest` | tools | Built by registry | `{ToolName, Input json.RawMessage, JudgeReasoning}` describing a call needing confirmation |
 | `ConfirmationResponse` | tools | Returned by host | Decision enum: `ConfirmAllowOnce`, `ConfirmDeny`, `ConfirmDenyAndStop` |
@@ -42,8 +44,9 @@ At startup the host builds the tool surface in this order:
 ## Data Flow Across Boundary
 
 - **Host → registry:** tool registration (name, `Tool`, source, category), `SetConfirmFunc`, `SetPolicyOverride`, optional `ParamManager`.
-- **executor → registry:** `Execute(ctx, name, input json.RawMessage)` and the `agent.ToolExecutor` helpers `GetToolSource(name)` / `IsToolUntrusted(name)`.
+- **executor → registry:** `Execute(ctx, name, input json.RawMessage)` and the `agent.ToolExecutor` helpers `GetToolSource(name)` / `IsToolUntrusted(name)` / `CacheStrategy(ctx, name, input)` (returns a `CacheMode`).
 - **registry → Tool:** `Execute(ctx, input json.RawMessage)` after policy is satisfied.
+- **registry → ContentBackedReader:** during `CacheStrategy`, if the tool implements `ContentBackedReader`, `IsContentBacked(ctx, input)` is consulted per-input to choose content-backed vs file-backed caching.
 - **registry → ConfirmFunc:** a `ConfirmationRequest` whenever the effective policy is `PolicyUserConfirm` or a judge escalates; the host returns a `ConfirmationResponse`.
 - **registry → ToolJudger:** before an `AlwaysAllow` tool executes, `Judge(ctx, input)` is consulted; a `false` verdict with reasoning escalates to confirmation.
 - **Tool → registry:** `ToolResult` (`{Content, IsError}`) and an error.
@@ -69,4 +72,5 @@ Data is plain Go values and `json.RawMessage`. Auto-injected parameters are inje
 - If you change `ToolJudger`, you MUST update every tool that implements it and the registry's judge-invocation path.
 - If you change `ToolResult`, you MUST update every tool implementation, the executor's observation handling, and the `Step.IsError` mapping.
 - If you change `ToolSourceCategory` or the untrusted-output classification, you MUST update `IsToolUntrusted`/`GetToolSource` consumers and the prompt-injection defense wrapping.
+- If you change `CacheMode` or the `ContentBackedReader` contract, you MUST update `ToolRegistry.CacheStrategy` and the executor's cache-mode dispatch (`buildCacheMeta`).
 - If you change `ParamManager` or `AutoInjectedParamProject`, you MUST update schema sanitizers, MCP schema handling, and the host's injection logic.

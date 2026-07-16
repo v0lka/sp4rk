@@ -5,6 +5,7 @@ go 1.26.3
 require github.com/v0lka/sp4rk v0.0.0-00010101000000-000000000000
 
 require (
+	codeberg.org/readeck/go-readability/v2 v2.1.2 // indirect
 	github.com/JohannesKaufmann/html-to-markdown v1.6.0 // indirect
 	github.com/PuerkitoBio/goquery v1.9.2 // indirect
 	github.com/andybalholm/cascadia v1.3.3 // indirect
@@ -18,6 +19,7 @@ require (
 	github.com/gogs/chardet v0.0.0-20211120154057-b7413eaefb8f // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/invopop/jsonschema v0.13.0 // indirect
+	github.com/itlightning/dateparse v0.2.1 // indirect
 	github.com/liushuangls/go-anthropic/v2 v2.17.3 // indirect
 	github.com/mailru/easyjson v0.7.7 // indirect
 	github.com/mark3labs/mcp-go v0.45.0 // indirect

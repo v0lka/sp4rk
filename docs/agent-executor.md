@@ -421,6 +421,7 @@ type ToolExecutor interface {
     Execute(ctx context.Context, name string, input json.RawMessage) (result tools.ToolResult, err error)
     GetToolSource(name string) string
     IsToolUntrusted(name string) bool
+    CacheStrategy(ctx context.Context, name string, input json.RawMessage) tools.CacheMode
 }
 ```
 
@@ -428,6 +429,7 @@ type ToolExecutor interface {
 - `ToolExecutor.Execute` — runs a tool by name with raw JSON input.
 - `GetToolSource` — returns the source of a tool (e.g. `"core"`, the MCP server name like `"filesystem"`); empty string if not found. Used to detect MCP tools for cache TTL handling.
 - `IsToolUntrusted` — reports whether a tool's output is from an untrusted external source (MCP tools and tools flagged `IsUntrusted()`). Drives the `<untrusted-content>` wrapping of observations.
+- `CacheStrategy` — reports the cache mode the executor should use for a tool's result: `tools.CacheModeDefault` keeps the existing heuristic (`read_file` is file-backed), while `tools.CacheModeContentBacked` caches the result in memory. A read tool opts into the latter by implementing `tools.ContentBackedReader`; this is a required method on the interface (return `CacheModeDefault` to preserve prior behavior).
 
 ## TrajectoryStore
 

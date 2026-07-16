@@ -114,6 +114,13 @@ type ToolExecutor interface {
 	// IsToolUntrusted reports whether a tool's output is from an untrusted external source.
 	// Returns true for MCP-sourced tools and tools with IsUntrusted() == true.
 	IsToolUntrusted(name string) bool
+	// CacheStrategy reports the cache mode the executor should use for a tool's
+	// result. The default (tools.CacheModeDefault) keeps the existing heuristic.
+	// A read tool may opt into tools.CacheModeContentBacked by implementing
+	// tools.ContentBackedReader, so a transformed view of a file (e.g. a decoded
+	// or converted representation) is cached in memory instead of being streamed
+	// from the raw bytes on disk.
+	CacheStrategy(ctx context.Context, name string, input json.RawMessage) tools.CacheMode
 }
 
 // CompactionStrategy defines an algorithm for compressing step history.

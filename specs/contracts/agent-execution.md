@@ -14,7 +14,7 @@ The host application consumes the agent execution types from `github.com/v0lka/s
 | `NoopEvents` | agent | Provided by SDK | No-op `Events` for struct embedding convenience |
 | `HITLHandler` | agent | Implemented by host | Human-in-the-loop hooks: `OnToolCall` (intercept/modify/reject) and `OnStepLimit` (extend/stop) |
 | `NoopHITLHandler` | agent | Provided by SDK | Default handler that allows all tool calls and denies step-limit extensions |
-| `ToolExecutor` | agent | Implemented by `tools.ToolRegistry` | Tool execution the executor needs: `Execute`, `GetToolSource`, `IsToolUntrusted` |
+| `ToolExecutor` | agent | Implemented by `tools.ToolRegistry` | Tool execution the executor needs: `Execute`, `GetToolSource`, `IsToolUntrusted`, `CacheStrategy` |
 | `LLMCaller` | agent | Implemented by `llm.Router` | Minimal LLM call interface the executor needs: `Call(ctx, ChatRequest)(*ChatResponse, error)` |
 | `ContextManager` | agent | Extended by host | Context window management (prompt building, step addition, compaction, fill tracking). **Note:** the SDK-level interface intentionally omits `SetTask`; the host application adds task-context concerns on top |
 | `CompactionStrategy` | agent | Implemented by host / SDK strategies | Compresses step history into a compact `[]llm.Message` within a token budget |
@@ -43,6 +43,7 @@ The host supplies concrete `Events` and `HITLHandler` implementations; `NoopEven
 - **LLMCaller → executor:** `llm.ChatResponse` (message, reasoning, usage, stop reason).
 - **executor → ToolExecutor:** tool name + `json.RawMessage` input.
 - **ToolExecutor → executor:** `tools.ToolResult` (`{Content string; IsError bool}`) plus an error.
+- **executor → ToolExecutor (cache):** `CacheStrategy(ctx, name, input)` returns a `tools.CacheMode` telling the executor how to store the result — `CacheModeDefault` keeps the existing file-backed heuristic, `CacheModeContentBacked` stores the (possibly transformed) result in memory.
 - **executor → Events:** lifecycle callbacks carrying step numbers, tool names/args, result previews, fill percentages, and diagnostics.
 - **executor → HITLHandler:** pre-execution tool call (`OnToolCall`) and budget-exhaustion events (`OnStepLimit`).
 - **executor → host (out):** `ExecutorResult` containing the final output and the full `[]Step` trajectory. Each `Step` carries the `IsUntrusted` flag so the host can treat external-source observations defensively.

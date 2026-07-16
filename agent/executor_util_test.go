@@ -18,6 +18,9 @@ func (m *mockToolExecutorMCP) Execute(_ context.Context, _ string, _ json.RawMes
 }
 func (m *mockToolExecutorMCP) GetToolSource(_ string) string { return "mcp:test" }
 func (m *mockToolExecutorMCP) IsToolUntrusted(_ string) bool { return true }
+func (m *mockToolExecutorMCP) CacheStrategy(_ context.Context, _ string, _ json.RawMessage) tools.CacheMode {
+	return tools.CacheModeDefault
+}
 
 var _ ToolExecutor = (*mockToolExecutorMCP)(nil)
 

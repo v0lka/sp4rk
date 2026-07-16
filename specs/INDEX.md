@@ -17,6 +17,7 @@
 | Subagent delegation, parallel steps                           | [domains/orchestration/subagents.md](domains/orchestration/subagents.md)        |
 | Resuming execution from a checkpoint (ResumeSteps, SeedSteps) | [domains/orchestration/conductor.md](domains/orchestration/conductor.md), [domains/orchestration/executor.md](domains/orchestration/executor.md), [domains/memory/README.md](domains/memory/README.md) |
 | Tool registry, execution pipeline                             | [domains/tool-system/README.md](domains/tool-system/README.md)                  |
+| Tool-result caching, file-backed vs content-backed modes      | [domains/orchestration/executor.md](domains/orchestration/executor.md), [domains/tool-system/README.md](domains/tool-system/README.md) |
 | Adding/modifying built-in tools                               | [domains/tool-system/builtins.md](domains/tool-system/builtins.md)              |
 | MCP servers, dynamic tools                                    | [domains/tool-system/mcp-gateway.md](domains/tool-system/mcp-gateway.md)        |
 | Context window, compaction strategies                         | [domains/memory/compaction.md](domains/memory/compaction.md)                    |

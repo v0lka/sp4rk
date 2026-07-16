@@ -37,7 +37,7 @@ func newCondFakeCM() *condFakeCM {
 }
 
 // ContextManager methods.
-func (m *condFakeCM) BuildPrompt() []llm.Message      { return m.buildPrompt }
+func (m *condFakeCM) BuildPrompt() []llm.Message { return m.buildPrompt }
 func (m *condFakeCM) AddStep(step agent.Step) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -128,6 +128,9 @@ func (condMockTools) Execute(_ context.Context, _ string, _ json.RawMessage) (to
 }
 func (condMockTools) GetToolSource(_ string) string { return "core" }
 func (condMockTools) IsToolUntrusted(_ string) bool { return false }
+func (condMockTools) CacheStrategy(_ context.Context, _ string, _ json.RawMessage) tools.CacheMode {
+	return tools.CacheModeDefault
+}
 
 // --- Tests ---
 
@@ -162,7 +165,7 @@ func TestConductor_Run_ResumeSteps_SeedsContextManager(t *testing.T) {
 	// Capture the CM instance created by the factory so we can assert on it.
 	var cmRef *condFakeCM
 	cfg := ConductorConfig{
-		LLM: &condMockLLM{responses: []*llm.ChatResponse{condFinishResponse("resuming", "done")}},
+		LLM:   &condMockLLM{responses: []*llm.ChatResponse{condFinishResponse("resuming", "done")}},
 		Tools: condMockTools{},
 		ContextFactory: func(_ string, _ llm.ModelMetadata, _ string, _ ...PruningOverride) agent.ContextManager {
 			cm := newCondFakeCM()
@@ -243,9 +246,9 @@ type condFakeCMNoSeed struct{}
 func (condFakeCMNoSeed) BuildPrompt() []llm.Message {
 	return []llm.Message{{Role: "system", Content: "sys"}}
 }
-func (condFakeCMNoSeed) AddStep(agent.Step)                          {}
+func (condFakeCMNoSeed) AddStep(agent.Step)                              {}
 func (condFakeCMNoSeed) Compact(context.Context) *agent.CompactionResult { return nil }
-func (condFakeCMNoSeed) SetStrategy(agent.CompactionStrategy)        {}
+func (condFakeCMNoSeed) SetStrategy(agent.CompactionStrategy)            {}
 func (condFakeCMNoSeed) CheckFill() agent.FillCheck {
 	return agent.FillCheck{Percent: 5, Status: "ok", Used: 100, Max: 100000}
 }

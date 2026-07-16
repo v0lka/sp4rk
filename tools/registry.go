@@ -364,6 +364,29 @@ func (r *ToolRegistry) IsToolUntrusted(name string) bool {
 	return r.categoryForLocked(name) == SourceCategoryMCP
 }
 
+// CacheStrategy reports the cache mode the executor should use for a tool's
+// result. The default (CacheModeDefault) keeps the existing heuristic. A read
+// tool opts into content-backed caching by implementing ContentBackedReader;
+// when IsContentBacked reports true for the given input, this returns
+// CacheModeContentBacked so a transformed view of a file (e.g. a decoded or
+// converted representation) is cached in memory instead of being streamed from
+// the raw bytes on disk. Returns CacheModeDefault for unknown tools.
+func (r *ToolRegistry) CacheStrategy(ctx context.Context, name string, input json.RawMessage) CacheMode {
+	r.mu.RLock()
+	tool, ok := r.tools[name]
+	// Unlock before IsContentBacked: it may parse input and runs on the cache hot path.
+	r.mu.RUnlock()
+	if !ok {
+		return CacheModeDefault
+	}
+	if cb, ok := tool.(ContentBackedReader); ok {
+		if cb.IsContentBacked(ctx, input) {
+			return CacheModeContentBacked
+		}
+	}
+	return CacheModeDefault
+}
+
 // SetParamManager sets a ParamManager that handles param injection at execution time.
 // When set, it is consulted during Execute() to inject auto-managed parameters
 // (e.g., "project") before invoking the tool.

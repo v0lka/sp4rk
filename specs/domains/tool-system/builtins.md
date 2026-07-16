@@ -52,7 +52,7 @@ A tool's output is **untrusted** when it may carry adversarial content (web, MCP
 
 ### File tools
 
-File tools resolve paths via context helpers (`WorkspacePathFrom`/`TempDirFrom`). Relative paths are joined with the workspace root and must stay within it; absolute paths are symlink-resolved and returned regardless of containment (containment is a policy concern, not a parse failure). Containment checks consult `SessionRoots(ctx)` — the union of workspace, temp directory, and any additional roots attached via `WithAllowedRoots` — so all roots are equal peers for path-locality auto-approval, judge fast-paths, symlink classification, and shell working-directory validation (`AllPathsInSessionRoots`, `isPathInSessionRoots`, `validateWorkDir`). `read_file` uses `ReadFileRange` for O(1)-memory streaming of line ranges and is file-backed in the `ToolResultCache` (zero content bytes stored; fragments streamed from disk on demand). Binary files (null bytes in the leading window) are detected and rejected.
+File tools resolve paths via context helpers (`WorkspacePathFrom`/`TempDirFrom`). Relative paths are joined with the workspace root and must stay within it; absolute paths are symlink-resolved and returned regardless of containment (containment is a policy concern, not a parse failure). Containment checks consult `SessionRoots(ctx)` — the union of workspace, temp directory, and any additional roots attached via `WithAllowedRoots` — so all roots are equal peers for path-locality auto-approval, judge fast-paths, symlink classification, and shell working-directory validation (`AllPathsInSessionRoots`, `isPathInSessionRoots`, `validateWorkDir`). `read_file` uses `ReadFileRange` for O(1)-memory streaming of line ranges and is file-backed by default in the `ToolResultCache` (zero content bytes stored; fragments streamed from disk on demand); a read wrapper that implements `ContentBackedReader` opts into content-backed caching for transformed views. Binary files (null bytes in the leading window) are detected and rejected.
 
 ### Web search providers
 
@@ -87,7 +87,8 @@ To add a new built-in tool:
 3. Implement `Execute(ctx, input)` — use `ParseInputError` for JSON parse failures and `ErrorResult` for logical errors.
 4. Set `Untrusted: true` if the tool returns external data (web, MCP, filesystem reads of external content).
 5. Optionally implement `ToolJudger` for tool-specific safety escalation on `PolicyAlwaysAllow` tools.
-6. Register the tool in the `ToolRegistry` alongside the `finish` tool.
+6. For a read tool that returns a transformed/decoded view of a file (not raw bytes), implement `tools.ContentBackedReader` (`IsContentBacked`) so the executor caches the result in memory while keeping file coherence metadata; leave it unimplemented to keep the default file-backed behavior.
+7. Register the tool in the `ToolRegistry` alongside the `finish` tool.
 
 ## Related Specs
 

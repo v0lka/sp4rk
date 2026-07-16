@@ -54,6 +54,9 @@ func (m *mockToolRegistry) Execute(_ context.Context, _ string, _ json.RawMessag
 }
 func (m *mockToolRegistry) GetToolSource(_ string) string { return "" }
 func (m *mockToolRegistry) IsToolUntrusted(_ string) bool { return false }
+func (m *mockToolRegistry) CacheStrategy(_ context.Context, _ string, _ json.RawMessage) tools.CacheMode {
+	return tools.CacheModeDefault
+}
 
 // ---------------------------------------------------------------------------
 // Helper to create a Config with minimal wired-in functions

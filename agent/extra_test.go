@@ -1235,3 +1235,48 @@ func TestProcessToolResult_FileBackedNudge_NoStage1Truncation(t *testing.T) {
 		t.Errorf("expected file-backed nudge even without Stage 1 truncation, got: %s", observation)
 	}
 }
+
+// contentBackedToolExecutor wraps mockToolExecutor but reports
+// CacheModeContentBacked for read_file, simulating a read wrapper that returns
+// a transformed view of the file (e.g. a converted document).
+type contentBackedToolExecutor struct {
+	mockToolExecutor
+}
+
+func (m *contentBackedToolExecutor) CacheStrategy(_ context.Context, name string, _ json.RawMessage) tools.CacheMode {
+	if name == tools.ToolReadFile {
+		return tools.CacheModeContentBacked
+	}
+	return tools.CacheModeDefault
+}
+
+func TestBuildCacheMeta_ContentBacked_ReadFile(t *testing.T) {
+	// A read_file tool that opts into content-backed caching (via
+	// ContentBackedReader) must NOT set FileBacked, yet still attach file
+	// coherence metadata so the executor can detect source-file changes.
+	tmpDir := t.TempDir()
+	testFile := tmpDir + "/doc.pdf"
+	if err := os.WriteFile(testFile, []byte("%PDF-1.4 fake"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	mockTools := &contentBackedToolExecutor{mockToolExecutor: *newMockToolExecutor()}
+	exec := newExecutorDefaultHITL(&mockLLMCaller{}, mockTools, &mockTokenCounter{}, 5, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+
+	input, _ := json.Marshal(map[string]string{"path": testFile})
+	meta := exec.buildCacheMeta(context.Background(), tools.ToolReadFile, input)
+
+	if meta.FileBacked {
+		t.Error("expected FileBacked = false for content-backed read_file")
+	}
+	// File coherence metadata must still be present.
+	if meta.FilePath != testFile {
+		t.Errorf("FilePath = %q, want %q", meta.FilePath, testFile)
+	}
+	if meta.FileSize == 0 {
+		t.Error("expected non-zero FileSize for content-backed read_file")
+	}
+	if meta.FileMtime == 0 {
+		t.Error("expected non-zero FileMtime for content-backed read_file")
+	}
+}

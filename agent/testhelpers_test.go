@@ -90,6 +90,10 @@ func (m *mockToolExecutor) IsToolUntrusted(name string) bool {
 	return false
 }
 
+func (m *mockToolExecutor) CacheStrategy(_ context.Context, _ string, _ json.RawMessage) tools.CacheMode {
+	return tools.CacheModeDefault
+}
+
 // --- Mock ContextManager ---
 
 type mockContextManager struct {
@@ -315,6 +319,10 @@ func (m *countingToolExecutor) GetToolSource(name string) string {
 
 func (m *countingToolExecutor) IsToolUntrusted(name string) bool {
 	return false
+}
+
+func (m *countingToolExecutor) CacheStrategy(_ context.Context, _ string, _ json.RawMessage) tools.CacheMode {
+	return tools.CacheModeDefault
 }
 
 // llmResponseWithMultipleToolCalls creates a ChatResponse with multiple tool calls.
