@@ -13,7 +13,7 @@ import (
 	"time"
 
 	md "github.com/JohannesKaufmann/html-to-markdown"
-	"github.com/go-shiori/go-readability"
+	"codeberg.org/readeck/go-readability/v2"
 	"github.com/v0lka/sp4rk/tools"
 )
 
@@ -312,12 +312,16 @@ func (t *WebFetchTool) htmlToMarkdown(htmlContent, pageURL string) (string, erro
 		return t.convertHTMLToMarkdown(htmlContent)
 	}
 
-	// Try to extract article content using readability
+	// Try to extract article content using readability. readeck/go-readability
+	// exposes the cleaned-up HTML via Article.RenderHTML (the go-shiori
+	// Article.Content string field no longer exists).
 	article, err := readability.FromReader(strings.NewReader(htmlContent), parsedURL)
-	if err == nil && len(article.Content) > 100 {
-		// Readability succeeded and produced meaningful content
-		// article.Content contains the extracted HTML
-		return t.convertHTMLToMarkdown(article.Content)
+	if err == nil {
+		var content strings.Builder
+		if rerr := article.RenderHTML(&content); rerr == nil && content.Len() > 100 {
+			// Readability succeeded and produced meaningful content.
+			return t.convertHTMLToMarkdown(content.String())
+		}
 	}
 
 	// Fall back to converting the full HTML
