@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 
 	doublestar "github.com/bmatcuk/doublestar/v4"
@@ -114,6 +115,20 @@ func (t *GlobTool) Execute(ctx context.Context, input json.RawMessage) (tools.To
 				return nil
 			}
 			// "all": no filtering
+		}
+
+		// Honour .gitignore/.aiignore when a checker is plumbed through the
+		// context. p is relative to params.Path (the search root), so resolve
+		// it to an absolute path that the multi-root checker can map to its
+		// containing root. No checker in context => today's behaviour (no
+		// filtering). Ignored directories are skipped here, and their file
+		// children are skipped too because the checker considers ancestor
+		// directories when deciding whether a path is ignored.
+		if checker := tools.IgnoreCheckerFrom(ctx); checker != nil {
+			absEntry := filepath.Join(params.Path, p)
+			if checker.Ignored(absEntry, d.IsDir()) {
+				return nil
+			}
 		}
 
 		results = append(results, p)

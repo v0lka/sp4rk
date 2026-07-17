@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -197,6 +199,18 @@ func (t *RipgrepTool) Execute(ctx context.Context, input json.RawMessage) (tools
 	}
 	if params.IncludeHidden {
 		args = append(args, "--hidden")
+	}
+	// ripgrep respects .gitignore natively. Additionally honour a root-level
+	// .aiignore (located at the resolved search root) via --ignore-file, but
+	// only when an ignore checker is plumbed through the context — this keeps
+	// "no checker => today's behaviour" intact (rg ignores .aiignore by
+	// default). Nested .aiignore files are not honoured by rg; this is a
+	// documented limitation.
+	if tools.IgnoreCheckerFrom(ctx) != nil {
+		rootAiignore := filepath.Join(params.Path, ".aiignore")
+		if info, err := os.Stat(rootAiignore); err == nil && !info.IsDir() {
+			args = append(args, "--ignore-file", rootAiignore)
+		}
 	}
 	args = append(args, "-e", params.Pattern, "--", params.Path)
 

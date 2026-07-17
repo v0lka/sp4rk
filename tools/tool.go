@@ -161,6 +161,37 @@ func AllowedRootsFrom(ctx context.Context) []string {
 	return nil
 }
 
+// IgnoreChecker reports whether an absolute path is ignored by the ignore
+// rules (.gitignore / .aiignore) of the root that contains it. It is satisfied
+// structurally by github.com/v0lka/sp4rk/ignore.Resolver and ignore.Multi, so
+// it is plumbed through tool context without the tools package taking a direct
+// dependency on the ignore package. Read-style tools (glob, ripgrep) consult
+// it to honour ignore rules for both the workspace and any work-directory root.
+type IgnoreChecker interface {
+	Ignored(absPath string, isDir bool) bool
+}
+
+// ignoreCheckerKey is the context key for the session ignore checker.
+type ignoreCheckerKey struct{}
+
+// WithIgnoreChecker returns a new context with the ignore checker attached.
+// Passing a nil checker is equivalent to not attaching one: downstream tools
+// treat a missing checker as "no ignore filtering" and preserve their default
+// behaviour.
+func WithIgnoreChecker(ctx context.Context, checker IgnoreChecker) context.Context {
+	return context.WithValue(ctx, ignoreCheckerKey{}, checker)
+}
+
+// IgnoreCheckerFrom extracts the ignore checker from the context. Returns nil
+// when none is attached; callers MUST then skip ignore filtering and keep
+// their pre-ignore behaviour (graceful, no regression).
+func IgnoreCheckerFrom(ctx context.Context) IgnoreChecker {
+	if v, ok := ctx.Value(ignoreCheckerKey{}).(IgnoreChecker); ok {
+		return v
+	}
+	return nil
+}
+
 // SessionRoots returns the deduplicated, non-empty union of the workspace
 // path, the temp directory, and any additional allowed roots. This is the
 // canonical list consulted by ALL path-containment checks.
