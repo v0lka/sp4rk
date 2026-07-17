@@ -17,6 +17,7 @@ Formal design specifications live in [`specs/`](specs/) (architecture, domains, 
 
 - Single Go module: `github.com/v0lka/sp4rk` (this directory). Go `1.26.3` (see `go.mod`).
 - The root `sp4rk` package is the public entry point. There is no internal/host-application layer here — every package is a reusable engine primitive.
+- **This is an SDK, not an application.** Every exported method, struct, interface, constant, and function is part of the public API consumed by downstream host applications — *even when it is only referenced from tests within this repo*. An exported symbol with no non-test call site inside sp4rk is **not** dead code: tests here stand in for real consumers, and the absence of a production call site is expected and normal. When reviewing, do **not** flag "exported X is only used in tests" as unreachable/dead code, and do not suggest un-exporting or removing such symbols on that basis alone. (Genuinely unused symbols are still caught by `go vet` / `unused`, which exclude test references appropriately.)
 
 ### Package map
 
@@ -39,6 +40,7 @@ Formal design specifications live in [`specs/`](specs/) (architecture, domains, 
 | `…/embedding` | ONNX-based `Embedder`, `Tokenizer`, and chunker for local vector embeddings |
 | `…/pathutil` | Reusable filesystem-path algorithms: `IsWithinPath`, `SplitPathComponents`, `ResolveExistingPrefix` |
 | `…/strutil` | String helpers: `TruncateUTF8` and related utilities |
+| `…/ignore` | Multi-root `.gitignore`/`.aiignore` resolver: `Resolver`, `Multi`, `IgnoreChecker` (satisfied structurally by `tools.IgnoreChecker`) |
 
 ### Entry points
 
@@ -69,6 +71,7 @@ The root `Makefile` provides `build`, `test`, and `lint` targets; otherwise run 
 - **Conductor vs Executor:** the Plan & Execute `Conductor` runs each plan step as its own ReAct loop — both are `Executor.Run` instances. When you change the execution loop, it affects single-shot `Execute`, subagent runs, and conductor steps alike.
 - **Prompts:** system prompts are assembled via the fluent `prompt.Builder` (`prompt`) with cache-break and substitution support. Prefer configurable prompt factories over hard-coded strings.
 - **Path & string helpers:** use `pathutil` (`IsWithinPath`, `SplitPathComponents`, `ResolveExistingPrefix`) and `strutil` (`TruncateUTF8`) rather than hand-rolling path/string logic.
+- **Ignore filtering:** `glob` and `ripgrep` honour `.gitignore`/`.aiignore` through a single shared authority — the `tools.IgnoreChecker` plumbed through context by the host (typically `ignore.Multi` over the workspace + work-dir roots). `tools` never imports `ignore`: both define `Ignored(absPath, isDir) bool`, and `ignore.Resolver`/`ignore.Multi` satisfy `tools.IgnoreChecker` structurally. A `nil` checker (none attached) means **no** ignore filtering — the opt-in, no-regression default; `rg` still honours `.gitignore` natively. Negation patterns (`!`) are unsupported.
 - **Security:** untrusted tool output (web, MCP, filesystem) is wrapped in `<untrusted-content>` boundary tags via `security` (`WrapUntrustedContent` / `StripUntrustedTags`) before it enters LLM context.
 - **ONNX Runtime is OPTIONAL:** only the local embedding subsystem (`embedding`) needs it. The rest of the framework runs without it. See [docs/embedding.md](docs/embedding.md).
 

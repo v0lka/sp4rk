@@ -30,7 +30,7 @@ The SDK is organized in four layers. Import direction flows downward — upper l
 | **Agent** | `agent` | The `Executor` runs the ReAct loop: think, call a tool, observe, repeat. Manages the step budget, circuit breakers, tool-result caching, and sub-agent parallelism. |
 | **Primitives** | `llm`, `tools`, `tools/builtins`, `tools/mcp` | The `Router` routes LLM calls to the active provider. The `ToolRegistry` holds and executes tools. Built-in tools cover file, shell, and search operations; the MCP gateway proxies external servers. |
 
-Supporting packages — `memory`, `prompt`, `skills`, `security`, `embedding`, `pathutil`, `strutil` — are consumed across layers as needed.
+Supporting packages — `memory`, `prompt`, `skills`, `security`, `embedding`, `pathutil`, `strutil`, `ignore` — are consumed across layers as needed.
 
 ## Package dependency graph
 
@@ -94,6 +94,9 @@ tools/mcp
 skills
   ├──→ pathutil
   └──→ tools
+
+ignore
+  └──→ pathutil   (external doublestar only otherwise)
 ```
 
 The `tools` package is a near-leaf dependency — it imports `llm`, `pathutil`, `strutil`, and `tools/internal/judge_prompts` (for the LLM-backed `ToolJudge`). The `llm` package is similarly foundational. This keeps the primitive layers free of higher-level concerns and prevents import cycles.

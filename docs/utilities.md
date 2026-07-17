@@ -1,6 +1,6 @@
 # Utilities
 
-The SDK ships two small, dependency-light utility packages with reusable algorithms: `pathutil` for filesystem-path operations and `strutil` for string helpers.
+The SDK ships small, dependency-light packages with reusable algorithms: `pathutil` for filesystem-path operations, `strutil` for string helpers, and `ignore` for multi-root `.gitignore`/`.aiignore` resolution.
 
 ## pathutil
 
@@ -194,5 +194,86 @@ func main() {
 		}
 		fmt.Println()
 	}
+}
+```
+
+## ignore
+
+```go
+import "github.com/v0lka/sp4rk/ignore"
+```
+
+The `ignore` package is a multi-root ignore resolver that loads `.gitignore` and `.aiignore` files (at the root and in every nested directory) for each root and answers whether an arbitrary path is ignored by the patterns of the root that contains it. It is a **pure algorithmic building block**: it performs no hidden-dotfile or binary-file filtering. Those universal guards are caller-side concerns layered on top.
+
+It imports only `pathutil` and an external glob library (`doublestar`) — no engine packages — so the host application wires it into tool context rather than the engine importing it.
+
+### NewResolver and Multi
+
+```go
+func NewResolver(root string) (*Resolver, error)
+func NewMulti(roots ...string) (*Multi, error)
+```
+
+`NewResolver` walks `root` once, collecting every `.gitignore` and `.aiignore` file (root plus nested directories) and compiling their patterns into globs anchored relative to the root. `root` may be absolute or relative; it is canonicalized to an absolute, symlink-resolved form (via `pathutil.ResolveExistingPrefix`) so queries work regardless of the path form callers supply.
+
+`NewMulti` builds a `Resolver` per root and answers queries by delegating to whichever root contains the path. Both `Resolver` and `Multi` satisfy the `IgnoreChecker` interface (`Ignored(absPath string, isDir bool) bool`), which the `tools` package defines itself — `tools` never imports `ignore`.
+
+```go
+// Single-root resolver.
+r, err := ignore.NewResolver("/home/user/project")
+
+// Multi-root resolver (workspace + a separate work directory).
+m, err := ignore.NewMulti(workspace, workDir)
+
+// Both are usable as a tools.IgnoreChecker:
+var checker tools.IgnoreChecker = m
+ctx := tools.WithIgnoreChecker(ctx, checker)
+```
+
+### Ignored
+
+```go
+func (r *Resolver) Ignored(absPath string, isDir bool) bool
+func (m *Multi) Ignored(absPath string, isDir bool) bool
+```
+
+`Ignored` reports whether an absolute path is ignored. `absPath` is canonicalized via longest-existing-prefix symlink resolution and then converted to a root-relative path, making the resolver robust to either path form callers supply (raw `/tmp/...` or resolved `/private/tmp/...`). Paths outside all known roots are never ignored (matching the `IgnoreChecker` contract).
+
+Directory semantics follow standard gitignore: if any ancestor directory is ignored, the path is ignored too.
+
+### Pattern semantics and limitations
+
+- A leading slash anchors a pattern to its file's directory; a bare name with no slash matches at any depth beneath that directory.
+- A trailing slash marks a rule as directory-only.
+- **Negation patterns** (lines beginning with `!`) are **unsupported** — they are silently skipped.
+- The `.git` directory is always pruned during the walk (never meaningful source, and can be enormous). Any directory that is itself ignored by the patterns collected so far is pruned too.
+
+### Complete ignore example
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+
+	"github.com/v0lka/sp4rk/ignore"
+	"github.com/v0lka/sp4rk/tools"
+)
+
+func main() {
+	// Build a resolver over the workspace; .gitignore + .aiignore at the
+	// root and in nested directories are honoured.
+	checker, err := ignore.NewResolver(".")
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("root:", checker.Root())
+
+	// Attach it to tool context so glob/ripgrep honour the rules.
+	ctx := tools.WithIgnoreChecker(context.Background(), checker)
+
+	_ = ctx // pass to the agent/executor
 }
 ```

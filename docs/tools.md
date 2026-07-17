@@ -415,8 +415,8 @@ import "github.com/v0lka/sp4rk/tools/builtins"
 | `list_directory` | `NewListDirectoryTool()` | Lists the immediate contents of a directory, returning each entry's name, type (file or dir), and size in bytes. Does not recurse into subdirectories. |
 | `create_directory` | `NewCreateDirectoryTool()` | Creates a directory at the specified path, including any necessary parent directories (like `mkdir -p`). Succeeds silently if the directory already exists. |
 | `delete_directory` | `NewDeleteDirectoryTool()` | Deletes a directory at the specified path. By default only empty directories can be deleted; set `recursive` to `true` to remove the directory and all its contents. |
-| `glob` | `NewGlobTool()` | Find files and directories by name using glob patterns. Supports `**` for recursive directory matching. Respects `.gitignore` rules automatically. |
-| `ripgrep` | `NewRipgrepTool()` | Search file contents using regex or literal patterns. Returns matches in `file:line: content` format with optional context lines. Respects `.gitignore` rules and skips binary files. |
+| `glob` | `NewGlobTool()` | Find files and directories by name using glob patterns. Supports `**` for recursive directory matching. Honours `.gitignore` and `.aiignore` rules when an `IgnoreChecker` is plumbed through tool context (see [Ignore filtering](#ignore-filtering) below). |
+| `ripgrep` | `NewRipgrepTool()` | Search file contents using regex or literal patterns. Returns matches in `file:line: content` format with optional context lines. `rg` honours `.gitignore` natively; `.aiignore` (root and nested) is additionally enforced via the context `IgnoreChecker` when present (see [Ignore filtering](#ignore-filtering) below). Skips binary files. |
 | `batch` | `NewBatchTool()` | Execute multiple tool calls sequentially in one turn. All calls execute in order even if one fails — errors are captured per-call and do not abort the batch. |
 | `update_checklist` | `NewUpdateChecklistTool()` | Update the checklist for the current step (or the task as a whole). Call first to initialize, then after completing each item. Update ONE item at a time — call it again immediately after each single sub-task rather than batching several checks, so progress stays visible incrementally. Uses ASCII checkboxes only. |
 | `tool_result_read` | `NewToolResultReadTool()` | Read a previously cached tool result in fragments using the hash from a truncation nudge. Retrieves more content from a truncated output without re-executing the original tool. |
@@ -435,6 +435,34 @@ import "github.com/v0lka/sp4rk/tools/builtins"
 > **Note on `semantic_search`:** the type is `VectorSearchTool`, but the name exposed to the LLM is `semantic_search`. Its constructor requires a `VectorSearchFunc` (performs the search) and a `VectorSearchWaitFunc` (blocks until the vector index is ready), both provided by the backend layer at wiring time.
 >
 > **Note on SSRF protection:** the `netcheck.go` file in the `builtins` package provides private-network detection helpers (`isPrivateIP`, `resolveHostIsPrivate`) consumed by `web_fetch` to guard against SSRF. It is not itself a registered tool.
+
+### Ignore filtering
+
+`glob` and `ripgrep` honour `.gitignore` and `.aiignore` rules through a single shared ignore authority — the `IgnoreChecker` plumbed through tool context by the host application. The checker is typically built from `ignore.Multi` over the workspace and any work-directory roots, so both tools agree on what is hidden.
+
+```go
+import (
+    "github.com/v0lka/sp4rk/ignore"
+    "github.com/v0lka/sp4rk/tools"
+)
+
+// Build a multi-root resolver over the workspace and a work directory.
+checker, err := ignore.NewMulti(workspace, workDir)
+if err != nil {
+    return err
+}
+// Attach it to tool context. glob/ripgrep consult tools.IgnoreCheckerFrom(ctx)
+// and skip ignored paths.
+ctx := tools.WithIgnoreChecker(ctx, checker)
+```
+
+Behaviour to keep in mind:
+
+- **Opt-in, no regression.** `tools.IgnoreCheckerFrom(ctx)` returns `nil` when no checker is attached. Both tools then keep their pre-ignore behaviour (`rg` still honours `.gitignore` natively; `glob` does not filter). Wiring the checker is additive.
+- **glob** resolves each `doublestar.GlobWalk` entry to an absolute path and drops it when `checker.Ignored(absEntry, isDir)` is true. An ignored directory is pruned, and its file children are skipped too (the checker considers ancestor directories when deciding whether a path is ignored).
+- **ripgrep** relies on `rg`'s native `.gitignore` handling and additionally **post-filters** every emitted match *and* context-line path through the same `IgnoreChecker`. This catches `.aiignore` rules (root *and* nested) and any resolver-only rule `rg` cannot see. `rg` still searches the matched files; the tool discards their matches afterwards. For the typical secret-suppression use case (a few `.aiignore` entries) the cost is negligible.
+
+See [Utilities → ignore](utilities.md#ignore) for the resolver's pattern semantics, limitations (negation patterns are unsupported), and its dependency on `pathutil` for symlink-aware path canonicalization.
 
 ### Tool name constants
 

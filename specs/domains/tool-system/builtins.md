@@ -27,8 +27,8 @@ The SDK ships a catalog of filesystem, search, web, execution, and agent-infrast
 | `create_directory` | File | `user_confirm` | no | Create a directory recursively. |
 | `delete_directory` | File | `user_confirm` | no | Remove a directory recursively. |
 | `delete_file` | File | `user_confirm` | no | Remove a single file. |
-| `glob` | Search | `always_allow` | yes | Glob-pattern file matching. |
-| `ripgrep` | Search | `always_allow` | yes | Fast regex content search (shells out to `rg`). |
+| `glob` | Search | `always_allow` | yes | Glob-pattern file matching; honours `.gitignore`/`.aiignore` via the context `IgnoreChecker` when present. |
+| `ripgrep` | Search | `always_allow` | yes | Fast regex content search (shells out to `rg`); honours `.gitignore`/`.aiignore` via the context `IgnoreChecker` when present. |
 | `semantic_search` | Search | `always_allow` | no | Vector similarity search (optional; see [../embedding.md](../embedding.md)). |
 | `web_fetch` | Web | `always_allow` | yes | Fetch URL content as markdown. |
 | `web_search` | Web | `always_allow` | yes | Search the web (optional; needs a search-provider config). |
@@ -58,6 +58,13 @@ File tools resolve paths via context helpers (`WorkspacePathFrom`/`TempDirFrom`)
 
 `web_search` is optional: it is silently not registered when no search-provider config/API key is supplied. The provider abstraction supports Brave, DuckDuckGo, Exa, and Tavily.
 
+### Ignore filtering (glob, ripgrep)
+
+`glob` and `ripgrep` honour `.gitignore` and `.aiignore` rules through a single shared authority — the `IgnoreChecker` plumbed through tool context by the host. The checker (typically `ignore.Multi` over the workspace and any work-directory roots) is consulted per result so both tools agree on what is hidden. A `nil` checker (none attached) means **no** ignore filtering — the pre-ignore default — so wiring the checker is opt-in and never a regression.
+
+- **glob** resolves each `doublestar.GlobWalk` entry to an absolute path and drops it when `checker.Ignored(absEntry, isDir)` is true. An ignored directory is skipped, and its file children are skipped too because the checker considers ancestor directories when deciding whether a path is ignored.
+- **ripgrep** relies on `rg`'s native `.gitignore` handling and additionally **post-filters** every emitted match *and* context-line path through the same `IgnoreChecker` (via `isIgnoredPath`). This catches `.aiignore` rules (root *and* nested) and any resolver-only rule `rg` cannot see. The trade-off is that `rg` searches (and the tool then discards) `.aiignore`-matched files; for the typical secret-suppression use case these are few, so the cost is negligible. Nested `.aiignore` files are fully honoured (a prior limitation, now resolved).
+
 ### Agent-infrastructure tools
 
 Blackboard-backed tools (`read_step_output`, `list_step_outputs`, `read_final_result`, `read_attachment`, `store_fact`, `search_facts`) read and write shared blackboard state through the `agent.*Store` adapters the [Conductor](../orchestration/conductor.md) injects (see [../memory/blackboard.md](../memory/blackboard.md)). `read_attachment` reads a user-attached file's converted markdown from the `AttachmentStore` by ID (the IDs are listed in the user message). `update_checklist` validates Markdown checkboxes and emits to-do updates via a context-injected callback; `read_step_output` is likewise context-aware. `tool_result_read` validates cache coherence on every read (file mtime+size for file tools; TTL for MCP tools).
@@ -77,6 +84,7 @@ Blackboard-backed tools (`read_step_output`, `list_step_outputs`, `read_final_re
 - Blackboard-backed tools read only error-free completed steps; outputs are listed in deterministic step-ID order.
 - `read_skill_resource` resolves paths via `skills.SafeResolvePath` (path-traversal safe).
 - Untrusted-output tools always set `Untrusted: true` and are wrapped when injection defense is enabled.
+- `glob` and `ripgrep` share a single ignore authority (`IgnoreChecker` from context); a `nil` checker means no filtering (the opt-in, no-regression default).
 
 ## Extension Guide
 
@@ -94,6 +102,7 @@ To add a new built-in tool:
 
 - [README.md](README.md) — tool system overview and execution pipeline
 - [mcp-gateway.md](mcp-gateway.md) — dynamic MCP tool discovery
+- [../../contracts/tools.md](../../contracts/tools.md) — `Tool`/`BaseTool`/`ToolJudger`/`IgnoreChecker` interfaces and the host-to-registry data flow
 - [../orchestration/executor.md](../orchestration/executor.md) — `batch` interception, two-stage truncation, `ToolResultCache`
 - [../memory/blackboard.md](../memory/blackboard.md) — store adapters backing the blackboard tools
 - [../embedding.md](../embedding.md) — `semantic_search` vector tool

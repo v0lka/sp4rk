@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -200,18 +199,15 @@ func (t *RipgrepTool) Execute(ctx context.Context, input json.RawMessage) (tools
 	if params.IncludeHidden {
 		args = append(args, "--hidden")
 	}
-	// ripgrep respects .gitignore natively. Additionally honour a root-level
-	// .aiignore (located at the resolved search root) via --ignore-file, but
-	// only when an ignore checker is plumbed through the context — this keeps
-	// "no checker => today's behaviour" intact (rg ignores .aiignore by
-	// default). Nested .aiignore files are not honoured by rg; this is a
-	// documented limitation.
-	if tools.IgnoreCheckerFrom(ctx) != nil {
-		rootAiignore := filepath.Join(params.Path, ".aiignore")
-		if info, err := os.Stat(rootAiignore); err == nil && !info.IsDir() {
-			args = append(args, "--ignore-file", rootAiignore)
-		}
-	}
+	// ripgrep respects .gitignore natively. Ignore filtering for .aiignore
+	// (root AND nested) and any resolver-only rules is applied uniformly via
+	// post-filtering every emitted match/context path through the ignore
+	// checker (see isIgnoredPath in the loop below) — the SAME authority glob
+	// uses, so both tools share one source of truth. The trade-off is that rg
+	// searches (and we then discard) .aiignore-matched files; for the typical
+	// secret-suppression use case these are few, so the cost is negligible.
+	// A nil checker => today's behaviour (no .aiignore filtering at all).
+	checker := tools.IgnoreCheckerFrom(ctx)
 	args = append(args, "-e", params.Pattern, "--", params.Path)
 
 	searchCtx, cancel := context.WithTimeout(ctx, t.limits.Timeout)
@@ -248,6 +244,13 @@ func (t *RipgrepTool) Execute(ctx context.Context, input json.RawMessage) (tools
 				continue
 			}
 			path := m.Path.Text
+			// Drop matches in ignored files (single ignore authority, shared
+			// with glob). rg honours .gitignore natively, so this is a no-op
+			// for those; it catches .aiignore (root + nested) and resolver-
+			// only rules rg cannot see.
+			if isIgnoredPath(checker, params.Path, path) {
+				continue
+			}
 			fileSet[path] = struct{}{}
 			content := strings.TrimRight(m.Lines.Text, "\n")
 			col := 0
@@ -266,6 +269,10 @@ func (t *RipgrepTool) Execute(ctx context.Context, input json.RawMessage) (tools
 		case "context":
 			var c rgContextData
 			if unmarshalErr := json.Unmarshal(ev.Data, &c); unmarshalErr != nil {
+				continue
+			}
+			// Drop context lines from ignored files, consistent with matches.
+			if isIgnoredPath(checker, params.Path, c.Path.Text) {
 				continue
 			}
 			content := strings.TrimRight(c.Lines.Text, "\n")
@@ -308,4 +315,21 @@ func (t *RipgrepTool) Execute(ctx context.Context, input json.RawMessage) (tools
 	}
 
 	return tools.ToolResult{Content: sb.String()}, nil
+}
+
+// isIgnoredPath reports whether a ripgrep-emitted path should be dropped
+// because the ignore checker considers it ignored. rgPath is the path string
+// ripgrep printed (absolute when the search root is absolute, otherwise
+// relative to the cwd); it is normalized to absolute against searchRoot before
+// the checker is consulted. A nil checker means no filtering (today's default
+// behaviour, before an IgnoreChecker was plumbed through context).
+func isIgnoredPath(checker tools.IgnoreChecker, searchRoot, rgPath string) bool {
+	if checker == nil {
+		return false
+	}
+	abs := rgPath
+	if !filepath.IsAbs(abs) {
+		abs = filepath.Join(searchRoot, abs)
+	}
+	return checker.Ignored(abs, false)
 }

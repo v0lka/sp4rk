@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/v0lka/sp4rk/pathutil"
 )
 
 // writeFile is a small helper that writes content to a path under dir,
@@ -66,6 +68,14 @@ func assertNotIgnored(t *testing.T, c IgnoreChecker, absPath string, isDir bool)
 	if c.Ignored(absPath, isDir) {
 		t.Errorf("expected %q (isDir=%v) NOT to be ignored, but it was", absPath, isDir)
 	}
+}
+
+// canonicalRoot returns the symlink-resolved absolute form a resolver stores
+// for dir, mirroring NewResolver's canonicalization. Used by tests that assert
+// on Resolver.Root().
+func canonicalRoot(t *testing.T, dir string) string {
+	t.Helper()
+	return pathutil.ResolveExistingPrefix(filepath.Clean(dir))
 }
 
 // ---------------------------------------------------------------------------
@@ -329,12 +339,13 @@ func TestMulti_RootForSelectsContainingRoot(t *testing.T) {
 	assertIgnored(t, m, joinRel(beta, "y.beta"), false)
 	assertNotIgnored(t, m, joinRel(beta, "x.alpha"), false)
 
-	// RootFor returns the matching resolver.
-	if got := m.RootFor(joinRel(alpha, "x.alpha")); got == nil || got.Root() != filepath.Clean(alpha) {
-		t.Errorf("RootFor(alpha path) = %v, want alpha root", got)
+	// RootFor returns the matching resolver. Its root is stored in
+	// symlink-resolved (canonical) form, so compare against canonicalRoot.
+	if got := m.RootFor(joinRel(alpha, "x.alpha")); got == nil || got.Root() != canonicalRoot(t, alpha) {
+		t.Errorf("RootFor(alpha path) = %v, want alpha root %s", got, canonicalRoot(t, alpha))
 	}
-	if got := m.RootFor(joinRel(beta, "y.beta")); got == nil || got.Root() != filepath.Clean(beta) {
-		t.Errorf("RootFor(beta path) = %v, want beta root", got)
+	if got := m.RootFor(joinRel(beta, "y.beta")); got == nil || got.Root() != canonicalRoot(t, beta) {
+		t.Errorf("RootFor(beta path) = %v, want beta root %s", got, canonicalRoot(t, beta))
 	}
 }
 
@@ -380,4 +391,116 @@ func TestNewMulti_RequiresAtLeastOneRoot(t *testing.T) {
 	if _, err := NewMulti(); err == nil {
 		t.Fatal("NewMulti() should error without roots")
 	}
+}
+
+// TestResolver_SymlinkedRootDoesNotLeak is the regression guard for a
+// path-form mismatch that silently leaked ignored files (including
+// .aiignore-gated secrets). Previously NewResolver stored the root as a raw
+// (un-resolved) path while the tools' resolvePath and IsWithinPath symlink-
+// resolve both sides: a resolver built from a symlinked/raw root (e.g. macOS
+// /tmp) queried with a resolved path (e.g. /private/tmp/...) yielded a
+// filepath.Rel of "../../private/tmp/...", and Match's ".." guard reported the
+// file as NOT ignored. The resolver now canonicalizes its root and resolves
+// query paths, so either form the caller supplies resolves correctly.
+//
+// This reproduces the macOS /tmp -> /private/tmp scenario portably by creating
+// an explicit symlink, so it is not platform-dependent.
+func TestResolver_SymlinkedRootDoesNotLeak(t *testing.T) {
+	realDir := t.TempDir()
+	writeFile(t, realDir, ".gitignore", "*.log\n")
+	writeFile(t, realDir, ".aiignore", "*.secret\n")
+	touchFile(t, realDir, "app.log")
+	touchFile(t, realDir, "creds.secret")
+	touchFile(t, realDir, "keep.txt")
+
+	// Create a symlink "link" -> realDir. Skip the test on systems that cannot
+	// create symlinks (some restricted Windows setups).
+	linkParent := t.TempDir()
+	link := filepath.Join(linkParent, "link")
+	if err := os.Symlink(realDir, link); err != nil {
+		t.Skipf("cannot create symlink, skipping symlink-root regression test: %v", err)
+	}
+
+	// resolved form of the target dir (what EvalSymlinks / the tools produce).
+	resolvedReal, err := filepath.EvalSymlinks(realDir)
+	if err != nil {
+		resolvedReal = realDir
+	}
+
+	// Sanity: the symlink form and the resolved form actually differ on this
+	// system — otherwise the test exercises nothing. When they coincide the
+	// assertions below still hold, but they would not prove anything new.
+	if link == resolvedReal {
+		t.Logf("symlink form == resolved form on this system; test still passes but does not exercise the mismatch")
+	}
+
+	r, err := NewResolver(link) // build from the SYMLINK (raw) path
+	if err != nil {
+		t.Fatalf("NewResolver(symlink): %v", err)
+	}
+
+	// The stored root must be the canonical (resolved) form, not the symlink.
+	if r.Root() != resolvedReal {
+		t.Errorf("root = %q, want canonical %q (symlink must be resolved)", r.Root(), resolvedReal)
+	}
+
+	// Query with the RESOLVED target form — the form the tools emit when a
+	// workspace is in context. This is the case that previously leaked.
+	assertIgnored(t, r, filepath.Join(resolvedReal, "app.log"), false)
+	assertIgnored(t, r, filepath.Join(resolvedReal, "creds.secret"), false)
+	assertNotIgnored(t, r, filepath.Join(resolvedReal, "keep.txt"), false)
+
+	// Query with the SYMLINK form too — the form callers without a workspace
+	// in context supply. Belt-and-suspenders: both forms must agree.
+	assertIgnored(t, r, filepath.Join(link, "app.log"), false)
+	assertIgnored(t, r, filepath.Join(link, "creds.secret"), false)
+	assertNotIgnored(t, r, filepath.Join(link, "keep.txt"), false)
+}
+
+// TestResolver_SkipsGitDirDuringLoad verifies load() prunes the .git directory:
+// ignore files nested under .git must not be collected (and the walk avoids
+// descending into a potentially huge .git tree).
+func TestResolver_SkipsGitDirDuringLoad(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, ".gitignore", "build/\n")
+	// A .gitignore under .git that would (wrongly) ignore *.go if collected.
+	writeFile(t, root, ".git/info/exclude", "*.go\n")
+	writeFile(t, root, ".git/objects/.gitignore", "*.go\n")
+	touchFile(t, root, "main.go")
+
+	r, err := NewResolver(root)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+
+	// main.go must NOT be ignored: the .gitignore files under .git were pruned.
+	assertNotIgnored(t, r, joinRel(root, "main.go"), false)
+	// build/ (from the real root .gitignore) is still honoured.
+	assertIgnored(t, r, joinRel(root, "build"), true)
+}
+
+// TestResolver_PrunesIgnoredSubtreeDuringLoad verifies load() prunes a
+// directory that is itself ignored by an earlier (root-level) rule: ignore
+// files beneath an ignored directory are irrelevant and reading them is wasted
+// work. Concretely, a nested ignore file under an ignored dir must not
+// contribute patterns.
+func TestResolver_PrunesIgnoredSubtreeDuringLoad(t *testing.T) {
+	root := t.TempDir()
+	// Ignore the whole vendored/ directory at the root.
+	writeFile(t, root, ".gitignore", "vendored/\n")
+	// A nested ignore file under the ignored dir that would (wrongly) ignore
+	// *.txt everywhere reachable from vendored/ if it were collected.
+	writeFile(t, root, "vendored/.gitignore", "*.txt\n")
+	touchFile(t, root, "notes.txt")
+
+	r, err := NewResolver(root)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+
+	// notes.txt at the root is NOT ignored: vendored/'s nested ignore file was
+	// pruned (vendored/ itself is ignored, so its contents are irrelevant).
+	assertNotIgnored(t, r, joinRel(root, "notes.txt"), false)
+	// The ignored dir and its contents are still ignored by the root rule.
+	assertIgnored(t, r, joinRel(root, "vendored"), true)
 }

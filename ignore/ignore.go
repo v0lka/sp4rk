@@ -49,13 +49,25 @@ type Resolver struct {
 }
 
 // NewResolver walks root once, collecting and compiling every ignore file
-// found beneath it. root may be absolute or relative; it is resolved to an
-// absolute path. A failure to read or walk returns a wrapping error.
+// found beneath it. root may be absolute or relative; it is canonicalized to
+// an absolute, symlink-resolved form so that ignore queries work regardless of
+// the path form callers supply. Root resolution uses pathutil's
+// longest-existing-prefix resolution (rather than a strict EvalSymlinks on the
+// whole path) so a root that does not fully exist yet still loads cleanly.
+// A failure to resolve, read, or walk returns a wrapping error.
 func NewResolver(root string) (*Resolver, error) {
 	absRoot, err := filepath.Abs(filepath.Clean(root))
 	if err != nil {
 		return nil, fmt.Errorf("ignore: resolve root %q: %w", root, err)
 	}
+	// Canonicalize via symlink resolution of the longest existing prefix.
+	// This makes the stored root match the form IsWithinPath and the tools
+	// produce (the tools' resolvePath runs ResolveExistingPrefix whenever a
+	// workspace is in context, yielding e.g. /private/tmp on macOS rather
+	// than the raw /tmp). Without this, a raw root (/tmp) queried with a
+	// resolved path (/private/tmp/...) would yield a Rel of "../../private/..."
+	// and every ignored file would leak as "not ignored".
+	absRoot = pathutil.ResolveExistingPrefix(absRoot)
 	r := &Resolver{root: absRoot}
 	if err := r.load(); err != nil {
 		return nil, fmt.Errorf("ignore: load root %q: %w", absRoot, err)
@@ -100,10 +112,14 @@ func (r *Resolver) Match(relPath string, isDir bool) bool {
 }
 
 // Ignored reports whether absPath (an absolute path) is ignored. absPath is
-// converted to a root-relative path first; paths that cannot be made relative
-// to this resolver's root are not ignored.
+// canonicalized via longest-existing-prefix symlink resolution and then
+// converted to a root-relative path; this makes the resolver robust to either
+// path form callers supply (raw /tmp/... or resolved /private/tmp/...), which
+// matters because the tools emit different forms depending on whether a
+// workspace is in context. Paths that cannot be made relative to this
+// resolver's root are not ignored.
 func (r *Resolver) Ignored(absPath string, isDir bool) bool {
-	rel, err := filepath.Rel(r.root, absPath)
+	rel, err := filepath.Rel(r.root, pathutil.ResolveExistingPrefix(absPath))
 	if err != nil {
 		return false
 	}
@@ -127,31 +143,51 @@ func (r *Resolver) matchOne(path string, isDir bool) bool {
 	return false
 }
 
-// load walks the root collecting patterns from every ignore file.
+// load walks the root collecting patterns from every ignore file. It prunes
+// the walk for efficiency: the .git directory is always skipped (it is never
+// source we want to honour ignore files for, and it can be enormous), and any
+// directory that is itself ignored by the patterns collected so far is pruned
+// too — once a directory is ignored, ignore files beneath it are irrelevant.
 func (r *Resolver) load() error {
 	return filepath.WalkDir(r.root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if d.IsDir() {
+		if !d.IsDir() {
+			if !ignoreFileNames[d.Name()] {
+				return nil
+			}
+			relDir, relErr := filepath.Rel(r.root, filepath.Dir(path))
+			if relErr != nil {
+				return nil //nolint:nilerr // skip ignore file whose dir is unresolvable; continue the walk
+			}
+			relDir = filepath.ToSlash(relDir)
+			if relDir == "." {
+				relDir = ""
+			}
+			pats, err := readIgnoreFile(path, relDir)
+			if err != nil {
+				return fmt.Errorf("read %s: %w", path, err)
+			}
+			r.patterns = append(r.patterns, pats...)
 			return nil
 		}
-		if !ignoreFileNames[d.Name()] {
-			return nil
+		// Directory pruning.
+		name := d.Name()
+		// Always skip .git: it is never meaningful source and can be huge.
+		if name == ".git" && path != r.root {
+			return fs.SkipDir
 		}
-		relDir, relErr := filepath.Rel(r.root, filepath.Dir(path))
-		if relErr != nil {
-			return nil //nolint:nilerr // skip ignore file whose dir is unresolvable; continue the walk
+		// Prune directories that are already ignored by the patterns gathered
+		// so far: ignore files beneath an ignored directory have no effect.
+		if path != r.root {
+			relDir, relErr := filepath.Rel(r.root, path)
+			if relErr == nil {
+				if r.Match(filepath.ToSlash(relDir), true) {
+					return fs.SkipDir
+				}
+			}
 		}
-		relDir = filepath.ToSlash(relDir)
-		if relDir == "." {
-			relDir = ""
-		}
-		pats, err := readIgnoreFile(path, relDir)
-		if err != nil {
-			return fmt.Errorf("read %s: %w", path, err)
-		}
-		r.patterns = append(r.patterns, pats...)
 		return nil
 	})
 }

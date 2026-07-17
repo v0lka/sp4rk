@@ -112,7 +112,7 @@ go run main.go
 | [security.md](security.md) | Prompt injection defense and untrusted-content wrapping |
 | [tool-safety.md](tool-safety.md) | Tool execution-context intelligence: LLM-backed `ToolJudge`, file coherence, environment info, symlink detection |
 | [embedding.md](embedding.md) | ONNX-based local embeddings and vector search |
-| [utilities.md](utilities.md) | `pathutil` and `strutil` helper packages |
+| [utilities.md](utilities.md) | `pathutil`, `strutil`, and `ignore` helper packages |
 
 ## Package map
 
@@ -135,6 +135,7 @@ go run main.go
 | `…/embedding` | ONNX-based `Embedder`, `Tokenizer`, and chunker for local vector embeddings |
 | `…/pathutil` | Reusable filesystem-path algorithms: `IsWithinPath`, `SplitPathComponents`, `ResolveExistingPrefix` |
 | `…/strutil` | String helpers: `TruncateUTF8` and related utilities |
+| `…/ignore` | Multi-root `.gitignore`/`.aiignore` resolver: `Resolver`, `Multi`, `IgnoreChecker` |
 
 ## Prerequisites
 

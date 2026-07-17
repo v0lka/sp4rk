@@ -19,6 +19,7 @@
 | Tool registry, execution pipeline                             | [domains/tool-system/README.md](domains/tool-system/README.md)                  |
 | Tool-result caching, file-backed vs content-backed modes      | [domains/orchestration/executor.md](domains/orchestration/executor.md), [domains/tool-system/README.md](domains/tool-system/README.md) |
 | Adding/modifying built-in tools                               | [domains/tool-system/builtins.md](domains/tool-system/builtins.md)              |
+| Ignore rules (.gitignore/.aiignore), glob & ripgrep filtering | [architecture/layers.md](architecture/layers.md), [contracts/tools.md](contracts/tools.md), [domains/tool-system/builtins.md](domains/tool-system/builtins.md) |
 | MCP servers, dynamic tools                                    | [domains/tool-system/mcp-gateway.md](domains/tool-system/mcp-gateway.md)        |
 | Context window, compaction strategies                         | [domains/memory/compaction.md](domains/memory/compaction.md)                    |
 | Blackboard, shared state, facts, attachments                  | [domains/memory/blackboard.md](domains/memory/blackboard.md)                    |
@@ -64,9 +65,10 @@ sp4rk is a single Go module (`github.com/v0lka/sp4rk`). Arrows show import direc
    tools/builtins  → tools
    tools/mcp       → tools
    skills          → {pathutil, tools}
+   ignore          → {pathutil}          (external doublestar only otherwise)
 ```
 
-Supporting packages — `prompt`, `skills`, `security`, `embedding`, `pathutil`, `strutil` — are consumed across layers as needed and have no upward dependencies.
+Supporting packages — `prompt`, `skills`, `security`, `embedding`, `pathutil`, `strutil`, `ignore` — are consumed across layers as needed and have no upward dependencies.
 
 Import rule: every arrow is one-way. `tools` and `llm` are near-leaf dependencies; they never import `agent`, `orchestration`, `planner`, or the root package. This keeps the primitive layers free of higher-level concerns and prevents import cycles.
 

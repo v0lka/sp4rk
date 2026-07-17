@@ -12,13 +12,11 @@ import (
 	"github.com/v0lka/sp4rk/tools"
 )
 
-// ignoreCheckerForDir builds a single-root IgnoreChecker rooted at dir WITHOUT
-// symlink-resolving the root. This deliberately matches the path form glob
-// uses: when no workspace is in context, resolvePath returns the search path
-// as-is (raw), so the checker root must also be raw for filepath.Rel inside
-// the resolver to succeed. Tests that DO set a workspace (and therefore cause
-// resolvePath to symlink-resolve) build their checker from resolved roots
-// explicitly (see TestGlobTool_HonorsIgnoreAtWorkDirRoot).
+// ignoreCheckerForDir builds a single-root IgnoreChecker rooted at dir.
+// NewResolver canonicalizes the root via longest-existing-prefix symlink
+// resolution, so the checker is robust to either path form callers supply
+// (raw or resolved). Tests therefore no longer need to manually resolve the
+// root to match the path form glob/ripgrep emit.
 func ignoreCheckerForDir(t *testing.T, dir string) ignore.IgnoreChecker {
 	t.Helper()
 	r, err := ignore.NewResolver(dir)

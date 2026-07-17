@@ -23,6 +23,8 @@ The host application consumes the tool types from `github.com/v0lka/sp4rk/tools`
 | `ConfirmationRequest` | tools | Built by registry | `{ToolName, Input json.RawMessage, JudgeReasoning}` describing a call needing confirmation |
 | `ConfirmationResponse` | tools | Returned by host | Decision enum: `ConfirmAllowOnce`, `ConfirmDeny`, `ConfirmDenyAndStop` |
 | `ToolSourceCategory` | tools | Set at registration | Origin classifier: `SourceCategoryCore`, `SourceCategoryMCP` (drives untrusted-output handling) |
+| `IgnoreChecker` | tools | Satisfied structurally by `ignore.Resolver`/`ignore.Multi` | Reports whether an absolute path is ignored by `.gitignore`/`.aiignore` rules: `Ignored(absPath string, isDir bool) bool`. Read-style tools (glob, ripgrep) consult it to honour ignore rules for the workspace and any work-directory root |
+| `WithIgnoreChecker` / `IgnoreCheckerFrom` | tools | Attached/consumed via context | Context plumbing for the ignore checker; `IgnoreCheckerFrom` returns `nil` when none is attached, and callers MUST then skip ignore filtering and keep their pre-ignore behaviour (graceful, no regression) |
 | `ParamManager` | tools | Provided by host (optional) | Auto-injected parameter management (`SanitizeSchema` + `InjectParams`), e.g. project path |
 | `AutoInjectedParamProject` | tools | Constant | `"project"` — the auto-injected param name stripped from tool schemas before the LLM sees them |
 
@@ -49,6 +51,7 @@ At startup the host builds the tool surface in this order:
 - **registry → ContentBackedReader:** during `CacheStrategy`, if the tool implements `ContentBackedReader`, `IsContentBacked(ctx, input)` is consulted per-input to choose content-backed vs file-backed caching.
 - **registry → ConfirmFunc:** a `ConfirmationRequest` whenever the effective policy is `PolicyUserConfirm` or a judge escalates; the host returns a `ConfirmationResponse`.
 - **registry → ToolJudger:** before an `AlwaysAllow` tool executes, `Judge(ctx, input)` is consulted; a `false` verdict with reasoning escalates to confirmation.
+- **host → tools (context):** the host attaches an `IgnoreChecker` via `WithIgnoreChecker(ctx, checker)` so read tools (glob, ripgrep) honour `.gitignore`/`.aiignore`. The checker is typically built from `ignore.Multi` over the workspace and work-directory roots; `IgnoreCheckerFrom(ctx)` returns `nil` when absent, in which case tools keep their pre-ignore behaviour (no filtering).
 - **Tool → registry:** `ToolResult` (`{Content, IsError}`) and an error.
 - **registry → executor:** `ToolResult` plus the untrusted-source classification (MCP tools and tools with `IsUntrusted()==true` are flagged untrusted so observations are wrapped defensively before entering LLM context).
 
@@ -74,3 +77,4 @@ Data is plain Go values and `json.RawMessage`. Auto-injected parameters are inje
 - If you change `ToolSourceCategory` or the untrusted-output classification, you MUST update `IsToolUntrusted`/`GetToolSource` consumers and the prompt-injection defense wrapping.
 - If you change `CacheMode` or the `ContentBackedReader` contract, you MUST update `ToolRegistry.CacheStrategy` and the executor's cache-mode dispatch (`buildCacheMeta`).
 - If you change `ParamManager` or `AutoInjectedParamProject`, you MUST update schema sanitizers, MCP schema handling, and the host's injection logic.
+- If you change `IgnoreChecker` or its context plumbing (`WithIgnoreChecker`/`IgnoreCheckerFrom`), you MUST update the `ignore.Resolver`/`ignore.Multi` implementations that satisfy it structurally and every read tool (glob, ripgrep) that consults it; preserve the `nil` ⇒ no-filtering default.
