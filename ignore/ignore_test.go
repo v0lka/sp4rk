@@ -504,3 +504,187 @@ func TestResolver_PrunesIgnoredSubtreeDuringLoad(t *testing.T) {
 	// The ignored dir and its contents are still ignored by the root rule.
 	assertIgnored(t, r, joinRel(root, "vendored"), true)
 }
+
+// TestResolver_IgnoredByAIIgnore verifies that the origin-scoped query reports
+// only .aiignore-sourced ignores, leaving .gitignore-sourced ignores to git
+// (which honours negation). This is the key behaviour the ListDirectory OR-merge
+// relies on: layering only .aiignore on top of git preserves git's un-ignore.
+func TestResolver_IgnoredByAIIgnore(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, ".gitignore", "*.log\nbuild/\n")
+	writeFile(t, root, ".aiignore", "*.secret\ndrafts/\n")
+	touchFile(t, root, "app.log")
+	touchFile(t, root, "build/app")
+	touchFile(t, root, "creds.secret")
+	touchFile(t, root, "drafts/old.txt")
+	touchFile(t, root, "keep.txt")
+
+	r, err := NewResolver(root)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+
+	// Full Ignored honours both files.
+	assertIgnored(t, r, joinRel(root, "app.log"), false)       // .gitignore
+	assertIgnored(t, r, joinRel(root, "creds.secret"), false)  // .aiignore
+	assertIgnored(t, r, joinRel(root, "build"), true)          // .gitignore dir
+	assertIgnored(t, r, joinRel(root, "drafts"), true)         // .aiignore dir
+
+	// IgnoredByAIIgnore honours ONLY .aiignore rules.
+	assertNotIgnoredAI := func(absPath string, isDir bool) {
+		t.Helper()
+		if r.IgnoredByAIIgnore(absPath, isDir) {
+			t.Errorf("IgnoredByAIIgnore(%q) = true, want false (rule is from .gitignore)", absPath)
+		}
+	}
+	assertIgnoredAI := func(absPath string, isDir bool) {
+		t.Helper()
+		if !r.IgnoredByAIIgnore(absPath, isDir) {
+			t.Errorf("IgnoredByAIIgnore(%q) = false, want true (rule is from .aiignore)", absPath)
+		}
+	}
+
+	// .gitignore-sourced ignores are NOT reported by the AI-only query.
+	assertNotIgnoredAI(joinRel(root, "app.log"), false)  // *.log from .gitignore
+	assertNotIgnoredAI(joinRel(root, "build"), true)     // build/ from .gitignore
+	// .aiignore-sourced ignores ARE reported.
+	assertIgnoredAI(joinRel(root, "creds.secret"), false) // *.secret from .aiignore
+	assertIgnoredAI(joinRel(root, "drafts"), true)        // drafts/ from .aiignore
+	// Contents of an .aiignore-ignored dir are reported (ancestor walking).
+	assertIgnoredAI(joinRel(root, "drafts/old.txt"), false)
+	// Unignored file stays unignored.
+	assertNotIgnoredAI(joinRel(root, "keep.txt"), false)
+}
+
+// TestResolver_IgnoredByAIIgnoreOutOfRoot verifies that a path outside the
+// resolver's root is never reported as .aiignore-ignored. filepath.Rel of such
+// a path escapes the root (".."), which match's guard rejects.
+func TestResolver_IgnoredByAIIgnoreOutOfRoot(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, ".aiignore", "*.secret\n")
+
+	r, err := NewResolver(root)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+
+	outside := joinRel(t.TempDir(), "sneaky.secret")
+	if got := r.IgnoredByAIIgnore(outside, false); got {
+		t.Errorf("IgnoredByAIIgnore(out-of-root %q) = true, want false", outside)
+	}
+}
+
+// TestResolver_IgnoredByAIIgnoreNestedAiignore verifies that a nested
+// .aiignore (beneath a directory that is NOT git-ignored) contributes
+// .aiignore-scoped rules, and that a nested .gitignore rule in the same
+// subtree is excluded from the .aiignore-only query.
+func TestResolver_IgnoredByAIIgnoreNestedAiignore(t *testing.T) {
+	root := t.TempDir()
+	// Nested .gitignore and .aiignore under a non-ignored directory.
+	writeFile(t, root, "pkg/.gitignore", "*.gen.go\n")
+	writeFile(t, root, "pkg/.aiignore", "drafts/\n")
+	touchFile(t, root, "pkg/thing.gen.go")
+	touchFile(t, root, "pkg/drafts/old.txt")
+	touchFile(t, root, "pkg/keep.go")
+
+	r, err := NewResolver(root)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+
+	// Sanity: the full Ignored query honours both nested files.
+	assertIgnored(t, r, joinRel(root, "pkg/thing.gen.go"), false) // nested .gitignore
+	assertIgnored(t, r, joinRel(root, "pkg/drafts"), true)        // nested .aiignore
+
+	// The .aiignore-only query reports the nested .aiignore rule...
+	if got := r.IgnoredByAIIgnore(joinRel(root, "pkg/drafts"), true); !got {
+		t.Errorf("IgnoredByAIIgnore(pkg/drafts) = false, want true (nested .aiignore)")
+	}
+	if got := r.IgnoredByAIIgnore(joinRel(root, "pkg/drafts/old.txt"), false); !got {
+		t.Errorf("IgnoredByAIIgnore(pkg/drafts/old.txt) = false, want true (contents of nested .aiignore dir)")
+	}
+	// ...but NOT the nested .gitignore rule.
+	if got := r.IgnoredByAIIgnore(joinRel(root, "pkg/thing.gen.go"), false); got {
+		t.Errorf("IgnoredByAIIgnore(pkg/thing.gen.go) = true, want false (nested .gitignore)")
+	}
+	// Unignored file stays unignored.
+	if got := r.IgnoredByAIIgnore(joinRel(root, "pkg/keep.go"), false); got {
+		t.Errorf("IgnoredByAIIgnore(pkg/keep.go) = true, want false")
+	}
+}
+
+// TestMulti_IgnoredByAIIgnore verifies the multi-root mirror: each root's
+// .aiignore rules apply only within that root, a path outside all roots is
+// never ignored, and the per-root resolver (via RootFor) agrees with the
+// Multi-level convenience method.
+func TestMulti_IgnoredByAIIgnore(t *testing.T) {
+	alpha := t.TempDir()
+	beta := t.TempDir()
+	writeFile(t, alpha, ".gitignore", "*.log\n")
+	writeFile(t, alpha, ".aiignore", "*.secret\n")
+	writeFile(t, beta, ".aiignore", "*.key\n")
+	touchFile(t, alpha, "creds.secret")
+	touchFile(t, beta, "priv.key")
+	touchFile(t, alpha, "app.log")
+
+	m, err := NewMulti(alpha, beta)
+	if err != nil {
+		t.Fatalf("NewMulti: %v", err)
+	}
+
+	// alpha's .aiignore applies only within alpha.
+	if got := m.IgnoredByAIIgnore(joinRel(alpha, "creds.secret"), false); !got {
+		t.Errorf("Multi.IgnoredByAIIgnore(alpha creds.secret) = false, want true")
+	}
+	// alpha's .gitignore-only ignore (*.log) is NOT reported by the AI query.
+	if got := m.IgnoredByAIIgnore(joinRel(alpha, "app.log"), false); got {
+		t.Errorf("Multi.IgnoredByAIIgnore(alpha app.log) = true, want false (.gitignore)")
+	}
+	// beta's .aiignore applies within beta, and alpha's rule does not leak.
+	if got := m.IgnoredByAIIgnore(joinRel(beta, "priv.key"), false); !got {
+		t.Errorf("Multi.IgnoredByAIIgnore(beta priv.key) = false, want true")
+	}
+	if got := m.IgnoredByAIIgnore(joinRel(beta, "creds.secret"), false); got {
+		t.Errorf("Multi.IgnoredByAIIgnore(beta creds.secret) = true, want false (alpha rule must not leak)")
+	}
+	// Out-of-root path is never ignored.
+	outside := joinRel(t.TempDir(), "stray.secret")
+	if got := m.IgnoredByAIIgnore(outside, false); got {
+		t.Errorf("Multi.IgnoredByAIIgnore(out-of-root) = true, want false")
+	}
+
+	// The per-root resolver selected by RootFor agrees with the Multi method.
+	r := m.RootFor(joinRel(alpha, "creds.secret"))
+	if r == nil {
+		t.Fatal("RootFor(alpha creds.secret) = nil, want the alpha resolver")
+	}
+	if gotAI, gotMulti := r.IgnoredByAIIgnore(joinRel(alpha, "creds.secret"), false),
+		m.IgnoredByAIIgnore(joinRel(alpha, "creds.secret"), false); gotAI != gotMulti {
+		t.Errorf("RootFor().IgnoredByAIIgnore = %v, Multi.IgnoredByAIIgnore = %v, want equal", gotAI, gotMulti)
+	}
+}
+
+// TestNewMultiFromResolvers verifies that a Multi can be assembled from
+// pre-built resolvers (so callers can skip+log roots that failed to build
+// instead of failing the whole workspace atomically).
+func TestNewMultiFromResolvers(t *testing.T) {
+	a := t.TempDir()
+	writeFile(t, a, ".aiignore", "*.secret\n")
+	touchFile(t, a, "x.secret")
+
+	ra, err := NewResolver(a)
+	if err != nil {
+		t.Fatalf("NewResolver(a): %v", err)
+	}
+
+	// Empty input → nil.
+	if m := NewMultiFromResolvers(); m != nil {
+		t.Fatalf("NewMultiFromResolvers() = %v, want nil", m)
+	}
+
+	m := NewMultiFromResolvers(ra)
+	if m == nil {
+		t.Fatalf("NewMultiFromResolvers(ra) = nil, want non-nil")
+	}
+	assertIgnored(t, m, joinRel(a, "x.secret"), false)
+}

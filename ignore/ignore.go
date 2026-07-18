@@ -31,12 +31,21 @@ var ignoreFileNames = map[string]bool{
 	".aiignore":  true,
 }
 
+// aiIgnoreFile is the ignore file that augments .gitignore with project-specific
+// AI exclusions. Patterns sourced from it are tracked so callers can query
+// .aiignore-only verdicts separately from .gitignore ones (git itself honours
+// .gitignore, including negation, that the resolver does not).
+const aiIgnoreFile = ".aiignore"
+
 // pattern is a single compiled ignore rule. glob is a doublestar-compatible
 // pattern expressed relative to the resolver root. dirOnly marks rules that
 // originated from a trailing-slash form and therefore match directories only.
+// origin records which ignore file the rule came from (".gitignore" or
+// ".aiignore"), enabling .aiignore-only queries.
 type pattern struct {
 	glob    string
 	dirOnly bool
+	origin  string
 }
 
 // Resolver is the ignore resolver for a single root directory. It walks the
@@ -89,6 +98,15 @@ func (r *Resolver) Root() string {
 // (the standard gitignore "once a directory is ignored, so are its contents"
 // behaviour).
 func (r *Resolver) Match(relPath string, isDir bool) bool {
+	return r.match(relPath, isDir, "")
+}
+
+// match is the ancestor-walking core shared by Match (all origins) and the
+// origin-scoped queries. origin == "" considers every pattern; a non-empty
+// origin restricts matching to patterns sourced from that ignore file, so a
+// directory ignored only by .gitignore does not cause its contents to be
+// reported as .aiignore-ignored.
+func (r *Resolver) match(relPath string, isDir bool, origin string) bool {
 	relPath = filepath.ToSlash(filepath.Clean(relPath))
 	// The root itself, an empty path, or a path escaping the root cannot be
 	// ignored by a rule.
@@ -104,7 +122,7 @@ func (r *Resolver) Match(relPath string, isDir bool) bool {
 			cum = cum + "/" + seg
 		}
 		segIsDir := i < len(segments)-1 || isDir
-		if r.matchOne(cum, segIsDir) {
+		if r.matchOne(cum, segIsDir, origin) {
 			return true
 		}
 	}
@@ -126,11 +144,39 @@ func (r *Resolver) Ignored(absPath string, isDir bool) bool {
 	return r.Match(rel, isDir)
 }
 
+// IgnoredByAIIgnore reports whether absPath is ignored by rules sourced
+// exclusively from .aiignore files. Rules originating from .gitignore are
+// excluded from this query. It is intended for callers that already obtain a
+// .gitignore verdict from git itself (which honours negation and the global
+// gitignore that the resolver does not): layering only .aiignore rules on top
+// preserves git's un-ignore semantics instead of overriding them.
+//
+// Limitation: load() prunes any directory that is ignored (by either ignore
+// file), so a nested .aiignore beneath a .gitignore-only-ignored directory
+// (e.g. vendor/pkg/.aiignore when vendor/ is ignored only by .gitignore) is
+// never collected and thus cannot contribute rules. This is a false negative
+// that is safe for the OR-merge consumer: such paths are already covered by
+// git's own ignored verdict and never reach the .aiignore query.
+//
+// Like Ignored, absPath is canonicalized via longest-existing-prefix symlink
+// resolution, and ancestor directories are considered with directory semantics.
+func (r *Resolver) IgnoredByAIIgnore(absPath string, isDir bool) bool {
+	rel, err := filepath.Rel(r.root, pathutil.ResolveExistingPrefix(absPath))
+	if err != nil {
+		return false
+	}
+	return r.match(rel, isDir, aiIgnoreFile)
+}
+
 // matchOne tests a single root-relative slash path (no ancestor walking)
 // against every compiled pattern. dirOnly rules are skipped when isDir is
-// false.
-func (r *Resolver) matchOne(path string, isDir bool) bool {
+// false. When origin is non-empty, only patterns whose origin matches it are
+// considered; an empty origin considers all patterns.
+func (r *Resolver) matchOne(path string, isDir bool, origin string) bool {
 	for _, p := range r.patterns {
+		if origin != "" && p.origin != origin {
+			continue
+		}
 		matched, err := doublestar.Match(p.glob, path)
 		if err != nil || !matched {
 			continue
@@ -165,7 +211,7 @@ func (r *Resolver) load() error {
 			if relDir == "." {
 				relDir = ""
 			}
-			pats, err := readIgnoreFile(path, relDir)
+			pats, err := readIgnoreFile(path, relDir, d.Name())
 			if err != nil {
 				return fmt.Errorf("read %s: %w", path, err)
 			}
@@ -194,8 +240,10 @@ func (r *Resolver) load() error {
 
 // readIgnoreFile parses a single ignore file at absPath and compiles its
 // non-empty, non-comment, non-negation lines into patterns scoped to relDir
-// (the slash-relative directory containing the file, "" for the root).
-func readIgnoreFile(absPath, relDir string) ([]pattern, error) {
+// (the slash-relative directory containing the file, "" for the root). source
+// is the ignore file's base name (".gitignore" or ".aiignore"); it is stamped
+// onto each compiled pattern so callers can later query patterns by origin.
+func readIgnoreFile(absPath, relDir, source string) ([]pattern, error) {
 	f, err := os.Open(absPath)
 	if err != nil {
 		return nil, err
@@ -223,6 +271,7 @@ func readIgnoreFile(absPath, relDir string) ([]pattern, error) {
 		}
 		p := compile(relDir, line)
 		if p.glob != "" {
+			p.origin = source
 			pats = append(pats, p)
 		}
 	}
@@ -301,6 +350,25 @@ func NewMulti(roots ...string) (*Multi, error) {
 	return &Multi{resolvers: resolvers}, nil
 }
 
+// NewMultiFromResolvers wraps pre-built resolvers into a Multi without
+// re-walking their roots. It is intended for callers that need per-root error
+// handling — building each Resolver individually and skipping (rather than
+// failing the whole workspace on) roots whose resolver could not be built
+// (e.g. a vanished or unreadable work directory) — instead of the
+// all-or-nothing failure of NewMulti. Returns nil when no resolvers are
+// supplied.
+//
+// The input slice is referenced (not copied): callers must not mutate it after
+// the call, and must not pass nil resolvers. The natural pattern of appending
+// only successfully-built resolvers satisfies both. For a defensive copy with
+// nil filtering, build the slice and pass it through NewMulti's per-root path.
+func NewMultiFromResolvers(resolvers ...*Resolver) *Multi {
+	if len(resolvers) == 0 {
+		return nil
+	}
+	return &Multi{resolvers: resolvers}
+}
+
 // Resolvers returns the per-root resolvers. The returned slice is a copy; it
 // is safe for callers to retain or reorder without affecting the Multi.
 func (m *Multi) Resolvers() []*Resolver {
@@ -333,6 +401,19 @@ func (m *Multi) Ignored(absPath string, isDir bool) bool {
 		return false
 	}
 	return r.Ignored(absPath, isDir)
+}
+
+// IgnoredByAIIgnore reports whether absPath is ignored by .aiignore rules of
+// the root that contains it, mirroring Resolver.IgnoredByAIIgnore. Returns
+// false when no known root contains the path. Use this for the multi-root
+// case where a single IgnoreChecker-like query over .aiignore-only verdicts is
+// needed; the per-root resolver is available via RootFor for finer control.
+func (m *Multi) IgnoredByAIIgnore(absPath string, isDir bool) bool {
+	r := m.RootFor(absPath)
+	if r == nil {
+		return false
+	}
+	return r.IgnoredByAIIgnore(absPath, isDir)
 }
 
 // IgnoreChecker is the abstraction tools depend on: given an absolute path and
