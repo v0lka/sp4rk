@@ -229,7 +229,10 @@ func TestEmbedder_EmbeddingFunc(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewEmbedder() error = %v", err)
 	}
-	defer func() { _ = emb.Close() }()
+	// Close the session only; the process-global ONNX environment is owned by
+	// TestMain and shared across all tests, so Embedder.Close (which destroys
+	// it) must not be used here.
+	defer closeSessionOnly(emb)
 
 	fn := emb.EmbeddingFunc()
 	if fn == nil {
@@ -259,7 +262,9 @@ func TestEmbedder_EndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewEmbedder() error = %v", err)
 	}
-	defer func() { _ = emb.Close() }()
+	// See TestEmbedder_EmbeddingFunc: close the session without destroying the
+	// shared ONNX environment owned by TestMain.
+	defer closeSessionOnly(emb)
 
 	ctx := context.Background()
 
@@ -360,6 +365,56 @@ func TestTokenizer_EncodeBatch_EmptyTexts_MaxLenZero(t *testing.T) {
 	if len(typeIDs) != 0 {
 		t.Errorf("tokenTypeIDs length = %d, want 0", len(typeIDs))
 	}
+}
+
+// --- buildSessionOptions ---
+
+func TestBuildSessionOptions_Zero(t *testing.T) {
+	// intraOpThreads == 0 must return (nil, nil) without touching the ONNX
+	// runtime. This is the legacy / default code path and must not require
+	// the shared library to be initialized.
+	opts, err := buildSessionOptions(0)
+	if err != nil {
+		t.Fatalf("buildSessionOptions(0) error = %v, want nil", err)
+	}
+	if opts != nil {
+		t.Errorf("buildSessionOptions(0) opts = %p, want nil", opts)
+	}
+}
+
+func TestBuildSessionOptions_Negative(t *testing.T) {
+	// Negative values are treated like 0: return (nil, nil).
+	for _, n := range []int{-1, -42} {
+		opts, err := buildSessionOptions(n)
+		if err != nil {
+			t.Fatalf("buildSessionOptions(%d) error = %v, want nil", n, err)
+		}
+		if opts != nil {
+			t.Errorf("buildSessionOptions(%d) opts = %p, want nil", n, opts)
+		}
+	}
+}
+
+func TestBuildSessionOptions_Positive(t *testing.T) {
+	// A positive thread count requires the ONNX runtime environment to be
+	// initialized (ort.NewSessionOptions checks IsInitialized). The environment
+	// is initialized once for the whole suite by TestMain; this test is gated
+	// on the shared library being available via testLibraryPath, which skips
+	// when EMBEDDING_TEST_LIBRARY_PATH is unset.
+	_ = testLibraryPath(t)
+
+	opts, err := buildSessionOptions(4)
+	if err != nil {
+		t.Fatalf("buildSessionOptions(4) error = %v, want nil", err)
+	}
+	if opts == nil {
+		t.Fatal("buildSessionOptions(4) opts = nil, want non-nil")
+	}
+	t.Cleanup(func() {
+		if err := opts.Destroy(); err != nil {
+			t.Errorf("opts.Destroy() error = %v", err)
+		}
+	})
 }
 
 // --- meanPoolAndNormalize edge cases ---

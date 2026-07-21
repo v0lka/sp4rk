@@ -913,6 +913,7 @@ func TestEmbedder_EmbeddingFunc_Nil(t *testing.T) {
 // =============================================================================
 
 func TestEmbedder_Close_NoONNXEnv(t *testing.T) {
+	skipIfEnvManaged(t)
 	// Closing an embedder that was manually constructed (no ONNX env initialized)
 	// should return an error from destroyONNXRuntime since the env was never created.
 	e := &Embedder{
@@ -930,6 +931,7 @@ func TestEmbedder_Close_NoONNXEnv(t *testing.T) {
 }
 
 func TestEmbedder_Close_WithTokenizerNil(t *testing.T) {
+	skipIfEnvManaged(t)
 	// Close with nil tokenizer and nil sess – should attempt destroyONNXRuntime.
 	e := &Embedder{
 		tokenizer: nil,
@@ -1284,6 +1286,7 @@ func TestEmbedder_EmbedDocuments_CancelledAfterLock(t *testing.T) {
 // =============================================================================
 
 func TestEmbedder_Close_WithSession(t *testing.T) {
+	skipIfEnvManaged(t)
 	// When sess is non-nil, Close should call sess.destroy() and set sess=nil.
 	// Using an empty onnxSession (all nil fields) is safe — destroy() checks
 	// each field before calling Destroy.

@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	chromem "github.com/philippgille/chromem-go"
+	ort "github.com/yalue/onnxruntime_go"
 )
 
 const (
@@ -38,6 +39,16 @@ type EmbedderConfig struct {
 	// HiddenDim is the embedding dimension of the model. Defaults to 512 for jina-v2-small.
 	HiddenDim int
 
+	// IntraOpThreads limits the number of ONNX Runtime intra-op threads used
+	// during inference. A value of 0 (the default) preserves the legacy
+	// behavior of letting ONNX Runtime choose the thread count (the session is
+	// created with a nil *SessionOptions). A positive value N constrains
+	// intra-op parallelism to exactly N threads, which is useful for bounding
+	// CPU usage in resource-constrained environments such as the desktop app.
+	// Negative values are treated as 0 (legacy behavior) rather than rejected:
+	// the field is not validated, so callers should pass a non-negative value.
+	IntraOpThreads int
+
 	// Logger for structured logging. If nil, a no-op logger is used.
 	Logger *slog.Logger
 }
@@ -52,6 +63,7 @@ type Embedder struct {
 	logger    *slog.Logger
 	mu        sync.Mutex
 	sess      *onnxSession // persistent session for batchSize=1 (fast path)
+	sessOpts  *ort.SessionOptions
 }
 
 // NewEmbedder creates a new Embedder by loading the tokenizer and initializing
@@ -95,17 +107,33 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 		return nil, fmt.Errorf("initializing ONNX Runtime: %w", err)
 	}
 
+	// Build session options (limits intra-op threads when configured). Must
+	// run after initONNXRuntime, because ort.NewSessionOptions requires the
+	// ONNX environment to be initialized. A nil result preserves the legacy
+	// behavior (session created with nil *SessionOptions).
+	sessOpts, err := buildSessionOptions(cfg.IntraOpThreads)
+	if err != nil {
+		_ = destroyONNXRuntime()
+		return nil, fmt.Errorf("building ONNX session options: %w", err)
+	}
+
 	logger.Info("loading tokenizer", "path", cfg.TokenizerPath)
 	tok, err := NewTokenizer(cfg.TokenizerPath)
 	if err != nil {
 		// Clean up ONNX env on failure.
+		if sessOpts != nil {
+			_ = sessOpts.Destroy()
+		}
 		_ = destroyONNXRuntime()
 		return nil, fmt.Errorf("loading tokenizer: %w", err)
 	}
 
 	logger.Info("creating persistent ONNX session", "model", cfg.ModelPath)
-	sess, err := newONNXSession(cfg.ModelPath, maxSeqLen, hiddenDim)
+	sess, err := newONNXSession(cfg.ModelPath, maxSeqLen, hiddenDim, sessOpts)
 	if err != nil {
+		if sessOpts != nil {
+			_ = sessOpts.Destroy()
+		}
 		_ = destroyONNXRuntime()
 		return nil, fmt.Errorf("creating persistent ONNX session: %w", err)
 	}
@@ -123,6 +151,7 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 		hiddenDim: hiddenDim,
 		logger:    logger,
 		sess:      sess,
+		sessOpts:  sessOpts,
 	}, nil
 }
 
@@ -169,7 +198,7 @@ func (e *Embedder) EmbedDocuments(ctx context.Context, texts []string) ([][]floa
 
 	// Batch path: create a temporary session for larger batches.
 	e.logger.Debug("running inference (batch session)", "batchSize", batchSize, "seqLen", e.maxSeqLen)
-	embeddings, err := runInferenceBatch(e.modelPath, batchSize, e.maxSeqLen, e.hiddenDim, inputIDs, attentionMask, tokenTypeIDs)
+	embeddings, err := runInferenceBatch(e.modelPath, batchSize, e.maxSeqLen, e.hiddenDim, inputIDs, attentionMask, tokenTypeIDs, e.sessOpts)
 	if err != nil {
 		return nil, fmt.Errorf("embedding batch of %d documents: %w", batchSize, err)
 	}
@@ -206,6 +235,10 @@ func (e *Embedder) Close() error {
 	if e.sess != nil {
 		e.sess.destroy()
 		e.sess = nil
+	}
+	if e.sessOpts != nil {
+		_ = e.sessOpts.Destroy()
+		e.sessOpts = nil
 	}
 	// Mark the embedder closed so EmbedDocuments/EmbedQuery return an error
 	// instead of touching the destroyed ONNX environment.

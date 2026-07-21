@@ -42,6 +42,33 @@ func destroyONNXRuntime() error {
 	return ort.DestroyEnvironment()
 }
 
+// buildSessionOptions constructs ONNX Runtime session options limiting
+// intra-op parallelism to intraOpThreads. It returns nil when
+// intraOpThreads <= 0, preserving the legacy behavior in which
+// NewAdvancedSession is called with a nil *SessionOptions (byte-identical to
+// the pre-existing code path). When intraOpThreads > 0, a fresh
+// *SessionOptions is allocated via ort.NewSessionOptions and configured with
+// SetIntraOpNumThreads.
+//
+// The ONNX Runtime environment must be initialized before calling this with a
+// positive thread count, because ort.NewSessionOptions requires it. The
+// caller owns the returned options and must call Destroy() exactly once when
+// they are no longer needed (typically in Embedder.Close).
+func buildSessionOptions(intraOpThreads int) (*ort.SessionOptions, error) {
+	if intraOpThreads <= 0 {
+		return nil, nil
+	}
+	opts, err := ort.NewSessionOptions()
+	if err != nil {
+		return nil, fmt.Errorf("creating ONNX session options: %w", err)
+	}
+	if err := opts.SetIntraOpNumThreads(intraOpThreads); err != nil {
+		_ = opts.Destroy()
+		return nil, fmt.Errorf("setting intra-op thread count: %w", err)
+	}
+	return opts, nil
+}
+
 // onnxSession holds a reusable ONNX Runtime session with pre-allocated tensors
 // for batchSize=1 inference. Creating an ONNX session is expensive (~2s for model
 // loading + graph optimization), while inference is fast (~50ms). Reusing the
@@ -58,7 +85,10 @@ type onnxSession struct {
 
 // newONNXSession creates a persistent ONNX session for batchSize=1 inference.
 // The session and its tensors are kept alive for reuse across multiple calls.
-func newONNXSession(modelPath string, seqLen, hiddenDim int) (*onnxSession, error) {
+// opts may be nil (legacy behavior) or a *SessionOptions produced by
+// buildSessionOptions to limit intra-op parallelism. opts ownership is NOT
+// transferred: the caller keeps the handle and must destroy it separately.
+func newONNXSession(modelPath string, seqLen, hiddenDim int, opts *ort.SessionOptions) (*onnxSession, error) {
 	inputShape := ort.NewShape(1, int64(seqLen))
 
 	inputIDsData := make([]int64, seqLen)
@@ -97,7 +127,7 @@ func newONNXSession(modelPath string, seqLen, hiddenDim int) (*onnxSession, erro
 		[]string{"last_hidden_state"},
 		[]ort.Value{inputIDsTensor, attMaskTensor, tokenTypesTensor},
 		[]ort.Value{outputTensor},
-		nil,
+		opts,
 	)
 	if err != nil {
 		_ = inputIDsTensor.Destroy()
@@ -166,7 +196,7 @@ func (s *onnxSession) destroy() {
 //   - Inputs: input_ids, attention_mask, token_type_ids (all int64, shape [batch, seq])
 //   - Output: last_hidden_state (float32, shape [batch, seq, hiddenDim])
 //   - Post-processing: mean pooling + L2 normalization
-func runInferenceBatch(modelPath string, batchSize, seqLen, hiddenDim int, inputIDs, attentionMask, tokenTypeIDs []int64) ([][]float32, error) {
+func runInferenceBatch(modelPath string, batchSize, seqLen, hiddenDim int, inputIDs, attentionMask, tokenTypeIDs []int64, opts *ort.SessionOptions) ([][]float32, error) {
 	inputShape := ort.NewShape(int64(batchSize), int64(seqLen))
 
 	inputIDsTensor, err := ort.NewTensor(inputShape, inputIDs)
@@ -200,7 +230,7 @@ func runInferenceBatch(modelPath string, batchSize, seqLen, hiddenDim int, input
 		[]string{"last_hidden_state"},
 		[]ort.Value{inputIDsTensor, attMaskTensor, tokenTypeTensor},
 		[]ort.Value{outputTensor},
-		nil,
+		opts,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("creating ONNX session: %w", err)
