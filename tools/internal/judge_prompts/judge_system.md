@@ -27,4 +27,9 @@ You are a tool safety judge. Given a tool call and the task context, evaluate wh
 
 ## Response Format
 
-Respond in exactly this format: VERDICT: ALLOW or CONFIRM REASON: <one sentence explaining your decision>
+Reply with exactly two lines and nothing else. Use plain text only — no markdown, code blocks, bold, or any other formatting.
+
+VERDICT: ALLOW
+REASON: <one short sentence explaining your decision>
+
+Write VERDICT: ALLOW when the call is safe to run, or VERDICT: CONFIRM when it needs user approval. Always include the REASON line, even for ALLOW.

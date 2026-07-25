@@ -23,6 +23,29 @@ import (
 // (e.g. C:\foo\bar or D:/baz).
 var pathRegex = regexp.MustCompile(`(?:/[a-zA-Z0-9/_.\-~]+|[A-Za-z]:[\\/][A-Za-z0-9\\/_.\-~]*)`)
 
+// judgeUnparsedReason is the fail-safe reasoning returned when the LLM
+// response cannot be parsed at all. Kept as a constant so callers (and tests)
+// can detect a total parse failure.
+const judgeUnparsedReason = "Unable to parse judge response; requiring manual confirmation for safety"
+
+// The following regexes make parseJudgeResponse tolerant of the formatting
+// variations LLMs commonly produce despite the requested two-line format.
+var (
+	// judgeListPrefixRe matches a leading markdown list marker ("- ", "* ",
+	// "+ ", "1. ") so such lines are still recognized as key/value pairs.
+	judgeListPrefixRe = regexp.MustCompile(`^(?:[-*+]|\d+\.)\s+`)
+	// judgeKeyRe matches a "KEY: value" or "KEY = value" pair at the start of a
+	// (markdown-stripped) line. The key is matched case-insensitively and
+	// accepts both VERDICT and REASON/REASONING aliases.
+	judgeKeyRe = regexp.MustCompile(`(?i)^(verdict|reason(?:ing)?)\s*[:=]\s*(.*)$`)
+	// judgeReasonInlineRe locates an inline REASON key within a VERDICT line
+	// value, e.g. "ALLOW — REASON: safe" so a single-line answer is parsed.
+	judgeReasonInlineRe = regexp.MustCompile(`(?i)\breason(?:ing)?\s*[:=]\s*(.*)$`)
+	// judgeJSONRe extracts a JSON object possibly embedded in prose, for models
+	// that emit {"verdict":"ALLOW","reason":"..."} despite the format request.
+	judgeJSONRe = regexp.MustCompile(`(?s)\{.*\}`)
+)
+
 // JudgeVerdict represents the safety assessment of a tool call.
 type JudgeVerdict int
 
@@ -197,6 +220,13 @@ func (j *ToolJudge) Judge(ctx context.Context, toolName string, input json.RawMe
 	content := strings.TrimSpace(resp.Message.Content)
 	verdict, reasoning := parseJudgeResponse(content)
 
+	if reasoning == judgeUnparsedReason && log != nil {
+		// Surface the raw model output so the unparseable response can be
+		// diagnosed instead of disappearing into a generic fail-safe message.
+		log.Warn("judge: could not parse LLM response, fail-safe to CONFIRM",
+			"tool", toolName, "raw_response", strutil.TruncateUTF8(content, 500))
+	}
+
 	if log != nil {
 		abbrevReasoning := strutil.TruncateUTF8(reasoning, 120)
 		if len(reasoning) > 120 {
@@ -353,38 +383,190 @@ func AllPathsInSessionRoots(ctx context.Context, input json.RawMessage) bool {
 	return true
 }
 
-// parseJudgeResponse extracts verdict and reasoning from LLM response.
-// Expected format:
+// parseJudgeResponse extracts verdict and reasoning from an LLM response.
+//
+// The judge prompt asks for exactly two lines:
 //
 //	VERDICT: ALLOW or CONFIRM
 //	REASON: <explanation>
 //
-// Falls back to reasonable defaults if parsing fails.
+// In practice LLMs frequently embellish the answer — markdown bold/italics
+// ("**VERDICT:** ALLOW"), list markers ("- VERDICT:"), code fences, lowercase
+// keys ("Verdict:"), an inline single-line form ("VERDICT: ALLOW — REASON: x"),
+// or even JSON. This parser tolerates all of those so a well-reasoned verdict
+// is not discarded as "unparseable", while still failing safe (VerdictConfirm)
+// when nothing can be recovered.
 func parseJudgeResponse(content string) (verdict JudgeVerdict, reasoning string) {
-	lines := strings.Split(content, "\n")
 	verdict = VerdictConfirm // default to safe
-	reasoning = "Unable to parse judge response; requiring manual confirmation for safety"
+	reasoning = ""           // empty == "not found"; finalizeJudge fills defaults
 
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "VERDICT:") {
-			verdictStr := strings.TrimSpace(strings.TrimPrefix(line, "VERDICT:"))
-			if strings.EqualFold(verdictStr, "ALLOW") {
-				verdict = VerdictAllow
-			} else {
-				verdict = VerdictConfirm
+	// 1) JSON object fallback (some models ignore the format and emit JSON).
+	if v, r, ok := parseJudgeJSON(content); ok {
+		return finalizeJudge(v, r)
+	}
+
+	// 2) Line-based extraction, tolerant of markdown decorations.
+	for _, raw := range strings.Split(content, "\n") {
+		line := stripJudgeLineDecoration(raw)
+		if line == "" {
+			continue
+		}
+		m := judgeKeyRe.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		key := strings.ToUpper(m[1])
+		val := strings.TrimSpace(m[2])
+
+		if key == "VERDICT" {
+			// A single line may carry both keys, e.g. "ALLOW | REASON: safe".
+			vPart, rPart, hasInline := splitInlineReason(val)
+			if v, ok := matchVerdict(vPart); ok {
+				verdict = v
 			}
-		} else if strings.HasPrefix(line, "REASON:") {
-			reasoning = strings.TrimSpace(strings.TrimPrefix(line, "REASON:"))
+			if hasInline && reasoning == "" {
+				reasoning = normalizeReason(rPart)
+			}
+			continue
+		}
+
+		// key == "REASON" or "REASONING"
+		if reasoning == "" && val != "" {
+			reasoning = normalizeReason(val)
 		}
 	}
 
-	// If we couldn't parse a reason but have a verdict, provide a default
-	if reasoning == "Unable to parse judge response; requiring manual confirmation for safety" && verdict == VerdictAllow {
-		reasoning = "Tool call appears safe and relevant to the task"
-	}
+	return finalizeJudge(verdict, reasoning)
+}
 
+// finalizeJudge applies the documented defaults when no reason was recovered:
+// ALLOW gets a positive default; CONFIRM keeps the fail-safe sentinel.
+func finalizeJudge(verdict JudgeVerdict, reasoning string) (finalVerdict JudgeVerdict, finalReasoning string) {
+	if reasoning == "" {
+		if verdict == VerdictAllow {
+			return verdict, "Tool call appears safe and relevant to the task"
+		}
+		return verdict, judgeUnparsedReason
+	}
 	return verdict, reasoning
+}
+
+// stripJudgeLineDecoration removes markdown decorations that would hide a
+// leading KEY: prefix: code fences, blockquote markers, list markers, and
+// emphasis/bold characters (`*`, `_`, backtick) in the key region (the part
+// before the first ':' or '=' separator). Leading/trailing emphasis on the
+// value itself is removed later by trimEmphasis (see matchVerdict /
+// normalizeReason), so internal emphasis inside a reason is preserved.
+func stripJudgeLineDecoration(line string) string {
+	line = strings.TrimSpace(line)
+	line = strings.TrimPrefix(line, "```")
+	line = strings.TrimSuffix(line, "```")
+	// Leading blockquote markers.
+	line = strings.TrimLeft(line, "> \t")
+	// Leading list marker ("- ", "* ", "+ ", "12. ").
+	line = judgeListPrefixRe.ReplaceAllString(line, "")
+	// Strip emphasis in the key region only (everything up to the separator),
+	// so "**VERDICT:**" exposes the VERDICT: prefix. The separator and the
+	// free-form value (which may contain colons, e.g. "12:00") are untouched.
+	if idx := strings.IndexAny(line, ":="); idx >= 0 {
+		deEmph := strings.NewReplacer("*", "", "_", "", "`", "")
+		line = deEmph.Replace(line[:idx]) + line[idx:]
+	}
+	return strings.TrimSpace(line)
+}
+
+// trimEmphasis strips leading/trailing whitespace plus markdown emphasis and
+// code characters (`*`, `_`, backtick) from a value. Used on verdict and reason
+// values so decorative wrapping like "**ALLOW**" or a leading "** " (left by a
+// bold key whose closing marker trails the separator) does not corrupt parsing.
+func trimEmphasis(s string) string {
+	return strings.Trim(s, "*_` \t")
+}
+
+// splitInlineReason detects a REASON key embedded in a VERDICT value (e.g.
+// "ALLOW — REASON: safe read") and returns the verdict part and reason part.
+func splitInlineReason(val string) (verdictPart, reasonPart string, ok bool) {
+	loc := judgeReasonInlineRe.FindStringSubmatchIndex(val)
+	if loc == nil {
+		return val, "", false
+	}
+	reasonPart = val[loc[2]:loc[3]]
+	verdictPart = val[:loc[0]]
+	return verdictPart, reasonPart, true
+}
+
+// matchVerdict classifies a verdict token as ALLOW or CONFIRM. Returns
+// ok=false when the token is not recognizable (the caller keeps the safe
+// default verdict in that case).
+func matchVerdict(val string) (JudgeVerdict, bool) {
+	v := strings.ToUpper(strings.TrimSpace(trimEmphasis(val)))
+	// Consider only the first whitespace/punctuation-delimited token so inline
+	// tails like "ALLOW — REASON: …" or "ALLOW (read-only)" still match.
+	if i := strings.IndexAny(v, " \t;|,\n"); i >= 0 {
+		v = v[:i]
+	}
+	v = strings.TrimRight(v, ".:!?")
+	switch {
+	case strings.Contains(v, "ALLOW"), strings.Contains(v, "APPROVE"), v == "SAFE":
+		return VerdictAllow, true
+	case strings.Contains(v, "CONFIRM"), strings.Contains(v, "DENY"), strings.Contains(v, "BLOCK"), v == "MANUAL":
+		return VerdictConfirm, true
+	default:
+		return VerdictConfirm, false
+	}
+}
+
+// normalizeReason trims surrounding whitespace and a single layer of matching
+// quote/backtick characters from a reason value.
+func normalizeReason(val string) string {
+	r := trimEmphasis(val)
+	if len(r) >= 2 {
+		first, last := r[0], r[len(r)-1]
+		if (first == '"' && last == '"') || (first == '\'' && last == '\'') || (first == '`' && last == '`') {
+			r = strings.TrimSpace(r[1 : len(r)-1])
+		}
+	}
+	return r
+}
+
+// parseJudgeJSON attempts to decode a JSON object embedded in the response and
+// extract verdict/reason from common key aliases.
+func parseJudgeJSON(content string) (verdict JudgeVerdict, reasoning string, ok bool) {
+	raw := judgeJSONRe.FindString(content)
+	if raw == "" {
+		return VerdictConfirm, "", false
+	}
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(raw), &obj); err != nil {
+		return VerdictConfirm, "", false
+	}
+	vStr := firstJSONString(obj, "verdict", "decision", "result")
+	rStr := firstJSONString(obj, "reason", "reasoning", "explanation", "justification")
+	if vStr == "" && rStr == "" {
+		return VerdictConfirm, "", false
+	}
+	verdict = VerdictConfirm
+	if vStr != "" {
+		if v, mok := matchVerdict(vStr); mok {
+			verdict = v
+		}
+	}
+	return verdict, rStr, true
+}
+
+// firstJSONString returns the first non-empty string value found under any of
+// the given case-insensitive keys.
+func firstJSONString(obj map[string]any, keys ...string) string {
+	for _, k := range keys {
+		for key, val := range obj {
+			if strings.EqualFold(key, k) {
+				if s, ok := val.(string); ok && strings.TrimSpace(s) != "" {
+					return strings.TrimSpace(s)
+				}
+			}
+		}
+	}
+	return ""
 }
 
 // JudgeConfig holds the settings needed to create a ToolJudge.

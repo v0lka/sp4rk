@@ -1436,3 +1436,167 @@ func TestParseJudgeResponse_ReasonBeforeVerdict(t *testing.T) {
 		t.Errorf("expected reason 'First line explanation', got %q", reason)
 	}
 }
+
+// --- Robustness tests: common LLM embellishments that previously caused the
+// "Unable to parse judge response" fail-safe. ---
+
+func TestParseJudgeResponse_MarkdownBoldKeys(t *testing.T) {
+	content := "**VERDICT:** ALLOW\n**REASON:** Safe read operation"
+	verdict, reason := parseJudgeResponse(content)
+	if verdict != VerdictAllow {
+		t.Errorf("expected VerdictAllow, got %d", verdict)
+	}
+	if reason != "Safe read operation" {
+		t.Errorf("expected reason 'Safe read operation', got %q", reason)
+	}
+}
+
+func TestParseJudgeResponse_MarkdownBoldValue(t *testing.T) {
+	content := "VERDICT: **ALLOW**\nREASON: safe"
+	verdict, _ := parseJudgeResponse(content)
+	if verdict != VerdictAllow {
+		t.Errorf("expected VerdictAllow for bold value, got %d", verdict)
+	}
+}
+
+func TestParseJudgeResponse_ListMarkers(t *testing.T) {
+	content := "- VERDICT: ALLOW\n- REASON: safe\n"
+	verdict, reason := parseJudgeResponse(content)
+	if verdict != VerdictAllow {
+		t.Errorf("expected VerdictAllow, got %d", verdict)
+	}
+	if reason != "safe" {
+		t.Errorf("expected reason 'safe', got %q", reason)
+	}
+}
+
+func TestParseJudgeResponse_NumberedList(t *testing.T) {
+	content := "1. VERDICT: CONFIRM\n2. REASON: destructive\n"
+	verdict, reason := parseJudgeResponse(content)
+	if verdict != VerdictConfirm {
+		t.Errorf("expected VerdictConfirm, got %d", verdict)
+	}
+	if reason != "destructive" {
+		t.Errorf("expected reason 'destructive', got %q", reason)
+	}
+}
+
+func TestParseJudgeResponse_LowercaseKeys(t *testing.T) {
+	content := "Verdict: ALLOW\nReason: lowercase keys"
+	verdict, reason := parseJudgeResponse(content)
+	if verdict != VerdictAllow {
+		t.Errorf("expected VerdictAllow for lowercase key, got %d", verdict)
+	}
+	if reason != "lowercase keys" {
+		t.Errorf("expected reason 'lowercase keys', got %q", reason)
+	}
+}
+
+func TestParseJudgeResponse_ReasoningAlias(t *testing.T) {
+	content := "VERDICT: CONFIRM\nREASONING: needs approval"
+	verdict, reason := parseJudgeResponse(content)
+	if verdict != VerdictConfirm {
+		t.Errorf("expected VerdictConfirm, got %d", verdict)
+	}
+	if reason != "needs approval" {
+		t.Errorf("expected reason 'needs approval', got %q", reason)
+	}
+}
+
+func TestParseJudgeResponse_CodeFence(t *testing.T) {
+	content := "```\nVERDICT: ALLOW\nREASON: fenced answer\n```"
+	verdict, reason := parseJudgeResponse(content)
+	if verdict != VerdictAllow {
+		t.Errorf("expected VerdictAllow, got %d", verdict)
+	}
+	if reason != "fenced answer" {
+		t.Errorf("expected reason 'fenced answer', got %q", reason)
+	}
+}
+
+func TestParseJudgeResponse_InlineSingleLine(t *testing.T) {
+	content := "VERDICT: ALLOW — REASON: safe read-only operation"
+	verdict, reason := parseJudgeResponse(content)
+	if verdict != VerdictAllow {
+		t.Errorf("expected VerdictAllow, got %d", verdict)
+	}
+	if reason != "safe read-only operation" {
+		t.Errorf("expected reason 'safe read-only operation', got %q", reason)
+	}
+}
+
+func TestParseJudgeResponse_InlineColonForm(t *testing.T) {
+	content := "VERDICT: ALLOW | REASON: safe"
+	verdict, reason := parseJudgeResponse(content)
+	if verdict != VerdictAllow {
+		t.Errorf("expected VerdictAllow, got %d", verdict)
+	}
+	if reason != "safe" {
+		t.Errorf("expected reason 'safe', got %q", reason)
+	}
+}
+
+func TestParseJudgeResponse_VerdictWithParenthetical(t *testing.T) {
+	content := "VERDICT: ALLOW (read-only)\nREASON: safe"
+	verdict, _ := parseJudgeResponse(content)
+	if verdict != VerdictAllow {
+		t.Errorf("expected VerdictAllow for parenthetical value, got %d", verdict)
+	}
+}
+
+func TestParseJudgeResponse_QuotedReason(t *testing.T) {
+	content := "VERDICT: ALLOW\nREASON: \"a quoted reason\""
+	verdict, reason := parseJudgeResponse(content)
+	if verdict != VerdictAllow {
+		t.Errorf("expected VerdictAllow, got %d", verdict)
+	}
+	if reason != "a quoted reason" {
+		t.Errorf("expected unquoted reason 'a quoted reason', got %q", reason)
+	}
+}
+
+func TestParseJudgeResponse_JSON(t *testing.T) {
+	content := `{"verdict":"ALLOW","reason":"safe read"}`
+	verdict, reason := parseJudgeResponse(content)
+	if verdict != VerdictAllow {
+		t.Errorf("expected VerdictAllow, got %d", verdict)
+	}
+	if reason != "safe read" {
+		t.Errorf("expected reason 'safe read', got %q", reason)
+	}
+}
+
+func TestParseJudgeResponse_JSONWithProse(t *testing.T) {
+	content := "Here is my assessment:\n{\"verdict\":\"CONFIRM\",\"reasoning\":\"destructive\"}\nDone."
+	verdict, reason := parseJudgeResponse(content)
+	if verdict != VerdictConfirm {
+		t.Errorf("expected VerdictConfirm, got %d", verdict)
+	}
+	if reason != "destructive" {
+		t.Errorf("expected reason 'destructive', got %q", reason)
+	}
+}
+
+func TestParseJudgeResponse_JSONConfirmWithoutReason(t *testing.T) {
+	content := `{"verdict":"CONFIRM"}`
+	verdict, reason := parseJudgeResponse(content)
+	if verdict != VerdictConfirm {
+		t.Errorf("expected VerdictConfirm, got %d", verdict)
+	}
+	if reason != judgeUnparsedReason {
+		t.Errorf("expected fail-safe reason, got %q", reason)
+	}
+}
+
+func TestParseJudgeResponse_EmphasisInKeyRegionOnly(t *testing.T) {
+	// Emphasis must be stripped from the key region but the value (12:00 colon)
+	// must be preserved: the first ':' belongs to REASON.
+	content := "**REASON:** file modified at 12:00 is fine\n**VERDICT:** ALLOW"
+	verdict, reason := parseJudgeResponse(content)
+	if verdict != VerdictAllow {
+		t.Errorf("expected VerdictAllow, got %d", verdict)
+	}
+	if reason != "file modified at 12:00 is fine" {
+		t.Errorf("expected preserved reason with colon, got %q", reason)
+	}
+}
