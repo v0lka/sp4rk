@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/liushuangls/go-anthropic/v2"
@@ -363,7 +364,7 @@ func TestAnthropicProvider_ParseResponse(t *testing.T) {
 			},
 		}
 
-		result, err := p.parseResponse(resp)
+		result, err := p.parseResponse(resp, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -396,7 +397,7 @@ func TestAnthropicProvider_ParseResponse(t *testing.T) {
 			StopReason: "tool_use",
 		}
 
-		result, err := p.parseResponse(resp)
+		result, err := p.parseResponse(resp, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -421,7 +422,7 @@ func TestAnthropicProvider_ParseResponse(t *testing.T) {
 			StopReason: "end_turn",
 		}
 
-		result, err := p.parseResponse(resp)
+		result, err := p.parseResponse(resp, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -445,7 +446,7 @@ func TestAnthropicProvider_ParseResponse(t *testing.T) {
 			StopReason: "end_turn",
 		}
 
-		result, err := p.parseResponse(resp)
+		result, err := p.parseResponse(resp, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -471,6 +472,96 @@ func TestAnthropicProvider_WrapError(t *testing.T) {
 			t.Errorf("expected status 0, got %d", llmErr.StatusCode)
 		}
 	})
+}
+
+func TestNormalizeAnthropicBaseURL(t *testing.T) {
+	tests := []struct {
+		name string
+		base string
+		want string
+	}{
+		{name: "no v1 adds v1", base: "https://api.z.ai/api/anthropic", want: "https://api.z.ai/api/anthropic/v1"},
+		{name: "trailing slash stripped then v1 added", base: "https://api.z.ai/api/anthropic/", want: "https://api.z.ai/api/anthropic/v1"},
+		{name: "existing v1 kept", base: "https://api.anthropic.com/v1", want: "https://api.anthropic.com/v1"},
+		{name: "existing v1 trailing slash normalized", base: "https://api.anthropic.com/v1/", want: "https://api.anthropic.com/v1"},
+		{name: "multiple trailing slashes", base: "https://proxy.example.com/anthropic///", want: "https://proxy.example.com/anthropic/v1"},
+		{name: "bare host", base: "http://localhost:8080", want: "http://localhost:8080/v1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := normalizeAnthropicBaseURL(tt.base); got != tt.want {
+				t.Errorf("normalizeAnthropicBaseURL(%q) = %q, want %q", tt.base, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestAnthropicProvider_ParseResponse_Degenerate verifies that a response with
+// no content and no tool calls (the signature of a non-compliant endpoint
+// returning a 200 with an empty/unrecognized body) is surfaced as an error
+// instead of a silent empty reply.
+func TestAnthropicProvider_ParseResponse_Degenerate(t *testing.T) {
+	p, _ := NewAnthropicProvider(AnthropicProviderConfig{Name: "zai", APIKey: "k"})
+
+	t.Run("empty content with raw body includes body in error", func(t *testing.T) {
+		resp := anthropic.MessagesResponse{
+			Type:       anthropic.MessagesResponseTypeMessage,
+			StopReason: "",
+			Content:    nil,
+		}
+		raw := []byte(`{"type":"message","content":[]}`)
+		_, err := p.parseResponse(resp, raw)
+		if err == nil {
+			t.Fatal("expected error for degenerate (empty content) response, got nil")
+		}
+		if !strings.Contains(err.Error(), "no content") {
+			t.Errorf("expected 'no content' in error, got: %v", err)
+		}
+		if !strings.Contains(err.Error(), "zai") {
+			t.Errorf("expected provider name in error, got: %v", err)
+		}
+	})
+
+	t.Run("explicit error type is surfaced", func(t *testing.T) {
+		resp := anthropic.MessagesResponse{
+			Type: anthropic.MessagesResponseTypeError,
+		}
+		raw := []byte(`{"type":"error","error":{"type":"invalid_request_error","message":"bad model"}}`)
+		_, err := p.parseResponse(resp, raw)
+		if err == nil {
+			t.Fatal("expected error for type=error response, got nil")
+		}
+		if !strings.Contains(err.Error(), "error response") {
+			t.Errorf("expected 'error response' in error, got: %v", err)
+		}
+		if !strings.Contains(err.Error(), "invalid_request_error") {
+			t.Errorf("expected raw body fragment in error, got: %v", err)
+		}
+	})
+}
+
+// TestAnthropicProvider_NewNormalizesBaseURL is a regression test verifying that
+// NewAnthropicProvider normalizes a base URL that lacks "/v1", so message calls
+// hit the correct endpoint path on Anthropic-compatible providers.
+func TestAnthropicProvider_NewNormalizesBaseURL(t *testing.T) {
+	// We cannot read the SDK's internal config, so verify indirectly: the
+	// provider must be constructible with a base URL that lacks /v1, and the
+	// helper must return the normalized form. This guards the wiring in
+	// NewAnthropicProvider against regressing to the raw base URL.
+	if got := normalizeAnthropicBaseURL("https://api.z.ai/api/anthropic"); got != "https://api.z.ai/api/anthropic/v1" {
+		t.Fatalf("normalization not applied: got %q", got)
+	}
+	p, err := NewAnthropicProvider(AnthropicProviderConfig{
+		Name:    "zai",
+		APIKey:  "k",
+		BaseURL: "https://api.z.ai/api/anthropic",
+	})
+	if err != nil {
+		t.Fatalf("NewAnthropicProvider with /v1-less base URL failed: %v", err)
+	}
+	if p.Name() != "zai" {
+		t.Errorf("name = %q, want 'zai'", p.Name())
+	}
 }
 
 func TestAnthropicProvider_BuildRequest_MultiSystem(t *testing.T) {

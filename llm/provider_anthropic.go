@@ -1,11 +1,14 @@
 package llm
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"regexp"
+	"strings"
 
 	"github.com/liushuangls/go-anthropic/v2"
 )
@@ -54,11 +57,27 @@ type AnthropicProvider struct {
 func NewAnthropicProvider(cfg AnthropicProviderConfig) (*AnthropicProvider, error) {
 	var opts []anthropic.ClientOption
 	if cfg.BaseURL != "" {
-		opts = append(opts, anthropic.WithBaseURL(cfg.BaseURL))
+		opts = append(opts, anthropic.WithBaseURL(normalizeAnthropicBaseURL(cfg.BaseURL)))
 	}
+
+	// Always install a response-body-capturing transport. The go-anthropic SDK
+	// only surfaces errors for non-2xx HTTP status codes; some
+	// Anthropic-compatible endpoints return an error object (or a degenerate
+	// empty body) with HTTP 200, which the SDK then silently decodes into an
+	// empty MessagesResponse. Capturing the raw body lets parseResponse include
+	// it in a descriptive error so such failures are observable instead of
+	// surfacing as a silent empty reply. The capture is opt-in per call via a
+	// context value (see ChatCompletion), so there is no overhead for callers
+	// that don't request it. The provided HTTP client is cloned (not mutated)
+	// so any shared proxy/TLS/timeout configuration is preserved and other
+	// consumers of the same client are unaffected.
+	httpClient := &http.Client{}
 	if cfg.HTTPClient != nil {
-		opts = append(opts, anthropic.WithHTTPClient(cfg.HTTPClient))
+		*httpClient = *cfg.HTTPClient
 	}
+	httpClient.Transport = &capturingTransport{base: httpClient.Transport}
+	opts = append(opts, anthropic.WithHTTPClient(httpClient))
+
 	client := anthropic.NewClient(cfg.APIKey, opts...)
 
 	name := cfg.Name
@@ -70,6 +89,72 @@ func NewAnthropicProvider(cfg AnthropicProviderConfig) (*AnthropicProvider, erro
 		client: client,
 		name:   name,
 	}, nil
+}
+
+// normalizeAnthropicBaseURL ensures the configured base URL ends with "/v1".
+//
+// The go-anthropic SDK treats the base URL as already including the API version
+// path — its built-in default is "https://api.anthropic.com/v1" and it appends
+// only "/messages" to produce ".../v1/messages". Anthropic-compatible endpoints
+// are conventionally documented with a base URL that EXCLUDES "/v1" (e.g.
+// Z.AI's "https://api.z.ai/api/anthropic", matching the ANTHROPIC_BASE_URL
+// convention used by the official Anthropic SDK, which appends "/v1/messages").
+// Passing such a URL through unchanged makes message calls hit the wrong path
+// ("/api/anthropic/messages" instead of "/api/anthropic/v1/messages"), which
+// the endpoint answers with a 200 and an empty/non-standard body — the SDK
+// returns no error and the provider sees a silently empty response.
+//
+// URLs that already end with "/v1" (with or without a trailing slash) are left
+// untouched, so callers that follow the go-anthropic convention keep working.
+func normalizeAnthropicBaseURL(base string) string {
+	trimmed := strings.TrimRight(base, "/")
+	if strings.HasSuffix(trimmed, "/v1") {
+		return trimmed
+	}
+	return trimmed + "/v1"
+}
+
+// bodyCaptureCtxKey is the context key under which ChatCompletion stashes a
+// *[]byte that the capturingTransport fills with the raw response body.
+type bodyCaptureCtxKey struct{}
+
+// capturingTransport is an http.RoundTripper that reads the full response body,
+// copies it into a per-request buffer (when the request context carries one),
+// and re-wraps it so the underlying SDK can still decode it.
+type capturingTransport struct {
+	base http.RoundTripper
+}
+
+func (t *capturingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	resp, err := base.RoundTrip(req)
+	if err != nil {
+		return resp, err
+	}
+	body, readErr := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if readErr != nil {
+		return nil, fmt.Errorf("anthropic: failed to read response body: %w", readErr)
+	}
+	if holder, ok := req.Context().Value(bodyCaptureCtxKey{}).(*[]byte); ok && holder != nil {
+		*holder = body
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	return resp, nil
+}
+
+// truncateForError returns a trimmed, length-limited view of b suitable for
+// embedding in an error message.
+func truncateForError(b []byte) string {
+	const max = 2048
+	s := strings.TrimSpace(string(b))
+	if len(s) > max {
+		return s[:max] + " …(truncated)"
+	}
+	return s
 }
 
 // Name returns the provider name.
@@ -84,12 +169,18 @@ func (p *AnthropicProvider) ChatCompletion(ctx context.Context, req ChatRequest)
 		return nil, fmt.Errorf("anthropic: failed to build request: %w", err)
 	}
 
+	// Stash a buffer the capturingTransport fills with the raw response body,
+	// so parseResponse can embed it in an error if the endpoint returns a
+	// non-standard or error response with HTTP 200.
+	var capturedBody []byte
+	ctx = context.WithValue(ctx, bodyCaptureCtxKey{}, &capturedBody)
+
 	resp, err := p.client.CreateMessages(ctx, *anthropicReq)
 	if err != nil {
 		return nil, p.wrapError(fmt.Errorf("anthropic: API error: %w", err))
 	}
 
-	return p.parseResponse(resp)
+	return p.parseResponse(resp, capturedBody)
 }
 
 // buildRequest converts ChatRequest to anthropic.MessagesRequest.
@@ -223,7 +314,28 @@ func (p *AnthropicProvider) convertMessage(msg Message) (anthropic.Message, erro
 }
 
 // parseResponse converts anthropic.MessagesResponse to ChatResponse.
-func (p *AnthropicProvider) parseResponse(resp anthropic.MessagesResponse) (*ChatResponse, error) {
+//
+// rawBody is the raw HTTP response body captured by the transport. It is used
+// only to enrich diagnostics when the endpoint returns a non-standard response
+// (e.g. an Anthropic-compatible endpoint that answers a 200 with an error
+// object or an empty body); a nil/empty value is fine for callers that capture
+// the response directly (tests).
+func (p *AnthropicProvider) parseResponse(resp anthropic.MessagesResponse, rawBody []byte) (*ChatResponse, error) {
+	// The go-anthropic SDK only treats non-2xx HTTP statuses as errors. Some
+	// Anthropic-compatible endpoints return an explicit {"type":"error",...}
+	// object WITH HTTP 200, which the SDK happily decodes into a zero-value
+	// MessagesResponse (empty content, empty stop_reason, zero usage) and
+	// returns as success. Detect that here so the caller sees a real error
+	// instead of a silent empty reply.
+	if resp.Type == anthropic.MessagesResponseTypeError {
+		detail := truncateForError(rawBody)
+		if detail == "" {
+			detail = "(no response body captured)"
+		}
+		return nil, fmt.Errorf("anthropic: endpoint %q returned an error response: %s",
+			p.name, detail)
+	}
+
 	message := Message{
 		Role: "assistant",
 	}
@@ -257,6 +369,25 @@ func (p *AnthropicProvider) parseResponse(resp anthropic.MessagesResponse) (*Cha
 				})
 			}
 		}
+	}
+
+	// Degenerate response guard: the SDK succeeded (no error) but the response
+	// carries neither text content nor tool calls. A well-formed Anthropic
+	// Messages response always has a non-empty stop_reason and at least one
+	// content block, so this combination indicates a non-compliant
+	// Anthropic-compatible endpoint (most often a misconfigured base URL that
+	// misses the "/v1" path segment, causing the endpoint to return a 200 with
+	// an empty or unrecognized body). Surface it as an error so callers and
+	// operators can diagnose it instead of seeing a silent empty result.
+	if message.Content == "" && len(message.ToolCalls) == 0 {
+		detail := truncateForError(rawBody)
+		if detail == "" {
+			detail = "(no response body captured)"
+		}
+		return nil, fmt.Errorf("anthropic: endpoint %q returned a 200 response with no content "+
+			"(stop_reason=%q) — this usually indicates a non-compliant Anthropic-compatible "+
+			"endpoint; verify the base_url includes the correct API path. Raw body: %s",
+			p.name, resp.StopReason, detail)
 	}
 
 	return &ChatResponse{
