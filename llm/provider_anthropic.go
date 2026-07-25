@@ -135,7 +135,7 @@ func (t *capturingTransport) RoundTrip(req *http.Request) (*http.Response, error
 		return resp, err
 	}
 	body, readErr := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close() // fully read above; close error is not actionable
 	if readErr != nil {
 		return nil, fmt.Errorf("anthropic: failed to read response body: %w", readErr)
 	}
@@ -149,10 +149,10 @@ func (t *capturingTransport) RoundTrip(req *http.Request) (*http.Response, error
 // truncateForError returns a trimmed, length-limited view of b suitable for
 // embedding in an error message.
 func truncateForError(b []byte) string {
-	const max = 2048
+	const maxLen = 2048
 	s := strings.TrimSpace(string(b))
-	if len(s) > max {
-		return s[:max] + " …(truncated)"
+	if len(s) > maxLen {
+		return s[:maxLen] + " …(truncated)"
 	}
 	return s
 }
