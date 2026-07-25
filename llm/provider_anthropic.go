@@ -66,11 +66,13 @@ func NewAnthropicProvider(cfg AnthropicProviderConfig) (*AnthropicProvider, erro
 	// empty body) with HTTP 200, which the SDK then silently decodes into an
 	// empty MessagesResponse. Capturing the raw body lets parseResponse include
 	// it in a descriptive error so such failures are observable instead of
-	// surfacing as a silent empty reply. The capture is opt-in per call via a
-	// context value (see ChatCompletion), so there is no overhead for callers
-	// that don't request it. The provided HTTP client is cloned (not mutated)
-	// so any shared proxy/TLS/timeout configuration is preserved and other
-	// consumers of the same client are unaffected.
+	// surfacing as a silent empty reply. The raw body is read into memory on
+	// every response and re-wrapped so the SDK can still decode it: this is a
+	// transient ~1× body-size allocation per call (acceptable for the
+	// non-streaming CreateMessages path), not a zero-overhead path. The
+	// provided HTTP client is cloned (not mutated) so any shared proxy/TLS/
+	// timeout configuration is preserved and other consumers of the same client
+	// are unaffected.
 	httpClient := &http.Client{}
 	if cfg.HTTPClient != nil {
 		*httpClient = *cfg.HTTPClient
@@ -132,7 +134,14 @@ func (t *capturingTransport) RoundTrip(req *http.Request) (*http.Response, error
 	}
 	resp, err := base.RoundTrip(req)
 	if err != nil {
-		return resp, err
+		// Per the http.RoundTripper contract, the response is undefined (and the
+		// http.Client will not close it) when err != nil. A transport that
+		// nevertheless returns a non-nil response here would leak its body, so
+		// close and discard it.
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		return nil, err
 	}
 	body, readErr := io.ReadAll(resp.Body)
 	_ = resp.Body.Close() // fully read above; close error is not actionable

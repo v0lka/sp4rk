@@ -110,11 +110,25 @@ The decision flows through several layers, cheapest first:
 5. **LLM evaluation** — a short request is built (system prompt + `Task / Tool / Input`, plus a compact environment block) and sent with a **2-minute timeout**. The response is parsed from a `VERDICT:`/`REASON:` text format.
 6. **Fail-safe** — on *any* LLM error (timeout, network, parse failure), the judge returns `VerdictConfirm` with explanatory reasoning. The judge never auto-approves on failure.
 
+### Response parsing (tolerant)
+
+The judge requests a strict two-line format, but LLMs frequently deviate. `parseJudgeResponse` is deliberately tolerant so a safe verdict is still recognized:
+
 ```go
-// Expected LLM response format:
+// Requested format:
 //   VERDICT: ALLOW
 //   REASON: <one-line explanation>
 ```
+
+The parser accepts the following variations and is **case-insensitive** throughout:
+
+- **Markdown list markers** — a leading `- `, `* `, `+ `, or `1. ` is stripped before matching, so list-style answers parse correctly.
+- **`KEY:` / `KEY =` separators** — both colon and `=` are accepted after `VERDICT`/`REASON` (and the `REASONING` alias).
+- **Single-line answers** — a `REASON`/`REASONING` key inlined in a `VERDICT` line value (e.g. `ALLOW — REASON: safe`) is extracted.
+- **JSON objects** — models that emit `{"verdict":"ALLOW","reason":"…"}` (possibly embedded in prose) are parsed; a JSON value takes precedence over the surrounding text.
+- **Fenced or quoted values** — surrounding backticks, code fences, or quotes around the verdict are ignored.
+
+The verdict value is matched on **whole tokens** (case-insensitive), so `ALLOW` is recognized but a token merely *containing* `allow` (e.g. a path, argument, or the negated compound `DISALLOW`) is not. Only these whole tokens map to `VerdictAllow` (the set that bypasses confirmation): `ALLOW`, `ALLOWED`, `APPROVE`, `APPROVED`, `SAFE`. The explicit confirm set (`CONFIRM`, `CONFIRMED`, `DENY`, `DENIED`, `BLOCK`, `BLOCKED`, `DISALLOW`, `DISAPPROVE`, `REJECT`, `MANUAL`) and any unrecognized token all map to `VerdictConfirm` — negated compounds are listed explicitly so they can never be misread as their affirmative base. A response that cannot be parsed at all is a total parse failure — the fail-safe applies and the judge returns `VerdictConfirm`.
 
 > **Tip:** the verdict cache is keyed only on `tool+input`. If your `taskContext` changes the safety assessment of the same call, the cached verdict from a prior task will be reused. Keep judge prompts focused on the *intrinsic* safety of the input, not on transient task context.
 

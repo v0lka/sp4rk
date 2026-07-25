@@ -28,7 +28,7 @@ The host application consumes the tool types from `github.com/v0lka/sp4rk/tools`
 | `ParamManager` | tools | Provided by host (optional) | Auto-injected parameter management (`SanitizeSchema` + `InjectParams`), e.g. project path |
 | `AutoInjectedParamProject` | tools | Constant | `"project"` — the auto-injected param name stripped from tool schemas before the LLM sees them |
 
-> The `ToolJudge` type in `github.com/v0lka/sp4rk/tools/judge.go` is a **separate**, LLM-powered safety evaluator (verdicts `VerdictAllow`/`VerdictConfirm`, fail-safe to confirm on LLM error). It is distinct from the `ToolJudger` interface a tool may implement; do not confuse the two.
+> The `ToolJudge` type in `github.com/v0lka/sp4rk/tools/judge.go` is a **separate**, LLM-powered safety evaluator (verdicts `VerdictAllow`/`VerdictConfirm`). It is distinct from the `ToolJudger` interface a tool may implement; do not confuse the two. The judge's response parser is tolerant of LLM formatting variations (markdown decoration, list markers, code fences, lowercase keys, inline single-line answers, and JSON) and classifies the verdict by **whole-token, case-insensitive matching**: `ALLOW`/`ALLOWED`/`APPROVE`/`APPROVED`/`SAFE` → `VerdictAllow`; `CONFIRM`/`CONFIRMED`/`DENY`/`DENIED`/`BLOCK`/`BLOCKED`/`REJECT`/`MANUAL`/`DISALLOW`/`DISAPPROVE` → `VerdictConfirm`. Any unrecognized token — including negations of allow-words (e.g. `DISALLOW`/`DISAPPROVE`, which contain `ALLOW`/`APPROVE` as substrings) — and any LLM error fail **safe** to `VerdictConfirm`, so an ambiguous or adversarial verdict never auto-allows a potentially destructive call.
 
 ## Initialization
 

@@ -54,7 +54,7 @@ Data is plain Go values (structs, slices, `json.RawMessage`). No host-specific t
 
 - A tool that **fails** returns a `tools.ToolResult` with `IsError=true` (a recoverable, in-loop result). This is recorded on the producing `Step` (`IsError`) and fed back as the observation so the model can self-correct; it is **not** propagated as a Go `error` out of the loop.
 - A tool execution that errors at the infrastructure level returns a Go `error`, which the executor surfaces per its loop contract.
-- `LLMCaller` errors (network, auth, context window) propagate through the executor and out of `Run`. Transient errors (HTTP 429/502/503/529) are retried with exponential backoff inside `llm.Router` before reaching the executor.
+- `LLMCaller` errors (network, auth, context window) propagate through the executor and out of `Run`. Transient errors (HTTP 408, 429, 500, 502, 503, 504, 520–524, 529) are retried with exponential backoff inside `llm.Router` before reaching the executor.
 - `HITLHandler` methods may return a Go `error`; the executor treats a handler error according to its loop contract (typically aborting the affected step).
 - `HITLToolDecision` with `Allow=false` is **not** an error — it is a normal rejection that becomes the tool's observation.
 - Circuit-breaker aborts (repeated identical calls, repeated truncation, repeated parse errors, fruitless loops) terminate the loop and are reflected in `ExecutorResult.Finished=false`.

@@ -204,6 +204,7 @@ File-based defaults, session roots, and blacklist regexes are host-application c
 - Untrusted tool output is wrapped in `<untrusted-content>` before it reaches the model, unconditionally for any tool whose `IsUntrusted()` is true (or that is MCP-sourced).
 - `WrapUntrustedContent` always sanitizes its content with `StripUntrustedTags` first.
 - An MCP tool registration can never overwrite an existing non-MCP tool.
+- The LLM-powered `ToolJudge` verdict parser fails **safe** to `VerdictConfirm` on any unrecognized or ambiguous verdict: verdict tokens are matched whole-token (case-insensitive), so negations of allow-words (e.g. `DISALLOW`, `DISAPPROVE`) are never misclassified as `VerdictAllow`. An LLM error likewise yields `VerdictConfirm`. See [../contracts/tools.md](../contracts/tools.md) for the verdict vocabulary.
 
 ## Anti-Patterns
 

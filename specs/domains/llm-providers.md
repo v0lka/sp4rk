@@ -54,8 +54,8 @@ Router.Call(ctx, req)
 ├─ Validate estimated tokens against the effective context window (SafetyMarginPercent +
 │      OutputTokenReserve); reject oversized requests with ErrContextWindowExceeded.
 ├─ Send the request to the active provider (Anthropic or OpenAI-compatible backend).
-└─ Retry transient errors (HTTP 429/502/503/529, transient network errors) with
-      exponential backoff + ±20% jitter, up to MaxRetries.
+└─ Retry transient errors (HTTP 408/429/500/502/503/504/520–524/529, transient
+      network errors) with exponential backoff + ±20% jitter, up to MaxRetries.
 ```
 
 ## Model identification: composite vs bare IDs
@@ -82,7 +82,7 @@ Two counters: `SimpleTokenCounter` (~4 chars = 1 token approximation) and `Tikto
 - `Resolve` always returns usable metadata, even for unknown models (fallback defaults).
 - `NewTokenCounter` always returns a non-nil counter.
 - Pre-call validation rejects oversized requests with `ErrContextWindowExceeded` (detectable via `errors.Is`); this is independent of the agent loop's ongoing context-fill tracking.
-- Retryable errors are classified by `WrapProviderError` (HTTP 429/502/503/529, transient network errors); `IsRetryable` reports whether a chain contains a retryable `*Error`.
+- Retryable errors are classified by `WrapProviderError` (HTTP 408/429/500/502/503/504/520–524/529 — request timeout, rate limit, upstream server/gateway faults, Cloudflare edge errors, Anthropic overload — plus transient network errors); `IsRetryable` reports whether a chain contains a retryable `*Error`.
 
 ## Configuration
 
@@ -103,6 +103,7 @@ Two counters: `SimpleTokenCounter` (~4 chars = 1 token approximation) and `Tikto
 ## Extension Points
 
 - **Add a provider**: a new `ProviderType` backend implementing the `Provider` interface; the Router dispatches by `ProviderType` (`"anthropic"` / `"openai"`). The `"openai"` type covers any OpenAI-compatible endpoint (set `BaseURL` to a proxy, LM Studio, vLLM, …).
+- **Anthropic-compatible endpoints**: the built-in Anthropic provider normalizes `BaseURL` to end with `/v1` (the go-anthropic SDK expects the version segment in the base URL, unlike the official Anthropic SDK convention which omits it). A URL already ending in `/v1` is left untouched; otherwise `/v1` is appended. The provider also installs a response-body-capturing transport and surfaces errors that the SDK would otherwise swallow — a `{"type":"error",...}` object or a degenerate empty response returned with HTTP 200 is reported as an error rather than a silent empty reply (common when a misconfigured base URL misses the `/v1` path segment).
 - **Custom metadata source**: `ModelRegistry.RegisterSource(src)` for a source consulted after the HuggingFace lookup (e.g. a local model server).
 - **Family-aware sampling**: supply `RouterConfig.SamplingFunc` (see [prompt-building.md](prompt-building.md) for the SDK's `DefaultSampling` defaults).
 - **Step-local callers**: `TrackingCaller.WithContextTracker` for independent context trackers in parallel branches.

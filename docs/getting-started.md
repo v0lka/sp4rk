@@ -48,7 +48,7 @@ Everything starts with [`sp4rk.Config`](../framework.go), passed to [`sp4rk.New`
 | --- | --- | --- | --- |
 | `Providers` | `[]llm.ProviderEntry` | — | Enabled LLM providers. **At least one is required.** |
 | `DefaultModel` | `string` | first provider's first model | Override the auto-selected default model. Accepts a bare name (`"claude-sonnet-4-5"`) or composite ID (`"anthropic/claude-sonnet-4-5"`). |
-| `MaxRetries` | `int` | `3` | Retry attempts for transient errors (HTTP 429, 502, 503, 529, network blips). `0` means the default (3); a **negative value** means explicitly 0 — retries disabled. |
+| `MaxRetries` | `int` | `3` | Retry attempts for transient errors (HTTP 408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529, and network blips). `0` means the default (3); a **negative value** means explicitly 0 — retries disabled. |
 | `InitialBackoff` | `string` | `"1s"` | Starting backoff duration for retries (parsed with `time.ParseDuration`). Empty means the default; a **negative duration** (e.g. `"-1s"`) means explicitly 0. |
 | `MaxBackoff` | `string` | `"30s"` | Maximum backoff duration for retries. Empty means the default; a **negative duration** means explicitly 0. |
 | `OutputTokenReserve` | `int` | `4096` | Context-window space reserved for model output; affects context-window validation. |

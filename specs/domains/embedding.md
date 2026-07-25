@@ -16,12 +16,13 @@ ONNX-based local text embedding for semantic search, plus a document chunker and
 
 ```go
 type EmbedderConfig struct {
-    ModelPath     string // .onnx model file
-    TokenizerPath string // HuggingFace tokenizer.json
-    LibraryPath   string // ONNX Runtime shared library
-    MaxSeqLength  int    // default 512
-    HiddenDim     int    // default 512
-    Logger        *slog.Logger
+    ModelPath      string // .onnx model file
+    TokenizerPath  string // HuggingFace tokenizer.json
+    LibraryPath    string // ONNX Runtime shared library
+    MaxSeqLength   int    // default 512
+    HiddenDim      int    // default 512
+    IntraOpThreads int    // default 0 (ONNX Runtime chooses); >0 bounds intra-op threads
+    Logger         *slog.Logger
 }
 
 type Chunk struct {
@@ -57,9 +58,11 @@ Querying:
 
 ## Embedder
 
-`NewEmbedder(cfg)` loads the tokenizer and initializes the ONNX Runtime environment. `ModelPath`, `TokenizerPath`, and `LibraryPath` are required; `MaxSeqLength`/`HiddenDim` default to `512`. The init sequence is `initONNXRuntime(libraryPath)` → `NewTokenizer(tokenizerPath)` → `newONNXSession(modelPath, maxSeqLen, hiddenDim)`; on any failure the ONNX environment is cleaned up before returning the error.
+`NewEmbedder(cfg)` loads the tokenizer and initializes the ONNX Runtime environment. `ModelPath`, `TokenizerPath`, and `LibraryPath` are required; `MaxSeqLength`/`HiddenDim` default to `512`. The init sequence is `initONNXRuntime(libraryPath)` → `buildSessionOptions(cfg.IntraOpThreads)` → `NewTokenizer(tokenizerPath)` → `newONNXSession(modelPath, maxSeqLen, hiddenDim, sessOpts)`; on any failure the ONNX environment is cleaned up (and any allocated session options destroyed) before returning the error.
 
-`EmbedDocuments` uses a **fast path** for single-text embedding: a persistent ONNX session with pre-allocated tensors is reused (session creation is ~2s; inference ~50ms). Larger batches create a temporary session. All embeddings are **mean-pooled** (attention mask) and **L2-normalized**. `EmbeddingFunc()` returns a chromem-go-compatible embedding function.
+`IntraOpThreads` bounds ONNX Runtime intra-op parallelism. `0` (or any non-positive value) preserves the legacy behavior: `buildSessionOptions` returns `nil` and the session is created with a nil `*SessionOptions`, letting ONNX Runtime choose the thread count. A positive value `N` allocates a `*SessionOptions` configured with `SetIntraOpNumThreads(N)`, constraining inference to `N` threads — useful for bounding CPU usage in resource-constrained environments. `buildSessionOptions` runs *after* `initONNXRuntime` because ONNX session-option construction requires the environment. The `Embedder` owns the options handle and destroys it in `Close`.
+
+`EmbedDocuments` uses a **fast path** for single-text embedding: a persistent ONNX session with pre-allocated tensors is reused (session creation is ~2s; inference ~50ms). Larger batches create a temporary session, passing the same `sessOpts` so the thread limit applies to batch inference too. All embeddings are **mean-pooled** (attention mask) and **L2-normalized**. `EmbeddingFunc()` returns a chromem-go-compatible embedding function.
 
 ### Process-global singleton limitation
 
@@ -104,7 +107,8 @@ Parameters: `query` (natural-language description; tokens prefixed with `+` are 
 
 ## Invariants
 
-- Only one `Embedder` exists per process (ONNX Runtime singleton); `Close()` releases it.
+- Only one `Embedder` exists per process (ONNX Runtime singleton); `Close()` releases the session, the session options (if allocated), and the ONNX environment.
+- A positive `IntraOpThreads` constrains inference in both the persistent (batch=1) and temporary (batch>1) sessions, because the same `sessOpts` is passed to both.
 - All embeddings are mean-pooled and L2-normalized before being returned.
 - `ChunkFile` returns `nil` for binary files; chunks always carry location metadata (file path + 1-based line range).
 - The persistent vector index/store is host-side; the SDK provides only the embedder, tokenizer, chunker, and the search tool that delegates to a host-provided function.
@@ -112,7 +116,7 @@ Parameters: `query` (natural-language description; tokens prefixed with `+` are 
 
 ## Configuration
 
-`EmbedderConfig` and `ChunkerConfig` are the configuration surfaces. Defaults: `MaxSeqLength`/`HiddenDim` = `512`; `MaxChunkSize` = `1500`; `Overlap` = `200` (reduced to `MaxChunkSize/5` if it would exceed `MaxChunkSize`). Model/tokenizer/runtime library paths are host-resolved at wiring time. Because the embedder loads asynchronously, the host gates `semantic_search` with a wait function and surfaces readiness separately.
+`EmbedderConfig` and `ChunkerConfig` are the configuration surfaces. Defaults: `MaxSeqLength`/`HiddenDim` = `512`; `IntraOpThreads` = `0` (ONNX Runtime chooses the thread count; a positive value bounds intra-op parallelism); `MaxChunkSize` = `1500`; `Overlap` = `200` (reduced to `MaxChunkSize/5` if it would exceed `MaxChunkSize`). Model/tokenizer/runtime library paths are host-resolved at wiring time. Because the embedder loads asynchronously, the host gates `semantic_search` with a wait function and surfaces readiness separately.
 
 ## Extension Points
 

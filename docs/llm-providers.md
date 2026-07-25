@@ -41,6 +41,14 @@ type ProviderEntry struct {
 - **`APIKey`** / **`BaseURL`** — must be pre-resolved by the caller (environment variables expanded, etc.) before constructing the router.
 - **`Models`** — the bare model names enabled for this provider. The first provider's first model becomes the initial active model.
 
+## Anthropic-compatible endpoints
+
+An `anthropic`-typed provider can target the official Anthropic API (`BaseURL` empty) or any Anthropic-compatible proxy (`BaseURL` set). Two provider-level behaviours make compatible proxies work reliably:
+
+**Base URL normalization.** The go-anthropic SDK treats `BaseURL` as *already including the API version path* — it appends only `/messages`, so its built-in default is `https://api.anthropic.com/v1`. Anthropic-compatible endpoints are conventionally documented with a base URL that **excludes** `/v1` (e.g. `https://api.z.ai/api/anthropic`, matching the `ANTHROPIC_BASE_URL` convention of the official SDK). To bridge this, the provider runs `BaseURL` through `normalizeAnthropicBaseURL`, which appends `/v1` unless the URL already ends with `/v1` (with or without a trailing slash). Pass the convention-style URL without `/v1`; URLs that already follow the go-anthropic convention are left untouched.
+
+**Response-body capture for swallowed errors.** The go-anthropic SDK surfaces errors only for non-2xx HTTP status codes. Some compatible endpoints return an error object (or a degenerate empty body) with HTTP 200, which the SDK then silently decodes into an empty `MessagesResponse` — the provider would see a silent empty reply. The provider installs a `capturingTransport` that reads the raw response body on every call and stashes it so a degenerate 200 response is surfaced as a descriptive error instead of an empty reply. The provided `HTTPClient` (if any) is *cloned*, not mutated, so shared proxy/TLS/timeout configuration is preserved and other consumers of the same client are unaffected.
+
 ## Router
 
 `Router` routes LLM calls to the active provider. It is created with `NewRouter`:
@@ -58,9 +66,9 @@ func NewRouter(ctx context.Context, cfg RouterConfig, registry *ModelRegistry) (
 ```go
 type RouterConfig struct {
     Providers           []ProviderEntry
-    MaxRetries          int           // default 3 when unset/zero/negative
-    InitialBackoff      time.Duration // default 1s
-    MaxBackoff          time.Duration // default 30s
+    MaxRetries          int           // default 3 when unset/zero; negative = 0 (disabled)
+    InitialBackoff      time.Duration // default 1s; negative = 0
+    MaxBackoff          time.Duration // default 30s; negative = 0
     SafetyMarginPercent int           // default 5
     OutputTokenReserve  int           // default 4096
     HTTPClient          *http.Client  // optional proxy-configured client
@@ -351,7 +359,8 @@ resp, err := stepCaller.Call(ctx, req)
 
 The router retries transient errors with exponential backoff plus ±20% jitter. Retryable errors are classified by `WrapProviderError` and include:
 
-- **HTTP 429, 502, 503, 529** — rate limits and transient server errors.
+- **HTTP 408, 429, 500, 502, 503, 504, 529** — request timeout, rate limits, transient server/gateway errors, and Anthropic-specific overload.
+- **HTTP 520–524** — Cloudflare edge errors (unknown error, web server down, connection timed out, origin unreachable, origin timeout); 524 is Cloudflare's equivalent of a gateway timeout.
 - **Transient network errors** — timeouts, connection refused/reset, EHOSTUNREACH, DNS errors, unexpected EOF.
 
 `IsRetryable(err)` reports whether an error chain contains a retryable `*Error`.
@@ -368,7 +377,16 @@ With the default `MaxRetries: 3`, the worst-case retry path adds up to ~7s of la
 
 ### Disabling retries
 
-`MaxRetries` defaults to **3** when unset or zero. Any non-positive value (including negatives) is replaced with the default of 3 — there is currently no way to disable retries entirely via this field. To minimise retry latency, set a small `MaxRetries` (e.g. `1`) and a short `MaxBackoff`:
+`MaxRetries` follows the same sentinel convention as the backoff durations: `0` (unset) resolves to the default of **3**; a **negative value** resolves to **0**, disabling retries entirely. To turn retries off, pass a negative `MaxRetries`:
+
+```go
+router, err := llm.NewRouter(ctx, llm.RouterConfig{
+    Providers:      providers,
+    MaxRetries:     -1,   // 0 retries — retries disabled
+}, registry)
+```
+
+To reduce retry latency without removing retries entirely, keep retries on with a small `MaxRetries` (e.g. `1`) and a short `MaxBackoff`:
 
 ```go
 router, err := llm.NewRouter(ctx, llm.RouterConfig{

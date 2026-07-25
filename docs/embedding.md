@@ -25,6 +25,13 @@ type EmbedderConfig struct {
     MaxSeqLength int
     // HiddenDim is the embedding dimension of the model. Defaults to 512.
     HiddenDim int
+    // IntraOpThreads limits ONNX Runtime intra-op threads during inference.
+    // 0 (the default) preserves legacy behavior: the session is created with a
+    // nil *SessionOptions, letting ONNX Runtime choose the thread count. A
+    // positive value N constrains intra-op parallelism to N threads, bounding
+    // CPU usage in resource-constrained environments. Negative values are
+    // treated as 0.
+    IntraOpThreads int
     // Logger for structured logging. If nil, a no-op logger is used.
     Logger *slog.Logger
 }
@@ -50,10 +57,11 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error)
 The initialization sequence is:
 
 1. `initONNXRuntime(libraryPath)` — sets the shared library path and initializes the global ONNX Runtime environment.
-2. `NewTokenizer(tokenizerPath)` — loads the HuggingFace tokenizer.
-3. `newONNXSession(modelPath, maxSeqLen, hiddenDim)` — creates a persistent ONNX session with pre-allocated tensors for the fast path.
+2. `buildSessionOptions(cfg.IntraOpThreads)` — builds `*ort.SessionOptions` that limit intra-op threads when `IntraOpThreads` is positive; returns `nil` for 0/negative to preserve legacy behavior (session created with nil options). Must run after `initONNXRuntime`.
+3. `NewTokenizer(tokenizerPath)` — loads the HuggingFace tokenizer.
+4. `newONNXSession(modelPath, maxSeqLen, hiddenDim, sessOpts)` — creates a persistent ONNX session with pre-allocated tensors for the fast path.
 
-On any failure, the ONNX Runtime environment is cleaned up before returning the error.
+The resulting `sessOpts` is reused for both the persistent single-text session and temporary batch sessions. On any failure, the session options and ONNX Runtime environment are cleaned up before returning the error. `sessOpts` is released by `Close()`.
 
 ### Process-global singleton limitation
 
@@ -87,6 +95,18 @@ if err != nil {
 defer emb.Close()
 
 vec, err := emb.EmbedQuery(context.Background(), "authentication middleware")
+```
+
+To bound CPU usage in a resource-constrained environment, set `IntraOpThreads` to a positive value (omitting it or setting `0` keeps the legacy ONNX default):
+
+```go
+emb, err := embedding.NewEmbedder(embedding.EmbedderConfig{
+    ModelPath:      "/path/to/model.onnx",
+    TokenizerPath:  "/path/to/tokenizer.json",
+    LibraryPath:    "/path/to/libonnxruntime.dylib",
+    IntraOpThreads: 2, // cap ONNX intra-op parallelism at 2 threads
+    Logger:         logger,
+})
 ```
 
 ## ONNX Runtime

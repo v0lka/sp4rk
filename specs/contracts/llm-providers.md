@@ -50,7 +50,7 @@ Data is plain Go values. The composite model-ID convention (`"provider/model"`) 
 
 ## Error Propagation
 
-- **Transient errors** (HTTP 429, 502, 503, 529, network blips) are retried inside `Router.Call` with exponential backoff (1s → 2s → 4s, capped at `MaxBackoff`, ±20% jitter) before the error reaches the caller. `MaxRetries` defaults to 3 when unset; a negative value disables retries.
+- **Transient errors** (HTTP 408, 429, 500, 502, 503, 504, 520–524, 529, network blips) are retried inside `Router.Call` with exponential backoff (1s → 2s → 4s, capped at `MaxBackoff`, ±20% jitter) before the error reaches the caller. `MaxRetries` defaults to 3 when unset; a negative value disables retries.
 - **Non-retryable errors** (auth, 4xx other than 429, malformed response) propagate out of `Call` to the executor.
 - **Context-window overflow** is detected pre-submission: `Router.validateContextWindow` rejects requests whose estimated token count exceeds the model's effective window (context window minus output reserve minus safety margin) by returning a context-window error before the provider is called.
 - **Model switching errors** from `SetModel` (unknown composite ID, ambiguous bare name) propagate to the host. When a bare model name is ambiguous across providers, the router logs a warning (if a logger is configured) and selects deterministically.
