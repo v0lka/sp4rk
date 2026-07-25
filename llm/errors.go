@@ -45,10 +45,25 @@ func IsRetryable(err error) bool {
 	return false
 }
 
-// classifyHTTPStatus returns true for retryable HTTP status codes: 429, 502, 503, 529.
+// classifyHTTPStatus returns true for transient HTTP status codes that are safe
+// to retry. This is exhaustive over the classes of transient failures a client
+// can observe from an LLM provider gateway:
+//
+//   - 408 Request Timeout: the origin gave up waiting for the client.
+//   - 429 Too Many Requests: rate limit / quota — back off and retry.
+//   - 500 Internal Server Error: transient upstream faults; the major provider
+//     SDKs (OpenAI, Anthropic) treat 500 as retryable for LLM calls.
+//   - 502 Bad Gateway, 503 Service Unavailable: gateway/origin unavailable.
+//   - 504 Gateway Timeout: the standard (RFC 7231) gateway timeout.
+//   - 520-524: Cloudflare edge errors (unknown error, web server down,
+//     connection timed out, origin unreachable, origin timeout). 524 in
+//     particular is Cloudflare's proprietary equivalent of 504: the edge waited
+//     for an origin that never responded in time. Without retry, a single slow
+//     generation surfaces as a hard, non-retryable task failure.
+//   - 529 Overloaded: Anthropic-specific transient overload.
 func classifyHTTPStatus(code int) bool {
 	switch code {
-	case 429, 502, 503, 529:
+	case 408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529:
 		return true
 	default:
 		return false

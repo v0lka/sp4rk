@@ -23,15 +23,24 @@ func TestIsRetryable_HTTPStatus(t *testing.T) {
 		status    int
 		retryable bool
 	}{
+		{"408 Request Timeout", 408, true},
 		{"429 Too Many Requests", 429, true},
+		{"500 Internal Server Error", 500, true},
 		{"502 Bad Gateway", 502, true},
 		{"503 Service Unavailable", 503, true},
+		{"504 Gateway Timeout", 504, true},
+		{"520 Cloudflare Unknown Error", 520, true},
+		{"521 Cloudflare Web Server Down", 521, true},
+		{"522 Cloudflare Connection Timed Out", 522, true},
+		{"523 Cloudflare Origin Unreachable", 523, true},
+		{"524 Cloudflare Origin Timeout", 524, true},
 		{"529 Overloaded", 529, true},
 		{"400 Bad Request", 400, false},
 		{"401 Unauthorized", 401, false},
 		{"403 Forbidden", 403, false},
 		{"404 Not Found", 404, false},
-		{"500 Internal Server Error", 500, false},
+		{"409 Conflict", 409, false},
+		{"451 Unavailable For Legal Reasons", 451, false},
 	}
 
 	for _, tt := range tests {
@@ -145,11 +154,18 @@ func TestWrapProviderError(t *testing.T) {
 			retryable:  true,
 		},
 		{
-			name:       "HTTP 500 not retryable",
+			name:       "HTTP 500 is retryable (transient upstream fault)",
 			provider:   "anthropic",
 			statusCode: 500,
 			err:        errors.New("server error"),
-			retryable:  false,
+			retryable:  true,
+		},
+		{
+			name:       "HTTP 524 Cloudflare origin timeout is retryable",
+			provider:   "Z-ai",
+			statusCode: 524,
+			err:        errors.New("a timeout occurred"),
+			retryable:  true,
 		},
 		{
 			name:       "network timeout with no HTTP status",
