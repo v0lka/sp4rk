@@ -495,6 +495,33 @@ func splitInlineReason(val string) (verdictPart, reasonPart string, ok bool) {
 	return verdictPart, reasonPart, true
 }
 
+// judgeAllowTokens and judgeConfirmTokens are the exact verdict spellings the
+// parser recognizes. Matching is whole-token (case-insensitive) rather than
+// substring so that negated compounds such as "DISALLOW" and "DISAPPROVE" —
+// which contain "ALLOW"/"APPROVE" as substrings but express the opposite
+// intent — are never misclassified as ALLOW, which would silently bypass the
+// confirmation gate. Such negations instead fail-safe to CONFIRM.
+var judgeAllowTokens = map[string]struct{}{
+	"ALLOW":    {},
+	"ALLOWED":  {},
+	"APPROVE":  {},
+	"APPROVED": {},
+	"SAFE":     {},
+}
+
+var judgeConfirmTokens = map[string]struct{}{
+	"CONFIRM":    {},
+	"CONFIRMED":  {},
+	"DENY":       {},
+	"DENIED":     {},
+	"BLOCK":      {},
+	"BLOCKED":    {},
+	"DISALLOW":   {},
+	"DISAPPROVE": {},
+	"REJECT":     {},
+	"MANUAL":     {},
+}
+
 // matchVerdict classifies a verdict token as ALLOW or CONFIRM. Returns
 // ok=false when the token is not recognizable (the caller keeps the safe
 // default verdict in that case).
@@ -506,14 +533,13 @@ func matchVerdict(val string) (JudgeVerdict, bool) {
 		v = v[:i]
 	}
 	v = strings.TrimRight(v, ".:!?")
-	switch {
-	case strings.Contains(v, "ALLOW"), strings.Contains(v, "APPROVE"), v == "SAFE":
+	if _, ok := judgeAllowTokens[v]; ok {
 		return VerdictAllow, true
-	case strings.Contains(v, "CONFIRM"), strings.Contains(v, "DENY"), strings.Contains(v, "BLOCK"), v == "MANUAL":
-		return VerdictConfirm, true
-	default:
-		return VerdictConfirm, false
 	}
+	if _, ok := judgeConfirmTokens[v]; ok {
+		return VerdictConfirm, true
+	}
+	return VerdictConfirm, false
 }
 
 // normalizeReason trims surrounding whitespace and a single layer of matching

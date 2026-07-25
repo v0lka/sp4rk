@@ -1600,3 +1600,57 @@ func TestParseJudgeResponse_EmphasisInKeyRegionOnly(t *testing.T) {
 		t.Errorf("expected preserved reason with colon, got %q", reason)
 	}
 }
+
+// TestParseJudgeResponse_NegationIsNotAllow is a security regression test.
+// Negated compounds such as "DISALLOW" and "DISAPPROVE" contain "ALLOW" and
+// "APPROVE" as substrings; a substring matcher misclassifies them as ALLOW,
+// silently bypassing the confirmation gate for a destructive call. They must
+// instead fail-safe to CONFIRM.
+func TestParseJudgeResponse_NegationIsNotAllow(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+	}{
+		{"disallow", "VERDICT: DISALLOW\nREASON: destructive write"},
+		{"disapprove", "VERDICT: DISAPPROVE\nREASON: unsafe operation"},
+		{"disallow_lowercase", "VERDICT: disallow\nREASON: dangerous"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			verdict, reason := parseJudgeResponse(tc.content)
+			if verdict != VerdictConfirm {
+				t.Errorf("negation must fail-safe to VerdictConfirm, got %d (ALLOW would bypass the gate)", verdict)
+			}
+			if reason == "" {
+				t.Errorf("expected the stated reason to be preserved, got empty")
+			}
+		})
+	}
+}
+
+// TestParseJudgeResponse_ConfirmTokens confirms the exact confirm-vocabulary
+// spellings are recognized (whole-token match), including aliases added when
+// switching from substring to exact-token matching.
+func TestParseJudgeResponse_ConfirmTokens(t *testing.T) {
+	for _, tok := range []string{"CONFIRM", "CONFIRMED", "DENY", "DENIED", "BLOCK", "BLOCKED", "REJECT", "MANUAL"} {
+		t.Run(tok, func(t *testing.T) {
+			verdict, _ := parseJudgeResponse("VERDICT: " + tok + "\nREASON: needs approval")
+			if verdict != VerdictConfirm {
+				t.Errorf("expected VerdictConfirm for %q, got %d", tok, verdict)
+			}
+		})
+	}
+}
+
+// TestParseJudgeResponse_AllowTokens confirms the exact allow-vocabulary
+// spellings (including ALLOWED/APPROVED/SAFE aliases) are recognized.
+func TestParseJudgeResponse_AllowTokens(t *testing.T) {
+	for _, tok := range []string{"ALLOW", "ALLOWED", "APPROVE", "APPROVED", "SAFE"} {
+		t.Run(tok, func(t *testing.T) {
+			verdict, _ := parseJudgeResponse("VERDICT: " + tok + "\nREASON: safe")
+			if verdict != VerdictAllow {
+				t.Errorf("expected VerdictAllow for %q, got %d", tok, verdict)
+			}
+		})
+	}
+}
