@@ -800,3 +800,80 @@ func TestModelRegistry_MultipleSources(t *testing.T) {
 		t.Errorf("expected TokenizerType %q, got %q", expectedMeta.TokenizerType, meta.TokenizerType)
 	}
 }
+
+// TestModelRegistry_SetCachedMetadata_PopulatesCache verifies that a late-learned
+// entry written via SetCachedMetadata is returned by Resolve and is preferred
+// over a HuggingFace fetch (tier 3 is consulted before the network lookup at
+// the same tier).
+func TestModelRegistry_SetCachedMetadata_PopulatesCache(t *testing.T) {
+	registry := NewModelRegistry(nil)
+	model := "local-only-model"
+	expected := ModelMetadata{
+		ContextWindow: 262144,
+		OutputLimit:   4096,
+		TokenizerType: "approximate",
+	}
+
+	registry.SetCachedMetadata(model, expected)
+
+	meta, ok := registry.Resolve(context.Background(), model)
+	if !ok {
+		t.Fatal("expected ok=true for cached model")
+	}
+	if meta.ContextWindow != expected.ContextWindow {
+		t.Errorf("ContextWindow: got %d, want %d", meta.ContextWindow, expected.ContextWindow)
+	}
+	if meta.OutputLimit != expected.OutputLimit {
+		t.Errorf("OutputLimit: got %d, want %d", meta.OutputLimit, expected.OutputLimit)
+	}
+	if meta.Family == "" {
+		t.Error("expected non-empty Family resolved by SetCachedMetadata")
+	}
+}
+
+// TestModelRegistry_SetCachedMetadata_DoesNotOverrideBuiltIn verifies the
+// tier priority: an entry written via SetCachedMetadata is shadowed when the
+// model has a built-in (tier 2) entry. Built-in specs always win.
+func TestModelRegistry_SetCachedMetadata_DoesNotOverrideBuiltIn(t *testing.T) {
+	registry := NewModelRegistry(nil)
+
+	// "gpt-4o" is a built-in model. Seed the cache with a bogus window.
+	registry.SetCachedMetadata("gpt-4o", ModelMetadata{
+		ContextWindow: 999999,
+		OutputLimit:   1,
+		TokenizerType: "approximate",
+	})
+
+	meta, _ := registry.Resolve(context.Background(), "gpt-4o")
+	// Built-in gpt-4o window is 128000; the cached bogus value must NOT surface.
+	if meta.ContextWindow != 128000 {
+		t.Errorf("built-in spec clobbered by cache: got %d, want 128000", meta.ContextWindow)
+	}
+}
+
+// TestModelRegistry_SetCachedMetadata_DoesNotOverrideUserOverride verifies that
+// a user override (tier 1) always wins over a late-learned cache entry (tier 3).
+func TestModelRegistry_SetCachedMetadata_DoesNotOverrideUserOverride(t *testing.T) {
+	overrides := map[string]ModelMetadata{
+		"custom-model": {
+			ContextWindow: 32768,
+			OutputLimit:   2048,
+			TokenizerType: "custom",
+		},
+	}
+	registry := NewModelRegistry(overrides)
+
+	registry.SetCachedMetadata("custom-model", ModelMetadata{
+		ContextWindow: 262144,
+		OutputLimit:   4096,
+		TokenizerType: "approximate",
+	})
+
+	meta, _ := registry.Resolve(context.Background(), "custom-model")
+	if meta.ContextWindow != 32768 {
+		t.Errorf("user override clobbered by cache: got %d, want 32768", meta.ContextWindow)
+	}
+	if meta.OutputLimit != 2048 {
+		t.Errorf("user override clobbered by cache: got %d, want 2048", meta.OutputLimit)
+	}
+}

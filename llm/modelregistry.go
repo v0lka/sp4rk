@@ -153,6 +153,24 @@ func (r *ModelRegistry) Invalidate(model string) {
 	r.mu.Unlock()
 }
 
+// SetCachedMetadata stores a late-learned metadata entry in the registry cache
+// (Resolution tier 3). This lets callers that discover a model's real context
+// window after construction — e.g. a lazy probe of a local OpenAI-compatible
+// server — populate the result so subsequent Resolve calls return it without
+// re-querying the network.
+//
+// Tier-3 priority means the entry takes effect only when no user override
+// (tier 1) or built-in entry (tier 2) already exists for the model, so a
+// config.yaml override or a well-known model's spec is never silently clobbered.
+// Calling this for a model that already resolved from tier 1/2 will simply be
+// shadowed at Resolve time.
+func (r *ModelRegistry) SetCachedMetadata(model string, meta ModelMetadata) {
+	meta.Family = resolveFamily(model, meta)
+	r.mu.Lock()
+	r.cache[model] = meta
+	r.mu.Unlock()
+}
+
 // resolveFamily determines the family for a model.
 // If already set in metadata, returns it directly; otherwise delegates to DetectFamily.
 func resolveFamily(modelID string, meta ModelMetadata) string {
