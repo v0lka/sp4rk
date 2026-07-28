@@ -10,16 +10,29 @@ sp4rk ships the *primitives*; the host application assembles the *policy*. The S
 
 - the `ToolPolicy` enum and per-tool policy resolution,
 - the `ToolJudger` interface and the fail-closed confirmation flow (`ConfirmFunc`/`ConfirmationRequest`/`ConfirmationResponse`),
+- the path-locality primitive — [`tools.IsWithinRoot`](#path-locality-primitive) and [`AllPathsInSessionRoots`](#path-locality-primitive), consulted by the judge fast-path auto-approval and every tool-argument containment check (see [Path-Locality Primitive](#path-locality-primitive)),
 - the prompt-injection defense (`security.WrapUntrustedContent`/`StripUntrustedTags`), and
 - the MCP tool-shadowing guard.
 
 The host application owns, and this spec deliberately does **not** cover:
 
-- workspace/temp-directory auto-approval (path-locality heuristics that bypass confirmation),
+- the *decision* to enable path-locality auto-approval (whether the judge fast-path is on, which session roots are configured, confirmation UX),
 - command blacklists (e.g. dangerous-shell patterns),
 - symlink-forced confirmation gating.
 
 Those decisions depend on host-specific concepts (session roots, command grammars, OS conventions) and are wired by the embedding application around the SDK registry.
+
+<a id="path-locality-primitive"></a>
+### Path-Locality Primitive
+
+`tools.IsWithinRoot(ctx, root, path)` is the canonical path-containment check consulted by the judge fast-path (`AllPathsInSessionRoots`), file-tool argument resolution, symlink inside/outside classification, working-directory validation, cache-coherence gating, and ignore-root selection. It resolves symlinks through the longest existing prefix of both paths, then folds letter case **only when the session flag is set** — determined by probing the filesystem at session-root resolution time (`pathutil.DetectCaseInsensitive`):
+
+- **Case-insensitive filesystems** (macOS APFS, Windows NTFS): the fold matches the on-disk reality, so a not-yet-existing target written with different casing than the session root is still recognized as local.
+- **Case-sensitive filesystems** (Linux ext4/tmpfs/btrfs, and case-sensitive APFS volumes): containment is case-sensitive, so distinct-cased siblings such as `/ws/Project` and `/ws/project` are never conflated. Applying the fold unconditionally here would be an authorization bypass — a non-local sibling whose name differs only by case would be auto-approved as "local".
+
+The flag defaults to **case-sensitive** (fail-safe): when detection is impossible (no existing ancestor, unreadable root), containment never widens. Case folding never weakens escape prevention — it can only cause an otherwise-mismatched path to be considered "within" a root; the `..` traversal and symlink-escape logic is unaffected.
+
+The flag is attached automatically by `tools.WithWorkspacePath` (which probes the workspace root) and may be overridden by `tools.WithCaseInsensitivePaths`. Hosts that construct their context without `WithWorkspacePath` (e.g. `WithWorkspacePathNoProbe`) inherit the fail-safe case-sensitive default unless they attach the flag explicitly.
 
 ## Tool Policies
 
@@ -209,7 +222,7 @@ File-based defaults, session roots, and blacklist regexes are host-application c
 ## Anti-Patterns
 
 - Treating the `ToolJudge` as a primary safety mechanism — it is advisory, not a gate. The hard boundary is the policy layer.
-- Relying on path-locality auto-approval as a security control — that is host wiring layered over these primitives, not an engine guarantee.
+- Relying on path-locality auto-approval as a security control — the SDK ships the primitive (`IsWithinRoot`/`AllPathsInSessionRoots`), but whether the judge fast-path is *enabled* and which roots are configured is host wiring, not an engine guarantee.
 - Calling `tool.Execute` directly instead of `registry.Execute` — bypasses policy resolution, the judge gate, the confirmation flow, and MCP shadowing protection.
 - Constructing a `ContextWindow` with `InjectionDefenseEnabled: false` in production — disables untrusted-content wrapping for all tool output.
 - Expecting the engine to enforce a command blacklist — blacklists are host/tool-specific `ToolJudger` heuristics, not engine behavior.

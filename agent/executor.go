@@ -15,7 +15,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/v0lka/sp4rk/llm"
-	"github.com/v0lka/sp4rk/pathutil"
 	"github.com/v0lka/sp4rk/tools"
 )
 
@@ -734,7 +733,7 @@ func (e *Executor) buildCacheMeta(ctx context.Context, toolName string, input js
 			}
 			// Validate path is within workspace boundary before stat.
 			if wsPath := tools.WorkspacePathFrom(ctx); wsPath != "" {
-				if !isPathWithinWorkspace(absPath, wsPath) {
+				if !isPathWithinWorkspace(ctx, absPath, wsPath) {
 					return meta
 				}
 			}
@@ -762,14 +761,11 @@ func (e *Executor) buildCacheMeta(ctx context.Context, toolName string, input js
 }
 
 // isPathWithinWorkspace checks whether the given absolute path lies within the workspace root.
-// It delegates to pathutil.IsWithinPath for symlink-aware containment validation.
-// On error (e.g. paths on different volumes) it fails safe by returning false.
-func isPathWithinWorkspace(path, workspaceRoot string) bool {
-	within, err := pathutil.IsWithinPath(workspaceRoot, path)
-	if err != nil {
-		return false
-	}
-	return within
+// It delegates to [tools.IsWithinRoot], which resolves symlinks and folds letter
+// case only when the session flag is set (i.e. the filesystem was detected
+// case-insensitive). On error it fails safe by returning false.
+func isPathWithinWorkspace(ctx context.Context, path, workspaceRoot string) bool {
+	return tools.IsWithinRoot(ctx, workspaceRoot, path)
 }
 
 // Run executes the ReAct loop for the given task tools and context manager.

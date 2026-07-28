@@ -2608,34 +2608,34 @@ func TestFormatPreCompactionNudge_Empty(t *testing.T) {
 // --- isPathWithinWorkspace tests ---
 
 func TestIsPathWithinWorkspace_Positive(t *testing.T) {
-	if !isPathWithinWorkspace("/home/user/project/src/main.go", "/home/user/project") {
+	if !isPathWithinWorkspace(context.Background(), "/home/user/project/src/main.go", "/home/user/project") {
 		t.Error("path within workspace should return true")
 	}
-	if !isPathWithinWorkspace("/home/user/project", "/home/user/project") {
+	if !isPathWithinWorkspace(context.Background(), "/home/user/project", "/home/user/project") {
 		t.Error("exact workspace root should return true")
 	}
-	if !isPathWithinWorkspace("/home/user/project/sub/deep/file.txt", "/home/user/project") {
+	if !isPathWithinWorkspace(context.Background(), "/home/user/project/sub/deep/file.txt", "/home/user/project") {
 		t.Error("deep path within workspace should return true")
 	}
 }
 
 func TestIsPathWithinWorkspace_Negative(t *testing.T) {
-	if isPathWithinWorkspace("/etc/passwd", "/home/user/project") {
+	if isPathWithinWorkspace(context.Background(), "/etc/passwd", "/home/user/project") {
 		t.Error("path outside workspace should return false")
 	}
-	if isPathWithinWorkspace("/home/user/other", "/home/user/project") {
+	if isPathWithinWorkspace(context.Background(), "/home/user/other", "/home/user/project") {
 		t.Error("sibling directory should return false")
 	}
-	if isPathWithinWorkspace("/home/user/projectsuffix", "/home/user/project") {
+	if isPathWithinWorkspace(context.Background(), "/home/user/projectsuffix", "/home/user/project") {
 		t.Error("path with shared prefix but not within workspace should return false")
 	}
 }
 
 func TestIsPathWithinWorkspace_DirtyPaths(t *testing.T) {
-	if !isPathWithinWorkspace("/home/user/project/src/../lib/main.go", "/home/user/project") {
+	if !isPathWithinWorkspace(context.Background(), "/home/user/project/src/../lib/main.go", "/home/user/project") {
 		t.Error("cleaned path within workspace should return true")
 	}
-	if isPathWithinWorkspace("/home/user/project/../../etc/passwd", "/home/user/project") {
+	if isPathWithinWorkspace(context.Background(), "/home/user/project/../../etc/passwd", "/home/user/project") {
 		t.Error("cleaned path escaping workspace should return false")
 	}
 }

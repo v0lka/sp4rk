@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+
+	"github.com/v0lka/sp4rk/pathutil"
 )
 
 // ToolPolicy defines the security policy for a tool.
@@ -108,8 +110,33 @@ func (b *BaseTool) IsUntrusted() bool { return b.Untrusted }
 // workspacePathKey is the context key for the session workspace path.
 type workspacePathKey struct{}
 
-// WithWorkspacePath returns a new context with the session workspace path attached.
+// WithWorkspacePath returns a new context with the session workspace path
+// attached. It also probes the filesystem at the workspace root (via
+// [pathutil.DetectCaseInsensitive]) to auto-attach the session-wide
+// case-folding flag, so path-containment checks correctly treat case-insensitive
+// filesystems (macOS APFS, Windows NTFS) and case-sensitive ones (Linux ext4)
+// according to their actual behaviour rather than a hardcoded assumption.
+//
+// The probe climbs to the nearest existing ancestor when the workspace does
+// not exist yet, and fails safe to case-sensitive when detection is impossible.
+// Hosts may override the auto-detected value with [WithCaseInsensitivePaths]
+// after this call (last-writer-wins). To attach a workspace without the probe
+// (e.g. when the caller has already determined case-sensitivity), use
+// [WithWorkspacePathNoProbe].
 func WithWorkspacePath(ctx context.Context, path string) context.Context {
+	ctx = context.WithValue(ctx, workspacePathKey{}, path)
+	if path != "" {
+		ctx = WithCaseInsensitivePaths(ctx, pathutil.DetectCaseInsensitive(path))
+	}
+	return ctx
+}
+
+// WithWorkspacePathNoProbe attaches the session workspace path WITHOUT probing
+// the filesystem for case-sensitivity. Use this when the caller has already
+// determined (or wishes to override) case-sensitivity via
+// [WithCaseInsensitivePaths], to avoid the one-time probe cost. Equivalent to
+// attaching the raw value as in earlier versions.
+func WithWorkspacePathNoProbe(ctx context.Context, path string) context.Context {
 	return context.WithValue(ctx, workspacePathKey{}, path)
 }
 
@@ -214,6 +241,73 @@ func SessionRoots(ctx context.Context) []string {
 		add(r)
 	}
 	return roots
+}
+
+// caseInsensitivePathsKey is the context key for the session-wide flag that
+// selects whether path-containment checks fold letter case. When true, a path
+// that differs from a session root only by casing (e.g. "/ws/Project" vs
+// "/ws/project") is treated as local — matching case-insensitive filesystems
+// (macOS APFS, Windows NTFS). When false (the default, fail-safe), containment
+// is case-sensitive so distinct-cased siblings on a case-sensitive filesystem
+// (Linux ext4/tmpfs) are never conflated.
+type caseInsensitivePathsKey struct{}
+
+// WithCaseInsensitivePaths attaches the session-wide case-folding flag to the
+// context. All path-containment checks that consult [IsWithinRoot] read it.
+//
+// Hosts do not normally need to call this directly: [WithWorkspacePath] probes
+// the filesystem at the workspace root via [pathutil.DetectCaseInsensitive] and
+// sets the flag automatically. Call this only to override the auto-detected
+// value (e.g. to force case-sensitive semantics on a case-insensitive volume,
+// or to avoid the one-time probe cost). Last-writer-wins: a later call
+// overrides an earlier auto-detection.
+func WithCaseInsensitivePaths(ctx context.Context, caseInsensitive bool) context.Context {
+	return context.WithValue(ctx, caseInsensitivePathsKey{}, caseInsensitive)
+}
+
+// CaseInsensitivePathsFrom reports whether path-containment checks should fold
+// letter case for the session. Returns false (case-sensitive, fail-safe) when
+// no flag is attached.
+func CaseInsensitivePathsFrom(ctx context.Context) bool {
+	if v, ok := ctx.Value(caseInsensitivePathsKey{}).(bool); ok {
+		return v
+	}
+	return false
+}
+
+// IsWithinRoot is the canonical path-containment check for the tools layer. It
+// reports whether path lies within root, resolving symlinks through the longest
+// existing prefix of both paths, and folding letter case when the session flag
+// ([CaseInsensitivePathsFrom]) is set.
+//
+// Case folding is gated on the detected filesystem case-sensitivity rather
+// than applied unconditionally: on a case-sensitive filesystem (Linux ext4/
+// tmpfs), distinct-cased siblings such as "/ws/Project" and "/ws/project" are
+// genuinely different directories and must NOT be treated as local. This
+// prevents an authorization-bypass where a path-locality auto-approve would
+// accept a non-local sibling whose name only differs by case.
+//
+// Fails closed: returns false on any error (empty root, paths on different
+// volumes, or Rel failure). Callers that need to distinguish "not contained"
+// from "errored" should call pathutil.IsWithinPath/IsWithinPathFold directly.
+func IsWithinRoot(ctx context.Context, root, path string) bool {
+	if root == "" {
+		return false
+	}
+	within, err := isWithinPath(ctx, root, path)
+	if err != nil {
+		return false
+	}
+	return within
+}
+
+// isWithinPath selects the case-sensitive or case-insensitive pathutil
+// primitive based on the session flag, resolving the error/containment result.
+func isWithinPath(ctx context.Context, root, path string) (bool, error) {
+	if CaseInsensitivePathsFrom(ctx) {
+		return pathutil.IsWithinPathFold(root, path)
+	}
+	return pathutil.IsWithinPath(root, path)
 }
 
 // taskContextKey is the context key for passing task context through Go's context.Context.

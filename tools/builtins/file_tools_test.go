@@ -1453,7 +1453,7 @@ func TestRipgrepTool_Judge_InsideWorkspace(t *testing.T) {
 
 func TestValidateWorkDir_EmptyWorkspace(t *testing.T) {
 	// Empty roots → any directory accepted.
-	err := validateWorkDir("/anywhere", nil)
+	err := validateWorkDir(context.Background(), "/anywhere", nil)
 	if err != nil {
 		t.Errorf("expected nil error when no workspace, got: %v", err)
 	}
@@ -1465,7 +1465,7 @@ func TestValidateWorkDir_InsideWorkspace(t *testing.T) {
 	if err := os.Mkdir(subDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	err := validateWorkDir(subDir, []string{tmpDir})
+	err := validateWorkDir(context.Background(), subDir, []string{tmpDir})
 	if err != nil {
 		t.Errorf("expected nil error for inside workspace, got: %v", err)
 	}
@@ -1475,7 +1475,7 @@ func TestValidateWorkDir_OutsideWorkspace(t *testing.T) {
 	tmpDir := t.TempDir()
 	// Use a path that is clearly outside workspace and NOT inside the system temp dir.
 	// We use /dev because it's a real directory on Unix that is not under /tmp.
-	err := validateWorkDir("/dev", []string{tmpDir})
+	err := validateWorkDir(context.Background(), "/dev", []string{tmpDir})
 	if err == nil {
 		t.Error("expected error for outside workspace")
 	}
@@ -1489,7 +1489,7 @@ func TestValidateWorkDir_InsideTempDir(t *testing.T) {
 	}
 	// Temp dir from context (different from workspace) should still allow.
 	ws := t.TempDir()
-	err := validateWorkDir(subDir, []string{ws, tmpDir})
+	err := validateWorkDir(context.Background(), subDir, []string{ws, tmpDir})
 	if err != nil {
 		t.Errorf("expected nil error for inside temp dir, got: %v", err)
 	}
@@ -1499,7 +1499,7 @@ func TestValidateWorkDir_InsideSystemTemp(t *testing.T) {
 	// System temp dir should always be allowed.
 	tmpDir := os.TempDir()
 	ws := t.TempDir()
-	err := validateWorkDir(tmpDir, []string{ws})
+	err := validateWorkDir(context.Background(), tmpDir, []string{ws})
 	if err != nil {
 		t.Errorf("expected nil error for system temp dir, got: %v", err)
 	}
@@ -2361,6 +2361,34 @@ func TestIsPathInSessionRoots_AllowedRoot(t *testing.T) {
 	}
 }
 
+// TestIsPathInSessionRoots_DifferingCase proves path-locality is
+// case-insensitive: a target whose path components differ only in letter case
+// from a session root is still recognized as local. The decisive case is a
+// NOT-YET-EXISTING target under a root whose canonical casing cannot be
+// recovered by EvalSymlinks — here the differing component lives entirely in
+// the non-existent suffix of an allowed root. This mirrors macOS APFS /
+// Windows NTFS semantics, where letter case does not change which file is
+// referenced.
+func TestIsPathInSessionRoots_DifferingCase(t *testing.T) {
+	ws := t.TempDir()
+	allowedRoot := t.TempDir()
+	ctx := tools.WithWorkspacePath(context.Background(), ws)
+	ctx = tools.WithAllowedRoots(ctx, []string{allowedRoot})
+	// allowedRoot exists on disk (canonical casing). Build a target whose
+	// non-existent suffix uses a casing variant of a NEW component under it.
+	// The existing prefix (allowedRoot) resolves to itself, so the case
+	// difference survives in the unresolved tail and must be folded.
+	target := filepath.Join(allowedRoot, "Project", "newfile.txt") // existing root, new "Project"
+	// Probe with the opposite casing in the target's differing component.
+	casedTarget := filepath.Join(allowedRoot, "project", "newfile.txt")
+	if isPathInSessionRoots(ctx, target) != isPathInSessionRoots(ctx, casedTarget) {
+		t.Error("locality verdict must be identical regardless of letter case")
+	}
+	if !isPathInSessionRoots(ctx, casedTarget) {
+		t.Error("expected differing-case target to be in session roots (case-insensitive)")
+	}
+}
+
 // TestValidateWorkDir_InsideAllowedRoot proves validateWorkDir accepts a
 // working directory inside an additional allowed root.
 func TestValidateWorkDir_InsideAllowedRoot(t *testing.T) {
@@ -2371,7 +2399,7 @@ func TestValidateWorkDir_InsideAllowedRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	roots := []string{ws, allowedRoot}
-	if err := validateWorkDir(subDir, roots); err != nil {
+	if err := validateWorkDir(context.Background(), subDir, roots); err != nil {
 		t.Errorf("expected nil error for inside allowed root, got: %v", err)
 	}
 }

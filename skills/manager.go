@@ -1,12 +1,14 @@
 package skills
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
 
+	sdktools "github.com/v0lka/sp4rk/tools"
 	"github.com/v0lka/sp4rk/pathutil"
 )
 
@@ -133,7 +135,14 @@ func (m *SkillManager) SkillPath(name string) (string, bool) {
 // path traversal attacks. Returns the cleaned absolute path or an error if the
 // resolved path escapes the base directory. Used by both SkillManager and
 // ReadSkillResourceTool to eliminate duplication (S-19).
-func SafeResolvePath(baseDir, relPath string) (string, error) {
+//
+// Containment respects the session case-sensitivity flag (see
+// [sdktools.CaseInsensitivePathsFrom]): case-insensitive filesystems (macOS
+// APFS / Windows NTFS) fold letter case, case-sensitive ones (Linux ext4)
+// do not. The base directory is checked via the case-aware IsWithinRoot, with
+// symlink resolution of both the base and the resolved path to prevent
+// symlink-based traversal bypass.
+func SafeResolvePath(ctx context.Context, baseDir, relPath string) (string, error) {
 	cleanBase := filepath.Clean(baseDir)
 	// Only resolve baseDir symlinks when baseDir itself is a symlink
 	// (not when an ancestor directory like /var → /private/var is).
@@ -156,8 +165,16 @@ func SafeResolvePath(baseDir, relPath string) (string, error) {
 	// symlink-checked (no textual-only fallback).
 	cleanAbs := filepath.Clean(pathutil.ResolveExistingPrefix(joined))
 	if cleanAbs != cleanBase {
-		ok, err := pathutil.IsWithinPath(cleanBase, cleanAbs)
-		if err != nil || !ok {
+		// Use the session case-sensitivity-aware containment check so a skill
+		// resource written with different casing than the skill directory is
+		// still recognized as contained on case-insensitive filesystems. Use a
+		// plain ctx-less fallback when ctx is nil (SafeResolvePath is also used
+		// in contexts without a session flag).
+		if ctx != nil {
+			if !sdktools.IsWithinRoot(ctx, cleanBase, cleanAbs) {
+				return "", fmt.Errorf("path %q escapes skill directory", relPath)
+			}
+		} else if ok, err := pathutil.IsWithinPath(cleanBase, cleanAbs); err != nil || !ok {
 			return "", fmt.Errorf("path %q escapes skill directory", relPath)
 		}
 	}

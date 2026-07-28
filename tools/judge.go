@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/v0lka/sp4rk/llm"
-	"github.com/v0lka/sp4rk/pathutil"
 	"github.com/v0lka/sp4rk/strutil"
 	"github.com/v0lka/sp4rk/tools/internal/judge_prompts"
 )
@@ -259,18 +258,14 @@ func isShellTool(toolName string) bool {
 
 // isPathInWorkspace checks if the given absolute path is within the workspace
 // directory (the workspace path itself counts as inside). Delegates to
-// pathutil.IsWithinPath, which resolves symlinks through the longest existing
-// prefix of both paths.
-func isPathInWorkspace(absPath, workspacePath string) bool {
-	if workspacePath == "" {
-		// Empty workspace means containment cannot be established.
-		return false
-	}
-	within, err := pathutil.IsWithinPath(workspacePath, absPath)
-	if err != nil {
-		return false
-	}
-	return within
+// [IsWithinRoot], which resolves symlinks through the longest existing prefix
+// of both paths and folds letter case only when the session flag
+// ([CaseInsensitivePathsFrom]) is set — i.e. when the filesystem was detected
+// to be case-insensitive (macOS APFS, Windows NTFS). On a case-sensitive
+// filesystem (Linux ext4/tmpfs) containment is case-sensitive so distinct-cased
+// siblings are not conflated. Fails closed (false) on error.
+func isPathInWorkspace(ctx context.Context, absPath, workspacePath string) bool {
+	return IsWithinRoot(ctx, workspacePath, absPath)
 }
 
 // ExtractJSONStrings recursively extracts all string values from a value
@@ -298,8 +293,10 @@ func ExtractPaths(s string) []string {
 }
 
 // AllPathsInDir returns true if the JSON input contains at least one absolute
-// path and every such path is within the specified directory.
-func AllPathsInDir(input json.RawMessage, dir string) bool {
+// path and every such path is within the specified directory. Containment
+// respects the session case-sensitivity flag (see [CaseInsensitivePathsFrom]):
+// case-insensitive filesystems fold letter case, case-sensitive ones do not.
+func AllPathsInDir(ctx context.Context, input json.RawMessage, dir string) bool {
 	if dir == "" {
 		return false
 	}
@@ -321,7 +318,7 @@ func AllPathsInDir(input json.RawMessage, dir string) bool {
 
 	for _, p := range allPaths {
 		cleaned := filepath.Clean(p)
-		if !isPathInWorkspace(cleaned, dir) {
+		if !isPathInWorkspace(ctx, cleaned, dir) {
 			return false
 		}
 	}
@@ -335,14 +332,15 @@ func AllPathsInWorkspace(ctx context.Context, input json.RawMessage) bool {
 	if workspacePath == "" {
 		return false
 	}
-	return AllPathsInDir(input, workspacePath)
+	return AllPathsInDir(ctx, input, workspacePath)
 }
 
 // pathInAnyRoot reports whether absPath is contained within at least one of
-// the given roots. Reuses isPathInWorkspace for symlink-resolved containment.
-func pathInAnyRoot(absPath string, roots []string) bool {
+// the given roots. Reuses [IsWithinRoot] for symlink-aware, case-sensitive-
+// aware containment.
+func pathInAnyRoot(ctx context.Context, absPath string, roots []string) bool {
 	for _, root := range roots {
-		if isPathInWorkspace(absPath, root) {
+		if isPathInWorkspace(ctx, absPath, root) {
 			return true
 		}
 	}
@@ -376,7 +374,7 @@ func AllPathsInSessionRoots(ctx context.Context, input json.RawMessage) bool {
 
 	for _, p := range allPaths {
 		cleaned := filepath.Clean(p)
-		if !pathInAnyRoot(cleaned, roots) {
+		if !pathInAnyRoot(ctx, cleaned, roots) {
 			return false
 		}
 	}

@@ -683,7 +683,7 @@ func TestAllPathsInDir(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := AllPathsInDir(json.RawMessage(tt.input), tt.dir)
+			got := AllPathsInDir(context.Background(), json.RawMessage(tt.input), tt.dir)
 			if got != tt.want {
 				t.Errorf("allPathsInDir() = %v, want %v", got, tt.want)
 			}
@@ -795,6 +795,7 @@ func TestAllPathsInSessionRoots(t *testing.T) {
 		ws       string
 		tempDir  string
 		roots    []string
+		fold     bool // forces case-insensitive containment (overrides auto-detect)
 		input    string
 		want     bool
 	}{
@@ -851,13 +852,36 @@ func TestAllPathsInSessionRoots(t *testing.T) {
 			input: `{"file":"/home/user/project/main.go"}`,
 			want:  true,
 		},
+		{
+			// Tool-argument path locality must be case-insensitive so that a
+			// path written with different casing than the session root is
+			// still recognized as local — matching macOS APFS / Windows NTFS
+			// case-insensitive filesystem semantics. The fold flag is set
+			// explicitly because the fictional root cannot be probed.
+			name:  "path inside workspace root with differing case",
+			ws:    "/home/user/Project",
+			fold:  true,
+			input: `{"file":"/home/user/project/main.go"}`,
+			want:  true,
+		},
+		{
+			name:  "path inside allowed root with differing case",
+			ws:    "/home/user/project",
+			roots: []string{"/Aux/Work"},
+			fold:  true,
+			input: `{"file":"/aux/work/build/out.bin"}`,
+			want:  true,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := context.Background()
 			if tt.ws != "" {
-				ctx = WithWorkspacePath(ctx, tt.ws)
+				ctx = WithWorkspacePathNoProbe(ctx, tt.ws)
+			}
+			if tt.fold {
+				ctx = WithCaseInsensitivePaths(ctx, true)
 			}
 			if tt.tempDir != "" {
 				ctx = WithTempDir(ctx, tt.tempDir)

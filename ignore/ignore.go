@@ -52,9 +52,16 @@ type pattern struct {
 // root once at construction, collecting every .gitignore and .aiignore file
 // (root plus nested directories) and compiling their patterns into globs
 // anchored relative to the root.
+//
+// caseInsensitive records whether the root's filesystem folds letter case
+// (macOS APFS / Windows NTFS). It is probed once at construction via
+// [pathutil.DetectCaseInsensitive] and selects the containment variant used by
+// RootFor / RootFor in Multi, so containment matches the filesystem's actual
+// case-sensitivity rather than a hardcoded assumption.
 type Resolver struct {
-	root     string
-	patterns []pattern
+	root            string
+	patterns        []pattern
+	caseInsensitive bool
 }
 
 // NewResolver walks root once, collecting and compiling every ignore file
@@ -77,7 +84,10 @@ func NewResolver(root string) (*Resolver, error) {
 	// resolved path (/private/tmp/...) would yield a Rel of "../../private/..."
 	// and every ignored file would leak as "not ignored".
 	absRoot = pathutil.ResolveExistingPrefix(absRoot)
-	r := &Resolver{root: absRoot}
+	r := &Resolver{
+		root:            absRoot,
+		caseInsensitive: pathutil.DetectCaseInsensitive(absRoot),
+	}
 	if err := r.load(); err != nil {
 		return nil, fmt.Errorf("ignore: load root %q: %w", absRoot, err)
 	}
@@ -378,10 +388,20 @@ func (m *Multi) Resolvers() []*Resolver {
 }
 
 // RootFor returns the Resolver whose root contains absPath, or nil when no
-// known root contains it. Containment is symlink-aware via pathutil.
+// known root contains it. Containment is symlink-aware via pathutil and
+// respects each resolver's detected filesystem case-sensitivity: case-
+// insensitive roots (macOS APFS / Windows NTFS) fold letter case via
+// [pathutil.IsWithinPathFold], case-sensitive roots (Linux ext4) use
+// [pathutil.IsWithinPath].
 func (m *Multi) RootFor(absPath string) *Resolver {
 	for _, r := range m.resolvers {
-		ok, err := pathutil.IsWithinPath(r.root, absPath)
+		var ok bool
+		var err error
+		if r.caseInsensitive {
+			ok, err = pathutil.IsWithinPathFold(r.root, absPath)
+		} else {
+			ok, err = pathutil.IsWithinPath(r.root, absPath)
+		}
 		if err != nil {
 			continue
 		}

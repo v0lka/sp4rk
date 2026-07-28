@@ -56,8 +56,7 @@ func resolvePath(ctx context.Context, path string) string {
 		return ""
 	}
 	resolved := pathutil.ResolveExistingPrefix(absJoined)
-	ok, err := pathutil.IsWithinPath(realWS, resolved)
-	if err != nil || !ok {
+	if !tools.IsWithinRoot(ctx, realWS, resolved) {
 		return ""
 	}
 	return resolved
@@ -115,7 +114,7 @@ func validateResolvedPath(resolved string) error {
 // negatives.
 func isPathInSessionRoots(ctx context.Context, absPath string) bool {
 	for _, root := range tools.SessionRoots(ctx) {
-		if isPathInRootStr(absPath, root) {
+		if isPathInRootStr(ctx, absPath, root) {
 			return true
 		}
 	}
@@ -124,8 +123,11 @@ func isPathInSessionRoots(ctx context.Context, absPath string) bool {
 
 // isPathInRootStr reports whether absPath is contained within the single root
 // string. Returns false when the root is empty or unresolvable, or when
-// absPath is not contained within it.
-func isPathInRootStr(absPath, root string) bool {
+// absPath is not contained within it. Uses [tools.IsWithinRoot] so containment
+// respects the session case-sensitivity flag: case-insensitive filesystems
+// (macOS APFS / Windows NTFS) fold letter case, case-sensitive ones (Linux
+// ext4) do not.
+func isPathInRootStr(ctx context.Context, absPath, root string) bool {
 	if root == "" {
 		return false
 	}
@@ -133,8 +135,7 @@ func isPathInRootStr(absPath, root string) bool {
 	if err != nil {
 		return false
 	}
-	ok, _ := pathutil.IsWithinPath(rootAbs, absPath)
-	return ok
+	return tools.IsWithinRoot(ctx, rootAbs, absPath)
 }
 
 // formatOutsideRootsError returns a descriptive error for a path that falls

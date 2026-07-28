@@ -267,7 +267,7 @@ func TestSafeResolvePathValid(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	path, err := SafeResolvePath(tmpDir, "sub/file.txt")
+	path, err := SafeResolvePath(context.TODO(), tmpDir, "sub/file.txt")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -286,7 +286,7 @@ func TestSafeResolvePathValid(t *testing.T) {
 func TestSafeResolvePathDot(t *testing.T) {
 	t.Parallel()
 	tmpDir := t.TempDir()
-	path, err := SafeResolvePath(tmpDir, ".")
+	path, err := SafeResolvePath(context.TODO(), tmpDir, ".")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -302,7 +302,7 @@ func TestSafeResolvePathDot(t *testing.T) {
 func TestSafeResolvePathEmptyRelPath(t *testing.T) {
 	t.Parallel()
 	tmpDir := t.TempDir()
-	path, err := SafeResolvePath(tmpDir, "")
+	path, err := SafeResolvePath(context.TODO(), tmpDir, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -329,7 +329,7 @@ func TestSafeResolvePathTraversal(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err := SafeResolvePath(baseDir, "../outside.txt")
+	_, err := SafeResolvePath(context.TODO(), baseDir, "../outside.txt")
 	if err == nil {
 		t.Error("expected error for path traversal")
 	}
@@ -353,7 +353,7 @@ func TestSafeResolvePathSymlinkEscapes(t *testing.T) {
 		t.Skipf("symlinks not supported: %v", err)
 	}
 
-	_, err := SafeResolvePath(baseDir, "escape-link")
+	_, err := SafeResolvePath(context.TODO(), baseDir, "escape-link")
 	if err == nil {
 		t.Error("expected error for symlink escaping base directory")
 	}
@@ -375,7 +375,7 @@ func TestSafeResolvePathBrokenSymlink(t *testing.T) {
 	// Broken symlink within base should still resolve; the longest existing
 	// prefix is symlink-resolved (e.g. /var → /private/var on macOS) and the
 	// non-existent suffix is joined back.
-	path, err := SafeResolvePath(baseDir, "broken")
+	path, err := SafeResolvePath(context.TODO(), baseDir, "broken")
 	if err != nil {
 		t.Fatalf("unexpected error for broken symlink within base: %v", err)
 	}
@@ -402,7 +402,7 @@ func TestSafeResolvePathSymlinkToDirInsideBase(t *testing.T) {
 		t.Skipf("symlinks not supported: %v", err)
 	}
 
-	path, err := SafeResolvePath(baseDir, "link-dir/data.txt")
+	path, err := SafeResolvePath(context.TODO(), baseDir, "link-dir/data.txt")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

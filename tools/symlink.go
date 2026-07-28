@@ -57,7 +57,7 @@ func DetectSymlinksInToolInput(ctx context.Context, toolName string, input, sche
 
 	if toolName == "bash_exec" {
 		paths, unexpandable := extractBashPathsFromInput(input, workspace)
-		inside, outside = checkPathsForSymlinks(paths, roots)
+		inside, outside = checkPathsForSymlinks(ctx, paths, roots)
 		return inside, outside, unexpandable
 	}
 
@@ -85,7 +85,7 @@ func DetectSymlinksInToolInput(ctx context.Context, toolName string, input, sche
 		// follow the path-naming convention.
 		paths = extractAllPathsFromJSON(input, workspace)
 	}
-	inside, outside = checkPathsForSymlinks(paths, roots)
+	inside, outside = checkPathsForSymlinks(ctx, paths, roots)
 	return inside, outside, false
 }
 
@@ -472,7 +472,7 @@ func wordLiteral(w *syntax.Word) string {
 // and allowed roots (from tools.SessionRoots); the primary root (first element,
 // the workspace) is passed to walkSymlinkComponents for OS-level symlink
 // detection and fail-closed escalation scope.
-func checkPathsForSymlinks(paths, roots []string) (inside, outside []SymlinkTraversal) {
+func checkPathsForSymlinks(ctx context.Context, paths, roots []string) (inside, outside []SymlinkTraversal) {
 	// The workspace (first session root, when present) is used for OS-level
 	// symlink detection (IsOSLevelSymlink) and for the fail-closed escalation
 	// scope in walkSymlinkComponents. Relative-path resolution is unaffected:
@@ -482,7 +482,7 @@ func checkPathsForSymlinks(paths, roots []string) (inside, outside []SymlinkTrav
 		workspace = roots[0]
 	}
 	for _, p := range paths {
-		for _, t := range walkSymlinkComponents(p, workspace) {
+		for _, t := range walkSymlinkComponents(ctx, p, workspace) {
 			if t.Unresolvable {
 				// Cannot determine where the component resolves — fail closed
 				// and escalate as an outside-workspace traversal.
@@ -495,7 +495,7 @@ func checkPathsForSymlinks(paths, roots []string) (inside, outside []SymlinkTrav
 				if root == "" {
 					continue
 				}
-				if within, _ := pathutil.IsWithinPath(root, t.FullResolved); within {
+				if within := IsWithinRoot(ctx, root, t.FullResolved); within {
 					ok = true
 					break
 				}
@@ -530,7 +530,7 @@ func checkPathsForSymlinks(paths, roots []string) (inside, outside []SymlinkTrav
 // mean the candidate string is not a valid filesystem path (e.g. a code blob
 // longer than NAME_MAX that was mistakenly treated as a path), so there is
 // definitely no symlink there. Escalating on them caused false prompts.
-func walkSymlinkComponents(absPath, workspace string) []SymlinkTraversal {
+func walkSymlinkComponents(ctx context.Context, absPath, workspace string) []SymlinkTraversal {
 	if absPath == "" {
 		return nil
 	}
@@ -584,7 +584,7 @@ func walkSymlinkComponents(absPath, workspace string) []SymlinkTraversal {
 			// lies within the workspace; unreadable paths outside the
 			// workspace are gated by containment checks elsewhere.
 			if workspace != "" {
-				if within, werr := pathutil.IsWithinPath(workspace, current); werr == nil && within {
+				if within := IsWithinRoot(ctx, workspace, current); within {
 					traversals = append(traversals, SymlinkTraversal{
 						OriginalPath: absPath,
 						SymlinkAt:    current,

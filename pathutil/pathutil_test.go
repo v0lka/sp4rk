@@ -3,6 +3,8 @@ package pathutil
 import (
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -130,6 +132,166 @@ func TestIsWithinPath_DifferentVolumes(t *testing.T) {
 	}
 }
 
+// TestIsWithinPath_CaseSensitiveDiffersOnNonExistent contrasts the two
+// variants on the SAME path pair. Case sensitivity only matters for paths
+// that do not exist on disk: once a prefix exists, EvalSymlinks (inside
+// ResolveExistingPrefix) canonicalizes its casing, so even the case-sensitive
+// primitive matches by location. For non-existent parents the casing is
+// preserved verbatim, which is exactly where IsWithinPath must reject a
+// differing-case child while IsWithinPathFold accepts it.
+func TestIsWithinPath_CaseSensitiveDiffersOnNonExistent(t *testing.T) {
+	dir := t.TempDir()
+	// Neither parent nor child exists, so casing cannot be canonicalized.
+	parent := filepath.Join(dir, "Workspace")
+	child := filepath.Join(dir, "workspace", "file.txt")
+
+	ok, err := IsWithinPath(parent, child)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ok {
+		t.Error("case-sensitive IsWithinPath must reject differing-case non-existent path")
+	}
+
+	// The fold variant must accept the exact same pair.
+	okFold, errFold := IsWithinPathFold(parent, child)
+	if errFold != nil {
+		t.Fatalf("unexpected fold error: %v", errFold)
+	}
+	if !okFold {
+		t.Error("fold variant must accept the differing-case path")
+	}
+}
+
+func TestIsWithinPathFold_InsideCaseInsensitive(t *testing.T) {
+	dir := t.TempDir()
+	parent := filepath.Join(dir, "Project")
+	_ = os.MkdirAll(parent, 0o755)
+	// Child uses a different casing for the parent component but stays inside.
+	child := filepath.Join(dir, "project", "sub", "file.txt")
+
+	ok, err := IsWithinPathFold(parent, child)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !ok {
+		t.Error("case-insensitive variant should recognize differing-case child as within parent")
+	}
+}
+
+func TestIsWithinPathFold_SamePathCaseInsensitive(t *testing.T) {
+	dir := t.TempDir()
+	// Two casings of the same on-disk location.
+	parent := dir
+	child := flipCaseTail(dir)
+
+	ok, err := IsWithinPathFold(parent, child)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !ok {
+		t.Error("same path with differing case should be within itself (fold)")
+	}
+}
+
+func TestIsWithinPathFold_NonExistentCaseInsensitive(t *testing.T) {
+	// The decisive case for tool-argument locality: neither parent nor child
+	// exists, so EvalSymlinks cannot carry canonical casing. Fold must still
+	// recognize the differing-case child as within the parent.
+	dir := t.TempDir()
+	parent := filepath.Join(dir, "Workspace")
+	child := filepath.Join(dir, "workspace", "new", "file.txt")
+
+	ok, err := IsWithinPathFold(parent, child)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !ok {
+		t.Error("non-existent differing-case path should be within parent (fold)")
+	}
+}
+
+func TestIsWithinPathFold_OutsideStillRejected(t *testing.T) {
+	dir := t.TempDir()
+	parent := filepath.Join(dir, "Workspace")
+	_ = os.MkdirAll(parent, 0o755)
+	// Genuinely different path, not just a casing variant.
+	child := filepath.Join(dir, "Other", "file.txt")
+	_ = os.MkdirAll(filepath.Dir(child), 0o755)
+
+	ok, err := IsWithinPathFold(parent, child)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ok {
+		t.Error("genuinely different path must still be rejected by fold variant")
+	}
+}
+
+func TestIsWithinPathFold_ParentEscapeStillRejected(t *testing.T) {
+	dir := t.TempDir()
+	// Parent is a deeper path; child is its ancestor with a different case —
+	// fold must NOT let an ancestor sneak in as "within" a descendant.
+	parent := filepath.Join(dir, "Workspace", "Sub")
+	_ = os.MkdirAll(parent, 0o755)
+	ancestor := filepath.Join(dir, "workspace") // "workspace" == "Workspace" by fold, but is an ANCESTOR
+
+	ok, err := IsWithinPathFold(parent, ancestor)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ok {
+		t.Error("ancestor must not be considered within a descendant, even when case matches by fold")
+	}
+}
+
+func TestIsWithinPathFold_DotDotEscapeStillRejected(t *testing.T) {
+	dir := t.TempDir()
+	parent := filepath.Join(dir, "Workspace")
+	_ = os.MkdirAll(parent, 0o755)
+	// A ".." escape with matching case must still be rejected.
+	child := filepath.Join(dir, "workspace", "..", "secret.txt")
+
+	ok, err := IsWithinPathFold(parent, child)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ok {
+		t.Error("'..' escape must still be rejected by fold variant")
+	}
+}
+
+func TestIsWithinPathFold_EmptyParent(t *testing.T) {
+	ok, err := IsWithinPathFold("", "/some/path")
+	if err == nil {
+		t.Error("empty parent should return an error (fail closed)")
+	}
+	if ok {
+		t.Error("empty parent should return false")
+	}
+}
+
+// flipCaseTail returns a same-location-but-different-case variant of an
+// absolute path by re-casing its last component. It mirrors the production
+// fold (strings.ToLower) and falls back to ToUpper when the name is already
+// all-lower-case, so the result always differs as long as the component has a
+// letter. Used to build a case-variant of a real temp dir without depending
+// on filesystem case-sensitivity at test time.
+func flipCaseTail(p string) string {
+	dir, base := filepath.Split(p)
+	if base == "" {
+		return p
+	}
+	flipped := strings.ToLower(base)
+	if flipped == base {
+		flipped = strings.ToUpper(base)
+	}
+	if flipped == base {
+		return p // no cased letters to flip
+	}
+	return dir + flipped
+}
+
 func TestSplitPathComponents_Absolute(t *testing.T) {
 	// Build the path with the OS separator so it is genuinely absolute on
 	// every platform (Windows needs a drive letter, handled by VolumeName).
@@ -138,6 +300,56 @@ func TestSplitPathComponents_Absolute(t *testing.T) {
 	if len(result) != 3 || result[0] != "home" || result[1] != "user" || result[2] != "file.txt" {
 		t.Errorf("got %v, want [home user file.txt]", result)
 	}
+}
+
+// TestDetectCaseInsensitive returns the filesystem's actual case-sensitivity
+// for a real writable directory. The assertion is platform-dependent: a temp
+// directory under /tmp on Linux reports false, while macOS APFS and Windows
+// report true. We assert against runtime.GOOS so the test is portable and
+// documents the expected per-platform outcome.
+func TestDetectCaseInsensitive(t *testing.T) {
+	dir := t.TempDir()
+	got := DetectCaseInsensitive(dir)
+	want := runtime.GOOS == "darwin" || runtime.GOOS == "windows"
+	if got != want {
+		t.Errorf("DetectCaseInsensitive(%q) = %v, want %v (GOOS=%s)", dir, got, want, runtime.GOOS)
+	}
+	// The probe must not leave artefacts behind.
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("DetectCaseInsensitive left probe artefacts: %v", names)
+	}
+}
+
+// TestDetectCaseInsensitive_NonExistentClimbsToAncestor verifies that a
+// non-existent target directory falls back to the nearest existing ancestor,
+// so detection returns the filesystem's true case-sensitivity rather than the
+// fail-safe false.
+func TestDetectCaseInsensitive_NonExistentClimbsToAncestor(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "DoesNotExist", "subdir", "leaf")
+	got := DetectCaseInsensitive(target)
+	want := runtime.GOOS == "darwin" || runtime.GOOS == "windows"
+	if got != want {
+		t.Errorf("DetectCaseInsensitive(%q) = %v, want %v (GOOS=%s)", target, got, want, runtime.GOOS)
+	}
+}
+
+// TestDetectCaseInsensitive_NoExistingAncestorFailsClosed documents the
+// fail-safe contract: the probe always returns a deterministic bool without
+// panicking. We cannot reliably construct a path with no existing ancestor on
+// a real system (the filesystem root always exists), so we assert only that
+// the call is panic-free and yields a bool.
+func TestDetectCaseInsensitive_NoExistingAncestorFailsClosed(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("DetectCaseInsensitive panicked: %v", r)
+		}
+	}()
+	_ = DetectCaseInsensitive("/nonexistent-root-probe/a/b/c")
 }
 
 func TestSplitPathComponents_Root(t *testing.T) {

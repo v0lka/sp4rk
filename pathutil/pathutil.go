@@ -14,16 +14,57 @@ import (
 // (ResolveExistingPrefix) to handle OS-level symlinks like macOS
 // /var → /private/var even when paths don't exist on disk.
 //
+// The comparison is case-SENSITIVE. Use [IsWithinPathFold] for the
+// case-insensitive variant required by path-locality decisions on
+// case-insensitive filesystems (the default on macOS and Windows), where
+// "/Users/Foo" and "/Users/foo" denote the same location.
+//
 // Returns an error when parent is empty (containment cannot be determined —
 // callers must guard empty roots explicitly) or when Rel fails (e.g., paths
 // on different volumes).
 func IsWithinPath(parent, child string) (bool, error) {
+	return isWithinPath(parent, child, false)
+}
+
+// IsWithinPathFold is the case-insensitive variant of [IsWithinPath]: two
+// path components that differ only by Unicode case (via strings.ToLower) are
+// treated as equal. This mirrors the semantics of case-insensitive
+// filesystems — the default on macOS (APFS) and Windows (NTFS) — where a path
+// written with different casing than the session root still resolves to the
+// same on-disk location.
+//
+// This is the primitive consulted by tool-argument path-locality checks
+// (judge fast-path auto-approval, file-tool judges, symlink inside/outside
+// classification, working-directory validation): a tool path that is local
+// must be recognized as such regardless of letter case. Existing paths are
+// already case-normalized by EvalSymlinks inside ResolveExistingPrefix, so
+// the folding only matters for not-yet-existing paths (e.g. write_file
+// targets) whose longest existing prefix cannot carry the canonical casing.
+//
+// Case folding never weakens escape prevention: it can only cause an
+// otherwise-mismatched path to be considered "within" a root; the ".."
+// traversal and symlink-escape logic is unaffected. Returns an error when
+// parent is empty, matching IsWithinPath.
+func IsWithinPathFold(parent, child string) (bool, error) {
+	return isWithinPath(parent, child, true)
+}
+
+// isWithinPath is the shared implementation of [IsWithinPath] (case-sensitive)
+// and [IsWithinPathFold] (case-insensitive). When fold is true, both resolved
+// paths are lowercased before the textual Rel comparison, making component
+// matching case-insensitive. Lowercasing both sides preserves volume-prefix
+// agreement (e.g. "C:" / "c:") and the ".." / separator checks.
+func isWithinPath(parent, child string, fold bool) (bool, error) {
 	// Empty parent means containment cannot be determined — fail closed.
 	if parent == "" {
 		return false, errors.New("pathutil: empty parent path — containment cannot be determined")
 	}
 	parentResolved := ResolveExistingPrefix(filepath.Clean(parent))
 	childResolved := ResolveExistingPrefix(filepath.Clean(child))
+	if fold {
+		parentResolved = strings.ToLower(parentResolved)
+		childResolved = strings.ToLower(childResolved)
+	}
 
 	rel, err := filepath.Rel(parentResolved, childResolved)
 	if err != nil {
@@ -63,6 +104,84 @@ func SplitPathComponents(absPath string) []string {
 		}
 	}
 	return result
+}
+
+// DetectCaseInsensitive reports whether the filesystem at dir treats names
+// that differ only by Unicode case as the same file. It probes by creating a
+// temporary file whose name carries an upper-case letter, then checking
+// whether the lower-cased name resolves to it. This mirrors the default
+// behaviour of macOS APFS and Windows NTFS (case-insensitive) versus Linux
+// ext4/tmpfs/btrfs (case-sensitive).
+//
+// When dir does not exist (e.g. a brand-new session workspace) or is not
+// writable, the probe climbs to the nearest existing ancestor directory:
+// case-sensitivity is a filesystem property shared by the whole mount, so an
+// ancestor on the same volume yields the correct answer for the target. If no
+// usable ancestor is found, it returns false — the fail-safe default, since
+// assuming case-insensitivity on an actually case-sensitive filesystem can
+// turn a non-local path into a "local" one (an authorization-bypass risk for
+// path-locality checks such as [IsWithinPathFold]).
+//
+// Detect once per session root (at session-root resolution time) and pass the
+// result down to containment checks rather than calling per query.
+func DetectCaseInsensitive(dir string) bool {
+	probeDir, ok := existingAncestorDir(filepath.Clean(dir))
+	if !ok {
+		return false
+	}
+	return probeCaseInsensitive(probeDir)
+}
+
+// existingAncestorDir returns the deepest existing directory at or above dir,
+// climbing toward the filesystem root. It returns ("", false) when no existing
+// directory is found (e.g. an unreachable root). Writability is confirmed by
+// the probe itself: a non-writable ancestor simply fails the probe.
+func existingAncestorDir(dir string) (string, bool) {
+	candidate := dir
+	for {
+		if info, err := os.Stat(candidate); err == nil && info.IsDir() {
+			return candidate, true
+		}
+		parent := filepath.Dir(candidate)
+		if parent == candidate {
+			// Reached the filesystem root without an existing directory.
+			return "", false
+		}
+		candidate = parent
+	}
+}
+
+// probeCaseInsensitive creates a uniquely-named temporary file with a
+// mixed-case name in dir and reports whether the opposite-case name resolves
+// to it. All created entries are removed before returning.
+func probeCaseInsensitive(dir string) bool {
+	f, err := os.CreateTemp(dir, "CaseSense-*.probe")
+	if err != nil {
+		return false
+	}
+	name := filepath.Base(f.Name())
+	if err := f.Close(); err != nil {
+		_ = os.Remove(name)
+		return false
+	}
+	defer func() { _ = os.Remove(f.Name()) }()
+
+	// The "CaseSense-" prefix guarantees an upper-case letter, so the
+	// lower-cased name always differs and the test is meaningful.
+	flipped := strings.ToLower(name)
+	if flipped == name {
+		flipped = strings.ToUpper(name)
+	}
+	if flipped == name {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(dir, flipped)); err == nil {
+		// The differently-cased name resolves — the filesystem is
+		// case-insensitive. On such a filesystem this is the same file, so
+		// the deferred Remove of the original name already cleaned it up.
+		return true
+	}
+	return false
 }
 
 // ResolveExistingPrefix resolves symlinks on the longest existing prefix of

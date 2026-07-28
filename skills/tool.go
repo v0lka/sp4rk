@@ -74,7 +74,7 @@ func (t *ReadSkillResourceTool) Execute(ctx context.Context, input json.RawMessa
 	}
 
 	// Resolve the resource path safely (prevent path traversal)
-	absPath, err := SafeResolvePath(skillDir, parsed.Path)
+	absPath, err := SafeResolvePath(ctx, skillDir, parsed.Path)
 	if err != nil {
 		return sdktools.ErrorResult("invalid resource path: %v", err), nil
 	}

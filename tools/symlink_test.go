@@ -382,7 +382,7 @@ func TestWalkSymlinkComponents_NoSymlink(t *testing.T) {
 	_ = os.MkdirAll(filepath.Dir(normalPath), 0o755)
 	_ = os.WriteFile(normalPath, []byte("hello"), 0o644)
 
-	result := walkSymlinkComponents(normalPath, dir)
+	result := walkSymlinkComponents(context.Background(), normalPath, dir)
 	if result != nil {
 		t.Fatalf("expected nil for non-symlink path, got %+v", result)
 	}
@@ -400,7 +400,7 @@ func TestWalkSymlinkComponents_SimpleSymlink(t *testing.T) {
 
 	nestedPath := filepath.Join(symlinkPath, "target.txt")
 
-	results := walkSymlinkComponents(nestedPath, dir)
+	results := walkSymlinkComponents(context.Background(), nestedPath, dir)
 	if len(results) == 0 {
 		t.Fatal("expected symlink traversal, got none")
 	}
@@ -429,7 +429,7 @@ func TestWalkSymlinkComponents_DeepSymlink(t *testing.T) {
 
 	nestedPath := filepath.Join(symlinkAt, "secret")
 
-	results := walkSymlinkComponents(nestedPath, dir)
+	results := walkSymlinkComponents(context.Background(), nestedPath, dir)
 	if len(results) == 0 {
 		t.Fatal("expected symlink traversal for deep symlink")
 	}
@@ -446,7 +446,7 @@ func TestWalkSymlinkComponents_DeepSymlink(t *testing.T) {
 func TestWalkSymlinkComponents_NonExistentPath(t *testing.T) {
 	// Use a path that doesn"t traverse OS-level symlinks (macOS /tmp -> /private/tmp)
 	path := "/does/not/exist/at/all"
-	result := walkSymlinkComponents(path, "")
+	result := walkSymlinkComponents(context.Background(), path, "")
 	if result != nil {
 		t.Fatalf("expected nil for non-existent path, got %+v", result)
 	}
@@ -455,14 +455,14 @@ func TestWalkSymlinkComponents_NonExistentPath(t *testing.T) {
 func TestWalkSymlinkComponents_NonExistentParent(t *testing.T) {
 	dir := t.TempDir()
 	nope := filepath.Join(dir, "nope", "file.txt")
-	result := walkSymlinkComponents(nope, dir)
+	result := walkSymlinkComponents(context.Background(), nope, dir)
 	if result != nil {
 		t.Fatalf("expected nil for non-existent parent, got %+v", result)
 	}
 }
 
 func TestWalkSymlinkComponents_Empty(t *testing.T) {
-	result := walkSymlinkComponents("", "")
+	result := walkSymlinkComponents(context.Background(), "", "")
 	if result != nil {
 		t.Fatalf("expected nil for empty path, got %+v", result)
 	}
@@ -475,7 +475,7 @@ func TestWalkSymlinkComponents_LastComponentSymlink(t *testing.T) {
 	symlinkPath := filepath.Join(dir, "link.file")
 	_ = os.Symlink(target, symlinkPath)
 
-	results := walkSymlinkComponents(symlinkPath, dir)
+	results := walkSymlinkComponents(context.Background(), symlinkPath, dir)
 	if len(results) == 0 {
 		t.Fatal("expected symlink traversal")
 	}
@@ -867,7 +867,7 @@ func TestExtractBashPathsFromInput_WithWorkingDir(t *testing.T) {
 
 func TestWalkSymlinkComponents_RootOnly(t *testing.T) {
 	// A path that is just "/" has no components after splitting.
-	result := walkSymlinkComponents("/", "")
+	result := walkSymlinkComponents(context.Background(), "/", "")
 	if result != nil {
 		t.Fatalf("expected nil for root-only path, got %+v", result)
 	}
@@ -881,14 +881,14 @@ func TestCheckPathsForSymlinks_NoSymlinks(t *testing.T) {
 	_ = os.MkdirAll(filepath.Dir(normalPath), 0o755)
 	_ = os.WriteFile(normalPath, []byte("hello"), 0o644)
 
-	inside, outside := checkPathsForSymlinks([]string{normalPath}, []string{dir})
+	inside, outside := checkPathsForSymlinks(context.Background(), []string{normalPath}, []string{dir})
 	if len(inside) != 0 || len(outside) != 0 {
 		t.Fatalf("expected no traversals, got inside=%d outside=%d", len(inside), len(outside))
 	}
 }
 
 func TestCheckPathsForSymlinks_Empty(t *testing.T) {
-	inside, outside := checkPathsForSymlinks(nil, []string{"/ws"})
+	inside, outside := checkPathsForSymlinks(context.Background(), nil, []string{"/ws"})
 	if len(inside) != 0 || len(outside) != 0 {
 		t.Fatalf("expected no traversals for empty input, got inside=%d outside=%d", len(inside), len(outside))
 	}
@@ -955,7 +955,7 @@ func TestCheckPathsForSymlinks_LongComponentNoEscalation(t *testing.T) {
 	// snippet (e.g. an edit_file old_string) glued onto the workspace root.
 	candidate := filepath.Join(ws, strings.Repeat("a", 300))
 
-	inside, outside := checkPathsForSymlinks([]string{candidate}, []string{ws})
+	inside, outside := checkPathsForSymlinks(context.Background(), []string{candidate}, []string{ws})
 	if len(inside) != 0 || len(outside) != 0 {
 		t.Fatalf("expected no traversals for over-long component, got inside=%v outside=%v", inside, outside)
 	}
@@ -982,14 +982,14 @@ func TestCheckPathsForSymlinks_AllowedRootClassifiedInside(t *testing.T) {
 	throughLink := filepath.Join(link, "file.txt")
 
 	// With only the workspace root, the resolved target escapes → outside.
-	inside, outside := checkPathsForSymlinks([]string{throughLink}, []string{ws})
+	inside, outside := checkPathsForSymlinks(context.Background(), []string{throughLink}, []string{ws})
 	if len(inside) != 0 || len(outside) == 0 {
 		t.Fatalf("expected traversal outside with workspace-only roots, got inside=%d outside=%d",
 			len(inside), len(outside))
 	}
 
 	// With the allowed root added, the resolved target is contained → inside.
-	inside, outside = checkPathsForSymlinks([]string{throughLink}, []string{ws, auxRoot})
+	inside, outside = checkPathsForSymlinks(context.Background(), []string{throughLink}, []string{ws, auxRoot})
 	if len(inside) == 0 || len(outside) != 0 {
 		t.Fatalf("expected traversal inside with allowed root, got inside=%d outside=%d",
 			len(inside), len(outside))
@@ -1276,11 +1276,11 @@ func TestCheckPathsForSymlinks_SymlinkBeforeENOTDIR(t *testing.T) {
 	// regular file — os.Lstat on this final component yields ENOTDIR.
 	throughLink := filepath.Join(link, "subpath")
 
-	inside, outside := checkPathsForSymlinks([]string{throughLink}, []string{ws})
+	inside, outside := checkPathsForSymlinks(context.Background(), []string{throughLink}, []string{ws})
 	got := append([]SymlinkTraversal(nil), inside...)
 	got = append(got, outside...)
 	if len(got) != 1 {
-		t.Fatalf("checkPathsForSymlinks(%q) = %d traversal(s), want exactly 1 (the symlink at %s reported before the trailing ENOTDIR): %+v",
+		t.Fatalf("checkPathsForSymlinks(context.Background(), %q) = %d traversal(s), want exactly 1 (the symlink at %s reported before the trailing ENOTDIR): %+v",
 			throughLink, len(got), link, got)
 	}
 	if got[0].SymlinkAt != link {
