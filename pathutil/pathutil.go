@@ -20,8 +20,8 @@ import (
 // "/Users/Foo" and "/Users/foo" denote the same location.
 //
 // Returns an error when parent is empty (containment cannot be determined —
-// callers must guard empty roots explicitly) or when Rel fails (e.g., paths
-// on different volumes).
+// callers must guard empty roots explicitly) or when parent and child live on
+// different volumes (e.g. different Windows drives).
 func IsWithinPath(parent, child string) (bool, error) {
 	return isWithinPath(parent, child, false)
 }
@@ -51,9 +51,21 @@ func IsWithinPathFold(parent, child string) (bool, error) {
 
 // isWithinPath is the shared implementation of [IsWithinPath] (case-sensitive)
 // and [IsWithinPathFold] (case-insensitive). When fold is true, both resolved
-// paths are lowercased before the textual Rel comparison, making component
-// matching case-insensitive. Lowercasing both sides preserves volume-prefix
-// agreement (e.g. "C:" / "c:") and the ".." / separator checks.
+// paths are lowercased so the final containment check is case-insensitive.
+// Lowercasing both sides preserves volume-prefix agreement (e.g. "C:" / "c:").
+//
+// Containment is decided by an explicit prefix check rather than filepath.Rel,
+// which compares path components case-insensitively on Windows
+// (strings.EqualFold) and would treat a differing-case sibling as a genuine
+// descendant. Two safeguards surround the prefix check:
+//   - a volume mismatch (filepath.VolumeName differs) means parent and child
+//     live in different roots and cannot nest — it returns an error;
+//     VolumeName is empty on Unix, so this is a no-op there.
+//   - the parent is terminated with a separator before the prefix test, but
+//     never doubled (a root parent already ends in one), so a filesystem root
+//     or a Windows volume root is correctly recognized as containing its
+//     children. That separator also rejects a prefix-only sibling whose name
+//     merely starts with the parent's last component (e.g. "/usr" vs "/us").
 func isWithinPath(parent, child string, fold bool) (bool, error) {
 	// Empty parent means containment cannot be determined — fail closed.
 	if parent == "" {
@@ -66,22 +78,28 @@ func isWithinPath(parent, child string, fold bool) (bool, error) {
 		childResolved = strings.ToLower(childResolved)
 	}
 
-	rel, err := filepath.Rel(parentResolved, childResolved)
-	if err != nil {
-		return false, err
+	// A volume mismatch (e.g. different Windows drives) means parent and child
+	// live in different roots and cannot nest. filepath.VolumeName is empty on
+	// Unix, so this is a no-op there.
+	if filepath.VolumeName(parentResolved) != filepath.VolumeName(childResolved) {
+		return false, errors.New("pathutil: parent and child on different volumes")
 	}
-	// rel == "." means same path (child is within parent).
-	if rel == "." {
-		return true, nil
+
+	// Decide containment with an explicit prefix check: child is within parent
+	// only when, after the optional case folding applied above, it is parent
+	// followed by a separator (or identical to it). Terminate the parent with a
+	// separator so the prefix test cannot match a prefix-only sibling whose
+	// last component merely starts with the parent's (e.g. "/usr" vs "/us"), but
+	// never double it — a root parent already ends in one, and "//" (or
+	// "C:\\") would match no real child. The fold variant lowercased both
+	// sides, so this same check is case-insensitive for it — the desired split
+	// between IsWithinPath and IsWithinPathFold.
+	sep := string(filepath.Separator)
+	if !strings.HasSuffix(parentResolved, sep) {
+		parentResolved += sep
 	}
-	// rel == ".." or rel starting with ".." + separator means child escapes
-	// above parent. Use filepath.Separator so this works on Windows, where
-	// filepath.Rel returns backslash-separated paths (e.g. "..\dir") — a
-	// hard-coded "../" prefix check would miss those escapes.
-	// Note: strings.HasPrefix(rel, "..") alone is incorrect — it would also
-	// reject legitimate children whose name begins with ".." (e.g. "..foo").
-	parentPrefix := ".." + string(filepath.Separator)
-	return rel != ".." && !strings.HasPrefix(rel, parentPrefix), nil
+	return childResolved == strings.TrimSuffix(parentResolved, sep) ||
+		strings.HasPrefix(childResolved, parentResolved), nil
 }
 
 // SplitPathComponents splits a cleaned absolute path into non-empty components,

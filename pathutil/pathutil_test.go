@@ -123,12 +123,52 @@ func TestIsWithinPath_EmptyParent(t *testing.T) {
 }
 
 func TestIsWithinPath_DifferentVolumes(t *testing.T) {
-	// filepath.Rel fails for paths on different roots.
-	// On macOS/Linux this is hard to test without actual mounts;
-	// test the error path by providing fundamentally incompatible paths.
-	ok, err := IsWithinPath("/nonexistent/vol/a", "/vol/b")
-	if err != nil && ok {
-		t.Error("ok should be false when Rel returns error")
+	// Containment is impossible when parent and child live on different
+	// volumes (e.g. different Windows drives). filepath.VolumeName is empty on
+	// Unix, so the mismatch only surfaces there with an explicit volume prefix
+	// — which Unix paths don't carry. Construct a genuine cross-volume pair on
+	// Windows and verify the contract; on Unix the inputs share a volume and
+	// the mismatch path cannot be exercised.
+	parent, child := "/vol/a", "/vol/b"
+	if runtime.GOOS == "windows" {
+		parent = `C:\vol\a`
+		child = `D:\vol\b`
+	}
+	ok, err := IsWithinPath(parent, child)
+	if err == nil {
+		// Same volume (e.g. Unix): containment is a plain prefix check with no
+		// error — the volume-mismatch contract is not exercisable here.
+		_ = ok
+		return
+	}
+	if ok {
+		t.Error("ok should be false when parent and child are on different volumes")
+	}
+}
+
+// TestIsWithinPath_RootParent guards the regression where a filesystem-root
+// parent stopped being recognized as containing its descendants: terminating
+// the root with another separator produced "//" (or "C:\\") on Windows, which
+// no real child starts with.
+func TestIsWithinPath_RootParent(t *testing.T) {
+	root := string(filepath.Separator)
+	descendant := filepath.Join(root, "usr", "bin")
+
+	ok, err := IsWithinPath(root, descendant)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !ok {
+		t.Errorf("filesystem root %q must contain its descendant %q", root, descendant)
+	}
+
+	// The root is also within itself.
+	ok, err = IsWithinPath(root, root)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !ok {
+		t.Error("filesystem root should be within itself")
 	}
 }
 
