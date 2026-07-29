@@ -61,6 +61,16 @@ type TaskAware interface {
 	SetTask(task string)
 }
 
+// BlockTaskAware is an optional capability interface for ContextManager
+// implementations that can receive structured content blocks (text + images)
+// alongside the task text. The Conductor type-asserts the ContextManager
+// against this interface and calls SetTaskWithBlocks when
+// ConductorConfig.ContentBlocks is non-empty, giving the blocks precedence
+// over the plain Content string. sp4rk's memory.ContextWindow implements it.
+type BlockTaskAware interface {
+	SetTaskWithBlocks(task string, blocks []llm.ContentBlock)
+}
+
 // ConversationAware is an optional capability interface for ContextManager
 // implementations that can receive prior conversation messages (previous
 // user/assistant exchanges) to render before the current task content. The

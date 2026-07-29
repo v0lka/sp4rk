@@ -92,7 +92,7 @@ func NewRouter(ctx context.Context, cfg RouterConfig, registry *ModelRegistry) (
 		if entry.ProviderType == "" {
 			return nil, fmt.Errorf("provider %q has no type", entry.Name)
 		}
-		provider, err := createProviderFromConfig(ctx, entry.Name, entry.ProviderType, entry.APIKey, entry.BaseURL, cfg.HTTPClient)
+		provider, err := createProviderFromConfig(ctx, entry.Name, entry.ProviderType, entry.APIKey, entry.BaseURL, cfg.HTTPClient, cfg.Logger)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create provider %q: %w", entry.Name, err)
 		}
@@ -174,8 +174,9 @@ func NewRouter(ctx context.Context, cfg RouterConfig, registry *ModelRegistry) (
 // name is the logical provider name (config key) used for logging and error
 // reporting; it is forwarded to the provider so named compatible providers
 // (e.g. "lmstudio", "my-anthropic-proxy") report their real name, not a
-// hardcoded family name.
-func createProviderFromConfig(ctx context.Context, name, provType, apiKey, baseURL string, httpClient *http.Client) (Provider, error) {
+// hardcoded family name. logger is forwarded to the provider for debug-level
+// diagnostics (nil = slog.Default()).
+func createProviderFromConfig(ctx context.Context, name, provType, apiKey, baseURL string, httpClient *http.Client, logger *slog.Logger) (Provider, error) {
 	switch provType {
 	case "openai":
 		return NewOpenAIProvider(OpenAIProviderConfig{
@@ -183,6 +184,7 @@ func createProviderFromConfig(ctx context.Context, name, provType, apiKey, baseU
 			APIKey:     apiKey,
 			BaseURL:    baseURL,
 			HTTPClient: httpClient,
+			Logger:     logger,
 		})
 
 	case "anthropic":
@@ -191,6 +193,7 @@ func createProviderFromConfig(ctx context.Context, name, provType, apiKey, baseU
 			APIKey:     apiKey,
 			BaseURL:    baseURL,
 			HTTPClient: httpClient,
+			Logger:     logger,
 		})
 
 	default:

@@ -131,7 +131,7 @@ outer:
 		switch msg.Role {
 		case "user":
 			exchangeNum++
-			summary := truncateSummaryContent(msg.Content, 120)
+			summary := truncateSummaryContent(userMessageText(msg), 120)
 			line := fmt.Sprintf("%d. User: %s\n", exchangeNum, summary)
 			if b.Len()+len(line) > maxSummaryChars {
 				break outer
@@ -153,6 +153,32 @@ outer:
 		return "[No previous user messages to summarise]"
 	}
 
+	return b.String()
+}
+
+// userMessageText extracts the textual representation of a user message for
+// inclusion in a conversation summary. When the message carries structured
+// content blocks, text blocks are concatenated and image blocks are replaced
+// with the placeholder "[image attached]" (image data is not useful in a text
+// summary); unknown block types are skipped (matching provider behavior).
+// When ContentBlocks is empty, the plain Content string is used as before
+// (backward compatible for text-only messages).
+func userMessageText(msg llm.Message) string {
+	blocks := llm.NormalizeContentBlocks(msg)
+	if blocks == nil {
+		return msg.Content
+	}
+	var b strings.Builder
+	for _, blk := range blocks {
+		switch blk.Type {
+		case "text":
+			b.WriteString(blk.Text)
+		case "image":
+			b.WriteString("[image attached]")
+		default:
+			// Unknown block types are skipped (consistent with providers).
+		}
+	}
 	return b.String()
 }
 

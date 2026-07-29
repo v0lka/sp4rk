@@ -66,15 +66,22 @@ const stepStatusEvictedText = "[checklist update — evicted]"
 type ContextWindow struct {
 	systemPrompt string
 	taskContent  string // formatted task content (user message)
-	planContent  string // formatted plan content (system message)
-	steps        []sdkagent.Step
-	strategy     sdkagent.CompactionStrategy
-	tracker      *llm.ContextTokenTracker
-	modelMeta    llm.ModelMetadata
-	thresholds   CompactionThresholds
-	pruning      ToolOutputPruning
-	mutation     HistoryMutation
-	safetyMargin int // percentage of context window reserved as safety margin (default: 5)
+	// taskContentBlocks, when non-empty, carries structured content blocks
+	// (text + images) for the task user message. When set, BuildPrompt emits
+	// a Message with ContentBlocks; providers render the blocks and, if they
+	// contain no text block, fall back to taskContent (via
+	// llm.NormalizeContentBlocks). nil/empty preserves the legacy text-only
+	// SetTask path (backward compatible).
+	taskContentBlocks []llm.ContentBlock
+	planContent       string // formatted plan content (system message)
+	steps             []sdkagent.Step
+	strategy          sdkagent.CompactionStrategy
+	tracker           *llm.ContextTokenTracker
+	modelMeta         llm.ModelMetadata
+	thresholds        CompactionThresholds
+	pruning           ToolOutputPruning
+	mutation          HistoryMutation
+	safetyMargin      int // percentage of context window reserved as safety margin (default: 5)
 
 	// priorConversation holds messages from previous exchanges (prior
 	// user/assistant turns) that should appear in the prompt before the
@@ -262,8 +269,25 @@ func (cw *ContextWindow) Tracker() *llm.ContextTokenTracker {
 
 // SetTask sets the task content (user message in prompt).
 // The caller is responsible for formatting the task, including any criteria or context.
+// SetTask reverts to the text-only prompt path: any content blocks set by a
+// prior SetTaskWithBlocks call are cleared so BuildPrompt emits a plain text
+// user message.
 func (cw *ContextWindow) SetTask(task string) {
 	cw.taskContent = task
+	cw.taskContentBlocks = nil
+}
+
+// SetTaskWithBlocks sets the task content along with structured content blocks
+// (e.g. text + images) for the user message. When blocks is non-empty,
+// BuildPrompt emits a Message carrying ContentBlocks alongside the task text;
+// providers render the blocks and, if they contain no text block, fall back to
+// the task text (via llm.NormalizeContentBlocks) so the instruction always
+// reaches the model. Pass nil or an empty slice to revert to the legacy
+// text-only SetTask path. The caller is responsible for formatting the task
+// text and encoding any image blocks (base64 without the "data:" prefix).
+func (cw *ContextWindow) SetTaskWithBlocks(task string, blocks []llm.ContentBlock) {
+	cw.taskContent = task
+	cw.taskContentBlocks = blocks
 }
 
 // SetPlan sets the plan content (system message in prompt).
@@ -364,8 +388,20 @@ func (cw *ContextWindow) BuildPrompt() []llm.Message {
 	// "implement variant a" has no referent.
 	messages = append(messages, cw.priorConversation...)
 
-	// 3. User message with task content (pre-formatted by caller)
-	if cw.taskContent != "" {
+	// 3. User message with task content (pre-formatted by caller).
+	// Hybrid mode: when taskContentBlocks is non-empty, emit a Message carrying
+	// ContentBlocks alongside the task text. Providers render the blocks and,
+	// if they contain no text block, fall back to the task text (via
+	// llm.NormalizeContentBlocks) so the instruction always reaches the model.
+	// Otherwise the legacy text-only path is used (backward compatible for
+	// SetTask callers).
+	if len(cw.taskContentBlocks) > 0 {
+		messages = append(messages, llm.Message{
+			Role:          "user",
+			Content:       cw.taskContent,
+			ContentBlocks: cw.taskContentBlocks,
+		})
+	} else if cw.taskContent != "" {
 		messages = append(messages, llm.Message{
 			Role:    "user",
 			Content: cw.taskContent,
@@ -818,7 +854,7 @@ func (cw *ContextWindow) Compact(ctx context.Context) *CompactionResult {
 	afterPercent := float64(0)
 	baseTokens := cw.tracker.EstimateMessages([]llm.Message{
 		{Role: "system", Content: cw.systemPrompt},
-		{Role: "user", Content: cw.taskContent},
+		{Role: "user", Content: cw.taskContent, ContentBlocks: cw.taskContentBlocks},
 	})
 	if cw.planContent != "" {
 		baseTokens += cw.tracker.EstimateMessages([]llm.Message{

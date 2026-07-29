@@ -21,13 +21,63 @@ type TokenCounter interface {
 // used for fast token count estimation.
 const estimatedTokensPerChar = 4
 
+// estimatedTokensPerImage is the conservative per-image token estimate used
+// when a message carries image content blocks. OpenAI's high-detail image
+// processing costs roughly 765 tokens for a typical screenshot, while
+// Anthropic charges ~85 tokens per image. The higher (conservative) estimate
+// is the default so the context budget is not over-optimistically consumed;
+// Anthropic-family counters override it with estimatedAnthropicTokensPerImage
+// to avoid ~9× over-counting that would trigger premature compaction.
+const estimatedTokensPerImage = 765
+
+// estimatedAnthropicTokensPerImage is the per-image token estimate for
+// Anthropic-family models, which charge approximately 85 tokens per image
+// regardless of size. Using the OpenAI-oriented 765 estimate for Anthropic
+// would over-count images ~9× and trigger premature context compaction on
+// image-heavy Anthropic conversations.
+const estimatedAnthropicTokensPerImage = 85
+
+// countContentTokens returns the token count for a message's content,
+// accounting for structured content blocks when present. When the message has
+// non-empty ContentBlocks (after normalization), text blocks are counted via
+// count and image blocks are estimated at imageEstimate tokens each; unknown
+// block types are skipped (matching provider behavior). When ContentBlocks is
+// empty, the legacy path counts msg.Content, preserving backward compatibility
+// for text-only messages. imageEstimate is provider-specific (see
+// estimatedTokensPerImage / estimatedAnthropicTokensPerImage).
+func countContentTokens(count func(string) int, msg Message, imageEstimate int) int {
+	blocks := NormalizeContentBlocks(msg)
+	if blocks == nil {
+		return count(msg.Content)
+	}
+	total := 0
+	for _, blk := range blocks {
+		switch blk.Type {
+		case "text":
+			total += count(blk.Text)
+		case "image":
+			total += imageEstimate
+		default:
+			// Unknown block types are skipped, matching provider rendering.
+		}
+	}
+	return total
+}
+
 // SimpleTokenCounter — approximate token counter using ~4 chars = 1 token rule.
-type SimpleTokenCounter struct{}
+type SimpleTokenCounter struct {
+	imageTokenEstimate int // per-image token estimate (provider-specific; see NewSimpleTokenCounter)
+}
 
 // NewSimpleTokenCounter creates a SimpleTokenCounter that estimates tokens
-// using the ~4 chars = 1 token heuristic.
+// using the ~4 chars = 1 token heuristic. The per-image token estimate
+// defaults to the conservative OpenAI-oriented value (estimatedTokensPerImage);
+// NewTokenCounter overrides it to estimatedAnthropicTokensPerImage for
+// Anthropic-family models so images are not over-counted ~9×.
 func NewSimpleTokenCounter() *SimpleTokenCounter {
-	return &SimpleTokenCounter{}
+	return &SimpleTokenCounter{
+		imageTokenEstimate: estimatedTokensPerImage,
+	}
 }
 
 // Count returns the approximate token count for text using ceiling division
@@ -40,12 +90,13 @@ func (c *SimpleTokenCounter) Count(text string) int {
 }
 
 // CountMessages returns the total approximate token count across all messages,
-// including role, content, tool-call names/inputs, and per-message framing overhead.
+// including role, content (or structured content blocks), tool-call
+// names/inputs, and per-message framing overhead.
 func (c *SimpleTokenCounter) CountMessages(msgs []Message) int {
 	total := 0
 	for _, msg := range msgs {
 		total += c.Count(msg.Role)
-		total += c.Count(msg.Content)
+		total += countContentTokens(c.Count, msg, c.imageTokenEstimate)
 		for _, tc := range msg.ToolCalls {
 			total += c.Count(tc.Name)
 			total += c.Count(string(tc.Input))
@@ -60,18 +111,25 @@ func (c *SimpleTokenCounter) CountMessages(msgs []Message) int {
 // The tiktoken-go library's Encode method is NOT safe for concurrent use
 // (it mutates internal caches), hence the exclusive Lock.
 type TiktokenCounter struct {
-	tkm *tiktoken.Tiktoken
-	mu  sync.Mutex
+	tkm                *tiktoken.Tiktoken
+	imageTokenEstimate int // per-image token estimate (OpenAI-oriented; see NewTiktokenCounter)
+	mu                 sync.Mutex
 }
 
 // NewTiktokenCounter creates a new TiktokenCounter with the specified encoding.
 // Valid encodings include: "o200k_base", "cl100k_base", "p50k_base", etc.
+// The per-image token estimate defaults to estimatedTokensPerImage (OpenAI
+// high-detail); tiktoken counters are OpenAI-oriented, so no Anthropic
+// override is applied.
 func NewTiktokenCounter(encoding string) (*TiktokenCounter, error) {
 	tkm, err := tiktoken.GetEncoding(encoding)
 	if err != nil {
 		return nil, err
 	}
-	return &TiktokenCounter{tkm: tkm}, nil
+	return &TiktokenCounter{
+		tkm:                tkm,
+		imageTokenEstimate: estimatedTokensPerImage,
+	}, nil
 }
 
 // Count returns the exact token count for text using the tiktoken encoding.
@@ -87,12 +145,13 @@ func (c *TiktokenCounter) Count(text string) int {
 }
 
 // CountMessages returns the total exact token count across all messages,
-// including role, content, tool-call names/inputs, and per-message framing overhead.
+// including role, content (or structured content blocks), tool-call
+// names/inputs, and per-message framing overhead.
 func (c *TiktokenCounter) CountMessages(msgs []Message) int {
 	total := 0
 	for _, msg := range msgs {
 		total += c.Count(msg.Role)
-		total += c.Count(msg.Content)
+		total += countContentTokens(c.Count, msg, c.imageTokenEstimate)
 		for _, tc := range msg.ToolCalls {
 			total += c.Count(tc.Name)
 			total += c.Count(string(tc.Input))
@@ -122,8 +181,14 @@ func NewTokenCounter(tokenizerType string) (TokenCounter, error) {
 		}
 		return counter, nil
 	case tokenizerType == "anthropic-api":
-		// For Anthropic models, we rely on API correction rather than local counting
-		return NewSimpleTokenCounter(), nil
+		// For Anthropic models, we rely on API correction rather than local
+		// counting. Use the Anthropic-specific per-image estimate (~85 tokens)
+		// instead of the conservative OpenAI-oriented default (765) so
+		// image-heavy Anthropic conversations do not over-count images ~9×
+		// and trigger premature context compaction.
+		counter := NewSimpleTokenCounter()
+		counter.imageTokenEstimate = estimatedAnthropicTokensPerImage
+		return counter, nil
 	case tokenizerType == "approximate" || tokenizerType == "":
 		return NewSimpleTokenCounter(), nil
 	default:

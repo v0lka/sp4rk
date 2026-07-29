@@ -277,7 +277,7 @@ func TestConvertToResponsesInput(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			items := convertToResponsesInput(tt.messages)
+			items := convertToResponsesInput(tt.messages, nil)
 			if len(items) != tt.wantCount {
 				t.Fatalf("got %d items, want %d", len(items), tt.wantCount)
 			}
@@ -687,7 +687,7 @@ func TestBuildResponsesParams_Store(t *testing.T) {
 	}
 
 	t.Run("official OpenAI sends store=false", func(t *testing.T) {
-		params := buildResponsesParams(req, "")
+		params := buildResponsesParams(req, "", nil)
 		if !params.Store.Valid() {
 			t.Fatal("expected Store to be set for official OpenAI endpoint")
 		}
@@ -697,7 +697,7 @@ func TestBuildResponsesParams_Store(t *testing.T) {
 	})
 
 	t.Run("compatible provider does not send store", func(t *testing.T) {
-		params := buildResponsesParams(req, "https://proxy.example.com/v1")
+		params := buildResponsesParams(req, "https://proxy.example.com/v1", nil)
 		if params.Store.Valid() {
 			t.Errorf("expected Store to be omitted for compatible provider, got %v", params.Store.Value)
 		}
@@ -720,7 +720,7 @@ func TestBuildResponsesParams_ReasoningEffort(t *testing.T) {
 				Messages:        messages,
 				ReasoningEffort: effort,
 			}
-			params := buildResponsesParams(req, "")
+			params := buildResponsesParams(req, "", nil)
 			if params.Reasoning.Effort == "" {
 				t.Errorf("expected reasoning.effort to be set for valid value %q", effort)
 			}
@@ -735,7 +735,7 @@ func TestBuildResponsesParams_ReasoningEffort(t *testing.T) {
 				Messages:        messages,
 				ReasoningEffort: effort,
 			}
-			params := buildResponsesParams(req, "")
+			params := buildResponsesParams(req, "", nil)
 			if params.Reasoning.Effort != "" {
 				t.Errorf("expected reasoning.effort to be omitted for invalid value %q, got %q", effort, params.Reasoning.Effort)
 			}
@@ -747,7 +747,7 @@ func TestBuildResponsesParams_ReasoningEffort(t *testing.T) {
 			Model:    "gpt-5.3-codex",
 			Messages: messages,
 		}
-		params := buildResponsesParams(req, "")
+		params := buildResponsesParams(req, "", nil)
 		if params.Reasoning.Effort != "" {
 			t.Errorf("expected reasoning to be omitted for empty effort, got %q", params.Reasoning.Effort)
 		}

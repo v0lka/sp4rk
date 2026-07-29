@@ -2,20 +2,37 @@ package llm
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 )
 
 // Message — unit of communication with LLM (system/user/assistant/tool).
 type Message struct {
-	Role             string     `json:"role"`                        // "system" | "user" | "assistant" | "tool"
-	Content          string     `json:"content"`                     // text content
-	ReasoningContent string     `json:"reasoning_content,omitempty"` // chain-of-thought / reasoning content (DeepSeek)
-	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`        // tool calls (for assistant)
-	ToolCallID       string     `json:"tool_call_id,omitempty"`      // call ID (for tool responses)
+	Role             string         `json:"role"`                        // "system" | "user" | "assistant" | "tool"
+	Content          string         `json:"content"`                     // text content (fallback when ContentBlocks has no text block)
+	ContentBlocks    []ContentBlock `json:"content_blocks,omitempty"`    // structured content; when non-empty, providers render the blocks
+	ReasoningContent string         `json:"reasoning_content,omitempty"` // chain-of-thought / reasoning content (DeepSeek)
+	ToolCalls        []ToolCall     `json:"tool_calls,omitempty"`        // tool calls (for assistant)
+	ToolCallID       string         `json:"tool_call_id,omitempty"`      // call ID (for tool responses)
 	// ReasoningItems carries reasoning output items from the OpenAI Responses API.
 	// Each item has an ID (required for round-tripping to the API) and a Summary text.
 	// Populated only by the Responses API provider; other providers use ReasoningContent.
 	ReasoningItems []ReasoningItem `json:"reasoning_items,omitempty"`
+}
+
+// ContentBlock represents a single structured content element within a Message.
+// A message may carry an ordered list of blocks (text and/or images) instead of
+// a plain Content string. When ContentBlocks is non-empty, providers render the
+// blocks; if the blocks contain no "text" block, Content is prepended as a text
+// block (see NormalizeContentBlocks) so the task text always reaches the model.
+// When ContentBlocks is empty, Content is used as before (backward compatible
+// for text-only messages). For "image" blocks both MediaType and ImageB64 are
+// required; ValidateContentBlocks enforces this at the provider boundary.
+type ContentBlock struct {
+	Type      string `json:"type"`                 // "text" | "image"
+	Text      string `json:"text,omitempty"`       // text content (for Type == "text")
+	ImageB64  string `json:"image_b64,omitempty"`  // base64-encoded image data, WITHOUT the "data:" prefix (for Type == "image")
+	MediaType string `json:"media_type,omitempty"` // MIME type of the image, e.g. "image/png" (for Type == "image")
 }
 
 // ReasoningItem represents a reasoning output item from the Responses API.
@@ -24,6 +41,59 @@ type Message struct {
 type ReasoningItem struct {
 	ID      string `json:"id"`
 	Summary string `json:"summary"`
+}
+
+// NormalizeContentBlocks returns the effective content blocks for a message,
+// making the Content fallback real. When ContentBlocks is empty (nil or
+// zero-length), it returns nil so callers take the legacy Content path. When
+// the blocks contain no "text" block and Content is non-empty, a text block
+// carrying Content is prepended — so a caller using SetTaskWithBlocks with an
+// image-only block list still gets its instruction text to the model. The
+// returned slice shares storage with msg.ContentBlocks when no prepend is
+// needed; callers must not mutate it.
+func NormalizeContentBlocks(msg Message) []ContentBlock {
+	if len(msg.ContentBlocks) == 0 {
+		return nil
+	}
+	hasText := false
+	for _, blk := range msg.ContentBlocks {
+		if blk.Type == "text" {
+			hasText = true
+			break
+		}
+	}
+	if !hasText && msg.Content != "" {
+		out := make([]ContentBlock, 0, len(msg.ContentBlocks)+1)
+		out = append(out, ContentBlock{Type: "text", Text: msg.Content})
+		out = append(out, msg.ContentBlocks...)
+		return out
+	}
+	return msg.ContentBlocks
+}
+
+// ValidateContentBlocks checks that every block is well-formed: "text" blocks
+// must carry non-empty Text, and "image" blocks must carry both a MediaType
+// and base64 image data. It returns an error describing the first invalid
+// block, or nil if all blocks are valid (or there are no blocks). Providers
+// call this before rendering so a caller that omits a required field gets a
+// clear local error instead of an opaque API 400.
+func ValidateContentBlocks(blocks []ContentBlock) error {
+	for i, blk := range blocks {
+		switch blk.Type {
+		case "text":
+			if blk.Text == "" {
+				return fmt.Errorf("content block %d: text block missing text", i)
+			}
+		case "image":
+			if blk.MediaType == "" {
+				return fmt.Errorf("content block %d: image block missing media_type", i)
+			}
+			if blk.ImageB64 == "" {
+				return fmt.Errorf("content block %d: image block missing image_b64", i)
+			}
+		}
+	}
+	return nil
 }
 
 // ToolCall — request to call a tool, generated by LLM.

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -32,8 +33,17 @@ func newResponsesClient(apiKey, baseURL string, httpClient *http.Client) *oai.Cl
 
 // responsesAPICompletion performs a non-streaming Responses API call.
 // baseURL is the provider's configured base URL (empty = official OpenAI).
-func responsesAPICompletion(ctx context.Context, client *oai.Client, providerName, baseURL string, req ChatRequest) (*ChatResponse, error) {
-	params := buildResponsesParams(req, baseURL)
+// logger is used for debug-level diagnostics (nil = slog.Default()).
+func responsesAPICompletion(ctx context.Context, client *oai.Client, providerName, baseURL string, req ChatRequest, logger *slog.Logger) (*ChatResponse, error) {
+	// Validate image blocks up front so a missing MediaType/ImageB64 yields a
+	// clear local error instead of an opaque API 400.
+	for _, msg := range req.Messages {
+		if err := ValidateContentBlocks(msg.ContentBlocks); err != nil {
+			return nil, fmt.Errorf("%s: %w", providerName, err)
+		}
+	}
+
+	params := buildResponsesParams(req, baseURL, logger)
 
 	resp, err := client.Responses.New(ctx, params)
 	if err != nil {
@@ -46,13 +56,14 @@ func responsesAPICompletion(ctx context.Context, client *oai.Client, providerNam
 // buildResponsesParams constructs ResponseNewParams from a ChatRequest.
 // baseURL is the provider's configured base URL (empty = official OpenAI);
 // it controls whether OpenAI-specific fields like `store` are included.
-func buildResponsesParams(req ChatRequest, baseURL string) responses.ResponseNewParams {
+// logger is used for debug-level diagnostics (nil = slog.Default()).
+func buildResponsesParams(req ChatRequest, baseURL string, logger *slog.Logger) responses.ResponseNewParams {
 	systemPrompt, filteredMsgs := ExtractSystemPrompt(req.Messages)
 
 	params := responses.ResponseNewParams{
 		Model: req.Model,
 		Input: responses.ResponseNewParamsInputUnion{
-			OfInputItemList: convertToResponsesInput(filteredMsgs),
+			OfInputItemList: convertToResponsesInput(filteredMsgs, logger),
 		},
 	}
 
@@ -108,19 +119,62 @@ func isValidResponsesReasoningEffort(effort string) bool {
 }
 
 // convertToResponsesInput converts internal messages to Responses API input items.
-func convertToResponsesInput(messages []Message) responses.ResponseInputParam {
+// logger is used for debug-level diagnostics when unknown block types are
+// encountered (nil = slog.Default()).
+func convertToResponsesInput(messages []Message, logger *slog.Logger) responses.ResponseInputParam {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	items := make(responses.ResponseInputParam, 0, len(messages))
 	for _, msg := range messages {
 		switch msg.Role {
 		case "user":
-			items = append(items, responses.ResponseInputItemUnionParam{
-				OfMessage: &responses.EasyInputMessageParam{
-					Role: responses.EasyInputMessageRoleUser,
-					Content: responses.EasyInputMessageContentUnionParam{
-						OfString: param.NewOpt(msg.Content),
+			// When ContentBlocks are present, render them as multipart content
+			// (input_text and/or input_image parts) instead of the plain
+			// Content string. NormalizeContentBlocks prepends Content as a
+			// text block when the blocks carry no text, so the task text
+			// always reaches the model. Text-only messages without
+			// ContentBlocks keep the existing OfString path.
+			blocks := NormalizeContentBlocks(msg)
+			if blocks != nil {
+				contentList := make(responses.ResponseInputMessageContentListParam, 0, len(blocks))
+				for _, block := range blocks {
+					switch block.Type {
+					case "text":
+						contentList = append(contentList, responses.ResponseInputContentParamOfInputText(block.Text))
+					case "image":
+						contentList = append(contentList, responses.ResponseInputContentUnionParam{
+							OfInputImage: &responses.ResponseInputImageParam{
+								Detail:   responses.ResponseInputImageDetailAuto,
+								ImageURL: param.NewOpt("data:" + block.MediaType + ";base64," + block.ImageB64),
+							},
+						})
+					default:
+						// Unknown block types are skipped (consistent with other
+						// providers); log at debug so misconfigured callers can
+						// diagnose silently dropped content.
+						logger.Debug("openai responses: skipping unknown content block type",
+							"block_type", block.Type)
+					}
+				}
+				items = append(items, responses.ResponseInputItemUnionParam{
+					OfMessage: &responses.EasyInputMessageParam{
+						Role: responses.EasyInputMessageRoleUser,
+						Content: responses.EasyInputMessageContentUnionParam{
+							OfInputItemContentList: contentList,
+						},
 					},
-				},
-			})
+				})
+			} else {
+				items = append(items, responses.ResponseInputItemUnionParam{
+					OfMessage: &responses.EasyInputMessageParam{
+						Role: responses.EasyInputMessageRoleUser,
+						Content: responses.EasyInputMessageContentUnionParam{
+							OfString: param.NewOpt(msg.Content),
+						},
+					},
+				})
+			}
 
 		case "assistant":
 			// Re-emit reasoning items first (with their original IDs) so the

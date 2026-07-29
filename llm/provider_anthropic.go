@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"regexp"
 	"strings"
@@ -37,12 +38,22 @@ type AnthropicProviderConfig struct {
 	APIKey     string
 	BaseURL    string       // empty = default Anthropic; otherwise custom endpoint (Anthropic-compatible proxy)
 	HTTPClient *http.Client // optional proxy-configured HTTP client (nil = default)
+	Logger     *slog.Logger // optional structured logger (nil = slog.Default())
 }
 
 // AnthropicProvider implements LLM Provider using Anthropic's Claude API.
 type AnthropicProvider struct {
 	client *anthropic.Client
 	name   string
+	logger *slog.Logger
+}
+
+// log returns the provider's logger, defaulting to slog.Default() when unset.
+func (p *AnthropicProvider) log() *slog.Logger {
+	if p.logger != nil {
+		return p.logger
+	}
+	return slog.Default()
 }
 
 // NewAnthropicProvider creates a new Anthropic provider with the given configuration.
@@ -90,6 +101,7 @@ func NewAnthropicProvider(cfg AnthropicProviderConfig) (*AnthropicProvider, erro
 	return &AnthropicProvider{
 		client: client,
 		name:   name,
+		logger: cfg.Logger,
 	}, nil
 }
 
@@ -194,13 +206,22 @@ func (p *AnthropicProvider) ChatCompletion(ctx context.Context, req ChatRequest)
 
 // buildRequest converts ChatRequest to anthropic.MessagesRequest.
 func (p *AnthropicProvider) buildRequest(req ChatRequest) (*anthropic.MessagesRequest, error) {
+	// Validate image blocks up front so a missing MediaType/ImageB64 yields a
+	// clear local error instead of an opaque API 400.
+	for _, msg := range req.Messages {
+		if err := ValidateContentBlocks(msg.ContentBlocks); err != nil {
+			return nil, fmt.Errorf("anthropic: %w", err)
+		}
+	}
 	// Extract system prompt parts from messages (preserves multi-part for caching)
 	systemParts, filteredMsgs := ExtractSystemPromptParts(req.Messages)
 	var messages []anthropic.Message
 
 	for _, msg := range filteredMsgs {
-		// Skip messages with empty content (Anthropic API rejects them)
-		if msg.Content == "" && len(msg.ToolCalls) == 0 && msg.ToolCallID == "" {
+		// Skip messages with no renderable content (Anthropic API rejects empty
+		// messages). ContentBlocks are included so an image-only user message
+		// (empty Content, non-empty ContentBlocks) is not silently dropped.
+		if msg.Content == "" && len(msg.ContentBlocks) == 0 && len(msg.ToolCalls) == 0 && msg.ToolCallID == "" {
 			continue
 		}
 		anthropicMsg, err := p.convertMessage(msg)
@@ -284,6 +305,37 @@ func (p *AnthropicProvider) buildRequest(req ChatRequest) (*anthropic.MessagesRe
 func (p *AnthropicProvider) convertMessage(msg Message) (anthropic.Message, error) {
 	switch msg.Role {
 	case "user":
+		// When ContentBlocks are present, render them as structured content
+		// (text and/or image blocks) instead of the plain Content string.
+		// NormalizeContentBlocks prepends Content as a text block when the
+		// blocks carry no text, so the task text always reaches the model.
+		// Text-only messages without ContentBlocks keep the existing path.
+		blocks := NormalizeContentBlocks(msg)
+		if blocks != nil {
+			content := make([]anthropic.MessageContent, 0, len(blocks))
+			for _, block := range blocks {
+				switch block.Type {
+				case "text":
+					content = append(content, anthropic.NewTextMessageContent(block.Text))
+				case "image":
+					content = append(content, anthropic.NewImageMessageContent(anthropic.MessageContentSource{
+						Type:      anthropic.MessagesContentSourceTypeBase64,
+						MediaType: block.MediaType,
+						Data:      block.ImageB64,
+					}))
+				default:
+					// Unknown block types are skipped (consistent with other
+					// providers); log at debug so misconfigured callers can
+					// diagnose silently dropped content.
+					p.log().Debug("anthropic: skipping unknown content block type",
+						"block_type", block.Type, "provider", p.name)
+				}
+			}
+			return anthropic.Message{
+				Role:    anthropic.RoleUser,
+				Content: content,
+			}, nil
+		}
 		return anthropic.Message{
 			Role: anthropic.RoleUser,
 			Content: []anthropic.MessageContent{

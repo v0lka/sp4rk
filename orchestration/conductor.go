@@ -66,6 +66,14 @@ type ConductorConfig struct {
 	// StepSeedable when ResumeSteps is non-empty, otherwise Run fails fast
 	// with an error (the steps could not be seeded into the prompt).
 	ResumeSteps []agent.Step
+
+	// ContentBlocks carries structured content blocks (text + images) for the
+	// task user message. When non-empty, the Conductor calls SetTaskWithBlocks
+	// (via the BlockTaskAware capability) instead of SetTask, so the
+	// ContextManager emits a Message carrying ContentBlocks — providers give
+	// the blocks precedence over the plain Content string. nil or an empty
+	// slice preserves the legacy text-only SetTask path (backward compatible).
+	ContentBlocks []llm.ContentBlock
 }
 
 // Conductor runs a single Executor.Run that owns a task end-to-end.
@@ -150,9 +158,7 @@ func (c *Conductor) Run(
 	systemPrompt := c.cfg.SystemPrompt(ctx, message, modelMeta)
 
 	cm := c.cfg.ContextFactory(systemPrompt, modelMeta, compactionStrategy)
-	if ccm, ok := cm.(TaskAware); ok {
-		ccm.SetTask(message)
-	}
+	setTaskOnContextManager(cm, message, c.cfg.ContentBlocks)
 
 	// Inject prior conversation (previous exchanges) so the LLM sees the
 	// dialogue context leading up to the current message. The ContextManager
@@ -338,4 +344,22 @@ func delegationRegistryFromContext(ctx context.Context) PendingDelegations {
 		return v
 	}
 	return nil
+}
+
+// setTaskOnContextManager sets the task on a ContextManager, preferring the
+// BlockTaskAware capability (structured content blocks) when blocks are
+// configured, and falling back to the TaskAware capability (plain text)
+// otherwise. Both capabilities are optional; a ContextManager implementing
+// neither is silently skipped (the task is then carried only via the system
+// prompt).
+func setTaskOnContextManager(cm agent.ContextManager, message string, blocks []llm.ContentBlock) {
+	if len(blocks) > 0 {
+		if bcm, ok := cm.(BlockTaskAware); ok {
+			bcm.SetTaskWithBlocks(message, blocks)
+			return
+		}
+	}
+	if ccm, ok := cm.(TaskAware); ok {
+		ccm.SetTask(message)
+	}
 }

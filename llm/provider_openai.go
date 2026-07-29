@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 
 	oai "github.com/openai/openai-go"
@@ -17,6 +18,7 @@ type OpenAIProviderConfig struct {
 	APIKey     string
 	BaseURL    string       // empty = default OpenAI; otherwise custom endpoint
 	HTTPClient *http.Client // optional proxy-configured HTTP client (nil = default)
+	Logger     *slog.Logger // optional structured logger (nil = slog.Default())
 }
 
 // OpenAIProvider implements Provider for OpenAI and compatible APIs.
@@ -25,6 +27,15 @@ type OpenAIProvider struct {
 	responsesClient *oai.Client // official SDK for Responses API
 	name            string
 	baseURL         string // empty = default OpenAI; non-empty = compatible provider
+	logger          *slog.Logger
+}
+
+// log returns the provider's logger, defaulting to slog.Default() when unset.
+func (p *OpenAIProvider) log() *slog.Logger {
+	if p.logger != nil {
+		return p.logger
+	}
+	return slog.Default()
 }
 
 // NewOpenAIProvider creates a new OpenAI provider.
@@ -53,6 +64,7 @@ func NewOpenAIProvider(cfg OpenAIProviderConfig) (*OpenAIProvider, error) {
 		responsesClient: responsesClient,
 		name:            cfg.Name,
 		baseURL:         cfg.BaseURL,
+		logger:          cfg.Logger,
 	}, nil
 }
 
@@ -63,6 +75,14 @@ func (p *OpenAIProvider) Name() string {
 
 // ChatCompletion sends a request and returns the full response.
 func (p *OpenAIProvider) ChatCompletion(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
+	// Validate image blocks up front so a missing MediaType/ImageB64 yields a
+	// clear local error instead of an opaque API 400.
+	for _, msg := range req.Messages {
+		if err := ValidateContentBlocks(msg.ContentBlocks); err != nil {
+			return nil, fmt.Errorf("openai: %w", err)
+		}
+	}
+
 	// The Responses API (/v1/responses) is an OpenAI-specific endpoint, not
 	// part of the "OpenAI-compatible" standard. Compatible providers (custom
 	// baseURL) implement Chat Completions, not the Responses API. Only route
@@ -70,7 +90,7 @@ func (p *OpenAIProvider) ChatCompletion(ctx context.Context, req ChatRequest) (*
 	// models require it. Compatible providers serve codex models via Chat
 	// Completions instead.
 	if p.baseURL == "" && needsResponsesAPI(req.Model) {
-		return responsesAPICompletion(ctx, p.responsesClient, p.name, p.baseURL, req)
+		return responsesAPICompletion(ctx, p.responsesClient, p.name, p.baseURL, req, p.logger)
 	}
 
 	params := p.buildChatParams(req)
@@ -232,6 +252,40 @@ func (p *OpenAIProvider) convertRequestMessage(msg Message) oai.ChatCompletionMe
 	case "system":
 		return oai.SystemMessage(content)
 	case "user":
+		// When ContentBlocks are present, render them as multipart content
+		// (text and/or image_url parts) instead of the plain Content string.
+		// NormalizeContentBlocks prepends Content as a text block when the
+		// blocks carry no text, so the task text always reaches the model.
+		// Text-only messages without ContentBlocks keep the existing path.
+		blocks := NormalizeContentBlocks(msg)
+		if blocks != nil {
+			parts := make([]oai.ChatCompletionContentPartUnionParam, 0, len(blocks))
+			for _, block := range blocks {
+				switch block.Type {
+				case "text":
+					parts = append(parts, oai.ChatCompletionContentPartUnionParam{
+						OfText: &oai.ChatCompletionContentPartTextParam{
+							Text: block.Text,
+						},
+					})
+				case "image":
+					parts = append(parts, oai.ChatCompletionContentPartUnionParam{
+						OfImageURL: &oai.ChatCompletionContentPartImageParam{
+							ImageURL: oai.ChatCompletionContentPartImageImageURLParam{
+								URL: "data:" + block.MediaType + ";base64," + block.ImageB64,
+							},
+						},
+					})
+				default:
+					// Unknown block types are skipped (consistent with other
+					// providers); log at debug so misconfigured callers can
+					// diagnose silently dropped content.
+					p.log().Debug("openai: skipping unknown content block type",
+						"block_type", block.Type, "provider", p.name)
+				}
+			}
+			return oai.UserMessage(parts)
+		}
 		return oai.UserMessage(content)
 	case "assistant":
 		assistantParam := oai.ChatCompletionAssistantMessageParam{
