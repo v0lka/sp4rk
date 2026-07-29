@@ -30,7 +30,8 @@ type SymlinkTraversal struct {
 // DetectSymlinksInToolInput extracts all path-like values from a tool input
 // and checks each for symlinks. Returns traversals partitioned by whether
 // the resolved target is inside or outside the workspace, plus a suspicious
-// flag for bash_exec commands with unexpandable tokens.
+// flag for shell-exec commands (bash_exec, posh_exec) that contain
+// unexpandable or dynamic tokens.
 //
 // schema is the tool's JSON input schema, used to identify which properties
 // carry filesystem paths. When path fields are recognizable, only those fields
@@ -55,8 +56,13 @@ func DetectSymlinksInToolInput(ctx context.Context, toolName string, input, sche
 	workspace := WorkspacePathFrom(ctx)
 	roots := SessionRoots(ctx)
 
-	if toolName == "bash_exec" {
+	switch toolName {
+	case ToolBashExec:
 		paths, unexpandable := extractBashPathsFromInput(input, workspace)
+		inside, outside = checkPathsForSymlinks(ctx, paths, roots)
+		return inside, outside, unexpandable
+	case ToolPoshExec:
+		paths, unexpandable := extractPoshPathsFromInput(input, workspace)
 		inside, outside = checkPathsForSymlinks(ctx, paths, roots)
 		return inside, outside, unexpandable
 	}
@@ -291,23 +297,35 @@ func extractPathsFromFields(input json.RawMessage, fields map[string]bool, works
 const maxPathCandidateLen = 4096
 
 func looksLikePath(s string) bool {
-	if s == "" || s == "." || s == ".." {
-		return false
-	}
-	if len(s) > maxPathCandidateLen {
-		return false
-	}
-	if hasControlChar(s) {
-		// Newlines, tabs, and other control characters never appear in a real
-		// filesystem path; their presence signals content (e.g. a code
-		// snippet from edit_file old_string/new_string) rather than a path.
+	if !looksLikePathCore(s) {
 		return false
 	}
 	hasSeparator := strings.Contains(s, "/") ||
 		strings.ContainsRune(s, filepath.Separator) ||
 		looksLikeWindowsDriveLetter(s) ||
 		strings.HasPrefix(s, `\\`)
-	if !hasSeparator {
+	return hasSeparator
+}
+
+// looksLikePathCore applies the content-rejection guards shared by
+// looksLikePath and poshLooksLikePath: it rejects empty/dot-only strings,
+// overlong candidates, control characters, and URL-prefixed strings. It does
+// NOT test for path separators — the separator criteria differ between the
+// host-OS-aware (looksLikePath) and PowerShell (poshLooksLikePath) variants.
+// Reordering the URL check before the separator test is behavior-preserving
+// because every URL scheme contains "/", so no URL-prefixed string could pass
+// a separator check.
+func looksLikePathCore(s string) bool {
+	if s == "" || s == "." || s == ".." {
+		return false
+	}
+	if len(s) > maxPathCandidateLen {
+		return false
+	}
+	// Newlines, tabs, and other control characters never appear in a real
+	// filesystem path; their presence signals content (e.g. a code snippet
+	// from edit_file old_string/new_string) rather than a path.
+	if hasControlChar(s) {
 		return false
 	}
 	lower := strings.ToLower(s)
@@ -461,6 +479,257 @@ func wordLiteral(w *syntax.Word) string {
 		}
 	}
 	return strings.Join(parts, "")
+}
+
+// extractPoshPathsFromInput extracts paths from a posh_exec (PowerShell) tool
+// input. It mirrors extractBashPathsFromInput: it JSON-parses the command and
+// working_directory fields, then delegates to extractPoshPaths. Returns
+// resolved paths and a flag indicating whether the command contains
+// unexpandable/dynamic tokens ($var, $(...), $env:..., expandable double
+// quotes, backtick escapes). working_directory falls back to workspace when
+// absent, matching the bash path.
+func extractPoshPathsFromInput(input json.RawMessage, workspace string) (paths []string, hasUnexpandable bool) {
+	var params struct {
+		Command          string `json:"command"`
+		WorkingDirectory string `json:"working_directory"`
+	}
+	if err := json.Unmarshal(input, &params); err != nil || params.Command == "" {
+		return nil, false
+	}
+
+	wd := params.WorkingDirectory
+	if wd == "" {
+		wd = workspace
+	}
+
+	return extractPoshPaths(params.Command, wd, workspace)
+}
+
+// extractPoshPaths extracts path-like literals from a PowerShell command using
+// a fail-closed heuristic tokenizer. PowerShell has no shell parser available
+// in this module (unlike bash's mvdan.cc/sh), so the tokenizer approximates an
+// AST by scanning char-by-char while tracking quote state:
+//
+//   - single quotes (') are literal and safe — their content is extracted as-is;
+//   - double quotes (") are expandable ($var interpolation) — any content seen
+//     inside them marks the token suspicious;
+//   - backtick (`) is PowerShell's escape/line-continuation char — its presence
+//     marks the token suspicious.
+//
+// Outside quotes, tokens are split on whitespace and PowerShell metacharacters
+// (| ; & ( ) { }). For each token:
+//
+//   - if it contains a "$" ($var, $env:VAR, $(...), ${...}) the token is marked
+//     suspicious and skipped (we cannot know what it expands to);
+//   - else if it is path-like, the literal is resolved and collected.
+//
+// A token's suspicious flag (from quotes/backtick) ORs into the overall result.
+// Unclosed quotes or any internal inconsistency sets hasUnexpandable=true so the
+// caller fails closed (escalates to confirmation) rather than trusting a partial
+// parse.
+func extractPoshPaths(command, workingDir, workspace string) (paths []string, hasUnexpandable bool) {
+	tokens, unclosed := poshTokenize(command)
+	if unclosed {
+		hasUnexpandable = true
+	}
+
+	seen := make(map[string]struct{})
+	for i := range tokens {
+		tok := &tokens[i]
+		// A "$" that can expand (outside single quotes) means the value is
+		// dynamic — mark suspicious and skip collection.
+		if tok.dollarExp {
+			hasUnexpandable = true
+			continue
+		}
+		if tok.suspicious() {
+			hasUnexpandable = true
+		}
+		if tok.content == "" || !poshLooksLikePath(tok.content) {
+			continue
+		}
+		resolved := resolvePoshPath(tok.content, workingDir, workspace)
+		if resolved == "" {
+			continue
+		}
+		cleaned := filepath.Clean(resolved)
+		if _, ok := seen[cleaned]; !ok {
+			seen[cleaned] = struct{}{}
+			paths = append(paths, cleaned)
+		}
+	}
+	return paths, hasUnexpandable
+}
+
+// poshToken captures the literal content of one PowerShell token plus flags
+// describing whether any part of it came from an expansion context.
+type poshToken struct {
+	content   string // accumulated literal text (quote/backtick chars stripped)
+	dollarExp bool   // a "$" appeared in an expansion context (outside single quotes)
+	quoteExp  bool   // content from an expandable (double-quoted) region
+	tickExp   bool   // a backtick escape/continuation appeared
+}
+
+// suspicious reports whether any expansion-context construct was seen in this
+// token (expandable double quotes or a backtick). dollarExp is handled
+// separately by the caller because it also skips collection.
+func (t *poshToken) suspicious() bool {
+	return t.quoteExp || t.tickExp
+}
+
+// poshMetachars are PowerShell control operators/whitespace that terminate a
+// token when seen outside quotes.
+var poshMetachars = map[byte]bool{
+	' ': true, '\t': true, '\n': true, '\r': true, '\f': true, '\v': true,
+	'|': true, ';': true, '&': true, '(': true, ')': true, '{': true, '}': true,
+}
+
+// poshTokenize scans a PowerShell command char-by-char, producing tokens with
+// quote/escape state tracked. The second return value is true when an unclosed
+// quote was encountered (the caller uses it to fail closed).
+func poshTokenize(command string) (tokens []poshToken, unclosed bool) {
+	var cur strings.Builder
+	tok := poshToken{}
+	hasContent := false
+	inSingle, inDouble := false, false
+
+	flush := func() {
+		if hasContent || tok.dollarExp || tok.quoteExp || tok.tickExp {
+			tok.content = cur.String()
+			tokens = append(tokens, tok)
+		}
+		cur.Reset()
+		tok = poshToken{}
+		hasContent = false
+	}
+
+	for i := 0; i < len(command); i++ {
+		c := command[i]
+		switch {
+		case inSingle:
+			// Single quotes are literal in PowerShell; nothing inside expands.
+			if c == '\'' {
+				inSingle = false
+			} else {
+				cur.WriteByte(c)
+				hasContent = true
+			}
+		case inDouble:
+			// Double quotes are expandable: $var interpolates, ` escapes.
+			switch c {
+			case '"':
+				inDouble = false
+				tok.quoteExp = true
+				hasContent = true
+			case '`':
+				// Backtick escapes the next char (which becomes literal), but
+				// its presence signals a dynamic/escaped construct.
+				tok.tickExp = true
+				hasContent = true
+				i++
+				if i < len(command) {
+					cur.WriteByte(command[i])
+				}
+			case '$':
+				tok.dollarExp = true
+				cur.WriteByte(c)
+				hasContent = true
+			default:
+				cur.WriteByte(c)
+				hasContent = true
+			}
+		default: // outside quotes
+			switch {
+			case c == '\'':
+				inSingle = true
+				hasContent = true
+			case c == '"':
+				inDouble = true
+				tok.quoteExp = true
+				hasContent = true
+			case c == '`':
+				// Backtick outside quotes escapes the next char / continues a
+				// line; treat the escaped char as literal but mark suspicious.
+				tok.tickExp = true
+				hasContent = true
+				i++
+				if i < len(command) {
+					cur.WriteByte(command[i])
+				}
+			case poshMetachars[c]:
+				flush()
+			case c == '$':
+				tok.dollarExp = true
+				cur.WriteByte(c)
+				hasContent = true
+			default:
+				cur.WriteByte(c)
+				hasContent = true
+			}
+		}
+	}
+
+	if inSingle || inDouble {
+		unclosed = true
+	}
+	flush()
+	return tokens, unclosed
+}
+
+// poshLooksLikePath reports whether a token resembles a filesystem path under
+// PowerShell path-likeness rules, independent of the host OS (the command may
+// be a Windows command parsed on a POSIX host). A candidate is path-like when
+// it is a drive-absolute path (^[A-Za-z]:[\\/]), a UNC path (^\\\\), contains a
+// forward slash, or is a relative path beginning with a separator
+// (^(\.\.?)?[\\/]). Non-path content is filtered via the same URL/control-char
+// and length guards used by looksLikePath.
+func poshLooksLikePath(s string) bool {
+	if !looksLikePathCore(s) {
+		return false
+	}
+	switch {
+	case looksLikeWindowsDriveLetter(s):
+		return true
+	case strings.HasPrefix(s, `\\`): // UNC: two leading backslashes
+		return true
+	case strings.Contains(s, "/"):
+		return true
+	case poshRelativeSep(s):
+		return true
+	}
+	return false
+}
+
+// poshRelativeSep reports whether s starts with an optional "." or ".." dot
+// prefix followed by a path separator (backslash or slash): ^(\.\.?)?[\\/].
+// This catches ".\foo", "..\bar", ".\baz/qux", "\root", "/abs" without relying
+// on the host OS path separator.
+func poshRelativeSep(s string) bool {
+	rest := strings.TrimPrefix(s, ".")
+	rest = strings.TrimPrefix(rest, ".")
+	return rest != "" && (rest[0] == '\\' || rest[0] == '/')
+}
+
+// resolvePoshPath resolves a PowerShell path literal to an absolute form.
+// Drive-absolute (C:\) and UNC (\\server) paths are treated as absolute on
+// every host OS (filepath.IsAbs would not recognize them on POSIX), so they
+// are returned cleaned as-is. Relative paths are joined against workingDir,
+// falling back to workspace when workingDir is empty.
+func resolvePoshPath(s, workingDir, workspace string) string {
+	if s == "" {
+		return ""
+	}
+	if looksLikeWindowsDriveLetter(s) || strings.HasPrefix(s, `\\`) || filepath.IsAbs(s) {
+		return filepath.Clean(s)
+	}
+	base := workingDir
+	if base == "" {
+		base = workspace
+	}
+	if base == "" {
+		return ""
+	}
+	return filepath.Clean(filepath.Join(base, s))
 }
 
 // checkPathsForSymlinks walks each path component-by-component looking for

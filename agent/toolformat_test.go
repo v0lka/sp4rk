@@ -13,6 +13,7 @@ func TestBuildGroupedToolList_AllTiers(t *testing.T) {
 		{Name: "read_file", Description: "reads a file", Source: "core"},
 		{Name: "mcp_search", Description: "MCP search", Source: "mcp", SourceCategory: tools.SourceCategoryMCP},
 		{Name: "bash_exec", Description: "run bash", Source: "core"},
+		{Name: "posh_exec", Description: "run powershell", Source: "core"},
 	}
 
 	result := BuildGroupedToolList(descriptors)
@@ -37,6 +38,20 @@ func TestBuildGroupedToolList_AllTiers(t *testing.T) {
 	}
 	if !strings.Contains(result, "bash_exec") {
 		t.Error("expected bash_exec in output")
+	}
+	if !strings.Contains(result, "posh_exec") {
+		t.Error("expected posh_exec in output")
+	}
+
+	// Both shell-exec tools must land in TIER 3, not TIER 1.
+	t3Start := strings.Index(result, "TIER 3")
+	if t3Start < 0 {
+		t.Fatal("expected TIER 3 label in output")
+	}
+	for _, name := range []string{"bash_exec", "posh_exec"} {
+		if idx := strings.Index(result, name); idx < t3Start {
+			t.Errorf("expected %s in TIER 3 section, not earlier", name)
+		}
 	}
 }
 

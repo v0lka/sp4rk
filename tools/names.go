@@ -15,3 +15,18 @@ const (
 	ToolPoshExec  = "posh_exec"
 	ToolBatch     = "batch"
 )
+
+// shellExecTools are the built-in tools that execute a shell command string
+// (bash_exec, posh_exec). They are the highest-uncertainty tools and are
+// intentionally deprioritized (Tier 3) in grouped tool lists so that more
+// purpose-built tools are preferred.
+var shellExecTools = map[string]bool{
+	ToolBashExec: true,
+	ToolPoshExec: true,
+}
+
+// IsShellExecTool reports whether name is one of the shell-executing built-in
+// tools (bash_exec or posh_exec).
+func IsShellExecTool(name string) bool {
+	return shellExecTools[name]
+}

@@ -9,9 +9,9 @@ import (
 
 // BuildGroupedToolList formats tool descriptors into a tiered, priority-labeled
 // text block for inclusion in LLM prompts. Tools are grouped into 3 tiers:
-//   - Tier 1 (Built-in): Source == "core" and not bash_exec
+//   - Tier 1 (Built-in): Source == "core" and not a shell-exec tool
 //   - Tier 2 (MCP/External): SourceCategory is MCP
-//   - Tier 3 (Fallback): bash_exec
+//   - Tier 3 (Fallback): shell-exec tools (bash_exec, posh_exec)
 //
 // Empty tiers are omitted from the output.
 func BuildGroupedToolList(descriptors []tools.ToolDescriptor) string {
@@ -19,7 +19,7 @@ func BuildGroupedToolList(descriptors []tools.ToolDescriptor) string {
 
 	for _, t := range descriptors {
 		switch {
-		case t.Name == "bash_exec":
+		case tools.IsShellExecTool(t.Name):
 			fallbackTools = append(fallbackTools, t)
 		case t.SourceCategory == tools.SourceCategoryMCP:
 			mcpTools = append(mcpTools, t)
