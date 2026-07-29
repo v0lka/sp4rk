@@ -390,11 +390,14 @@ func TestExtractPoshPaths_DriveAbsolute(t *testing.T) {
 
 func TestExtractPoshPaths_DriveForwardSlash(t *testing.T) {
 	// Drive-absolute with forward slashes is also path-like and extracted.
+	// filepath.Clean normalizes separators to the host OS convention: on POSIX
+	// the result keeps "/", on Windows it becomes "\". Assert the cleaned form
+	// so the test is portable across both platforms.
 	paths, suspicious := extractPoshPaths(`Get-Content D:/logs/app.log`, osAbsPath("wd"), osAbsPath("ws"))
 	if suspicious {
 		t.Fatal("expected not suspicious")
 	}
-	want := `D:/logs/app.log`
+	want := filepath.Clean("D:/logs/app.log")
 	if len(paths) != 1 || paths[0] != want {
 		t.Fatalf("expected [%s], got %v", want, paths)
 	}
