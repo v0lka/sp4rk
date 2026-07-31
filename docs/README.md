@@ -17,6 +17,7 @@ It is a standalone library with no opinion about your UI, storage, or deployment
 - **Human-in-the-loop** — a `HITLHandler` intercepts tool calls for confirmation or modification and decides what happens when the step budget is reached.
 - **Event streaming** — an `Events` interface streams every lifecycle event (thoughts, tool calls, results, context fill, compaction, sub-agent launches) for live observability.
 - **Skill discovery** — a `SkillManager` discovers and parses Agent Skills (agentskills.io specification) from priority-ordered directories and exposes lightweight descriptors for routing.
+- **Subagent Profiles** — an `AgentManager` discovers and parses `AGENT.md` profiles (specialized subagent personas and tool budgets) and serves their directive bodies; a `PlanStep.Agent` targets a named profile whose prompt/tools/max-steps/model are applied to the subagent executing that step.
 - **ONNX embeddings** — a local `Embedder` runs jina-embeddings-v2-small-en through ONNX Runtime for vector search without external API calls.
 - **Prompt injection defense** — untrusted tool output (web, MCP, filesystem) is wrapped in `<untrusted-content>` boundary tags and sanitized before entering LLM context.
 
@@ -109,6 +110,7 @@ go run main.go
 | [memory.md](memory.md) | Context window management, compaction strategies, and pruning |
 | [prompt-building.md](prompt-building.md) | The prompt `Builder`, cache breaks, and substitutions |
 | [skills.md](skills.md) | Agent Skill discovery, parsing, and routing |
+| [agents.md](agents.md) | Subagent Profiles — `AGENT.md` discovery, parsing, and per-agent model/tools |
 | [security.md](security.md) | Prompt injection defense and untrusted-content wrapping |
 | [tool-safety.md](tool-safety.md) | Tool execution-context intelligence: LLM-backed `ToolJudge`, file coherence, environment info, symlink detection |
 | [embedding.md](embedding.md) | ONNX-based local embeddings and vector search |
@@ -130,6 +132,7 @@ go run main.go
 | `…/planner` | `Planner`, `Config`, `PromptSet`, `AgentProfile` for DAG plan generation |
 | `…/prompt` | Fluent prompt `Builder` with cache-break support and substitutions |
 | `…/skills` | `SkillManager` for agentskills.io skill discovery, parsing, and serving |
+| `…/agents` | `AgentManager` for Subagent Profile (`AGENT.md`) discovery, parsing, and serving |
 | `…/memory` | `ContextWindow`, compaction strategies (sliding_window, summarization, hierarchical), pruning |
 | `…/security` | Prompt-injection defense: `WrapUntrustedContent`, `StripUntrustedTags` |
 | `…/embedding` | ONNX-based `Embedder`, `Tokenizer`, and chunker for local vector embeddings |

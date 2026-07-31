@@ -113,4 +113,5 @@ Each example prints its output to stdout. Examples that require interactive inpu
 | `…/agent/reflector`                  | `Reflector` for failure analysis                    |
 | `…/prompt`                           | `SystemPromptBuilder`, cache-break support          |
 | `…/skills`                           | `SkillManager`, skill discovery                     |
+| `…/agents`                           | `AgentManager`, Subagent Profile (`AGENT.md`) discovery |
 | `…/memory`                           | `ContextWindow`, compaction strategies              |

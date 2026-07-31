@@ -495,6 +495,7 @@ type PlanStep struct {
     DependsOn      []string `json:"depends_on"`
     Parallelizable bool     `json:"parallelizable"`
     EstimatedTools []string `json:"estimated_tools"`
+    Agent          string   `json:"agent,omitempty"`
     Profile        any      `json:"profile,omitempty"`
 }
 ```
@@ -507,6 +508,7 @@ type PlanStep struct {
 | `DependsOn` | IDs of steps that must complete successfully before this one can start. |
 | `Parallelizable` | Hint that this step can run concurrently with its siblings. |
 | `EstimatedTools` | Tools the step is expected to use. |
+| `Agent` | Optionally names a **Subagent Profile** (an `AGENT.md`-declared persona — see [Subagent Profiles](agents.md)) that should execute this step. When non-empty, the step runs with that profile's system prompt, tools, max-steps, and model instead of the generic orchestrator defaults. The name is resolved by the execution layer (e.g. the Conductor's agent resolver). Orthogonal to `Profile`. |
 | `Profile` | Optional step-level configuration. During JSON deserialization this is `map[string]any`; consumers convert it to a domain-specific profile (e.g. `*planner.AgentProfile`). The field type is `any`. |
 
 ### CompletedStep

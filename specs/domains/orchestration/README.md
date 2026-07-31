@@ -11,6 +11,7 @@ The orchestration domain turns a single ReAct agent loop into a multi-step, self
 - `github.com/v0lka/sp4rk/agent/router` — request classification (domain, complexity, skills)
 - `github.com/v0lka/sp4rk/agent/reflector` — failure analysis producing a `Reflection`
 - `github.com/v0lka/sp4rk/planner` — DAG plan generation, replanning, continuation
+- `github.com/v0lka/sp4rk/agents` — Subagent Profile discovery/parsing (`AgentManager`), referenced when a `PlanStep.Agent` targets a named profile
 - `github.com/v0lka/sp4rk/llm` — Router (LLM caller), ModelRegistry, token counting
 - `github.com/v0lka/sp4rk/memory` — ContextManager / ContextWindow backing each Conductor run
 - `github.com/v0lka/sp4rk/prompt` — system-prompt construction with cache-break support
@@ -155,6 +156,7 @@ The Conductor is the only top-level execution entry point this domain exposes. D
 - **Custom `Blackboard`** persistence via the `Checkpointer` interface and `CheckpointedBlackboard`.
 - **Custom `Events`** — embed `orchestration.NoopEvents` and override only the hooks you need (plan/step/reflection lifecycle).
 - **Delegation tools** — the host wires `delegate`/`declare_plan`/`reflect`/`cancel_delegation` as ordinary tools; the engine exposes the primitives (`RunSubAgent`, `PendingDelegations`, `Planner`, `Reflector`) they are built on.
+- **Subagent Profiles** — a `PlanStep.Agent` names a profile from `agents.AgentManager` whose directive/tools/model/max-steps/redelegation policy are applied to the subagent executing that step (see [../agents.md](../agents.md) and [subagents.md](subagents.md)).
 
 ## Related Specs
 
@@ -164,5 +166,6 @@ The Conductor is the only top-level execution entry point this domain exposes. D
 - [planner.md](planner.md) — DAG plan generation
 - [reflector.md](reflector.md) — failure analysis and self-correction
 - [subagents.md](subagents.md) — delegated parallel execution primitive
+- [../agents.md](../agents.md) — Subagent Profiles that configure a launched subagent
 - [../memory/README.md](../memory/README.md) — context management backing each run
 - [../memory/blackboard.md](../memory/blackboard.md) — shared task state container

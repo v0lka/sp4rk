@@ -64,6 +64,7 @@ Detailed guides live in [`docs/`](docs/):
 - [Embedding & vector search](docs/embedding.md) — semantic search
 - [Security](docs/security.md) — tool policies and safety
 - [Skills](docs/skills.md) — reusable skill packages
+- [Subagent Profiles](docs/agents.md) — `AGENT.md`-declared subagent personas and tool budgets
 - [Subagents](docs/subagents.md) — delegated execution
 - [Human-in-the-loop](docs/hitl.md) — confirmations and ask-user
 - [Events](docs/events.md) — streaming event types

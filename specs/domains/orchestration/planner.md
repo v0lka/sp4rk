@@ -49,6 +49,8 @@ The placeholder system substitutes keys iteratively (up to a pass cap) so nested
 
 `AgentProfile` is the step-level configuration carried in `PlanStep.Profile` (typed as `any` on the plan, deserialized by consumers). It selects a system-prompt variant, pruning defaults, allowed tools, and reasoning behavior per step (e.g. `coder`, `researcher`, `tester`, `executor`).
 
+`PlanStep.Agent` (`json:"agent,omitempty"`) optionally names a **Subagent Profile** (an `AGENT.md`-declared persona — see [../agents.md](../agents.md)) that should execute this step. When non-empty, the step runs with that profile's system prompt, tools, max-steps, and model instead of the generic orchestrator defaults. The name is resolved by the execution layer (e.g. the Conductor's agent resolver). `Agent` and `Profile` are independent: `Agent` targets a named, externally-declared profile by directory name, while `Profile` carries inline step-level configuration on the plan object itself. `Agent` round-trips through JSON so a declared plan survives blackboard persistence and task continuation (the blackboard's plan deep-copy propagates it).
+
 ### Methods
 
 - **`Plan(ctx, task, availableTools, reflections, availableSkills, singleStep, conversationHistory)`** — generate a DAG for a new task. Sets `Plan.ExplorationContext` to a summary of any exploration performed.
@@ -76,6 +78,7 @@ Direct planning is used when `domain == general` with `complexity < 4`, or when 
 - `MaxExploreSteps` defaults to `7` when unset or non-positive; positive values are used as-is (not clamped).
 - `Replan` preserves successfully completed steps that still appear in the new plan and whose dependencies are all carried forward.
 - `PlanStep.Profile` is `any` on the wire; consumers convert it to a domain profile (e.g. `*planner.AgentProfile`).
+- `PlanStep.Agent` names a Subagent Profile resolved by the execution layer; it is orthogonal to `Profile` and round-trips through JSON persistence.
 
 ## Related Specs
 
@@ -83,4 +86,5 @@ Direct planning is used when `domain == general` with `complexity < 4`, or when 
 - [router.md](router.md) — domain/complexity drive the planning strategy
 - [reflector.md](reflector.md) — reflections feed `Replan`
 - [conductor.md](conductor.md) — the executor that runs each generated `PlanStep`
+- [../agents.md](../agents.md) — Subagent Profiles targeted by `PlanStep.Agent`
 - [../memory/blackboard.md](../memory/blackboard.md) — `BuildCarryForward` / `CompletedStep` carry-forward semantics

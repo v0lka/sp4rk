@@ -6,6 +6,8 @@ The `skills` package provides discovery, parsing, and management of Agent Skills
 import "github.com/v0lka/sp4rk/skills"
 ```
 
+> **Sibling package:** the [`agents` package](agents.md) mirrors this Manager/Parser design for **Subagent Profiles** (`AGENT.md`), which declare specialized subagent personas and tool budgets rather than on-demand skills.
+
 ## SkillManager
 
 `SkillManager` discovers, parses, and serves Agent Skills from configured directories. Directories are scanned in priority order; the first occurrence of a skill name wins, so higher-priority directories override lower-priority ones.

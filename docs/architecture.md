@@ -30,7 +30,7 @@ The SDK is organized in four layers. Import direction flows downward — upper l
 | **Agent** | `agent` | The `Executor` runs the ReAct loop: think, call a tool, observe, repeat. Manages the step budget, circuit breakers, tool-result caching, and sub-agent parallelism. |
 | **Primitives** | `llm`, `tools`, `tools/builtins`, `tools/mcp` | The `Router` routes LLM calls to the active provider. The `ToolRegistry` holds and executes tools. Built-in tools cover file, shell, and search operations; the MCP gateway proxies external servers. |
 
-Supporting packages — `memory`, `prompt`, `skills`, `security`, `embedding`, `pathutil`, `strutil`, `ignore` — are consumed across layers as needed.
+Supporting packages — `memory`, `prompt`, `skills`, `agents`, `security`, `embedding`, `pathutil`, `strutil`, `ignore` — are consumed across layers as needed.
 
 ## Package dependency graph
 
@@ -94,6 +94,9 @@ tools/mcp
 skills
   ├──→ pathutil
   └──→ tools
+
+agents
+  (stdlib + yaml.v3 + log/slog only; no engine packages)
 
 ignore
   └──→ pathutil   (external doublestar only otherwise)
@@ -299,6 +302,7 @@ Steps communicate through the blackboard rather than direct references. A step c
 | `orchestration.MapBlackboard` | **Yes** | Protected by a `sync.RWMutex`. All read and write methods are safe for concurrent use. |
 | `embedding.Embedder` | **Yes** | Protected by a `sync.Mutex`. Safe for concurrent embedding calls. |
 | `skills.SkillManager` | **Yes** | Protected by a `sync.RWMutex`. Scan and lookups are safe for concurrent use. |
+| `agents.AgentManager` | **Yes** | Protected by a `sync.RWMutex`. Scan and lookups are safe for concurrent use. |
 | `agent.Executor` | **No** | An executor owns a single ReAct loop. For parallel steps, create separate executors and run them via `RunSubAgent` goroutines. |
 
 The `Conductor` runs one task at a time. Parallelism within a plan is achieved by launching multiple subagent goroutines (`RunSubAgent`), each with its own `Executor` and `ContextManager`, writing results back to the shared `Blackboard`.

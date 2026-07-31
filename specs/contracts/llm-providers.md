@@ -39,7 +39,7 @@ At startup the host assembles the LLM surface in this order:
 
 - **Host → Router (in):** `RouterConfig` (providers, HTTP client, retry/backoff, sampling) and a `*ModelRegistry`.
 - **Host → Router (runtime):** `SetModel(ctx, compositeModelID)` selects the active provider+model; `ActiveModel()` returns the composite ID (`"provider/model"`).
-- **executor → Router:** `Call(ctx, ChatRequest)` — messages, tools, max tokens, temperature, reasoning effort.
+- **executor → Router:** `Call(ctx, ChatRequest)` — messages, tools, max tokens, temperature, reasoning effort. When `ChatRequest.Model` is empty the router fills it with the active bare model snapshot (`prepareRequest` sets `req.Model = bareModel` only when `req.Model == ""`); a pre-set `req.Model` is preserved and sent to the active provider unchanged. This lets a caller force a specific model without switching providers — `agent.NewModelOverrideCaller` wraps an `LLMCaller` to set `req.Model` on every call, relying on this "fill only when empty" rule. The provider that handles the call is always the active one (`r.activeProvider`); the override changes the model string, not provider routing.
 - **Router → Provider:** an internally-built provider request derived from the `ChatRequest` (provider-specific mapping).
 - **Provider → Router:** `*ChatResponse` (message, reasoning, usage, stop reason).
 - **Router → executor:** `*ChatResponse`, or a retryable-error path that re-attempts with backoff.
@@ -67,3 +67,4 @@ Data is plain Go values. The composite model-ID convention (`"provider/model"`) 
 - If you change the 5-tier `ModelRegistry.Resolve` ordering, you MUST document the new precedence and update host overrides expectations.
 - If you change `TokenCounter`, you MUST update `SimpleTokenCounter`, `TiktokenCounter`, `NewTokenCounter`, and every counter consumer (router validation, context manager fill tracking).
 - If you alter retry/backoff defaults or the retryable-status-code set, you MUST document the latency impact on callers that rely on error propagation for compaction timing, circuit-breaker resets, or budget control.
+- If you change `prepareRequest`'s "fill `req.Model` only when empty" rule, you MUST update `agent.NewModelOverrideCaller` (which relies on it to force a per-agent model) and document the new contract for callers that pre-set `ChatRequest.Model`.

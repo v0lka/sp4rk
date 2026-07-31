@@ -287,6 +287,12 @@ type AgentProfile struct {
 
 The planner emits profiles in the JSON example so the LLM can attach them to steps. Downstream, the host application reads the profile to configure each step's executor (tool set, compaction, budget).
 
+### Subagent Profiles (`PlanStep.Agent`)
+
+In addition to the inline `Profile`, a step may carry an `Agent` field (`json:"agent,omitempty"`) that optionally names a **Subagent Profile** — an `AGENT.md`-declared persona (see [Subagent Profiles](agents.md)). When non-empty, the step runs with that profile's system prompt, tools, max-steps, and model instead of the generic orchestrator defaults. The name is resolved by the execution layer (e.g. the Conductor's agent resolver).
+
+`Agent` and `Profile` are independent: `Agent` targets a named, externally-declared profile by directory name, while `Profile` carries inline step-level configuration on the plan object itself. `Agent` round-trips through JSON so a declared plan survives blackboard persistence and task continuation (the blackboard's plan deep-copy propagates it).
+
 ```json
 {
   "id": "step_1",

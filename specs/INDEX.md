@@ -25,6 +25,7 @@
 | Blackboard, shared state, facts, attachments                  | [domains/memory/blackboard.md](domains/memory/blackboard.md)                    |
 | LLM providers, router, model registry, tokens                 | [domains/llm-providers.md](domains/llm-providers.md)                            |
 | Skill system, activation, resources                           | [domains/skills.md](domains/skills.md)                                          |
+| Subagent Profiles, AGENT.md discovery, per-agent model/tools  | [domains/agents.md](domains/agents.md)                                          |
 | Prompt builder, system-prompt composition                     | [domains/prompt-building.md](domains/prompt-building.md)                        |
 | Embeddings, chunking, ONNX                                    | [domains/embedding.md](domains/embedding.md)                                    |
 | What an embedding application must provide (events, confirm)  | [contracts/agent-execution.md](contracts/agent-execution.md)                    |
@@ -65,10 +66,11 @@ sp4rk is a single Go module (`github.com/v0lka/sp4rk`). Arrows show import direc
    tools/builtins  → tools
    tools/mcp       → tools
    skills          → {pathutil, tools}
+   agents          → {}                   (stdlib + yaml.v3 + log/slog only; no engine packages)
    ignore          → {pathutil}          (external doublestar only otherwise)
 ```
 
-Supporting packages — `prompt`, `skills`, `security`, `embedding`, `pathutil`, `strutil`, `ignore` — are consumed across layers as needed and have no upward dependencies.
+Supporting packages — `prompt`, `skills`, `agents`, `security`, `embedding`, `pathutil`, `strutil`, `ignore` — are consumed across layers as needed and have no upward dependencies.
 
 Import rule: every arrow is one-way. `tools` and `llm` are near-leaf dependencies; they never import `agent`, `orchestration`, `planner`, or the root package. This keeps the primitive layers free of higher-level concerns and prevents import cycles.
 
@@ -110,6 +112,7 @@ See [META.md](META.md) for document templates, naming rules, and update protocol
 
 - [llm-providers.md](domains/llm-providers.md) - Provider abstraction, router, model registry, token counting
 - [skills.md](domains/skills.md) - Skill system, activation, resource access
+- [agents.md](domains/agents.md) - Subagent Profiles (AGENT.md discovery, parsing, management)
 - [prompt-building.md](domains/prompt-building.md) - Prompt builder and system-prompt composition
 - [embedding.md](domains/embedding.md) - Embeddings, chunking, ONNX runtime
 

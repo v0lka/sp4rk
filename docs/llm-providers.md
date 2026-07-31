@@ -400,7 +400,7 @@ router, err := llm.NewRouter(ctx, llm.RouterConfig{
 
 ```go
 type ChatRequest struct {
-    Model           string           // bare model name (filled from active model if empty)
+    Model           string           // bare model name (filled from active model only when empty)
     ModelFamily     string           // family hint; auto-detected if empty
     Messages        []Message
     Tools           []ToolDefinition
@@ -425,6 +425,12 @@ type TokenUsage struct {
 ```
 
 `Router.Call` fills in the active bare model when `Model` is empty, applies the default temperature, validates the context window, then sends the request. On success it ensures `Model` and `Family` are set on the response and trims trailing whitespace from content and reasoning fields.
+
+### Forcing a specific model without switching providers
+
+The "fill only when empty" rule for `Model` is part of the router contract: a pre-set `req.Model` is preserved and sent to the active provider (`r.activeProvider`) unchanged, while the provider that handles the call is always the active one. This lets a caller force a specific model string without switching providers.
+
+`agent.NewModelOverrideCaller(inner LLMCaller, model string)` exploits this: it wraps an `LLMCaller` so every `Call` sets `req.Model` to `model` before delegating to `inner`, relying on the rule above to bypass the router's active-model selection for that caller. It returns `inner` unchanged when `model` is empty, so the override applies conditionally — used to apply a per-agent `Model` from a [Subagent Profile](agents.md). It is a `Caller` wrapper in the same spirit as the usage-tracking wrapper described in [Usage tracking](#usage-tracking).
 
 ## Message types
 

@@ -45,6 +45,7 @@ sp4rk is a reusable agent-execution engine. It is organized as a single Go modul
 │           hierarchical), Steps                                       │
 │  prompt   PromptBuilder, sampling helpers                            │
 │  skills   SkillManager, parser, resource tool                        │
+│  agents   AgentManager, AGENT.md parser (Subagent Profiles)          │
 │  security untrusted-content wrapping (prompt-injection defense)      │
 │  embedding Embedder, chunker, ONNX runtime, tokenizer                │
 │  pathutil pure path algorithmic primitives                           │
@@ -57,7 +58,7 @@ sp4rk is a reusable agent-execution engine. It is organized as a single Go modul
 
 | Package                    | May Import                                                                                  | Must NOT Import                          |
 | -------------------------- | ------------------------------------------------------------------------------------------- | ---------------------------------------- |
-| root `sp4rk`               | `agent`, `agent/reflector`, `llm`, `memory`, `orchestration`, `planner`, `tools`, `tools/builtins`, `tools/mcp`, `skills`, `embedding`, `prompt`, `security` | External libs only (no upward cycle)     |
+| root `sp4rk`               | `agent`, `agent/reflector`, `llm`, `memory`, `orchestration`, `planner`, `tools`, `tools/builtins`, `tools/mcp`, `skills`, `agents`, `embedding`, `prompt`, `security` | External libs only (no upward cycle)     |
 | `orchestration`            | `agent`, `llm`, `tools`, `skills`                                                           | `planner`, root, `backend`-equivalents   |
 | `planner`                  | `agent`, `llm`, `orchestration`, `prompt`, `skills`, `tools`                                | root                                     |
 | `agent`                    | `llm`, `tools`                                                                              | `orchestration`, `planner`, root         |
@@ -68,7 +69,7 @@ sp4rk is a reusable agent-execution engine. It is organized as a single Go modul
 | `tools`                    | `llm`, `pathutil`, `strutil`, `tools/internal/judge_prompts`                                | `agent`, `memory`, `orchestration`, root |
 | `tools/builtins` | `tools`, `agent`, `pathutil` | `orchestration`, `planner`, root (intentional `agent` edge — see note) |
 | `tools/mcp`      | `tools` (and through it, `llm`, `pathutil`)                                              | siblings via the agent/orchestration layer |
-| `prompt`, `skills`, `security`, `embedding`, `pathutil`, `strutil`, `ignore` | leaves / near-leaves only                                       | `tools`, `agent`, `orchestration`, root  |
+| `prompt`, `skills`, `agents`, `security`, `embedding`, `pathutil`, `strutil`, `ignore` | leaves / near-leaves only                                       | `tools`, `agent`, `orchestration`, root  |
 
 > **Module boundary.** sp4rk is a standalone Go module. It cannot import any host-application package — an embedding application imports sp4rk, never the reverse. The import prohibitions on upward engine layers are enforced both by convention and by the import cycles they would otherwise create.
 
@@ -106,6 +107,7 @@ Coordinates multi-step tasks across the engine.
 - **`memory`** — `ContextWindow` manages the LLM context window (`BuildPrompt`, `AddStep`, `Compact`, `CheckFill`). Compaction strategies: sliding window, summarization, hierarchical. Applies the `<untrusted-content>` wrapping at prompt-build time when `InjectionDefenseEnabled` is set.
 - **`prompt`** — `PromptBuilder` composes system prompts from segments; `sampling` helpers. No engine-internal imports.
 - **`skills`** — `SkillManager` scans and activates skills; the resource tool reads skill files. Imports `pathutil` and `tools` only.
+- **`agents`** — `AgentManager` discovers and parses **Subagent Profiles** (`AGENT.md` files declaring specialized subagent personas and tool budgets). Mirrors the `skills` Manager/Parser design but is fully self-contained: imports only the Go standard library plus `gopkg.in/yaml.v3` and `log/slog` (no engine packages). A profile's body is the core directive applied when a subagent is launched under it; `PlanStep.Agent` targets a profile by name, resolved by the execution layer.
 - **`security`** — prompt-injection defense primitives: `UntrustedTag`, `WrapUntrustedContent`, `StripUntrustedTags`.
 - **`embedding`** — `Embedder` over ONNX Runtime; `chunker` for text segmentation; tokenizer. Thread-safe.
 - **`pathutil`** — pure path algorithmic primitives (containment checks, component splitting, prefix resolution). Zero engine-specific knowledge; usable from any layer.

@@ -7,9 +7,10 @@ The delegated-execution primitive: goroutine-based wrappers around an `Executor`
 ## Key Files
 
 - `github.com/v0lka/sp4rk/agent` — `SubAgentTask`, `RunSubAgent`, `RunSubAgentsParallel`, `SubAgentResult`, `DetectToolCallSyntaxInContent`, `StepTodoUpdateFunc`, context helpers (`WithStepID`, `WithStepTodoUpdateFunc`)
-- `github.com/v0lka/sp4rk/agent` — `Executor`, `ContextManager`, `Events` (`SubAgentLaunch`/`SubAgentComplete` hooks)
+- `github.com/v0lka/sp4rk/agent` — `Executor`, `ContextManager`, `Events` (`SubAgentLaunch`/`SubAgentComplete` hooks), `NewModelOverrideCaller`
 - `github.com/v0lka/sp4rk/tools` — `ToolDescriptor`, `WithTaskContext`
-- `github.com/v0lka/sp4rk/orchestration` — `CompletedStep`, DAG utilities (`FindReadySteps`) used to select independent steps
+- `github.com/v0lka/sp4rk/orchestration` — `CompletedStep`, DAG utilities (`FindReadySteps`) used to select independent steps, `PlanStep.Agent` (names a Subagent Profile that should execute a step)
+- `github.com/v0lka/sp4rk/agents` — `AgentManager`, `Agent` profile discovery/parsing (resolves `PlanStep.Agent` to a profile)
 
 ## Behavior
 
@@ -87,6 +88,23 @@ if success && DetectToolCallSyntaxInContent(result.Output) {
 
 The function is exported so callers can use it independently.
 
+### Subagent Profiles
+
+A subagent may be launched under a named **Subagent Profile** (an `AGENT.md`-declared persona; see [../agents.md](../agents.md)). A profile is discovered and parsed by `agents.AgentManager` (mirroring `skills.SkillManager`); the execution layer resolves the profile name — set on a plan step via `PlanStep.Agent`, or chosen directly by a host delegation tool — to an `*agents.Agent` and applies its fields to the launched subagent:
+
+| Profile field | Applied to the subagent as |
+| ------------- | -------------------------- |
+| `Body` | the core directive / system prompt (replaces the generic orchestrator default) |
+| `Tools` (`ToolPreference`) | the tool budget (`nil`=all, `"read-only"`, or a comma-list of mutating tools) |
+| `MaxSteps` | the ReAct iteration cap (0/absent → derived from task complexity) |
+| `Model` | forced per-call via `NewModelOverrideCaller` |
+| `AllowRedelegate` | whether the subagent may launch further subagents |
+| `Hidden` | discovery visibility only (never blocks invocation) |
+
+`NewModelOverrideCaller(inner LLMCaller, model string)` wraps an `LLMCaller` so every `Call` sets `req.Model` before delegating to `inner`. It returns `inner` unchanged when `model` is empty, so the override applies conditionally without callers branching. It relies on the [LLM router contract](../../contracts/llm-providers.md) that `req.Model` is filled with the active model only when empty — setting it beforehand bypasses the router's active-model selection for that caller while still routing to the active provider.
+
+Profile application is an execution-layer concern: `RunSubAgent`/`RunSubAgentsParallel` themselves are profile-agnostic primitives. The host or Conductor resolves the profile and constructs the `Executor`, `ContextManager`, `TaskTools`, and caller before handing them to `RunSubAgent` as a `SubAgentTask`.
+
 ## Error Handling
 
 - **Executor fatal error**: `Error` is set; `Steps` carries the partial trajectory when available.
@@ -106,4 +124,5 @@ The function is exported so callers can use it independently.
 - [README.md](README.md) — orchestration overview
 - [executor.md](executor.md) — the ReAct loop primitive each subagent runs
 - [conductor.md](conductor.md) — the top-level caller that a host's delegation tool launches subagents from
+- [../agents.md](../agents.md) — Subagent Profiles that configure a launched subagent
 - [../memory/README.md](../memory/README.md) — isolated context per subagent
