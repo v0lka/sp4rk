@@ -472,6 +472,7 @@ func copyPlan(p *Plan) *Plan {
 			Summary:        s.Summary,
 			Description:    s.Description,
 			Parallelizable: s.Parallelizable,
+			Agent:          s.Agent,
 			Profile:        s.Profile, // opaque value; simple assignment
 		}
 		if s.DependsOn != nil {

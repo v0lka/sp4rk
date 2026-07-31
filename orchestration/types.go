@@ -27,6 +27,13 @@ type PlanStep struct {
 	DependsOn      []string `json:"depends_on"`
 	Parallelizable bool     `json:"parallelizable"`
 	EstimatedTools []string `json:"estimated_tools"`
+	// Agent optionally names a Subagent Profile that should execute this step.
+	// When non-empty, the step runs with that profile's system prompt, tools,
+	// max-steps, and model instead of the generic orchestrator defaults. The
+	// name is resolved by the execution layer (e.g. the Conductor's agent
+	// resolver). It round-trips through JSON so a declared plan survives
+	// blackboard persistence and task continuation.
+	Agent string `json:"agent,omitempty"`
 	// Profile holds optional step-level configuration.
 	// During JSON deserialization this is map[string]any; consumers should
 	// convert to a domain-specific profile (e.g. *planner.AgentProfile).
