@@ -242,7 +242,11 @@ func TestNewTool_WithSanitizer(t *testing.T) {
 		if source != "test-mcp" {
 			return schema
 		}
-		return sdktools.DefaultParamManager().SanitizeSchema(source, schema)
+		result, err := sdktools.StripParamsFromSchema(schema, map[string]bool{"project": true})
+		if err != nil {
+			return schema
+		}
+		return result
 	}
 
 	tool := NewTool(server, info, sanitizer)
@@ -303,7 +307,11 @@ func TestNewTool_SanitizerSkippedForOtherSource(t *testing.T) {
 		if source != "test-mcp" {
 			return schema
 		}
-		return sdktools.DefaultParamManager().SanitizeSchema(source, schema)
+		result, err := sdktools.StripParamsFromSchema(schema, map[string]bool{"project": true})
+		if err != nil {
+			return schema
+		}
+		return result
 	}
 
 	tool := NewTool(server, info, sanitizer)

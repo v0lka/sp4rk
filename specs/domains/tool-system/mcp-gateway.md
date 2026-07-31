@@ -7,7 +7,7 @@ Manages connections to external MCP (Model Context Protocol) servers, discovers 
 ## Key Files
 
 - `github.com/v0lka/sp4rk/tools/mcp` — `Gateway`, `GatewayConfig`, `ServerEntry`, `StartGateway`, `Server`, `Tool`, `SchemaSanitizer`, `ServerStatus`, error types (`StartError`/`StopError`/`ReconfigureError`)
-- `github.com/v0lka/sp4rk/tools` — `ToolRegistry`, `RegisterWithSource`, `RegisterWithSourceCategory`, `UnregisterBySource`, `ParamManager`
+- `github.com/v0lka/sp4rk/tools` — `ToolRegistry`, `RegisterWithSource`, `RegisterWithSourceCategory`, `UnregisterBySource`, `StripParamsFromSchema`
 
 ## Behavior
 
@@ -58,7 +58,7 @@ After connecting, each server is queried with `tools/list`. Returned tools becom
 
 ### SchemaSanitizer
 
-`SchemaSanitizer func(source string, schema json.RawMessage) json.RawMessage` transforms an input schema before it is exposed to the LLM (applied in `NewTool`). The typical use is stripping auto-injected parameters (e.g. `project`) that a `ParamManager` adds at execution time. Share one `ParamManager` instance between the gateway (`SanitizeSchema`) and the registry (`InjectParams`) so both sides agree on the auto-injected set.
+`SchemaSanitizer func(source string, schema json.RawMessage) json.RawMessage` transforms an input schema before it is exposed to the LLM (applied in `NewTool`). The typical use is stripping source-specific parameters the model should not be asked to fill (e.g. a `project` scoping field the host supplies itself). `tools.StripParamsFromSchema(schema, paramsToRemove)` is the SDK helper for this; return the input unchanged to pass through.
 
 ### Reconfigure
 

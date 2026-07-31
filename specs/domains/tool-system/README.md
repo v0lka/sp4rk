@@ -6,7 +6,7 @@ Provides the tool abstraction for the agent: a single `Tool` interface, a thread
 
 ## Key Files
 
-- `github.com/v0lka/sp4rk/tools` — `Tool` interface, `BaseTool`, `ToolResult`, `ToolPolicy`, `ToolJudger`, `ToolDescriptor`, `ToolRegistry`, `ParamManager`
+- `github.com/v0lka/sp4rk/tools` — `Tool` interface, `BaseTool`, `ToolResult`, `ToolPolicy`, `ToolJudger`, `ToolDescriptor`, `ToolRegistry`, `StripParamsFromSchema`
 - `github.com/v0lka/sp4rk/tools` (registry) — `Register`/`RegisterWithSource`/`RegisterWithSourceCategory`, `Execute` (fail-closed policy enforcement), `List`/`ListFiltered`, MCP shadowing protection
 - `github.com/v0lka/sp4rk/tools` (context helpers) — `WithWorkspacePath`, `WithTempDir`, `WithAllowedRoots`, `SessionRoots`, `WithTaskContext`. `SessionRoots` returns the deduplicated union of workspace + temp + additional allowed roots consulted by every path-containment check.
 - `github.com/v0lka/sp4rk/tools/builtins` — built-in tool catalog
@@ -59,8 +59,7 @@ type ToolDescriptor struct {
 ToolRegistry.Execute(ctx, name, input)
 │
 ├─ 1. Look up the tool by name → not found ⇒ error ToolResult
-├─ 2. Apply parameter injection (if a ParamManager is configured)
-└─ 3. Resolve effective policy (per-tool override, else the tool's DefaultPolicy):
+└─ 2. Resolve effective policy (per-tool override, else the tool's DefaultPolicy):
       ├─ PolicyAlwaysAllow  → execute (escalate to confirmation if a ToolJudger flags it)
       ├─ PolicyAlwaysDeny   → reject with an error result
       └─ PolicyUserConfirm  → consult ConfirmFunc; DENIED (fail-closed) if none configured
@@ -88,7 +87,6 @@ Policy is set per tool. Override a tool's effective policy explicitly, or relax 
 registry.SetPolicyOverride("bash_exec", tools.PolicyAlwaysAllow) // deliberate opt-in
 registry.ClearPolicyOverride("bash_exec")
 registry.SetConfirmFunc(myConfirmFunc)   // consulted for PolicyUserConfirm + judge escalation
-registry.SetParamManager(pm)             // execution-time parameter injection
 ```
 
 Stage 1 truncation limits are configured per tool on the executor (see [../orchestration/executor.md](../orchestration/executor.md)); tool result budget (Stage 2) is configured on the executor's `ToolResultBudget`.
@@ -98,7 +96,7 @@ Stage 1 truncation limits are configured per tool on the executor (see [../orche
 - **New built-in tool**: embed `tools.BaseTool`, implement `Execute`, optionally implement `ToolJudger`, set `Untrusted: true` for external-output tools, and register. See [builtins.md](builtins.md).
 - **Transformed read view (content-backed cache)**: a read tool that returns a transformed/decoded representation of a file (not its raw bytes) implements `tools.ContentBackedReader` (`IsContentBacked(ctx, input) bool`). When it reports `true` for an input, `ToolRegistry.CacheStrategy` returns `CacheModeContentBacked`, so the executor caches the result in memory while still attaching file coherence metadata (path+mtime+size). The decision is per-input, so the same tool can stay file-backed for plain text and content-backed for transformed formats.
 - **Custom policy enforcement layer**: hosts may wrap the registry and shadow `Execute` (calling `tool.Execute` directly after their own checks); the SDK-level enforcement only applies to calls routed through `ToolRegistry.Execute`.
-- **`ParamManager`**: transform tool input at execution time (e.g. inject a `project` parameter into MCP tools); share one instance with the MCP gateway so schema sanitization and injection agree on the auto-injected parameter set.
+- **Schema sanitization**: `StripParamsFromSchema(schema, paramsToRemove)` removes named properties from a JSON Schema's `properties` object and (if present) from `required` — used to hide source-specific parameters from the LLM. The MCP gateway applies it through `GatewayConfig.SchemaSanitizer`; hosts may also call it directly before exposing a schema.
 - **MCP servers**: add external tools without writing Go code per server. See [mcp-gateway.md](mcp-gateway.md).
 
 ## Related Specs

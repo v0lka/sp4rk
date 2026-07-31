@@ -143,10 +143,9 @@ registry := tools.NewToolRegistry()
 | `CacheStrategy(ctx, name, input)` | Reports the cache mode for a tool's result: `CacheModeDefault` (existing heuristic, `read_file` is file-backed) or `CacheModeContentBacked` (result cached in memory). A read tool opts into the latter by implementing the optional `ContentBackedReader`. |
 | `SetConfirmFunc(fn)` | Install the confirmation callback consulted for `PolicyUserConfirm` tools and judge-escalated calls. |
 | `SetPolicyOverride(name, policy)` / `ClearPolicyOverride(name)` | Explicitly override (or restore) a tool's effective policy. |
-| `SetParamManager(pm)` | Install a `ParamManager` for execution-time parameter injection. |
 | `SetLogger(l)` | Set the logger used for registration warnings. |
 
-`Execute` applies parameter injection (if a `ParamManager` is configured) before invoking the tool. If the tool is not found it returns an error `ToolResult` rather than a Go error.
+`Execute` applies fail-closed policy enforcement (see below) before invoking the tool. If the tool is not found it returns an error `ToolResult` rather than a Go error.
 
 ### Policy enforcement in Execute (fail-closed)
 
@@ -374,29 +373,15 @@ func main() {
 
 Returning a Go `error` signals that the executor should treat the failure as infrastructure-level (and potentially retry or reflect); an `IsError` result is a normal, reportable tool failure that the agent can reason about.
 
-## ParamManager
+## Schema sanitization
 
-`ParamManager` handles auto-injected tool parameters. It has two responsibilities:
-
-- **`SanitizeSchema(source, schema)`** — strip auto-injected params from tool schemas so the LLM never sees them.
-- **`InjectParams(ctx, toolName, source, input)`** — add their values at execution time.
-
-A single `ParamManager` instance should be shared between the MCP gateway (which calls `SanitizeSchema`) and the tool registry (which calls `InjectParams`) so both sides agree on the set of auto-injected parameters.
+`StripParamsFromSchema` removes named properties from a JSON Schema's `properties` object and (if present) from `required`:
 
 ```go
-type ParamManager interface {
-    SanitizeSchema(source string, schema json.RawMessage) json.RawMessage
-    InjectParams(ctx context.Context, toolName, source string, input json.RawMessage) json.RawMessage
-}
+func StripParamsFromSchema(schema json.RawMessage, paramsToRemove map[string]bool) (json.RawMessage, error)
 ```
 
-`DefaultParamManager()` handles all known auto-injected parameters (currently the `"project"` parameter, which is injected from the workspace path in the context). Install it on the registry with `SetParamManager`:
-
-```go
-registry.SetParamManager(tools.DefaultParamManager())
-```
-
-When set, `ToolRegistry.Execute` consults the manager and injects the workspace path as the `"project"` parameter before invoking the tool — but only if the parameter is not already present in the input.
+It is used to hide parameters from the LLM — e.g. a source-specific field an MCP server expects but the model should not be asked to fill. The MCP gateway applies it through `GatewayConfig.SchemaSanitizer` (see [MCP integration](mcp-integration.md)); hosts can also call it directly before exposing a schema. If `paramsToRemove` is empty the schema is returned unchanged; invalid JSON yields an error.
 
 ## Built-in tools reference
 

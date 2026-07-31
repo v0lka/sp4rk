@@ -35,8 +35,3 @@ const (
 // ConfirmFunc is called before executing a mutating tool.
 // If nil, all tools execute without confirmation (CLI mode).
 type ConfirmFunc func(ctx context.Context, req ConfirmationRequest) (ConfirmationResponse, error)
-
-// AutoInjectedParamProject is the parameter name auto-injected by param injectors
-// (e.g. project path). Schema sanitizers strip this parameter from tool schemas so
-// the LLM never sees it, while the injector adds it at execution time.
-const AutoInjectedParamProject = "project"

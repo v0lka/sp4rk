@@ -25,8 +25,7 @@ The host application consumes the tool types from `github.com/v0lka/sp4rk/tools`
 | `ToolSourceCategory` | tools | Set at registration | Origin classifier: `SourceCategoryCore`, `SourceCategoryMCP` (drives untrusted-output handling) |
 | `IgnoreChecker` | tools | Satisfied structurally by `ignore.Resolver`/`ignore.Multi` | Reports whether an absolute path is ignored by `.gitignore`/`.aiignore` rules: `Ignored(absPath string, isDir bool) bool`. Read-style tools (glob, ripgrep) consult it to honour ignore rules for the workspace and any work-directory root |
 | `WithIgnoreChecker` / `IgnoreCheckerFrom` | tools | Attached/consumed via context | Context plumbing for the ignore checker; `IgnoreCheckerFrom` returns `nil` when none is attached, and callers MUST then skip ignore filtering and keep their pre-ignore behaviour (graceful, no regression) |
-| `ParamManager` | tools | Provided by host (optional) | Auto-injected parameter management (`SanitizeSchema` + `InjectParams`), e.g. project path |
-| `AutoInjectedParamProject` | tools | Constant | `"project"` — the auto-injected param name stripped from tool schemas before the LLM sees them |
+| `StripParamsFromSchema` | tools | Consumed by MCP gateway / host | Schema utility that removes named properties from a JSON Schema (`properties` + `required`), e.g. to hide source-specific parameters from the LLM |
 
 > The `ToolJudge` type in `github.com/v0lka/sp4rk/tools/judge.go` is a **separate**, LLM-powered safety evaluator (verdicts `VerdictAllow`/`VerdictConfirm`). It is distinct from the `ToolJudger` interface a tool may implement; do not confuse the two. The judge's response parser is tolerant of LLM formatting variations (markdown decoration, list markers, code fences, lowercase keys, inline single-line answers, and JSON) and classifies the verdict by **whole-token, case-insensitive matching**: `ALLOW`/`ALLOWED`/`APPROVE`/`APPROVED`/`SAFE` → `VerdictAllow`; `CONFIRM`/`CONFIRMED`/`DENY`/`DENIED`/`BLOCK`/`BLOCKED`/`REJECT`/`MANUAL`/`DISALLOW`/`DISAPPROVE` → `VerdictConfirm`. Any unrecognized token — including negations of allow-words (e.g. `DISALLOW`/`DISAPPROVE`, which contain `ALLOW`/`APPROVE` as substrings) — and any LLM error fail **safe** to `VerdictConfirm`, so an ambiguous or adversarial verdict never auto-allows a potentially destructive call.
 
@@ -37,7 +36,7 @@ At startup the host builds the tool surface in this order:
 1. Construct a `ToolRegistry` via `NewToolRegistry()` (empty) and optionally `SetLogger`.
 2. Implement each built-in/host tool by embedding `BaseTool` and providing `Execute`; set a `DefaultPolicy` and the `Untrusted` flag on the base. Register each via the registry's registration methods (with a `ToolSourceCategory`).
 3. Implement a `ConfirmFunc` that routes `ConfirmationRequest`s to the user (e.g. a UI prompt) and returns a `ConfirmationResponse`. Call `SetConfirmFunc(fn)`.
-4. Optionally install a `ParamManager` for auto-injected parameters, and apply per-tool policy overrides via `SetPolicyOverride`.
+4. Apply per-tool policy overrides via `SetPolicyOverride`; optionally attach a `SchemaSanitizer` to the MCP gateway config (see [../domains/tool-system/mcp-gateway.md](../domains/tool-system/mcp-gateway.md)) to transform schemas before they reach the LLM.
 5. Register MCP tools through the MCP gateway's `RegisterTools(registry)` (see [../decisions/002-skills-mcp-in-sdk.md](../decisions/002-skills-mcp-in-sdk.md)), which registers them with `SourceCategoryMCP`.
 6. The host passes the `ToolRegistry` to the agent executor as its `ToolExecutor`.
 
@@ -45,7 +44,7 @@ At startup the host builds the tool surface in this order:
 
 ## Data Flow Across Boundary
 
-- **Host → registry:** tool registration (name, `Tool`, source, category), `SetConfirmFunc`, `SetPolicyOverride`, optional `ParamManager`.
+- **Host → registry:** tool registration (name, `Tool`, source, category), `SetConfirmFunc`, `SetPolicyOverride`.
 - **executor → registry:** `Execute(ctx, name, input json.RawMessage)` and the `agent.ToolExecutor` helpers `GetToolSource(name)` / `IsToolUntrusted(name)` / `CacheStrategy(ctx, name, input)` (returns a `CacheMode`).
 - **registry → Tool:** `Execute(ctx, input json.RawMessage)` after policy is satisfied.
 - **registry → ContentBackedReader:** during `CacheStrategy`, if the tool implements `ContentBackedReader`, `IsContentBacked(ctx, input)` is consulted per-input to choose content-backed vs file-backed caching.
@@ -55,7 +54,7 @@ At startup the host builds the tool surface in this order:
 - **Tool → registry:** `ToolResult` (`{Content, IsError}`) and an error.
 - **registry → executor:** `ToolResult` plus the untrusted-source classification (MCP tools and tools with `IsUntrusted()==true` are flagged untrusted so observations are wrapped defensively before entering LLM context).
 
-Data is plain Go values and `json.RawMessage`. Auto-injected parameters are injected at execution time and stripped from schemas before they reach the LLM.
+Data is plain Go values and `json.RawMessage`. Schemas may be transformed (e.g. source-specific parameters stripped) before they reach the LLM via the MCP gateway's `SchemaSanitizer`.
 
 ## Error Propagation
 
@@ -76,5 +75,5 @@ Data is plain Go values and `json.RawMessage`. Auto-injected parameters are inje
 - If you change `ToolResult`, you MUST update every tool implementation, the executor's observation handling, and the `Step.IsError` mapping.
 - If you change `ToolSourceCategory` or the untrusted-output classification, you MUST update `IsToolUntrusted`/`GetToolSource` consumers and the prompt-injection defense wrapping.
 - If you change `CacheMode` or the `ContentBackedReader` contract, you MUST update `ToolRegistry.CacheStrategy` and the executor's cache-mode dispatch (`buildCacheMeta`).
-- If you change `ParamManager` or `AutoInjectedParamProject`, you MUST update schema sanitizers, MCP schema handling, and the host's injection logic.
+- If you change `StripParamsFromSchema` or the `SchemaSanitizer` contract, you MUST update MCP schema handling and any host that transforms schemas before exposing them to the LLM.
 - If you change `IgnoreChecker` or its context plumbing (`WithIgnoreChecker`/`IgnoreCheckerFrom`), you MUST update the `ignore.Resolver`/`ignore.Multi` implementations that satisfy it structurally and every read tool (glob, ripgrep) that consults it; preserve the `nil` ⇒ no-filtering default.

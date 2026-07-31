@@ -31,7 +31,6 @@ type ToolRegistry struct {
 	toolCategories  map[string]ToolSourceCategory
 	policyOverrides map[string]ToolPolicy
 	confirmFunc     ConfirmFunc
-	paramManager    ParamManager // optional param injector for execution-time injection
 	logger          *slog.Logger
 	mu              sync.RWMutex
 }
@@ -236,7 +235,6 @@ func (r *ToolRegistry) ListFiltered(excludeNames map[string]bool) []ToolDescript
 // Execute looks up a tool by name and executes it with the given input,
 // applying fail-closed policy enforcement (see the ToolRegistry doc comment).
 // Returns a not-found error result if the tool is not registered.
-// Param injection is applied if a ParamManager is configured.
 func (r *ToolRegistry) Execute(ctx context.Context, name string, input json.RawMessage) (ToolResult, error) {
 	tool, ok := r.Get(name)
 	if !ok {
@@ -244,15 +242,8 @@ func (r *ToolRegistry) Execute(ctx context.Context, name string, input json.RawM
 	}
 
 	r.mu.RLock()
-	pm := r.paramManager
-	source := r.toolSources[name]
 	policy, hasOverride := r.policyOverrides[name]
 	r.mu.RUnlock()
-
-	// Apply param injection if configured (e.g., project scoping for MCP tools).
-	if pm != nil {
-		input = pm.InjectParams(ctx, name, source, input)
-	}
 
 	if !hasOverride {
 		policy = tool.DefaultPolicy()
@@ -385,13 +376,4 @@ func (r *ToolRegistry) CacheStrategy(ctx context.Context, name string, input jso
 		}
 	}
 	return CacheModeDefault
-}
-
-// SetParamManager sets a ParamManager that handles param injection at execution time.
-// When set, it is consulted during Execute() to inject auto-managed parameters
-// (e.g., "project") before invoking the tool.
-func (r *ToolRegistry) SetParamManager(pm ParamManager) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.paramManager = pm
 }

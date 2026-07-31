@@ -447,7 +447,7 @@ type GatewayConfig struct {
 
 	// SchemaSanitizer transforms tool input schemas before registration.
 	// When set, it is called for every tool registered from MCP servers.
-	// Use this to strip auto-injected parameters that should not be visible
+	// Use this to strip source-specific parameters that should not be visible
 	// to the LLM. Nil means no sanitization.
 	SchemaSanitizer SchemaSanitizer
 }

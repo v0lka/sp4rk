@@ -196,19 +196,24 @@ Every MCP tool wrapper has these fixed behaviors:
 type SchemaSanitizer func(source string, schema json.RawMessage) json.RawMessage
 ```
 
-When set in `GatewayConfig`, it is applied to every tool registered from MCP servers (in `NewTool`). Return the input unchanged to pass through. The typical use is to strip auto-injected parameters (e.g. `"project"`) that should not be visible to the LLM but are added at execution time by a `ParamManager`.
-
-A single `ParamManager` instance should be shared between the MCP gateway (which calls `SanitizeSchema`) and the tool registry (which calls `InjectParams`) so both sides agree on the set of auto-injected parameters:
+When set in `GatewayConfig`, it is applied to every tool registered from MCP servers (in `NewTool`). Return the input unchanged to pass through. The typical use is to strip source-specific parameters the LLM should not be asked to fill — `tools.StripParamsFromSchema(schema, paramsToRemove)` is the SDK helper for this:
 
 ```go
-pm := tools.DefaultParamManager()
+sanitize := func(source string, schema json.RawMessage) json.RawMessage {
+    if source != "my-server" {
+        return schema
+    }
+    result, err := tools.StripParamsFromSchema(schema, map[string]bool{"project": true})
+    if err != nil {
+        return schema // invalid JSON — pass through
+    }
+    return result
+}
 
 gateway, err := mcp.StartGateway(ctx, mcp.GatewayConfig{
-    Servers: servers,
-    SchemaSanitizer: pm.SanitizeSchema, // strip "project" from MCP schemas
+    Servers:         servers,
+    SchemaSanitizer: sanitize, // strip "project" from this server's schemas
 }, registry, os.ExpandEnv, logger)
-
-registry.SetParamManager(pm) // inject "project" at execution time
 ```
 
 ## Error handling

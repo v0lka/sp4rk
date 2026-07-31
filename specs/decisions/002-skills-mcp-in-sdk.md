@@ -18,7 +18,7 @@ The MCP gateway depends on:
 
 - The tool registry (registering MCP tools with source/policy metadata).
 - Environment-variable expansion for server configuration.
-- Schema sanitization (stripping auto-injected parameters so the LLM never sees them).
+- Schema sanitization (stripping source-specific parameters from tool schemas so the LLM never sees them, via the `SchemaSanitizer` hook).
 
 A earlier position held that these were application-level integrations that should live above the framework, because skills needed orchestration-level context and the gateway needed policy enforcement the framework "did not model." That position was abandoned once the coupling was resolved through interface indirection rather than relocation: skills use context values for per-session activation, and the MCP gateway registers through the standard sp4rk tool registry.
 

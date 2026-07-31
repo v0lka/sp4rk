@@ -29,7 +29,8 @@ type SchemaSanitizer func(source string, schema json.RawMessage) json.RawMessage
 
 // NewTool creates a new Tool from the given server and tool info.
 // Optional SchemaSanitizers are applied in order to transform the input schema
-// before it is stored (e.g., to strip auto-injected parameters).
+// before it is stored (e.g., to strip source-specific parameters the model
+// should not be asked to fill).
 func NewTool(server *Server, info ToolInfo, sanitizers ...SchemaSanitizer) *Tool {
 	schema := info.InputSchema
 	for _, s := range sanitizers {

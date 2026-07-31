@@ -341,12 +341,9 @@ func New(cfg Config) (*Framework, error) {
 
 	// Start MCP gateway if configured
 	if cfg.MCP != nil && len(cfg.MCP.Servers) > 0 {
-		pm := tools.DefaultParamManager()
-		fw.tools.SetParamManager(pm)
 		mcpCfg := mcp.GatewayConfig{
-			Servers:         cfg.MCP.Servers,
-			DefaultWorkDir:  cfg.MCP.DefaultWorkDir,
-			SchemaSanitizer: pm.SanitizeSchema,
+			Servers:        cfg.MCP.Servers,
+			DefaultWorkDir: cfg.MCP.DefaultWorkDir,
 		}
 		gw, gwErr := mcp.StartGateway(context.Background(), mcpCfg, fw.tools, os.ExpandEnv, logger)
 		if gwErr != nil {
