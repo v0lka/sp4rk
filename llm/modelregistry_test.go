@@ -107,6 +107,9 @@ func TestModelRegistry_FallbackForUnknownModel(t *testing.T) {
 		ContextWindow: 128000,
 		OutputLimit:   4096,
 		TokenizerType: "approximate",
+		// Unknown models default to optimistic attachment support: better to
+		// surface a runtime provider error than to deny image uploads.
+		Capabilities: ModelCapabilities{Attachment: true},
 	}
 
 	if meta.ContextWindow != expected.ContextWindow {
@@ -117,6 +120,9 @@ func TestModelRegistry_FallbackForUnknownModel(t *testing.T) {
 	}
 	if meta.TokenizerType != expected.TokenizerType {
 		t.Errorf("expected TokenizerType %s, got %s", expected.TokenizerType, meta.TokenizerType)
+	}
+	if meta.Capabilities != expected.Capabilities {
+		t.Errorf("expected Capabilities %+v, got %+v", expected.Capabilities, meta.Capabilities)
 	}
 }
 
@@ -243,6 +249,142 @@ func TestModelRegistry_CaseInsensitiveSetCachedInvalidate(t *testing.T) {
 	registry.mu.RUnlock()
 	if exists {
 		t.Error("cache entry should be removed after case-insensitive Invalidate")
+	}
+}
+
+func TestModelRegistry_FuzzyMatch_BuiltInDottedToNoDot(t *testing.T) {
+	// Real-world scenario: a host serves "Qwen/Qwen36-35B-A3B-FP8" for the
+	// registry key "qwen/qwen3.6-35b-a3b-fp8" (dot dropped). Case is already
+	// handled; this exercises separator-insensitive matching.
+	registry := NewModelRegistry(nil)
+
+	meta, ok := registry.Resolve(context.Background(), "Qwen/Qwen36-35B-A3B-FP8")
+	if !ok {
+		t.Fatal("expected ok=true for fuzzy (separator-insensitive) built-in match")
+	}
+	if meta.ContextWindow != 262144 {
+		t.Errorf("ContextWindow = %d, want 262144", meta.ContextWindow)
+	}
+	if !meta.Capabilities.Attachment {
+		t.Error("fuzzy-matched built-in should keep its declared Attachment capability")
+	}
+}
+
+func TestModelRegistry_FuzzyMatch_Table(t *testing.T) {
+	// Covers separator variations that should collapse to the same model, plus
+	// negative cases that must NOT spuriously match (different version, org,
+	// or capacity).
+	registry := NewModelRegistry(nil)
+
+	tests := []struct {
+		name    string
+		model   string
+		wantOK  bool
+		wantCtx int
+	}{
+		{"dotted key, no-dot query", "qwen/qwen36-35b-a3b-fp8", true, 262144},
+		{"underscores instead of dots/dashes", "qwen/qwen3_6_35b_a3b_fp8", true, 262144},
+		{"plain qwen3.6 built-in via dashes", "qwen/qwen36-35b-a3b", true, 262144},
+		{"slashes kept, dots/dashes removed", "qwen/qwen3635ba3bfp8", true, 262144},
+		// Negatives: org boundary removed entirely -> must NOT match.
+		{"org boundary dropped does not match", "qwenqwen3635ba3bfp8", false, 0},
+		// Negatives: a different minor version must NOT match qwen3.6.
+		{"different version does not match", "qwen/qwen3.7-35b-a3b-fp8", false, 0},
+		{"different capacity does not match", "qwen/qwen3.6-27b-a3b-fp8", false, 0},
+		// "gpt4o" should fuzzy-match the built-in "gpt-4o" (dash removed).
+		{"gpt4o matches gpt-4o", "gpt4o", true, 128000},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			meta, ok := registry.Resolve(context.Background(), tt.model)
+			if ok != tt.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tt.wantOK)
+			}
+			if ok && meta.ContextWindow != tt.wantCtx {
+				t.Errorf("ContextWindow = %d, want %d", meta.ContextWindow, tt.wantCtx)
+			}
+		})
+	}
+}
+
+func TestModelRegistry_FuzzyMatch_CachesUnderQueryKey(t *testing.T) {
+	// A fuzzy hit must be cached under the (lowercased) query key so repeat
+	// resolves take the fast cache path and don't re-run the fuzzy scan.
+	registry := NewModelRegistry(nil)
+
+	if _, ok := registry.Resolve(context.Background(), "qwen/qwen36-35b-a3b-fp8"); !ok {
+		t.Fatal("expected fuzzy match")
+	}
+
+	registry.mu.RLock()
+	_, cached := registry.cache["qwen/qwen36-35b-a3b-fp8"]
+	registry.mu.RUnlock()
+	if !cached {
+		t.Error("fuzzy match should be cached under the lowercased query key")
+	}
+}
+
+func TestModelRegistry_FuzzyMatch_OverrideStillWins(t *testing.T) {
+	// A user override that only fuzzy-matches (separators differ from the
+	// query) must still win over a closer-built-in fuzzy match.
+	registry := NewModelRegistry(map[string]ModelMetadata{
+		"qwen/qwen3.6-35b-a3b-fp8": {
+			ContextWindow: 999999, // sentinel: proves the override, not built-in, won
+		},
+	})
+
+	meta, ok := registry.Resolve(context.Background(), "qwen/qwen36-35b-a3b-fp8")
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if meta.ContextWindow != 999999 {
+		t.Errorf("ContextWindow = %d, want override sentinel 999999", meta.ContextWindow)
+	}
+}
+
+func TestModelRegistry_FuzzyMatch_DoesNotCollideVersions(t *testing.T) {
+	// Guard against the core risk of fuzzy matching: collapsing distinct model
+	// versions together. "qwen3.6" (-> qwen36) and "qwen3.7" (-> qwen37) must
+	// resolve to different metadata. Both are in the built-in registry.
+	registry := NewModelRegistry(nil)
+
+	m36, ok36 := registry.Resolve(context.Background(), "qwen/qwen3.6-35b-a3b-fp8")
+	m37, ok37 := registry.Resolve(context.Background(), "qwen3.7-max")
+
+	if !ok36 || !ok37 {
+		t.Fatalf("both should resolve; got ok36=%v ok37=%v", ok36, ok37)
+	}
+	// Built-in qwen3.6-35b-a3b-fp8 has OutputLimit 8192; qwen3.7-max has 65536.
+	// They must not have been swapped or merged.
+	if m36.OutputLimit == m37.OutputLimit {
+		t.Errorf("distinct versions resolved to identical OutputLimit %d — possible collision",
+			m36.OutputLimit)
+	}
+}
+
+func TestModelRegistry_HuggingFace_AttachmentDefault(t *testing.T) {
+	// A model resolved from HuggingFace config.json has no capability data,
+	// so it should get the optimistic Attachment default.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"max_position_embeddings": 8192}`))
+	}))
+	defer server.Close()
+
+	registry := NewModelRegistry(nil)
+	registry.httpClient = &http.Client{
+		Transport: &rewriteTransport{base: http.DefaultTransport, serverURL: server.URL},
+	}
+
+	meta, ok := registry.Resolve(context.Background(), "hf-unknown-model")
+	if !ok {
+		t.Fatal("expected ok=true for HuggingFace-resolved model")
+	}
+	if !meta.Capabilities.Attachment {
+		t.Error("HuggingFace-resolved model should default to Attachment=true")
+	}
+	if meta.ContextWindow != 8192 {
+		t.Errorf("ContextWindow = %d, want 8192", meta.ContextWindow)
 	}
 }
 

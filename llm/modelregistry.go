@@ -88,12 +88,16 @@ func (r *ModelRegistry) SetHTTPClient(client *http.Client) {
 	}
 }
 
-// Resolve returns model metadata using 5-tier lookup:
-// 1. User overrides (from config)
-// 2. Built-in registry (hardcoded table)
-// 3. HuggingFace API lookup (lazy, cached)
-// 4. Registered sources (e.g., LM Studio provider)
-// 5. Fallback defaults (ok=false)
+// Resolve returns model metadata using a tiered lookup:
+//   - 1. User overrides (from config)
+//   - 2. Built-in registry (hardcoded table)
+//   - 2b. Fuzzy match across overrides + built-ins, with separator punctuation
+//     (".", "-", "_") removed — so "qwen3.6" matches "qwen36" and "gpt-4"
+//     matches "gpt4". Consulted only on an exact-lookup miss; the result is
+//     cached under the query key.
+//   - 3. HuggingFace API lookup (lazy, cached)
+//   - 4. Registered sources (e.g., LM Studio provider)
+//   - 5. Fallback defaults (ok=false)
 //
 // The second return value indicates whether the model was found in a known source.
 // When ok is false, the returned metadata contains usable fallback defaults.
@@ -116,6 +120,20 @@ func (r *ModelRegistry) Resolve(ctx context.Context, model string) (ModelMetadat
 	if meta, ok := r.builtIn[key]; ok {
 		meta.Family = resolveFamily(model, meta)
 		meta.Protocol = resolveProtocol(model, meta)
+		return meta, true
+	}
+
+	// Priority 2b: Fuzzy match — separator-insensitive lookup across overrides
+	// and built-ins. Bridges cosmetic naming drift (a host serving
+	// "Qwen/Qwen36-35B-A3B-FP8" for the registry key "qwen/qwen3.6-35b-a3b-fp8")
+	// without the false-positive risk of edit-distance matching. Cache the hit
+	// under the query key so repeat resolves take the fast path.
+	if meta, ok := r.fuzzyLookup(model); ok {
+		meta.Family = resolveFamily(model, meta)
+		meta.Protocol = resolveProtocol(model, meta)
+		r.mu.Lock()
+		r.cache[key] = meta
+		r.mu.Unlock()
 		return meta, true
 	}
 
@@ -161,11 +179,15 @@ func (r *ModelRegistry) Resolve(ctx context.Context, model string) (ModelMetadat
 		return m, true
 	}
 
-	// Priority 5: Fallback to defaults
+	// Priority 5: Fallback to defaults.
+	// Assume attachment support optimistically: an unknown model may well be
+	// multimodal, and it is better to surface a runtime provider error than to
+	// silently deny image uploads for a model the registry does not know.
 	meta = ModelMetadata{
 		ContextWindow: 128000,
 		OutputLimit:   4096,
 		TokenizerType: "approximate",
+		Capabilities:  defaultUnknownCapabilities(),
 	}
 	meta.Family = resolveFamily(model, meta)
 	meta.Protocol = resolveProtocol(model, meta)
@@ -214,6 +236,75 @@ func resolveProtocol(modelID string, meta ModelMetadata) APIProtocol {
 		return meta.Protocol
 	}
 	return DetectProtocol(modelID)
+}
+
+// modelIDSeparators strips the punctuation real-world hosts use (or omit)
+// inconsistently between tokens of a model identifier.
+var modelIDSeparators = strings.NewReplacer(".", "", "-", "", "_", "")
+
+// normalizeModelID lowercases a model identifier and removes its separator
+// punctuation (".", "-", "_"), preserving the org/name boundary ("/") and all
+// alphanumeric characters. Distinct model versions stay distinct: "qwen3.6"
+// and "qwen3.7" normalize to "qwen36" and "qwen37" respectively. This is the
+// foundation of the fuzzy lookup and is deliberately conservative — unlike
+// edit distance it can never silently remap one model version onto another,
+// because it removes only punctuation, never alphanumerics.
+func normalizeModelID(id string) string {
+	return modelIDSeparators.Replace(strings.ToLower(id))
+}
+
+// fuzzyMatchIn returns the entry in m whose normalized identifier equals want.
+// When several entries normalize to the same form (rare: usually aliases for
+// one model), the lexicographically smallest key wins so the result is
+// deterministic.
+func fuzzyMatchIn(m map[string]ModelMetadata, want string) (ModelMetadata, bool) {
+	var (
+		bestKey  string
+		bestMeta ModelMetadata
+		found    bool
+	)
+	for k, v := range m {
+		if normalizeModelID(k) != want {
+			continue
+		}
+		if !found || k < bestKey {
+			bestKey = k
+			bestMeta = v
+			found = true
+		}
+	}
+	return bestMeta, found
+}
+
+// fuzzyLookup performs a separator-insensitive search across user overrides and
+// the built-in registry, used when the exact (case-insensitive) lookup misses.
+// It bridges the cosmetic naming differences real-world model hosts introduce —
+// e.g. a registry key "qwen/qwen3.6-35b-a3b-fp8" served by a host as
+// "Qwen/Qwen36-35B-A3B-FP8" (dot dropped) collapses to the same normalized
+// form. Overrides take priority over built-ins, mirroring the exact-lookup
+// tiers. Returns false when nothing matches, so callers can fall through to
+// network sources and the final default.
+func (r *ModelRegistry) fuzzyLookup(model string) (ModelMetadata, bool) {
+	want := normalizeModelID(model)
+	if want == "" {
+		return ModelMetadata{}, false
+	}
+	if meta, ok := fuzzyMatchIn(r.overrides, want); ok {
+		return meta, true
+	}
+	return fuzzyMatchIn(r.builtIn, want)
+}
+
+// defaultUnknownCapabilities is the capability assumption applied to models for
+// which the registry has no authoritative capability data: the final fallback
+// (no source recognized the model) and HuggingFace-resolved models (config.json
+// yields a context window but no capability information).
+//
+// Attachment support is assumed optimistically. It is far better to let a user
+// attach an image and surface a provider error at runtime than to silently
+// disable image uploads for a model the registry simply does not know about.
+func defaultUnknownCapabilities() ModelCapabilities {
+	return ModelCapabilities{Attachment: true}
 }
 
 // RegisterSource adds a metadata source to the registry.
@@ -275,6 +366,9 @@ func (r *ModelRegistry) fetchFromHuggingFace(ctx context.Context, model string) 
 		ContextWindow: config.MaxPositionEmbeddings,
 		OutputLimit:   4096,
 		TokenizerType: "approximate",
+		// config.json carries no capability information, so assume attachment
+		// support optimistically (see defaultUnknownCapabilities).
+		Capabilities: defaultUnknownCapabilities(),
 	}, nil
 }
 
