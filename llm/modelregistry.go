@@ -96,10 +96,11 @@ func (r *ModelRegistry) SetHTTPClient(client *http.Client) {
 // Resolve returns model metadata using a tiered lookup:
 //   - 1. User overrides (from config)
 //   - 2. Built-in registry (hardcoded table)
-//   - 2b. Fuzzy match across overrides + built-ins, with separator punctuation
-//     (".", "-", "_") removed — so "qwen3.6" matches "qwen36" and "gpt-4"
-//     matches "gpt4". Consulted only on an exact-lookup miss; the result is
-//     cached under the query key.
+//   - 2b. Fuzzy match across overrides + built-ins, with the vendor prefix
+//     stripped and separator punctuation (".", "-", "_") removed — so
+//     "qwen3.6" matches "qwen36", "gpt-4" matches "gpt4", and a bare
+//     "glm-5.2-fp8" matches the prefixed "zai-org/glm-5.2-fp8". Consulted only
+//     on an exact-lookup miss; the result is cached under the query key.
 //   - 3. HuggingFace API lookup (lazy, cached)
 //   - 4. Registered sources (e.g., LM Studio provider)
 //   - 5. Fallback defaults (ok=false)
@@ -247,15 +248,23 @@ func resolveProtocol(modelID string, meta ModelMetadata) APIProtocol {
 // inconsistently between tokens of a model identifier.
 var modelIDSeparators = strings.NewReplacer(".", "", "-", "", "_", "")
 
-// normalizeModelID lowercases a model identifier and removes its separator
-// punctuation (".", "-", "_"), preserving the org/name boundary ("/") and all
-// alphanumeric characters. Distinct model versions stay distinct: "qwen3.6"
-// and "qwen3.7" normalize to "qwen36" and "qwen37" respectively. This is the
-// foundation of the fuzzy lookup and is deliberately conservative — unlike
-// edit distance it can never silently remap one model version onto another,
-// because it removes only punctuation, never alphanumerics.
+// normalizeModelID normalizes a model identifier for the fuzzy lookup. It
+// strips the vendor/org prefix (everything up to and including the first "/"),
+// lowercases the result, then removes separator punctuation (".", "-", "_").
+//
+// The vendor prefix is a routing decoration, not a property of the model: the
+// HuggingFace checkpoint "zai-org/glm-5.2-fp8" and the Z.ai API model
+// "GLM-5.2-FP8" share the same metadata. Discarding the prefix before
+// comparison lets a bare query match a prefixed registry key (and vice versa),
+// so vendor spelling never defeats the match.
+//
+// Only the vendor prefix and punctuation are removed; alphanumerics are never
+// altered, so distinct model versions stay distinct: "qwen3.6" and "qwen3.7"
+// normalize to "qwen36" and "qwen37". This is the foundation of the fuzzy
+// lookup and is deliberately conservative — unlike edit distance it can never
+// silently remap one model version onto another.
 func normalizeModelID(id string) string {
-	return modelIDSeparators.Replace(strings.ToLower(id))
+	return modelIDSeparators.Replace(strings.ToLower(BareModel(id)))
 }
 
 // fuzzyMatchIn returns the entry in m whose normalized identifier equals want.
@@ -281,14 +290,15 @@ func fuzzyMatchIn(m map[string]ModelMetadata, want string) (ModelMetadata, bool)
 	return bestMeta, found
 }
 
-// fuzzyLookup performs a separator-insensitive search across user overrides and
-// the built-in registry, used when the exact (case-insensitive) lookup misses.
-// It bridges the cosmetic naming differences real-world model hosts introduce —
-// e.g. a registry key "qwen/qwen3.6-35b-a3b-fp8" served by a host as
-// "Qwen/Qwen36-35B-A3B-FP8" (dot dropped) collapses to the same normalized
-// form. Overrides take priority over built-ins, mirroring the exact-lookup
-// tiers. Returns false when nothing matches, so callers can fall through to
-// network sources and the final default.
+// fuzzyLookup performs a vendor-prefix- and separator-insensitive search across
+// user overrides and the built-in registry, used when the exact
+// (case-insensitive) lookup misses. It bridges the cosmetic naming differences
+// real-world model hosts introduce — e.g. a registry key "qwen/qwen3.6-35b-a3b-fp8"
+// served by a host as "Qwen/Qwen36-35B-A3B-FP8" (dot dropped) collapses to the
+// same normalized form, and a prefixed key "zai-org/glm-5.2-fp8" matches a bare
+// query "GLM-5.2-FP8" (vendor prefix discarded). Overrides take priority over
+// built-ins, mirroring the exact-lookup tiers. Returns false when nothing
+// matches, so callers can fall through to network sources and the final default.
 func (r *ModelRegistry) fuzzyLookup(model string) (ModelMetadata, bool) {
 	want := normalizeModelID(model)
 	if want == "" {

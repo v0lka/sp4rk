@@ -286,8 +286,10 @@ func TestModelRegistry_FuzzyMatch_Table(t *testing.T) {
 		{"underscores instead of dots/dashes", "qwen/qwen3_6_35b_a3b_fp8", true, 262144},
 		{"plain qwen3.6 built-in via dashes", "qwen/qwen36-35b-a3b", true, 262144},
 		{"slashes kept, dots/dashes removed", "qwen/qwen3635ba3bfp8", true, 262144},
-		// Negatives: org boundary removed entirely -> must NOT match.
-		{"org boundary dropped does not match", "qwenqwen3635ba3bfp8", false, 0},
+		// Negative: the query has no "/", so its "qwen" org fragment is NOT
+		// stripped and becomes part of the bare name — it must NOT match a
+		// prefixed key whose org prefix WAS stripped.
+		{"org jammed into name with no slash does not match", "qwenqwen3635ba3bfp8", false, 0},
 		// Negatives: a different minor version must NOT match qwen3.6.
 		{"different version does not match", "qwen/qwen3.7-35b-a3b-fp8", false, 0},
 		{"different capacity does not match", "qwen/qwen3.6-27b-a3b-fp8", false, 0},
@@ -359,6 +361,56 @@ func TestModelRegistry_FuzzyMatch_DoesNotCollideVersions(t *testing.T) {
 	if m36.OutputLimit == m37.OutputLimit {
 		t.Errorf("distinct versions resolved to identical OutputLimit %d — possible collision",
 			m36.OutputLimit)
+	}
+}
+
+func TestModelRegistry_FuzzyMatch_IgnoresVendorPrefix(t *testing.T) {
+	// The vendor/org prefix is a routing decoration, not a property of the
+	// model. A prefixed built-in key ("zai-org/glm-5.2-fp8", the HuggingFace
+	// checkpoint) and a bare query ("GLM-5.2-FP8", the Z.ai API name) must
+	// resolve to the same metadata. Both directions of the asymmetry are
+	// exercised: prefixed-key-exact/bare-query-fuzzy and bare-exact-does-not-
+	// exist/prefixed-key-fuzzy.
+	registry := NewModelRegistry(nil)
+
+	// zai-org/glm-5.2-fp8 is an exact built-in key (the HuggingFace FP8
+	// checkpoint, 1 MiB context). GLM-5.2-FP8 is NOT a built-in key — only the
+	// fuzzy lookup, which now discards the vendor prefix, can match it.
+	prefixed, okP := registry.Resolve(context.Background(), "zai-org/glm-5.2-fp8")
+	bare, okB := registry.Resolve(context.Background(), "GLM-5.2-FP8")
+
+	if !okP || !okB {
+		t.Fatalf("both should resolve; got okP=%v okB=%v", okP, okB)
+	}
+	// 1048576 is unique to the zai-org/glm-5.2-fp8 entry; the bare "glm-5.2"
+	// built-in has a 1000000 context window, so this also guards against the
+	// bare query accidentally matching the shorter-context sibling.
+	const wantCtx = 1048576
+	if prefixed.ContextWindow != wantCtx {
+		t.Errorf("prefixed ContextWindow = %d, want %d", prefixed.ContextWindow, wantCtx)
+	}
+	if bare.ContextWindow != wantCtx {
+		t.Errorf("bare ContextWindow = %d, want %d", bare.ContextWindow, wantCtx)
+	}
+	if prefixed.ContextWindow != bare.ContextWindow {
+		t.Errorf("prefixed (%d) and bare (%d) resolved to different metadata",
+			prefixed.ContextWindow, bare.ContextWindow)
+	}
+}
+
+func TestModelRegistry_FuzzyMatch_VendorPrefixCaseInsensitive(t *testing.T) {
+	// A vendor prefix spelled with different casing must not block the match:
+	// "ZAI-Org/glm-5.2-fp8" (uppercased org) and "zai-org/glm-5.2-fp8" (the
+	// canonical key) differ only in the prefix's casing, which the prefix
+	// stripping discards entirely.
+	registry := NewModelRegistry(nil)
+
+	meta, ok := registry.Resolve(context.Background(), "ZAI-Org/glm-5.2-fp8")
+	if !ok {
+		t.Fatal("expected ok=true for case-variant vendor prefix")
+	}
+	if meta.ContextWindow != 1048576 {
+		t.Errorf("ContextWindow = %d, want 1048576", meta.ContextWindow)
 	}
 }
 
