@@ -353,6 +353,9 @@ func convertResponsesResponse(resp *responses.Response) (*ChatResponse, error) {
 func wrapResponsesError(providerName string, err error) error {
 	var apiErr *oai.Error
 	if errors.As(err, &apiErr) {
+		if msg := enrichOpenAIError(apiErr); msg != "" {
+			return WrapProviderError(providerName, apiErr.StatusCode, fmt.Errorf("responses API: %s: %w", msg, err))
+		}
 		return WrapProviderError(providerName, apiErr.StatusCode, fmt.Errorf("responses API: %w", err))
 	}
 	return WrapProviderError(providerName, 0, fmt.Errorf("responses API: %w", err))

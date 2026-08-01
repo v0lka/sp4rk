@@ -46,9 +46,10 @@ func TestLoggingCaller_CallSuccess_LogsTokenUsage(t *testing.T) {
 	}
 }
 
-func TestLoggingCaller_CallError_NoLog(t *testing.T) {
+func TestLoggingCaller_CallError_LogsWarn(t *testing.T) {
 	inner := &mockLLMCaller{errors: []error{errors.New("provider down")}}
 
+	// Capture slog output at DEBUG so all levels are recorded.
 	var buf bytes.Buffer
 	handler := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
 	origLogger := slog.Default()
@@ -62,14 +63,45 @@ func TestLoggingCaller_CallError_NoLog(t *testing.T) {
 		t.Fatal("expected error")
 	}
 
-	// With the new implementation, a "llm: request" and "llm: call failed" line are logged.
-	// The old test expected zero output on error, but now we log pre-call + error.
-	// We verify the error is logged.
+	// A failed LLM call must be logged at WARN (not DEBUG) with the provider
+	// and the underlying error, so it surfaces at the default log level.
 	logged := buf.String()
-	for _, want := range []string{"llm: request", "llm: call failed", "provider=anthropic"} {
+	for _, want := range []string{"llm: call failed", "level=WARN", "provider=anthropic", "error=\"provider down\""} {
 		if !bytes.Contains([]byte(logged), []byte(want)) {
 			t.Errorf("log output missing %q; got: %s", want, logged)
 		}
+	}
+}
+
+func TestLoggingCaller_CallError_VisibleAtDefaultLevel(t *testing.T) {
+	inner := &mockLLMCaller{errors: []error{errors.New("boom")}}
+
+	// Default handler level is INFO: DEBUG records must be filtered out, but a
+	// WARN-level failure log must still appear. This is the bug being fixed —
+	// previously the failure was DEBUG and invisible at the default level.
+	var buf bytes.Buffer
+	handler := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})
+	origLogger := slog.Default()
+	slog.SetDefault(slog.New(handler))
+	defer slog.SetDefault(origLogger)
+
+	caller := NewLoggingLLMCaller(inner, "openai", slog.New(handler))
+	_, err := caller.Call(context.Background(), llm.ChatRequest{Model: "gpt-4o"})
+
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	logged := buf.String()
+	if !bytes.Contains([]byte(logged), []byte("llm: call failed")) {
+		t.Errorf("failure log should be visible at default (INFO) level; got: %s", logged)
+	}
+	if !bytes.Contains([]byte(logged), []byte("level=WARN")) {
+		t.Errorf("failure log should be at WARN level; got: %s", logged)
+	}
+	// The DEBUG-only request log must NOT leak through at INFO level.
+	if bytes.Contains([]byte(logged), []byte("llm: request")) {
+		t.Errorf("request (DEBUG) log leaked through INFO level; got: %s", logged)
 	}
 }
 

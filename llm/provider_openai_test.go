@@ -1,10 +1,16 @@
 package llm
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -716,26 +722,97 @@ func TestExtractReasoningContent(t *testing.T) {
 	}
 }
 
-func TestNeedsResponsesAPI(t *testing.T) {
+// TestModelProtocolRouting asserts the model→API-protocol mapping that drives
+// OpenAIProvider.ChatCompletion dispatch via DetectProtocol. This replaces the
+// legacy needsResponsesAPI gate: GPT-5.x (flagship and codex) now route to the
+// Responses API, while gpt-4o / o3 / gpt-4.1 stay on Chat Completions. Claude
+// and Gemini are detected as their own (non-OpenAI) protocols.
+func TestModelProtocolRouting(t *testing.T) {
 	tests := []struct {
 		model string
-		want  bool
+		want  APIProtocol
 	}{
-		{"codex-mini-latest", true},
-		{"codex-mini-2025-03-25", true},
-		{"gpt-4o", false},
-		{"o3", false},
-		{"claude-sonnet-4-20250514", false},
-		{"gpt-4.1-mini", false},
-		{"deepseek-chat", false},
-		{"gemini-2.5-pro", false},
+		{"gpt-5.3-codex", ProtocolResponses},
+		{"gpt-5.6", ProtocolResponses},
+		{"codex-mini-latest", ProtocolResponses},
+		{"gpt-4o", ProtocolChatCompletions},
+		{"o3", ProtocolChatCompletions},
+		{"gpt-4.1-mini", ProtocolChatCompletions},
+		{"deepseek-chat", ProtocolChatCompletions},
+		{"claude-sonnet-4-20250514", ProtocolAnthropic},
+		{"gemini-2.5-pro", ProtocolGoogle},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.model, func(t *testing.T) {
-			got := needsResponsesAPI(tt.model)
+			got := DetectProtocol(tt.model)
 			if got != tt.want {
-				t.Errorf("needsResponsesAPI(%q) = %v, want %v", tt.model, got, tt.want)
+				t.Errorf("DetectProtocol(%q) = %q, want %q", tt.model, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestOpenAIProvider_ProtocolRouting verifies the DetectProtocol-driven
+// dispatch in ChatCompletion at the HTTP level: GPT-5.x models (flagship and
+// codex) now route to the Responses API (/responses), while Chat-Completions
+// models (gpt-4o, o3, gpt-4.1) stay on /chat/completions. This is the core
+// behavior change from the legacy needsResponsesAPI gate, which only covered
+// codex-family models — a plain gpt-5.x flagship previously fell through to
+// /chat/completions.
+func TestOpenAIProvider_ProtocolRouting(t *testing.T) {
+	// pathRecorder serves a valid response for either endpoint and records the
+	// request path.
+	newPathRecorder := func(t *testing.T) (*string, *httptest.Server) {
+		var got string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			got = r.URL.Path
+			w.Header().Set("Content-Type", "application/json")
+			// Minimal valid response for BOTH endpoints so either path succeeds.
+			body := `{"id":"x","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`
+			if strings.Contains(r.URL.Path, "responses") {
+				body = `{"id":"x","object":"response","created":1,"model":"m","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"status":"completed","usage":{"input_tokens":1,"output_tokens":1}}`
+			}
+			_, _ = w.Write([]byte(body))
+		}))
+		t.Cleanup(srv.Close)
+		return &got, srv
+	}
+
+	tests := []struct {
+		name    string
+		model   string
+		wantSub string // path substring that must be present
+		notSub  string // path substring that must NOT be present (optional)
+	}{
+		{name: "gpt-5.6 flagship routes to responses", model: "gpt-5.6", wantSub: "responses"},
+		{name: "gpt-5.3-codex routes to responses", model: "gpt-5.3-codex", wantSub: "responses"},
+		{name: "gpt-4o stays on chat completions", model: "gpt-4o", wantSub: "chat/completions", notSub: "responses"},
+		{name: "o3 stays on chat completions", model: "o3", wantSub: "chat/completions", notSub: "responses"},
+		{name: "gpt-4.1-mini stays on chat completions", model: "gpt-4.1-mini", wantSub: "chat/completions", notSub: "responses"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, srv := newPathRecorder(t)
+			p, err := NewOpenAIProvider(OpenAIProviderConfig{
+				Name: "Zen", APIKey: "k", BaseURL: srv.URL,
+				Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+			})
+			if err != nil {
+				t.Fatalf("NewOpenAIProvider failed: %v", err)
+			}
+			if _, err := p.ChatCompletion(context.Background(), ChatRequest{
+				Model: tt.model, MaxTokens: 100,
+				Messages: []Message{{Role: "user", Content: "hi"}},
+			}); err != nil {
+				t.Fatalf("ChatCompletion failed: %v", err)
+			}
+			if !strings.Contains(*got, tt.wantSub) {
+				t.Errorf("model %q: expected path to contain %q, got %q", tt.model, tt.wantSub, *got)
+			}
+			if tt.notSub != "" && strings.Contains(*got, tt.notSub) {
+				t.Errorf("model %q: expected path NOT to contain %q, got %q", tt.model, tt.notSub, *got)
 			}
 		})
 	}
@@ -771,44 +848,155 @@ func TestOpenAIProvider_ResponsesClientInitialized_CustomBaseURL(t *testing.T) {
 	}
 }
 
-// TestOpenAIProvider_CompatibleProviderDoesNotUseResponsesAPI verifies that
-// codex-family models routed through a compatible provider (non-empty baseURL)
-// use Chat Completions, NOT the Responses API. The Responses API
-// (/v1/responses) is an OpenAI-specific endpoint; "OpenAI-compatible"
-// providers implement Chat Completions (/v1/chat/completions) only.
-func TestOpenAIProvider_CompatibleProviderDoesNotUseResponsesAPI(t *testing.T) {
-	t.Run("compatible provider with codex model uses chat completions", func(t *testing.T) {
+// TestOpenAIProvider_CodexRoutesToResponsesAPI verifies that codex-family
+// models are routed to the Responses API (/v1/responses) regardless of whether
+// the provider is the official OpenAI endpoint or a compatible gateway.
+//
+// This matters because compatible gateways such as OpenCode Zen serve
+// gpt-5.x-codex exclusively via /v1/responses; sending these models to
+// /v1/chat/completions produces a degenerate HTTP 400 with an empty completion
+// body. When a compatible provider does NOT implement /v1/responses (HTTP
+// 404/405), the provider falls back to Chat Completions.
+func TestOpenAIProvider_CodexRoutesToResponsesAPI(t *testing.T) {
+	// pathRecorder returns 200 with a valid completion and records the request path.
+	newPathRecorder := func(t *testing.T) (*string, *httptest.Server) {
+		var got string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			got = r.URL.Path
+			w.Header().Set("Content-Type", "application/json")
+			// Minimal valid response for BOTH endpoints so either path succeeds.
+			body := `{"id":"x","object":"chat.completion","created":1,"model":"gpt-5.3-codex","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`
+			if strings.Contains(r.URL.Path, "responses") {
+				body = `{"id":"x","object":"response","created":1,"model":"gpt-5.3-codex","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"status":"completed","usage":{"input_tokens":1,"output_tokens":1}}`
+			}
+			_, _ = w.Write([]byte(body))
+		}))
+		t.Cleanup(srv.Close)
+		return &got, srv
+	}
+
+	codexReq := func() ChatRequest {
+		return ChatRequest{
+			Model:     "gpt-5.3-codex",
+			MaxTokens: 100,
+			Messages:  []Message{{Role: "user", Content: "hi"}},
+		}
+	}
+
+	t.Run("compatible provider (Zen) with codex uses responses API", func(t *testing.T) {
+		got, srv := newPathRecorder(t)
 		p, err := NewOpenAIProvider(OpenAIProviderConfig{
-			Name:    "Zen",
-			APIKey:  "test-key",
-			BaseURL: "https://opencode.ai/zen/v1",
+			Name: "Zen", APIKey: "k", BaseURL: srv.URL,
+			Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		})
 		if err != nil {
 			t.Fatalf("NewOpenAIProvider failed: %v", err)
 		}
-		if p.baseURL == "" {
-			t.Fatal("expected non-empty baseURL for compatible provider")
+		if _, err := p.ChatCompletion(context.Background(), codexReq()); err != nil {
+			t.Fatalf("ChatCompletion failed: %v", err)
 		}
-		// The routing decision: baseURL != "" means Chat Completions even for codex
-		if p.baseURL == "" && needsResponsesAPI("gpt-5.3-codex") {
-			t.Fatal("compatible provider should NOT route codex models to Responses API")
+		if !strings.Contains(*got, "responses") {
+			t.Fatalf("expected codex on compatible provider to hit /responses, got path %q", *got)
 		}
 	})
 
-	t.Run("official OpenAI with codex model uses responses API", func(t *testing.T) {
+	t.Run("official OpenAI with codex uses responses API", func(t *testing.T) {
+		got, srv := newPathRecorder(t)
 		p, err := NewOpenAIProvider(OpenAIProviderConfig{
-			Name:   "chatgpt",
-			APIKey: "test-key",
+			Name: "chatgpt", APIKey: "k", BaseURL: srv.URL,
+			Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		})
 		if err != nil {
 			t.Fatalf("NewOpenAIProvider failed: %v", err)
 		}
-		if p.baseURL != "" {
-			t.Fatal("expected empty baseURL for official OpenAI")
+		if _, err := p.ChatCompletion(context.Background(), codexReq()); err != nil {
+			t.Fatalf("ChatCompletion failed: %v", err)
 		}
-		// The routing decision: baseURL == "" + codex model → Responses API
-		if p.baseURL == "" && !needsResponsesAPI("gpt-5.3-codex") {
-			t.Fatal("official OpenAI should route codex models to Responses API")
+		if !strings.Contains(*got, "responses") {
+			t.Fatalf("expected codex on official OpenAI to hit /responses, got path %q", *got)
+		}
+	})
+
+	t.Run("returns clear error when responses endpoint is 404 (no fallback)", func(t *testing.T) {
+		var paths []string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			paths = append(paths, r.URL.Path)
+			if strings.Contains(r.URL.Path, "responses") {
+				// Responses endpoint not implemented → 404.
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(`{"error":{"message":"not found","type":"not_found"}}`))
+				return
+			}
+			// Chat Completions is "available" — but must NOT be used as a
+			// fallback, because gpt-5.x/codex return a degenerate 400 there.
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"x","object":"chat.completion","created":1,"model":"gpt-5.3-codex","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+		}))
+		t.Cleanup(srv.Close)
+		p, err := NewOpenAIProvider(OpenAIProviderConfig{
+			Name: "chatonly", APIKey: "k", BaseURL: srv.URL,
+			Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		})
+		if err != nil {
+			t.Fatalf("NewOpenAIProvider failed: %v", err)
+		}
+		_, err = p.ChatCompletion(context.Background(), codexReq())
+		if err == nil {
+			t.Fatal("expected an error when the Responses endpoint is unavailable, got nil")
+		}
+		// The error must explain the real cause, not be an opaque chat-completions 400.
+		if !strings.Contains(err.Error(), "Responses API") {
+			t.Errorf("expected error to mention the Responses API, got: %v", err)
+		}
+		// Must have hit /responses first (404)...
+		hitResponses := false
+		hitChat := false
+		for _, pth := range paths {
+			if strings.Contains(pth, "responses") {
+				hitResponses = true
+			}
+			if strings.Contains(pth, "chat/completions") {
+				hitChat = true
+			}
+		}
+		if !hitResponses {
+			t.Fatalf("expected to attempt /responses first, paths=%v", paths)
+		}
+		// ...and must NOT have silently fallen back to /chat/completions.
+		if hitChat {
+			t.Fatalf("should not fall back to /chat/completions when /responses is 404, paths=%v", paths)
+		}
+	})
+
+	t.Run("does not fall back on responses 400 (endpoint exists, request failed)", func(t *testing.T) {
+		var paths []string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			paths = append(paths, r.URL.Path)
+			if strings.Contains(r.URL.Path, "responses") {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":{"message":"bad request","type":"invalid_request_error"}}`))
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"x","object":"chat.completion","created":1,"model":"gpt-5.3-codex","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+		}))
+		t.Cleanup(srv.Close)
+		p, err := NewOpenAIProvider(OpenAIProviderConfig{
+			Name: "p", APIKey: "k", BaseURL: srv.URL,
+			Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		})
+		if err != nil {
+			t.Fatalf("NewOpenAIProvider failed: %v", err)
+		}
+		_, err = p.ChatCompletion(context.Background(), codexReq())
+		if err == nil {
+			t.Fatal("expected an error from the 400 responses call, got nil")
+		}
+		// Should NOT have fallen back to chat completions on a 400.
+		for _, pth := range paths {
+			if strings.Contains(pth, "chat/completions") {
+				t.Fatalf("should not fall back to chat completions on responses 400, paths=%v", paths)
+			}
 		}
 	})
 }
@@ -938,6 +1126,148 @@ func TestOpenAIProvider_WrapError(t *testing.T) {
 			t.Errorf("expected status 0, got %d", llmErr.StatusCode)
 		}
 	})
+}
+
+// newOAIErrorFromBody builds a realistic *oai.Error that mimics how the OpenAI
+// SDK constructs errors from an HTTP response: the SDK reads the body, extracts
+// the nested {"error":{...}} envelope via gjson and unmarshals only that into
+// the error (so Message is populated), while re-populating Response.Body with a
+// fresh, readable buffer of the original contents.
+func newOAIErrorFromBody(t *testing.T, statusCode int, body string) *oai.Error {
+	t.Helper()
+	bodyBytes := []byte(body)
+	u, err := url.Parse("https://api.example.com/v1/chat/completions")
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	resp := &http.Response{
+		StatusCode: statusCode,
+		Status:     fmt.Sprintf("%d %s", statusCode, http.StatusText(statusCode)),
+		// The SDK re-populates the body via io.NopCloser(bytes.NewBuffer(contents))
+		// so it remains readable for later inspection/dumping.
+		Body:   io.NopCloser(bytes.NewReader(bodyBytes)),
+		Header: make(http.Header),
+	}
+	aerr := &oai.Error{
+		Request:    &http.Request{Method: http.MethodPost, URL: u, Header: make(http.Header)},
+		Response:   resp,
+		StatusCode: statusCode,
+	}
+	// Replicate gjson.Get(body, "error").Raw extraction with encoding/json.
+	if unwrapped := extractErrorEnvelope(bodyBytes); unwrapped != "" {
+		if err := aerr.UnmarshalJSON([]byte(unwrapped)); err != nil {
+			t.Fatalf("UnmarshalJSON: %v", err)
+		}
+	}
+	return aerr
+}
+
+// extractErrorEnvelope returns the raw JSON of the nested "error" field, or "".
+// This mirrors the SDK's gjson.Get(body, "error").Raw step.
+func extractErrorEnvelope(body []byte) string {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(body, &m); err != nil {
+		return ""
+	}
+	if raw, ok := m["error"]; ok {
+		return string(raw)
+	}
+	return ""
+}
+
+func TestOpenAIProvider_WrapError_EnrichedMessage(t *testing.T) {
+	p, _ := NewOpenAIProvider(OpenAIProviderConfig{Name: "openai", APIKey: "k"})
+
+	// (1) Standard OpenAI envelope: {"error":{"message":"bad image"}}.
+	t.Run("standard error message", func(t *testing.T) {
+		apiErr := newOAIErrorFromBody(t, 400, `{"error":{"message":"bad image","type":"invalid_request_error"}}`)
+		result := p.wrapError(apiErr)
+		var llmErr *Error
+		if !errors.As(result, &llmErr) {
+			t.Fatal("expected *Error")
+		}
+		if llmErr.StatusCode != 400 {
+			t.Errorf("status = %d, want 400", llmErr.StatusCode)
+		}
+		if llmErr.Retryable {
+			t.Error("400 must not be retryable")
+		}
+		if msg := result.Error(); !strings.Contains(msg, "bad image") {
+			t.Errorf("expected message to contain 'bad image', got: %s", msg)
+		}
+	})
+
+	// (2) Non-standard envelope (e.g. OpenCode Zen): {"detail":"image not allowed"}.
+	// Message is empty because there is no nested "error" field; the upstream
+	// message survives only in the raw response body.
+	t.Run("non-standard detail body", func(t *testing.T) {
+		apiErr := newOAIErrorFromBody(t, 400, `{"detail":"image not allowed"}`)
+		result := p.wrapError(apiErr)
+		var llmErr *Error
+		if !errors.As(result, &llmErr) {
+			t.Fatal("expected *Error")
+		}
+		if llmErr.StatusCode != 400 {
+			t.Errorf("status = %d, want 400", llmErr.StatusCode)
+		}
+		if msg := result.Error(); !strings.Contains(msg, "image not allowed") {
+			t.Errorf("expected message to contain 'image not allowed' (raw body), got: %s", msg)
+		}
+	})
+
+	// (3) Empty body: must not panic and must surface the HTTP status.
+	t.Run("empty body surfaces status", func(t *testing.T) {
+		apiErr := newOAIErrorFromBody(t, 400, "")
+		result := p.wrapError(apiErr)
+		var llmErr *Error
+		if !errors.As(result, &llmErr) {
+			t.Fatal("expected *Error")
+		}
+		if llmErr.StatusCode != 400 {
+			t.Errorf("status = %d, want 400", llmErr.StatusCode)
+		}
+		// Should contain the status code and not panic.
+		if msg := result.Error(); !strings.Contains(msg, "400") {
+			t.Errorf("expected message to contain status '400', got: %s", msg)
+		}
+	})
+}
+
+// TestOpenAIProvider_EnrichError_RealSDKPath verifies error-body enrichment
+// through the real OpenAI SDK HTTP round-trip (not a hand-built *oai.Error).
+// A gateway returning a non-standard envelope — {"detail":"..."} with no nested
+// "error" field — leaves apiErr.Message empty, so the upstream message survives
+// only in the repopulated Response.Body. This test pins the SDK's body-
+// repopulation contract: if a future SDK version drains the body once (returning
+// EOF on re-read), enrichOpenAIError would silently degrade to a bare "400 Bad
+// Request" and this test would catch it.
+func TestOpenAIProvider_EnrichError_RealSDKPath(t *testing.T) {
+	const detail = "model 'deepseek-fake' not found"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"detail":"` + detail + `"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	p, err := NewOpenAIProvider(OpenAIProviderConfig{
+		Name: "zen", APIKey: "k", BaseURL: srv.URL,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("NewOpenAIProvider failed: %v", err)
+	}
+
+	_, err = p.ChatCompletion(context.Background(), ChatRequest{
+		Model:    "deepseek-chat",
+		Messages: []Message{{Role: "user", Content: "hi"}},
+	})
+	if err == nil {
+		t.Fatal("expected an error from the 400 response, got nil")
+	}
+	if !strings.Contains(err.Error(), detail) {
+		t.Errorf("expected error to surface the non-standard detail body %q, got: %s", detail, err.Error())
+	}
 }
 
 func TestConvertSchemaToMap(t *testing.T) {
@@ -1102,4 +1432,237 @@ func TestOpenAIProvider_BuildChatParams_GLMReasoning(t *testing.T) {
 			t.Errorf("reasoning_effort must be absent for legacy GLM, got %v", out["reasoning_effort"])
 		}
 	})
+}
+
+// TestOpenAIProvider_AnthropicDelegate_RoutesToMessages verifies that a Claude
+// model served by an OpenAI-compatible gateway (e.g. Zen) under the
+// ProtocolAnthropic dispatch path is delegated to the co-located
+// AnthropicProvider: the request POSTs to the gateway's Anthropic /messages
+// endpoint (NOT /chat/completions), with an Anthropic Messages-format body, and
+// the response is parsed into a ChatResponse. The delegation reuses the
+// existing Anthropic Messages implementation — no code is duplicated from
+// provider_anthropic.go.
+func TestOpenAIProvider_AnthropicDelegate_RoutesToMessages(t *testing.T) {
+	var (
+		gotPath string
+		gotBody []byte
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		body, _ := io.ReadAll(r.Body)
+		gotBody = body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant","model":"claude-3-5-sonnet","content":[{"type":"text","text":"hello world"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	p, err := NewOpenAIProvider(OpenAIProviderConfig{
+		Name:    "Zen",
+		APIKey:  "k",
+		BaseURL: srv.URL,
+		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("NewOpenAIProvider failed: %v", err)
+	}
+
+	resp, err := p.ChatCompletion(context.Background(), ChatRequest{
+		Model:     "claude-3-5-sonnet",
+		MaxTokens: 100,
+		Messages:  []Message{{Role: "user", Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("ChatCompletion failed: %v", err)
+	}
+
+	// Must hit the Anthropic Messages endpoint, NOT the OpenAI chat endpoint.
+	if !strings.Contains(gotPath, "/messages") {
+		t.Errorf("expected Claude model to POST to /messages, got path %q", gotPath)
+	}
+	if strings.Contains(gotPath, "/chat/completions") {
+		t.Errorf("Claude model must NOT POST to /chat/completions, got path %q", gotPath)
+	}
+
+	// The request body must be in Anthropic Messages format: a top-level
+	// "messages" array, "max_tokens", and the "model" field — the hallmarks of
+	// the Messages API (OpenAI Chat Completions would never target /messages).
+	var body map[string]any
+	if err := json.Unmarshal(gotBody, &body); err != nil {
+		t.Fatalf("failed to unmarshal request body: %v\nbody: %s", err, gotBody)
+	}
+	if _, ok := body["messages"]; !ok {
+		t.Errorf("expected Anthropic Messages body to contain \"messages\", got: %s", gotBody)
+	}
+	if _, ok := body["max_tokens"]; !ok {
+		t.Errorf("expected Anthropic Messages body to contain \"max_tokens\", got: %s", gotBody)
+	}
+	if model, _ := body["model"].(string); model != "claude-3-5-sonnet" {
+		t.Errorf("expected body model %q, got %q", "claude-3-5-sonnet", model)
+	}
+
+	// The Anthropic Messages response must be parsed into a ChatResponse.
+	if resp == nil {
+		t.Fatal("expected non-nil ChatResponse")
+	}
+	if resp.Message.Content != "hello world" {
+		t.Errorf("expected parsed content %q, got %q", "hello world", resp.Message.Content)
+	}
+	if resp.Usage.OutputTokens != 5 {
+		t.Errorf("expected output tokens 5, got %d", resp.Usage.OutputTokens)
+	}
+}
+
+// TestOpenAIProvider_AnthropicDelegate_ErrorWrappedWithProviderName verifies
+// that when the delegated Anthropic path fails, the error is wrapped with the
+// provider name (inherited from the OpenAIProvider config) so it is observable
+// to the caller.
+func TestOpenAIProvider_AnthropicDelegate_ErrorWrappedWithProviderName(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"overloaded_error","message":"Internal Server Error"}}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	p, err := NewOpenAIProvider(OpenAIProviderConfig{
+		Name:    "Zen",
+		APIKey:  "k",
+		BaseURL: srv.URL,
+		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("NewOpenAIProvider failed: %v", err)
+	}
+
+	_, err = p.ChatCompletion(context.Background(), ChatRequest{
+		Model:    "claude-3-5-sonnet",
+		Messages: []Message{{Role: "user", Content: "hi"}},
+	})
+	if err == nil {
+		t.Fatal("expected an error from the failed Anthropic request, got nil")
+	}
+	// The delegate inherits the provider name from the OpenAIProvider config;
+	// the error must surface it so the failure is attributable.
+	if !strings.Contains(err.Error(), "Zen") {
+		t.Errorf("expected error to be wrapped with provider name \"Zen\", got: %v", err)
+	}
+}
+
+// TestOpenAIProvider_AllFourProtocolsRouteThroughSingleZenEntry is the
+// end-to-end integration of the multi-protocol routing: a SINGLE
+// openai_compatible provider entry (the "Zen" style gateway) — one
+// OpenAIProvider, one httptest server, one BaseURL — must dispatch each model
+// to the API protocol it speaks, verified by the capturing server recording
+// the hit path:
+//
+//   - gpt-5.6        → POST /responses            (ProtocolResponses)
+//   - claude-…sonnet → POST /messages             (ProtocolAnthropic, delegated)
+//   - gemini-1.5-pro → POST /models/…:generateContent (ProtocolGoogle, delegated)
+//   - grok-2         → POST /chat/completions     (ProtocolChatCompletions)
+//
+// This consolidates the per-protocol routing tests (which each stand up their
+// own provider+server) into a single entry-point proof: one Zen provider
+// instance correctly fans out to four distinct wire protocols.
+func TestOpenAIProvider_AllFourProtocolsRouteThroughSingleZenEntry(t *testing.T) {
+	// One capturing server: it records every hit path and serves a valid
+	// response in the format matching the requested protocol (so each call
+	// succeeds and produces exactly one recorded request).
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(r.URL.Path, "responses"):
+			// OpenAI Responses API shape.
+			_, _ = w.Write([]byte(`{"id":"x","object":"response","created":1,"model":"m","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"status":"completed","usage":{"input_tokens":1,"output_tokens":1}}`))
+		case strings.Contains(r.URL.Path, "generateContent"):
+			// Google Generative Language shape.
+			_, _ = w.Write([]byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}`))
+		case strings.Contains(r.URL.Path, "/messages"):
+			// Anthropic Messages shape.
+			_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant","model":"claude","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+		default:
+			// OpenAI Chat Completions shape.
+			_, _ = w.Write([]byte(`{"id":"x","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	// A SINGLE Zen-style openai_compatible provider entry.
+	p, err := NewOpenAIProvider(OpenAIProviderConfig{
+		Name:    "Zen",
+		APIKey:  "k",
+		BaseURL: srv.URL,
+		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("NewOpenAIProvider failed: %v", err)
+	}
+
+	cases := []struct {
+		name    string
+		model   string
+		wantSub string // path substring that MUST be present
+		notSub  string // path substring that MUST NOT be present
+	}{
+		{"gpt-5.6 routes to /responses", "gpt-5.6", "responses", "chat/completions"},
+		{"claude routes to /messages", "claude-3-5-sonnet", "/messages", "chat/completions"},
+		{"gemini routes to generateContent", "gemini-1.5-pro", "generateContent", "chat/completions"},
+		{"grok routes to /chat/completions", "grok-2", "chat/completions", ""},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			before := len(paths)
+			// A uniform request for every protocol; the Anthropic delegate
+			// supplies its own default max_tokens, so none is required here.
+			resp, err := p.ChatCompletion(context.Background(), ChatRequest{
+				Model:    tc.model,
+				Messages: []Message{{Role: "user", Content: "hi"}},
+			})
+			if err != nil {
+				t.Fatalf("ChatCompletion for %q failed: %v", tc.model, err)
+			}
+			if resp == nil {
+				t.Fatalf("expected non-nil ChatResponse for %q", tc.model)
+			}
+
+			// Each call must produce exactly one backend request.
+			if got := len(paths) - before; got != 1 {
+				t.Fatalf("expected exactly 1 request for %q, got %d (paths=%v)", tc.model, got, paths)
+			}
+			gotPath := paths[len(paths)-1]
+
+			if !strings.Contains(gotPath, tc.wantSub) {
+				t.Errorf("model %q: expected path to contain %q, got %q", tc.model, tc.wantSub, gotPath)
+			}
+			if tc.notSub != "" && strings.Contains(gotPath, tc.notSub) {
+				t.Errorf("model %q: expected path NOT to contain %q, got %q", tc.model, tc.notSub, gotPath)
+			}
+		})
+	}
+
+	// After all four calls, the captured paths must cover every protocol
+	// endpoint exactly once — proving a single provider entry fans out to four
+	// distinct wire protocols with no cross-contamination.
+	if len(paths) != 4 {
+		t.Fatalf("expected exactly 4 total backend requests (one per protocol), got %d: %v", len(paths), paths)
+	}
+	wantProtocols := map[string]bool{
+		"/responses":       false,
+		"/messages":        false,
+		"generateContent":  false,
+		"chat/completions": false,
+	}
+	for _, pth := range paths {
+		for sub := range wantProtocols {
+			if strings.Contains(pth, sub) {
+				wantProtocols[sub] = true
+			}
+		}
+	}
+	for sub, hit := range wantProtocols {
+		if !hit {
+			t.Errorf("expected a request hitting %q among captured paths, got %v", sub, paths)
+		}
+	}
 }

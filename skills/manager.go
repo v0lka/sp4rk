@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"sync"
 
-	sdktools "github.com/v0lka/sp4rk/tools"
 	"github.com/v0lka/sp4rk/pathutil"
+	sdktools "github.com/v0lka/sp4rk/tools"
 )
 
 // SkillManager discovers, parses, and serves Agent Skills from configured directories.

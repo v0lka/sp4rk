@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	md "github.com/JohannesKaufmann/html-to-markdown"
 	"codeberg.org/readeck/go-readability/v2"
+	md "github.com/JohannesKaufmann/html-to-markdown"
 	"github.com/v0lka/sp4rk/tools"
 )
 

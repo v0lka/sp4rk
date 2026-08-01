@@ -154,6 +154,98 @@ func TestModelRegistry_Invalidate(t *testing.T) {
 	}
 }
 
+func TestModelRegistry_CaseInsensitiveResolve(t *testing.T) {
+	registry := NewModelRegistry(nil)
+
+	// Built-in keys are stored lowercase (e.g. "gpt-5.4"). A model ID arriving
+	// from an OpenAI-compatible host may differ only in casing. All casings
+	// must resolve to the same metadata as the canonical lowercase key.
+	//
+	// This mirrors the real-world vLLM scenario where models are registered
+	// with mixed-case HF identifiers (e.g. "Qwen/Qwen35-397B-A17B-FP8").
+	tests := []struct {
+		name  string
+		model string
+	}{
+		{"lowercase canonical", "gpt-5.4"},
+		{"uppercase", "GPT-5.4"},
+		{"mixed case", "Gpt-5.4"},
+	}
+
+	var canonical ModelMetadata
+	for i, tt := range tests {
+		meta, ok := registry.Resolve(context.Background(), tt.model)
+		if !ok {
+			t.Fatalf("%s: expected ok=true for %q", tt.name, tt.model)
+		}
+		if i == 0 {
+			canonical = meta
+			continue
+		}
+		if meta.ContextWindow != canonical.ContextWindow {
+			t.Errorf("%s: ContextWindow mismatch: got %d, want %d", tt.name, meta.ContextWindow, canonical.ContextWindow)
+		}
+		if meta.OutputLimit != canonical.OutputLimit {
+			t.Errorf("%s: OutputLimit mismatch: got %d, want %d", tt.name, meta.OutputLimit, canonical.OutputLimit)
+		}
+		if meta.Family != canonical.Family {
+			t.Errorf("%s: Family mismatch: got %q, want %q", tt.name, meta.Family, canonical.Family)
+		}
+	}
+}
+
+func TestModelRegistry_CaseInsensitiveOverride(t *testing.T) {
+	// An override registered with a mixed-case key must be found regardless of
+	// the casing used at Resolve time.
+	overrides := map[string]ModelMetadata{
+		"Zai-Org/GLM-5.2-FP8": {
+			ContextWindow: 1048576,
+			OutputLimit:   8192,
+		},
+	}
+	registry := NewModelRegistry(overrides)
+
+	// Resolve with the exact mixed-case, then with a different casing.
+	for _, model := range []string{"zai-org/GLM-5.2-FP8", "ZAI-ORG/GLM-5.2-FP8", "Zai-Org/GLM-5.2-FP8"} {
+		meta, ok := registry.Resolve(context.Background(), model)
+		if !ok {
+			t.Fatalf("expected ok=true for %q", model)
+		}
+		if meta.ContextWindow != 1048576 {
+			t.Errorf("Resolve(%q): ContextWindow = %d, want 1048576", model, meta.ContextWindow)
+		}
+	}
+}
+
+func TestModelRegistry_CaseInsensitiveSetCachedInvalidate(t *testing.T) {
+	registry := NewModelRegistry(nil)
+
+	// SetCachedMetadata with mixed case, then Resolve with a different case.
+	registry.SetCachedMetadata("Qwen/Qwen35-397B-A17B-FP8", ModelMetadata{
+		ContextWindow: 262144,
+		OutputLimit:   8192,
+	})
+
+	meta, ok := registry.Resolve(context.Background(), "qwen/qwen35-397b-a17b-fp8")
+	if !ok {
+		t.Fatal("expected ok=true for case-insensitive cache lookup")
+	}
+	if meta.ContextWindow != 262144 {
+		t.Errorf("ContextWindow = %d, want 262144", meta.ContextWindow)
+	}
+
+	// Invalidate with yet another casing must remove the entry.
+	registry.Invalidate("QWEN/Qwen35-397B-A17B-FP8")
+
+	// After invalidation, the lowercased key should no longer hit the cache.
+	registry.mu.RLock()
+	_, exists := registry.cache["qwen/qwen35-397b-a17b-fp8"]
+	registry.mu.RUnlock()
+	if exists {
+		t.Error("cache entry should be removed after case-insensitive Invalidate")
+	}
+}
+
 func TestModelRegistry_ThreadSafe(t *testing.T) {
 	registry := NewModelRegistry(nil)
 
@@ -875,5 +967,167 @@ func TestModelRegistry_SetCachedMetadata_DoesNotOverrideUserOverride(t *testing.
 	}
 	if meta.OutputLimit != 2048 {
 		t.Errorf("user override clobbered by cache: got %d, want 2048", meta.OutputLimit)
+	}
+}
+
+// TestResolveProtocol_BuiltinAndPattern verifies that ModelMetadata.Protocol is
+// populated by Resolve across the four protocols, for both built-in models and
+// DetectProtocol-based pattern matching.
+func TestResolveProtocol_BuiltinAndPattern(t *testing.T) {
+	registry := NewModelRegistry(nil)
+
+	tests := []struct {
+		model            string
+		expectedProtocol APIProtocol
+	}{
+		// GPT-5 / Codex → Responses (built-in)
+		{"gpt-5", ProtocolResponses},
+		{"gpt-5.6", ProtocolResponses},
+		{"codex-mini-latest", ProtocolResponses},
+
+		// GPT-5 pattern matching → Responses (the family-vs-protocol split:
+		// FamilyOpenAIFlagship, but protocol Responses)
+		{"gpt-5-preview", ProtocolResponses},
+
+		// Claude → Anthropic (built-in + pattern)
+		{"claude-opus-4-6", ProtocolAnthropic},
+		{"claude-sonnet-4-5", ProtocolAnthropic},
+		{"claude-custom-model", ProtocolAnthropic},
+
+		// Gemini / Gemma → Google (built-in + pattern)
+		{"gemini-2.5-pro", ProtocolGoogle},
+		{"gemini-2.0-flash", ProtocolGoogle},
+		{"gemini-custom-pro", ProtocolGoogle},
+		{"gemma-4-31b-it", ProtocolGoogle},
+
+		// Chat Completions — OpenAI non-gpt-5 models (built-in)
+		{"gpt-4o", ProtocolChatCompletions},
+		{"gpt-4o-mini", ProtocolChatCompletions},
+		{"gpt-4.1", ProtocolChatCompletions},
+		{"o1", ProtocolChatCompletions},
+		{"o3", ProtocolChatCompletions},
+		{"o4-mini", ProtocolChatCompletions},
+
+		// Chat Completions — other families / default
+		{"grok-4", ProtocolChatCompletions},
+		{"deepseek-v4-pro", ProtocolChatCompletions},
+		{"llama-3.1-70b", ProtocolChatCompletions},
+		{"unknown-model", ProtocolChatCompletions},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.model, func(t *testing.T) {
+			meta, _ := registry.Resolve(context.Background(), tt.model)
+			if meta.Protocol != tt.expectedProtocol {
+				t.Errorf("expected Protocol %q for model %q, got %q",
+					tt.expectedProtocol, tt.model, meta.Protocol)
+			}
+		})
+	}
+}
+
+// TestResolveProtocol_SourceWithoutProtocol verifies that when a source returns
+// metadata without Protocol set, resolveProtocol delegates to DetectProtocol.
+func TestResolveProtocol_SourceWithoutProtocol(t *testing.T) {
+	tests := []struct {
+		name             string
+		model            string
+		expectedProtocol APIProtocol
+	}{
+		{
+			name:             "gpt-5 model from source gets responses protocol",
+			model:            "gpt-5-custom-v2",
+			expectedProtocol: ProtocolResponses,
+		},
+		{
+			name:             "claude model from source gets anthropic protocol",
+			model:            "claude-custom-v2",
+			expectedProtocol: ProtocolAnthropic,
+		},
+		{
+			name:             "gemini model from source gets google protocol",
+			model:            "gemini-custom-pro",
+			expectedProtocol: ProtocolGoogle,
+		},
+		{
+			name:             "unknown model from source gets chat_completions protocol",
+			model:            "custom-llm-v1",
+			expectedProtocol: ProtocolChatCompletions,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			registry := NewModelRegistry(nil)
+
+			// Register a source that returns metadata without Protocol set
+			registry.RegisterSource(func(model string) (ModelMetadata, bool) {
+				if model == tt.model {
+					return ModelMetadata{
+						ContextWindow: 128000,
+						OutputLimit:   8192,
+						TokenizerType: "test",
+					}, true
+				}
+				return ModelMetadata{}, false
+			})
+
+			meta, _ := registry.Resolve(context.Background(), tt.model)
+			if meta.Protocol != tt.expectedProtocol {
+				t.Errorf("expected Protocol %q, got %q", tt.expectedProtocol, meta.Protocol)
+			}
+		})
+	}
+}
+
+// TestResolveProtocol_UserOverride verifies that an explicit user-override
+// Protocol takes precedence over DetectProtocol.
+func TestResolveProtocol_UserOverride(t *testing.T) {
+	tests := []struct {
+		name             string
+		model            string
+		overrideProtocol APIProtocol
+		expectedProtocol APIProtocol
+	}{
+		{
+			name:             "override with explicit responses protocol",
+			model:            "custom-model",
+			overrideProtocol: ProtocolResponses,
+			expectedProtocol: ProtocolResponses,
+		},
+		{
+			name:             "override without protocol should get DetectProtocol result",
+			model:            "claude-custom", // matches anthropic pattern
+			overrideProtocol: "",
+			expectedProtocol: ProtocolAnthropic,
+		},
+		{
+			name:             "override builtin model with different protocol",
+			model:            "gpt-4o", // normally chat_completions
+			overrideProtocol: ProtocolResponses,
+			expectedProtocol: ProtocolResponses,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			overrideMeta := ModelMetadata{
+				ContextWindow: 100000,
+				OutputLimit:   5000,
+				TokenizerType: "override",
+			}
+			if tt.overrideProtocol != "" {
+				overrideMeta.Protocol = tt.overrideProtocol
+			}
+
+			registry := NewModelRegistry(map[string]ModelMetadata{
+				tt.model: overrideMeta,
+			})
+
+			meta, _ := registry.Resolve(context.Background(), tt.model)
+			if meta.Protocol != tt.expectedProtocol {
+				t.Errorf("expected Protocol %q, got %q", tt.expectedProtocol, meta.Protocol)
+			}
+		})
 	}
 }

@@ -1,12 +1,15 @@
 package llm
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	oai "github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
@@ -23,11 +26,14 @@ type OpenAIProviderConfig struct {
 
 // OpenAIProvider implements Provider for OpenAI and compatible APIs.
 type OpenAIProvider struct {
-	client          *oai.Client // official SDK for Chat Completions API
-	responsesClient *oai.Client // official SDK for Responses API
-	name            string
-	baseURL         string // empty = default OpenAI; non-empty = compatible provider
-	logger          *slog.Logger
+	client            *oai.Client        // official SDK for Chat Completions API
+	responsesClient   *oai.Client        // official SDK for Responses API
+	anthropicDelegate *AnthropicProvider // serves ProtocolAnthropic models (Claude) via a co-located Anthropic provider using the same baseURL/APIKey/HTTPClient/Logger
+	name              string
+	baseURL           string       // empty = default OpenAI; non-empty = compatible provider
+	apiKey            string       // API key (passed to the Google delegate; empty for local backends)
+	httpClient        *http.Client // optional proxy-configured HTTP client (passed to the Google delegate; nil = http.DefaultClient)
+	logger            *slog.Logger
 }
 
 // log returns the provider's logger, defaulting to slog.Default() when unset.
@@ -59,12 +65,36 @@ func NewOpenAIProvider(cfg OpenAIProviderConfig) (*OpenAIProvider, error) {
 
 	responsesClient := newResponsesClient(cfg.APIKey, cfg.BaseURL, cfg.HTTPClient)
 
+	// Build a co-located Anthropic provider so ProtocolAnthropic models (Claude)
+	// served by an OpenAI-compatible gateway (e.g. Zen) can be delegated to the
+	// existing Anthropic Messages implementation — reusing the same
+	// baseURL/APIKey/HTTPClient/Logger, with no code duplication. This is only
+	// invoked on the ProtocolAnthropic dispatch path; for purely OpenAI
+	// providers the delegate is constructed but never used. The delegate is built
+	// from the shared connection fields explicitly (rather than via a direct
+	// type conversion) so that adding Anthropic-specific fields to
+	// AnthropicProviderConfig later cannot silently drop or mis-map a field.
+	//nolint:staticcheck // S1016: explicit field copy is deliberate — see comment above; survives future divergent fields.
+	anthropicDelegate, err := NewAnthropicProvider(AnthropicProviderConfig{
+		Name:       cfg.Name,
+		APIKey:     cfg.APIKey,
+		BaseURL:    cfg.BaseURL,
+		HTTPClient: cfg.HTTPClient,
+		Logger:     cfg.Logger,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("openai: failed to build anthropic delegate: %w", err)
+	}
+
 	return &OpenAIProvider{
-		client:          &client,
-		responsesClient: responsesClient,
-		name:            cfg.Name,
-		baseURL:         cfg.BaseURL,
-		logger:          cfg.Logger,
+		client:            &client,
+		responsesClient:   responsesClient,
+		anthropicDelegate: anthropicDelegate,
+		name:              cfg.Name,
+		baseURL:           cfg.BaseURL,
+		apiKey:            cfg.APIKey,
+		httpClient:        cfg.HTTPClient,
+		logger:            cfg.Logger,
 	}, nil
 }
 
@@ -83,14 +113,71 @@ func (p *OpenAIProvider) ChatCompletion(ctx context.Context, req ChatRequest) (*
 		}
 	}
 
-	// The Responses API (/v1/responses) is an OpenAI-specific endpoint, not
-	// part of the "OpenAI-compatible" standard. Compatible providers (custom
-	// baseURL) implement Chat Completions, not the Responses API. Only route
-	// to the Responses API for the official OpenAI endpoint where codex-family
-	// models require it. Compatible providers serve codex models via Chat
-	// Completions instead.
-	if p.baseURL == "" && needsResponsesAPI(req.Model) {
-		return responsesAPICompletion(ctx, p.responsesClient, p.name, p.baseURL, req, p.logger)
+	// Dispatch each model to the API protocol it speaks. The OpenAI provider
+	// natively handles the two OpenAI protocols:
+	//   - ProtocolResponses (GPT-5.x, Codex) → Responses API (/v1/responses).
+	//     These models are served exclusively via /responses — both the
+	//     official OpenAI endpoint and compatible gateways (e.g. OpenCode Zen
+	//     exposes gpt-5.x / gpt-5.x-codex there) — and sending them to
+	//     /chat/completions returns a degenerate HTTP 400 with an empty body.
+	//     Therefore, when the Responses endpoint is genuinely missing (HTTP
+	//     404/405) we surface a clear "Responses API required but unavailable"
+	//     error instead of silently falling back to a Chat Completions path
+	//     that is known to fail. The responsesClient is already configured with
+	//     the provider's baseURL, so a single code path covers both the
+	//     official endpoint and compatible gateways.
+	//   - ProtocolChatCompletions (gpt-4o, o-series, gpt-4.1, and most
+	//     compatible models) → Chat Completions (/v1/chat/completions).
+	//
+	// ProtocolAnthropic (Claude) is delegated to a co-located AnthropicProvider
+	// built with the same baseURL/APIKey/HTTPClient/Logger, so a Claude model
+	// served by an OpenAI-compatible gateway (e.g. Zen) hits the gateway's
+	// Anthropic /messages endpoint with no code duplication. ProtocolGoogle
+	// (Gemini/Gemma) is delegated to googleCompletion, which POSTs
+	// {baseURL}/models/{model}:generateContent with the Google contents/parts
+	// format, reusing the same baseURL/apiKey/httpClient.
+	switch protocol := DetectProtocol(req.Model); protocol {
+	case ProtocolResponses:
+		resp, err := responsesAPICompletion(ctx, p.responsesClient, p.name, p.baseURL, req, p.logger)
+		if err == nil {
+			return resp, nil
+		}
+		// GPT-5.x / Codex models require the Responses API: both the official
+		// endpoint and compatible gateways serve them only via /responses, and
+		// /chat/completions returns a degenerate HTTP 400 with an empty body.
+		// When the endpoint is genuinely missing (404/405), surface a clear,
+		// actionable error instead of silently falling back to Chat Completions
+		// — which would mask the real cause behind an opaque 400 from a path
+		// that is known not to work for these models. Other errors (400/500/...)
+		// mean the endpoint exists but the request failed, so they are returned
+		// as-is.
+		if isResponsesEndpointUnsupported(err) {
+			p.log().Warn("openai: responses API required for model but unavailable",
+				"model", req.Model, "provider", p.name)
+			return nil, fmt.Errorf("openai: model %q requires the Responses API (/responses) which is unavailable on provider %q (HTTP 404/405): %w",
+				req.Model, p.name, err)
+		}
+		return resp, err
+	case ProtocolAnthropic:
+		// A Claude model served by an OpenAI-compatible gateway (e.g. Zen
+		// exposing Claude via an Anthropic-compatible /messages endpoint) is
+		// delegated to the co-located AnthropicProvider built with the same
+		// baseURL/APIKey/HTTPClient/Logger. This reuses the entire existing
+		// Anthropic Messages implementation — which already normalizes
+		// baseURL→/v1 and POSTs /messages → Zen's /v1/messages — with no code
+		// duplication. Error wrapping and body capture happen inside the
+		// delegate. The provider name is inherited from this OpenAIProvider.
+		return p.anthropicDelegate.ChatCompletion(ctx, req)
+	case ProtocolGoogle:
+		// A Gemini/Gemma model served by an OpenAI-compatible gateway (e.g.
+		// Zen exposing Gemini via its generateContent endpoint) is delegated to
+		// googleCompletion, which POSTs {baseURL}/models/{model}:generateContent
+		// with the Google contents/parts format. The delegate reuses this
+		// provider's baseURL/apiKey/httpClient; error wrapping and body capture
+		// happen inside the delegate, with the provider name inherited here.
+		return googleCompletion(ctx, p.httpClient, p.baseURL, p.apiKey, p.name, req)
+	case ProtocolChatCompletions:
+		// Handled by the shared Chat Completions path below.
 	}
 
 	params := p.buildChatParams(req)
@@ -379,18 +466,72 @@ func extractReasoningContent(rawJSON string) string {
 	return payload.ReasoningContent
 }
 
+// enrichOpenAIError extracts a human-readable message from an OpenAI SDK *oai.Error.
+//
+// The OpenAI SDK only parses the nested {"error":{...}} envelope (it unmarshals
+// gjson.Get(body, "error").Raw). For responses that use a non-standard error
+// shape — e.g. OpenCode Zen returns {"detail":"..."} — the Message field and
+// RawJSON() are both empty, and the upstream message survives only in
+// Response.Body. Without this enrichment a 400 surfaces as a bare
+// "400 Bad Request" with an empty body.
+//
+// The lookup order is:
+//  1. apiErr.Message (standard OpenAI error envelope).
+//  2. The raw response body (covers non-standard envelopes), truncated.
+//
+// Retryable classification is intentionally left untouched — callers classify by
+// HTTP status code, not by the message contents.
+func enrichOpenAIError(apiErr *oai.Error) string {
+	if msg := strings.TrimSpace(apiErr.Message); msg != "" {
+		return msg
+	}
+	return readOpenAIErrorBody(apiErr)
+}
+
+// readOpenAIErrorBody reads the raw response body from an *oai.Error, truncated
+// to a sane size. It is nil-safe: Response/Body may be unset (e.g. in tests or
+// when the error was constructed without an HTTP round-trip).
+func readOpenAIErrorBody(apiErr *oai.Error) string {
+	if apiErr == nil || apiErr.Response == nil || apiErr.Response.Body == nil {
+		return ""
+	}
+	body, err := io.ReadAll(apiErr.Response.Body)
+	if err != nil {
+		return ""
+	}
+	body = bytes.TrimSpace(body)
+	const maxErrorBodySize = 4096 // 4 KiB cap to keep error messages bounded
+	if len(body) > maxErrorBodySize {
+		return string(body[:maxErrorBodySize]) + "..."
+	}
+	return string(body)
+}
+
 // wrapError maps OpenAI SDK error types to *Error.
 func (p *OpenAIProvider) wrapError(err error) error {
 	var apiErr *oai.Error
 	if errors.As(err, &apiErr) {
+		if msg := enrichOpenAIError(apiErr); msg != "" {
+			return WrapProviderError(p.name, apiErr.StatusCode, fmt.Errorf("%s: %w", msg, err))
+		}
 		return WrapProviderError(p.name, apiErr.StatusCode, err)
 	}
 	// Fallback: check for net errors directly
 	return WrapProviderError(p.name, 0, err)
 }
 
-// needsResponsesAPI returns true if the model requires the Responses API
-// (e.g., Codex models use /v1/responses instead of /v1/chat/completions).
-func needsResponsesAPI(model string) bool {
-	return DetectFamily(model) == FamilyOpenAICodex
+// isResponsesEndpointUnsupported reports whether err indicates that the
+// Responses API endpoint (/v1/responses) is not implemented by the provider —
+// i.e. HTTP 404 Not Found or 405 Method Not Allowed. It is used to decide
+// whether to surface a clear "Responses API required but unavailable" error for
+// codex/gpt-5.x-family models, which are served exclusively via /responses and
+// for which a Chat Completions fallback is known to fail (degenerate HTTP 400
+// with an empty body). Other statuses (400/500/...) mean the endpoint exists but
+// the request or processing failed, so they are NOT treated as "unsupported".
+func isResponsesEndpointUnsupported(err error) bool {
+	var llmErr *Error
+	if errors.As(err, &llmErr) {
+		return llmErr.StatusCode == http.StatusNotFound || llmErr.StatusCode == http.StatusMethodNotAllowed
+	}
+	return false
 }

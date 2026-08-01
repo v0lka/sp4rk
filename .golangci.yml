@@ -73,3 +73,7 @@ linters:
     prealloc:
       simple: true
       for-loops: true
+
+formatters:
+  enable:
+    - gofmt

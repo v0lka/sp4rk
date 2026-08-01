@@ -298,13 +298,13 @@ func TestResolver_MatchRootRelativeAPI(t *testing.T) {
 		dir  bool
 		want bool
 	}{
-		{"dist", false, true},       // anchored root file
-		{"sub/dist", false, false},  // anchored -> not nested
-		{"app.log", false, true},    // bare name any depth
+		{"dist", false, true},      // anchored root file
+		{"sub/dist", false, false}, // anchored -> not nested
+		{"app.log", false, true},   // bare name any depth
 		{"deep/app.log", false, true},
-		{"build", true, true},       // dirOnly matches dir
-		{"build", false, false},     // dirOnly not a file
-		{"build/x", false, true},    // contents under ignored dir
+		{"build", true, true},    // dirOnly matches dir
+		{"build", false, false},  // dirOnly not a file
+		{"build/x", false, true}, // contents under ignored dir
 		{"src/main.go", false, false},
 		{".", false, false}, // root itself
 		{"", false, false},
@@ -525,10 +525,10 @@ func TestResolver_IgnoredByAIIgnore(t *testing.T) {
 	}
 
 	// Full Ignored honours both files.
-	assertIgnored(t, r, joinRel(root, "app.log"), false)       // .gitignore
-	assertIgnored(t, r, joinRel(root, "creds.secret"), false)  // .aiignore
-	assertIgnored(t, r, joinRel(root, "build"), true)          // .gitignore dir
-	assertIgnored(t, r, joinRel(root, "drafts"), true)         // .aiignore dir
+	assertIgnored(t, r, joinRel(root, "app.log"), false)      // .gitignore
+	assertIgnored(t, r, joinRel(root, "creds.secret"), false) // .aiignore
+	assertIgnored(t, r, joinRel(root, "build"), true)         // .gitignore dir
+	assertIgnored(t, r, joinRel(root, "drafts"), true)        // .aiignore dir
 
 	// IgnoredByAIIgnore honours ONLY .aiignore rules.
 	assertNotIgnoredAI := func(absPath string, isDir bool) {
@@ -545,8 +545,8 @@ func TestResolver_IgnoredByAIIgnore(t *testing.T) {
 	}
 
 	// .gitignore-sourced ignores are NOT reported by the AI-only query.
-	assertNotIgnoredAI(joinRel(root, "app.log"), false)  // *.log from .gitignore
-	assertNotIgnoredAI(joinRel(root, "build"), true)     // build/ from .gitignore
+	assertNotIgnoredAI(joinRel(root, "app.log"), false) // *.log from .gitignore
+	assertNotIgnoredAI(joinRel(root, "build"), true)    // build/ from .gitignore
 	// .aiignore-sourced ignores ARE reported.
 	assertIgnoredAI(joinRel(root, "creds.secret"), false) // *.secret from .aiignore
 	assertIgnoredAI(joinRel(root, "drafts"), true)        // drafts/ from .aiignore

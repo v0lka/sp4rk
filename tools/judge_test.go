@@ -791,13 +791,13 @@ func TestAllPathsInWorkspace(t *testing.T) {
 // equal peers. Every path must be inside at least one root.
 func TestAllPathsInSessionRoots(t *testing.T) {
 	tests := []struct {
-		name     string
-		ws       string
-		tempDir  string
-		roots    []string
-		fold     bool // forces case-insensitive containment (overrides auto-detect)
-		input    string
-		want     bool
+		name    string
+		ws      string
+		tempDir string
+		roots   []string
+		fold    bool // forces case-insensitive containment (overrides auto-detect)
+		input   string
+		want    bool
 	}{
 		{
 			name:  "path inside workspace root",

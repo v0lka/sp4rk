@@ -8,8 +8,10 @@ import (
 )
 
 // loggingCaller wraps an LLMCaller to log request/response details via a
-// session-specific logger. Logging is performed at DEBUG level so it can be
-// toggled via the log-level configuration without any code changes.
+// session-specific logger. Request and usage details are logged at DEBUG level
+// so they can be toggled via the log-level configuration without any code
+// changes. Call failures are logged at WARN level because a failed LLM call is
+// an event worth surfacing at the default (INFO) log level.
 type loggingCaller struct {
 	inner    LLMCaller
 	provider string
@@ -41,7 +43,9 @@ func (l *loggingCaller) Call(ctx context.Context, req llm.ChatRequest) (*llm.Cha
 
 	resp, err := l.inner.Call(ctx, req)
 	if err != nil {
-		l.logger.Debug("llm: call failed",
+		// A failed LLM call is surfaced at WARN so it is visible at the default
+		// (INFO) log level, not silently dropped with DEBUG-only diagnostics.
+		l.logger.Warn("llm: call failed",
 			"provider", l.provider,
 			"error", err,
 		)

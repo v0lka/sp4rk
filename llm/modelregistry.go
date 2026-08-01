@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -30,8 +31,18 @@ type ModelMetadata struct {
 	ContextWindow int
 	OutputLimit   int
 	TokenizerType string
-	Family        string
-	Capabilities  ModelCapabilities
+	// Family is the model family (e.g. "openai_flagship", "anthropic"). When
+	// set, it is AUTHORITATIVE: resolveFamily returns it as-is and only falls
+	// back to DetectFamily when it is empty. Thus the Family value in a built-in
+	// or override record is not merely documentary — it wins over substring
+	// detection. Omit it only when DetectFamily should derive the family.
+	Family string
+	// Protocol is the wire protocol / canonical endpoint postfix the model
+	// speaks. Populated lazily by resolveProtocol at Resolve time from
+	// DetectProtocol (or an explicit override), so callers can route the
+	// request to the right endpoint. See DetectProtocol for the mapping.
+	Protocol     APIProtocol
+	Capabilities ModelCapabilities
 }
 
 // ModelMetadataSource is a function that can resolve model metadata from an external source.
@@ -56,7 +67,9 @@ type ModelRegistry struct {
 func NewModelRegistry(overrides map[string]ModelMetadata) *ModelRegistry {
 	copied := make(map[string]ModelMetadata, len(overrides))
 	for k, v := range overrides {
-		copied[k] = v
+		// Normalize override keys to lowercase so they are matched by the
+		// case-insensitive Resolve lookup.
+		copied[strings.ToLower(k)] = v
 	}
 	return &ModelRegistry{
 		builtIn:    getBuiltInRegistry(),
@@ -85,23 +98,33 @@ func (r *ModelRegistry) SetHTTPClient(client *http.Client) {
 // The second return value indicates whether the model was found in a known source.
 // When ok is false, the returned metadata contains usable fallback defaults.
 func (r *ModelRegistry) Resolve(ctx context.Context, model string) (ModelMetadata, bool) {
+	// Case-insensitive lookup: model IDs arriving from OpenAI-compatible hosts
+	// (e.g. vLLM) frequently differ only in casing from their canonical
+	// registry keys. Normalize once and use this key for every map lookup;
+	// family/protocol detection lowercases independently and HuggingFace
+	// fetching preserves the original casing for the URL path.
+	key := strings.ToLower(model)
+
 	// Priority 1: Check overrides (no lock needed for read-only map after construction)
-	if meta, ok := r.overrides[model]; ok {
+	if meta, ok := r.overrides[key]; ok {
 		meta.Family = resolveFamily(model, meta)
+		meta.Protocol = resolveProtocol(model, meta)
 		return meta, true
 	}
 
 	// Priority 2: Check built-in registry (no lock needed for read-only map)
-	if meta, ok := r.builtIn[model]; ok {
+	if meta, ok := r.builtIn[key]; ok {
 		meta.Family = resolveFamily(model, meta)
+		meta.Protocol = resolveProtocol(model, meta)
 		return meta, true
 	}
 
 	// Priority 3: Check cache (needs lock)
 	r.mu.RLock()
-	if meta, ok := r.cache[model]; ok {
+	if meta, ok := r.cache[key]; ok {
 		r.mu.RUnlock()
 		meta.Family = resolveFamily(model, meta)
+		meta.Protocol = resolveProtocol(model, meta)
 		return meta, true
 	}
 	r.mu.RUnlock()
@@ -110,8 +133,9 @@ func (r *ModelRegistry) Resolve(ctx context.Context, model string) (ModelMetadat
 	meta, err := r.fetchFromHuggingFace(ctx, model)
 	if err == nil {
 		meta.Family = resolveFamily(model, meta)
+		meta.Protocol = resolveProtocol(model, meta)
 		r.mu.Lock()
-		r.cache[model] = meta
+		r.cache[key] = meta
 		r.mu.Unlock()
 		return meta, true
 	}
@@ -130,8 +154,9 @@ func (r *ModelRegistry) Resolve(ctx context.Context, model string) (ModelMetadat
 			continue
 		}
 		m.Family = resolveFamily(model, m)
+		m.Protocol = resolveProtocol(model, m)
 		r.mu.Lock()
-		r.cache[model] = m
+		r.cache[key] = m
 		r.mu.Unlock()
 		return m, true
 	}
@@ -143,13 +168,14 @@ func (r *ModelRegistry) Resolve(ctx context.Context, model string) (ModelMetadat
 		TokenizerType: "approximate",
 	}
 	meta.Family = resolveFamily(model, meta)
+	meta.Protocol = resolveProtocol(model, meta)
 	return meta, false
 }
 
 // Invalidate removes an entry from the cache map (for model change mid-session).
 func (r *ModelRegistry) Invalidate(model string) {
 	r.mu.Lock()
-	delete(r.cache, model)
+	delete(r.cache, strings.ToLower(model))
 	r.mu.Unlock()
 }
 
@@ -166,8 +192,9 @@ func (r *ModelRegistry) Invalidate(model string) {
 // shadowed at Resolve time.
 func (r *ModelRegistry) SetCachedMetadata(model string, meta ModelMetadata) {
 	meta.Family = resolveFamily(model, meta)
+	meta.Protocol = resolveProtocol(model, meta)
 	r.mu.Lock()
-	r.cache[model] = meta
+	r.cache[strings.ToLower(model)] = meta
 	r.mu.Unlock()
 }
 
@@ -178,6 +205,15 @@ func resolveFamily(modelID string, meta ModelMetadata) string {
 		return meta.Family
 	}
 	return string(DetectFamily(modelID))
+}
+
+// resolveProtocol determines the API protocol for a model.
+// If already set in metadata, returns it directly; otherwise delegates to DetectProtocol.
+func resolveProtocol(modelID string, meta ModelMetadata) APIProtocol {
+	if meta.Protocol != "" {
+		return meta.Protocol
+	}
+	return DetectProtocol(modelID)
 }
 
 // RegisterSource adds a metadata source to the registry.
@@ -944,6 +980,24 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			Family:        "qwen",
 			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
+		// Qwen3.5 FP8 (HuggingFace): official FP8 checkpoints of the flagship
+		// gated-delta-networks MoE members. Same multimodal (text+image),
+		// thinking, and 256K context as the rest of the Qwen3.5 line.
+		//   config: max_position_embeddings=262144 (Qwen3_5MoeForConditionalGeneration)
+		"qwen/qwen3.5-397b-a17b-fp8": {
+			ContextWindow: 262144,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"qwen/qwen3.5-122b-a10b-fp8": {
+			ContextWindow: 262144,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
 		// Qwen3.6: multimodal, thinking, 256K context.
 		"qwen/qwen3.6-27b": {
 			ContextWindow: 262144,
@@ -953,6 +1007,16 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"qwen/qwen3.6-35b-a3b": {
+			ContextWindow: 262144,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		// Qwen3.6 FP8 (HuggingFace): FP8 checkpoint of the smaller Qwen3.6
+		// flagship — same multimodal MoE architecture and 256K context.
+		//   config: max_position_embeddings=262144 (Qwen3_5MoeForConditionalGeneration)
+		"qwen/qwen3.6-35b-a3b-fp8": {
 			ContextWindow: 262144,
 			OutputLimit:   8192,
 			TokenizerType: "approximate",
@@ -1114,6 +1178,17 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			Family:        "glm",
 			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
+		// GLM-5.2 FP8 (HuggingFace): official FP8 checkpoint of Z.ai's
+		// flagship 753B MoE. Same reasoning/tool-calling model with native
+		// 1 MiB context (config max_position_embeddings=1048576,
+		// GlmMoeDsaForCausalLM); FP8 only trims the memory footprint.
+		"zai-org/glm-5.2-fp8": {
+			ContextWindow: 1048576,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "glm",
+			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+		},
 
 		// ── Google Gemma (open-weights) ────────────────────────────────
 		// Gemma 4: multimodal (text+image; +audio on E2B/E4B/12B), thinking,
@@ -1147,6 +1222,44 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"google/gemma-4-31b": {
+			ContextWindow: 262144,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "google",
+			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		// Gemma 4 QAT (Quantization-Aware Training): GGUF builds of the
+		// instruction-tuned 12B/26B-A4B/31B models trained to be robust to
+		// low-bit quantization. Same architecture, 256K context, and
+		// capabilities as their dense/MoE base models — QAT only reduces the
+		// memory footprint, not model behavior.
+		//   config: max_position_embeddings=262144 (verified google/gemma-4-31B-it)
+		"google/gemma-4-12b-qat": {
+			ContextWindow: 262144,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "google",
+			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"google/gemma-4-26b-a4b-qat": {
+			ContextWindow: 262144,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "google",
+			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"google/gemma-4-31b-qat": {
+			ContextWindow: 262144,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "google",
+			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		// Gemma 4 31B-it FP8: official FP8 checkpoint of the instruction-tuned
+		// 31B model (google/gemma-4-31B-it, image-text-to-text). FP8 only trims
+		// the memory footprint — same 256K context and multimodal capabilities
+		// as the dense 31B model.
+		"google/gemma-4-31b-it-fp8": {
 			ContextWindow: 262144,
 			OutputLimit:   8192,
 			TokenizerType: "approximate",
