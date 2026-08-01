@@ -56,7 +56,7 @@ func TestModelRegistry_BuiltInResolution(t *testing.T) {
 		{"codex-mini-latest", 200000, 100000, "tiktoken/o200k_base"},
 
 		// Anthropic models — verified July 2026 from platform.claude.com/docs
-		{"claude-opus-4.6", 1000000, 128000, "anthropic-api"},
+		{"claude-opus-4-6", 1000000, 128000, "anthropic-api"},
 		{"claude-3.5-sonnet", 200000, 8192, "anthropic-api"},
 
 		// Gemini models
@@ -64,8 +64,8 @@ func TestModelRegistry_BuiltInResolution(t *testing.T) {
 		{"gemini-2.0-flash", 1048576, 8192, "approximate"},
 
 		// DeepSeek V4 models
-		{"deepseek-v4-pro", 1000000, 16384, "approximate"},
-		{"deepseek-v4-flash", 1000000, 16384, "approximate"},
+		{"deepseek-v4-pro", 1000000, 384000, "approximate"},
+		{"deepseek-v4-flash", 1000000, 384000, "approximate"},
 
 		// Grok models — verified from docs.x.ai
 		{"grok-4.20", 1000000, 32768, "approximate"},
@@ -169,7 +169,7 @@ func TestModelRegistry_ThreadSafe(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < numIterations; j++ {
 				_, _ = registry.Resolve(context.Background(), "gpt-4o")
-				_, _ = registry.Resolve(context.Background(), "claude-opus-4.6")
+				_, _ = registry.Resolve(context.Background(), "claude-opus-4-6")
 				_, _ = registry.Resolve(context.Background(), "unknown-model")
 			}
 		}()
@@ -301,9 +301,9 @@ func TestResolveFamily_BuiltinModels(t *testing.T) {
 		{"codex-mini-latest", "openai_codex"},
 
 		// Anthropic models
-		{"claude-opus-4.6", "anthropic"},
-		{"claude-sonnet-4.5", "anthropic"},
-		{"claude-haiku-4.5", "anthropic"},
+		{"claude-opus-4-6", "anthropic"},
+		{"claude-sonnet-4-5", "anthropic"},
+		{"claude-haiku-4-5", "anthropic"},
 		{"claude-3.5-sonnet", "anthropic"},
 		{"claude-3.5-haiku", "anthropic"},
 

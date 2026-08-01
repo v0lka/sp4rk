@@ -84,6 +84,70 @@ func TestOpenAIProvider_Integration(t *testing.T) {
 	}
 }
 
+func TestOpenAIProvider_BuildChatParams_HoistsNonLeadingSystemMessage(t *testing.T) {
+	// Regression: vLLM serving Qwen rejects any system message that is not at
+	// the very beginning with HTTP 400 "System message must be at the
+	// beginning". sp4rk's prompt assembly can emit a non-leading system message
+	// (e.g. the plan as a trailing system message after the task, or a system
+	// message carried inside injected conversation history). buildChatParams
+	// must hoist every system message to the front so the Chat Completions
+	// payload is always system-first, mirroring the Anthropic and OpenAI
+	// Responses providers.
+	p, _ := NewOpenAIProvider(OpenAIProviderConfig{Name: "vllm", APIKey: "k", BaseURL: "http://localhost:8000/v1"})
+
+	req := ChatRequest{
+		Model: "Qwen/Qwen36-35B-A3B-FP8",
+		Messages: []Message{
+			{Role: "system", Content: "You are a coding agent."},
+			{Role: "user", Content: "Do the task."},
+			{Role: "system", Content: "Plan:\n1. step one\n2. step two"},
+			{Role: "assistant", Content: "Working on it."},
+		},
+	}
+
+	oaiReq := p.buildChatParams(req)
+
+	jsonBytes, err := json.Marshal(oaiReq)
+	if err != nil {
+		t.Fatalf("marshal params: %v", err)
+	}
+	var parsed struct {
+		Messages []map[string]any `json:"messages"`
+	}
+	if err := json.Unmarshal(jsonBytes, &parsed); err != nil {
+		t.Fatalf("unmarshal params: %v", err)
+	}
+
+	// The very first message must be a system message.
+	if got := parsed.Messages[0]["role"]; got != "system" {
+		t.Fatalf("expected first message role 'system', got %v", got)
+	}
+	// No message after the first may be a system message.
+	for i, m := range parsed.Messages[1:] {
+		if m["role"] == "system" {
+			t.Fatalf("message at index %d is a non-leading system message: %v", i+1, m)
+		}
+	}
+	// Both system messages merge into the single leading one (joined with "\n").
+	leadingSystem, _ := parsed.Messages[0]["content"].(string)
+	if !strings.Contains(leadingSystem, "You are a coding agent.") {
+		t.Errorf("leading system message lost the first system content: %q", leadingSystem)
+	}
+	if !strings.Contains(leadingSystem, "Plan:\n1. step one\n2. step two") {
+		t.Errorf("leading system message lost the trailing system (plan) content: %q", leadingSystem)
+	}
+	// Non-system messages keep their relative order after the system message.
+	wantRoles := []string{"system", "user", "assistant"}
+	if len(parsed.Messages) != len(wantRoles) {
+		t.Fatalf("expected %d messages, got %d", len(wantRoles), len(parsed.Messages))
+	}
+	for i, want := range wantRoles {
+		if got := parsed.Messages[i]["role"]; got != want {
+			t.Errorf("message[%d].role = %v, want %q", i, got, want)
+		}
+	}
+}
+
 func TestOpenAIProvider_BuildChatParams(t *testing.T) {
 	p, _ := NewOpenAIProvider(OpenAIProviderConfig{Name: "openai", APIKey: "k"})
 

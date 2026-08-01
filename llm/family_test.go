@@ -28,10 +28,10 @@ func TestDetectFamily(t *testing.T) {
 		{"o4-mini", FamilyOpenAIFlagship},
 
 		// Anthropic
-		{"claude-opus-4.6", FamilyAnthropic},
-		{"claude-sonnet-4.5", FamilyAnthropic},
+		{"claude-opus-4-6", FamilyAnthropic},
+		{"claude-sonnet-4-5", FamilyAnthropic},
 		{"claude-3.5-sonnet", FamilyAnthropic},
-		{"claude-haiku-4.5", FamilyAnthropic},
+		{"claude-haiku-4-5", FamilyAnthropic},
 		{"claude-custom", FamilyAnthropic},
 
 		// Google (Gemini + Gemma)
@@ -98,7 +98,7 @@ func TestDetectFamily_CaseInsensitive(t *testing.T) {
 		modelID  string
 		expected ModelFamily
 	}{
-		{"Claude-Opus-4.6", FamilyAnthropic},
+		{"Claude-Opus-4-6", FamilyAnthropic},
 		{"GPT-4O", FamilyOpenAIFlagship},
 		{"GEMINI-2.5-PRO", FamilyGoogle},
 		{"DeepSeek-Chat", FamilyDeepSeek},

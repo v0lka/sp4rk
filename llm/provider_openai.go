@@ -121,8 +121,24 @@ func (p *OpenAIProvider) ChatCompletion(ctx context.Context, req ChatRequest) (*
 
 // buildChatParams converts our ChatRequest to OpenAI ChatCompletionNewParams.
 func (p *OpenAIProvider) buildChatParams(req ChatRequest) oai.ChatCompletionNewParams {
-	messages := make([]oai.ChatCompletionMessageParamUnion, 0, len(req.Messages))
-	for _, msg := range req.Messages {
+	// Normalize system messages to a single leading system message.
+	//
+	// sp4rk's prompt assembly can emit system messages after a user/assistant/
+	// tool message (e.g. the plan as a trailing system message, or system
+	// messages carried inside injected conversation history). Some
+	// OpenAI-compatible backends — notably vLLM serving Qwen — apply a strict
+	// chat template that rejects any non-leading system message with HTTP 400
+	// "System message must be at the beginning" (LM Studio's template is
+	// lenient, which is why the same payload works there). Hoist every system
+	// message to the front, exactly as the Anthropic and OpenAI Responses
+	// providers already do via ExtractSystemPrompt(Parts). This is a no-op for
+	// the common case of a single leading system message.
+	systemPrompt, filtered := ExtractSystemPrompt(req.Messages)
+	messages := make([]oai.ChatCompletionMessageParamUnion, 0, len(filtered)+1)
+	if systemPrompt != "" {
+		messages = append(messages, oai.SystemMessage(systemPrompt))
+	}
+	for _, msg := range filtered {
 		messages = append(messages, p.convertRequestMessage(msg))
 	}
 
