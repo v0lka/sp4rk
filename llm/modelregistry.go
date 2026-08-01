@@ -809,6 +809,749 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			Family:        "default",
 			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
+
+		// ── Local / open-weights models (LM Studio catalog) ────────────
+		// Source: https://lmstudio.ai/models (catalog) + HuggingFace model
+		// cards / config.json for context windows (Aug 2026).
+		// Identifiers are the lowercase org/name form LM Studio serves via its
+		// OpenAI-compatible API (e.g. "openai/gpt-oss-20b"). sp4rk strips a
+		// provider prefix like "lmstudio/" before lookup, so the bare org/name
+		// is what's matched here. TokenizerType is "approximate" for all (no
+		// per-model tiktoken); OutputLimit is a conservative context reserve,
+		// not the absolute output ceiling. Temperature is accepted by all
+		// local backends (llama.cpp/MLX sampling), hence set everywhere.
+		//
+		// ── Qwen (Alibaba) ──────────────────────────────────────────────
+		// Qwen3 (2507 generation): instruct + thinking variants, 256K context.
+		"qwen/qwen3-4b-2507": {
+			ContextWindow: 262144,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+		},
+		"qwen/qwen3-4b-thinking-2507": {
+			ContextWindow: 262144,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"qwen/qwen3-30b-a3b-2507": {
+			ContextWindow: 262144,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+		},
+		"qwen/qwen3-30b-a3b-thinking-2507": {
+			ContextWindow: 262144,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"qwen/qwen3-235b-a22b-2507": {
+			ContextWindow: 262144,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+		},
+		"qwen/qwen3-235b-a22b-thinking-2507": {
+			ContextWindow: 262144,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		// Qwen3 (1st generation, 2504): hybrid thinking, 128K context.
+		"qwen/qwen3-4b": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"qwen/qwen3-8b": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"qwen/qwen3-14b": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"qwen/qwen3-32b": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"qwen/qwen3-30b-a3b": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"qwen/qwen3-235b-a22b": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		// Qwen3.5: multimodal (text+image), thinking, 256K context.
+		"qwen/qwen3.5-2b": {
+			ContextWindow: 262144,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"qwen/qwen3.5-4b": {
+			ContextWindow: 262144,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"qwen/qwen3.5-9b": {
+			ContextWindow: 262144,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"qwen/qwen3.5-27b": {
+			ContextWindow: 262144,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"qwen/qwen3.5-35b-a3b": {
+			ContextWindow: 262144,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		// Qwen3.6: multimodal, thinking, 256K context.
+		"qwen/qwen3.6-27b": {
+			ContextWindow: 262144,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"qwen/qwen3.6-35b-a3b": {
+			ContextWindow: 262144,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		// Qwen3-Coder: non-thinking coding MoE, 256K context.
+		"qwen/qwen3-coder-30b": {
+			ContextWindow: 262144,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+		},
+		"qwen/qwen3-coder-480b": {
+			ContextWindow: 262144,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+		},
+		"qwen/qwen3-coder-next": {
+			ContextWindow: 262144,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+		},
+		"qwen/qwen3-next-80b": {
+			ContextWindow: 262144,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+		},
+		// Qwen3-VL: vision-language, thinking, 256K context.
+		"qwen/qwen3-vl-2b": {
+			ContextWindow: 262144,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"qwen/qwen3-vl-4b": {
+			ContextWindow: 262144,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"qwen/qwen3-vl-8b": {
+			ContextWindow: 262144,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"qwen/qwen3-vl-30b": {
+			ContextWindow: 262144,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"qwen/qwen3-vl-32b": {
+			ContextWindow: 262144,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		// Qwen2.5-VL: vision-language, 128K context.
+		"qwen/qwen2.5-vl-3b": {
+			ContextWindow: 128000,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+		},
+		"qwen/qwen2.5-vl-7b": {
+			ContextWindow: 128000,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+		},
+		"qwen/qwen2.5-vl-32b": {
+			ContextWindow: 128000,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+		},
+		"qwen/qwen2.5-vl-72b": {
+			ContextWindow: 128000,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+		},
+
+		// ── DeepSeek (open reasoning distills) ─────────────────────────
+		// R1 / distills: reasoning-only, not trained for tool calling.
+		"deepseek/deepseek-r1-0528-qwen3-8b": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "deepseek",
+			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true},
+		},
+		"deepseek/deepseek-r1-distill-qwen-7b": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "deepseek",
+			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true},
+		},
+		"deepseek/deepseek-r1-distill-llama-8b": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "deepseek",
+			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true},
+		},
+		"deepseek/deepseek-r1-distill-qwen-14b": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "deepseek",
+			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true},
+		},
+		"deepseek/deepseek-r1-distill-qwen-32b": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "deepseek",
+			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true},
+		},
+		"deepseek/deepseek-r1-distill-llama-70b": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "deepseek",
+			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true},
+		},
+
+		// ── GLM (Z.ai open coding) ─────────────────────────────────────
+		"zai-org/glm-4.7-flash": {
+			ContextWindow: 202752,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "glm",
+			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"zai-org/glm-4.6v-flash": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "glm",
+			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+
+		// ── Google Gemma (open-weights) ────────────────────────────────
+		// Gemma 4: multimodal (text+image; +audio on E2B/E4B/12B), thinking,
+		// native function calling. E2B/E4B = 128K; 12B/26B-A4B/31B = 256K.
+		"google/gemma-4-e2b": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "google",
+			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"google/gemma-4-e4b": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "google",
+			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"google/gemma-4-12b": {
+			ContextWindow: 262144,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "google",
+			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"google/gemma-4-26b-a4b": {
+			ContextWindow: 262144,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "google",
+			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"google/gemma-4-31b": {
+			ContextWindow: 262144,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "google",
+			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		// Gemma 3: image+text (≥4B), 128K; 270M/1B text-only, 32K.
+		"google/gemma-3-270m": {
+			ContextWindow: 32768,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "google",
+			Capabilities:  ModelCapabilities{Temperature: true},
+		},
+		"google/gemma-3-1b": {
+			ContextWindow: 32768,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "google",
+			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+		},
+		"google/gemma-3-4b": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "google",
+			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+		},
+		"google/gemma-3-12b": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "google",
+			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+		},
+		"google/gemma-3-27b": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "google",
+			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+		},
+		// Gemma 3n: on-device multimodal, 32K.
+		"google/gemma-3n-e2b": {
+			ContextWindow: 32768,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "google",
+			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true},
+		},
+		"google/gemma-3n-e4b": {
+			ContextWindow: 32768,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "google",
+			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true},
+		},
+		// FunctionGemma: tiny function-calling foundation, 32K.
+		"google/functiongemma-270m": {
+			ContextWindow: 32768,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "google",
+			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+		},
+
+		// ── Mistral (open-weights) ─────────────────────────────────────
+		"mistralai/mistral-7b-instruct-v0.3": {
+			ContextWindow: 32768,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "mistral",
+			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+		},
+		"mistralai/mistral-nemo-instruct-2407": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "mistral",
+			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+		},
+		"mistralai/mistral-small-3.2": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "mistral",
+			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+		},
+		// Magistral: reasoning, 128K. v1.2 (+vision) and v1.1 (text).
+		"mistralai/magistral-small-2509": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "mistral",
+			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"mistralai/magistral-small": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "mistral",
+			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		// Devstral: agentic coding, 128K. Devstral 2 adds vision (123B = 256K).
+		"mistralai/devstral-small-2507": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "mistral",
+			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+		},
+		"mistralai/devstral-small-2505": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "mistral",
+			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+		},
+		"mistralai/devstral-small-2-2512": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "mistral",
+			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+		},
+		"mistralai/devstral-2-2512": {
+			ContextWindow: 262144,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "mistral",
+			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+		},
+		// Codestral: coding, 32K.
+		"mistralai/codestral-22b-v0.1": {
+			ContextWindow: 32768,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "mistral",
+			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+		},
+		// Ministral 3: multimodal, 256K (base instruct variants).
+		"mistralai/ministral-3-3b": {
+			ContextWindow: 262144,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "mistral",
+			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+		},
+		"mistralai/ministral-3-8b": {
+			ContextWindow: 262144,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "mistral",
+			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+		},
+		"mistralai/ministral-3-14b": {
+			ContextWindow: 262144,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "mistral",
+			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+		},
+
+		// ── OpenAI gpt-oss (open-weights) ──────────────────────────────
+		// gpt-oss: configurable reasoning effort + tool use, 128K.
+		"openai/gpt-oss-20b": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "default",
+			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"openai/gpt-oss-120b": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "default",
+			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		// gpt-oss-safeguard: content classifiers (not chat/agent models).
+		"openai/gpt-oss-safeguard-20b": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "default",
+			Capabilities:  ModelCapabilities{Temperature: true},
+		},
+		"openai/gpt-oss-safeguard-120b": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "default",
+			Capabilities:  ModelCapabilities{Temperature: true},
+		},
+
+		// ── ByteDance / Baidu ──────────────────────────────────────────
+		// seed-oss: reasoning with configurable thinking budget, 512K.
+		"bytedance/seed-oss-36b": {
+			ContextWindow: 524288,
+			OutputLimit:   16384,
+			TokenizerType: "approximate",
+			Family:        "default",
+			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		// ERNIE 4.5: 21B MoE, 128K.
+		"baidu/ernie-4.5-21b-a3b": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "default",
+			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+		},
+
+		// ── NVIDIA Nemotron ────────────────────────────────────────────
+		// Nemotron 3 / Super: up to 1M context. Omni is multimodal.
+		"nvidia/nemotron-3-nano": {
+			ContextWindow: 1048576,
+			OutputLimit:   16384,
+			TokenizerType: "approximate",
+			Family:        "default",
+			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"nvidia/nemotron-3-nano-omni": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "default",
+			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"nvidia/nemotron-3-super": {
+			ContextWindow: 1048576,
+			OutputLimit:   16384,
+			TokenizerType: "approximate",
+			Family:        "default",
+			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+		},
+
+		// ── IBM Granite ────────────────────────────────────────────────
+		// Granite 4.x: tool calling + JSON output, 128K.
+		"ibm/granite-4-h-micro": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "default",
+			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+		},
+		"ibm/granite-4-micro": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "default",
+			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+		},
+		"ibm/granite-4-h-tiny": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "default",
+			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+		},
+		"ibm/granite-4-h-small": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "default",
+			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+		},
+		"ibm/granite-4.1-3b": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "default",
+			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+		},
+		"ibm/granite-4.1-8b": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "default",
+			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+		},
+		"ibm/granite-4.1-30b": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "default",
+			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+		},
+
+		// ── Liquid AI LFM2 (on-device hybrid) ──────────────────────────
+		// Small variants: text, 32K, no tool use. 24B-A2B: native function calling.
+		"liquid/lfm2-350m": {
+			ContextWindow: 32768,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "default",
+			Capabilities:  ModelCapabilities{Temperature: true},
+		},
+		"liquid/lfm2-700m": {
+			ContextWindow: 32768,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "default",
+			Capabilities:  ModelCapabilities{Temperature: true},
+		},
+		"liquid/lfm2-1.2b": {
+			ContextWindow: 32768,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "default",
+			Capabilities:  ModelCapabilities{Temperature: true},
+		},
+		"liquid/lfm2-24b-a2b": {
+			ContextWindow: 32768,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "default",
+			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+		},
+
+		// ── Allen AI (Olmo / olmOCR) ───────────────────────────────────
+		// Olmo 3: 64K. olmOCR 2: vision-language OCR, 128K, no tool use.
+		"allenai/olmo-3-7b": {
+			ContextWindow: 65536,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "default",
+			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+		},
+		"allenai/olmo-3-7b-think": {
+			ContextWindow: 65536,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "default",
+			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"allenai/olmo-3-32b-think": {
+			ContextWindow: 65536,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "default",
+			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"allenai/olmocr-2-7b": {
+			ContextWindow: 128000,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "default",
+			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true},
+		},
+
+		// ── Essential AI / MiniMax ─────────────────────────────────────
+		// Rnj-1: dense reasoning, 32K. MiniMax M2: 230B MoE, ~196K.
+		"essentialai/rnj-1": {
+			ContextWindow: 32768,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "default",
+			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"minimax/minimax-m2": {
+			ContextWindow: 196608,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "default",
+			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+		},
+
+		// ── Microsoft Phi ──────────────────────────────────────────────
+		// phi-4: 16K, no tool use. phi-4-mini: 128K. Reasoning variants: 32K/128K.
+		"microsoft/phi-4": {
+			ContextWindow: 16384,
+			OutputLimit:   4096,
+			TokenizerType: "approximate",
+			Family:        "default",
+			Capabilities:  ModelCapabilities{Temperature: true},
+		},
+		"microsoft/phi-4-mini": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "default",
+			Capabilities:  ModelCapabilities{Temperature: true},
+		},
+		"microsoft/phi-4-mini-reasoning": {
+			ContextWindow: 131072,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "default",
+			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"microsoft/phi-4-reasoning": {
+			ContextWindow: 32768,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "default",
+			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"microsoft/phi-4-reasoning-plus": {
+			ContextWindow: 32768,
+			OutputLimit:   8192,
+			TokenizerType: "approximate",
+			Family:        "default",
+			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+		},
 	}
 }
 
