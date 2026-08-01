@@ -1273,3 +1273,92 @@ func TestResolveProtocol_UserOverride(t *testing.T) {
 		})
 	}
 }
+
+func TestResolveBuiltInModel_KnownModel(t *testing.T) {
+	// A model present in the built-in catalog must return its built-in values
+	// with ok=true, regardless of any override that would be active in a real
+	// registry. gpt-4o is a stable, well-known built-in entry.
+	meta, ok := ResolveBuiltInModel("gpt-4o")
+	if !ok {
+		t.Fatal("expected ok=true for a known built-in model")
+	}
+	if meta.ContextWindow != 128000 {
+		t.Errorf("expected ContextWindow 128000, got %d", meta.ContextWindow)
+	}
+	if meta.OutputLimit != 16384 {
+		t.Errorf("expected OutputLimit 16384, got %d", meta.OutputLimit)
+	}
+	if meta.TokenizerType != "tiktoken/o200k_base" {
+		t.Errorf("expected TokenizerType tiktoken/o200k_base, got %s", meta.TokenizerType)
+	}
+	// Family and Protocol must be resolved, not left empty.
+	if meta.Family == "" {
+		t.Error("expected non-empty Family for a known built-in model")
+	}
+	if meta.Protocol == "" {
+		t.Error("expected non-empty Protocol for a known built-in model")
+	}
+}
+
+func TestResolveBuiltInModel_CaseInsensitive(t *testing.T) {
+	// Built-in lookup is case-insensitive, mirroring Resolve.
+	upper, okUpper := ResolveBuiltInModel("GPT-4O")
+	lower, okLower := ResolveBuiltInModel("gpt-4o")
+	if !okUpper || !okLower {
+		t.Fatal("expected both lookups to succeed")
+	}
+	if upper != lower {
+		t.Errorf("case-insensitive lookup mismatch: %+v vs %+v", upper, lower)
+	}
+}
+
+func TestResolveBuiltInModel_FuzzyMatch(t *testing.T) {
+	// The separator-insensitive fuzzy lookup should bridge a host that drops
+	// the dot ("gpt4o" vs "gpt-4o"). The result must equal the built-in entry.
+	meta, ok := ResolveBuiltInModel("gpt4o")
+	if !ok {
+		t.Fatal("expected fuzzy match to succeed for 'gpt4o'")
+	}
+	if meta.ContextWindow != 128000 {
+		t.Errorf("expected fuzzy-matched ContextWindow 128000, got %d", meta.ContextWindow)
+	}
+}
+
+func TestResolveBuiltInModel_UnknownModel(t *testing.T) {
+	// An unknown model must return the fallback defaults with ok=false and
+	// never touch the network.
+	meta, ok := ResolveBuiltInModel("definitely-not-a-real-model-xyz")
+	if ok {
+		t.Fatal("expected ok=false for an unknown model")
+	}
+	if meta.ContextWindow != 128000 {
+		t.Errorf("expected fallback ContextWindow 128000, got %d", meta.ContextWindow)
+	}
+	if meta.OutputLimit != 4096 {
+		t.Errorf("expected fallback OutputLimit 4096, got %d", meta.OutputLimit)
+	}
+	if meta.TokenizerType != "approximate" {
+		t.Errorf("expected fallback TokenizerType approximate, got %s", meta.TokenizerType)
+	}
+	if !meta.Capabilities.Attachment {
+		t.Error("expected optimistic attachment capability in fallback")
+	}
+}
+
+func TestResolveBuiltInModel_UnaffectedByOverride(t *testing.T) {
+	// Constructing a registry with an override for gpt-4o must NOT change what
+	// ResolveBuiltInModel returns — it consults only the built-in catalog.
+	_ = NewModelRegistry(map[string]ModelMetadata{
+		"gpt-4o": {ContextWindow: 999999, OutputLimit: 999999},
+	})
+	meta, ok := ResolveBuiltInModel("gpt-4o")
+	if !ok {
+		t.Fatal("expected ok=true for gpt-4o")
+	}
+	if meta.ContextWindow != 128000 {
+		t.Errorf("override leaked into built-in lookup: got ContextWindow %d, want 128000", meta.ContextWindow)
+	}
+	if meta.OutputLimit != 16384 {
+		t.Errorf("override leaked into built-in lookup: got OutputLimit %d, want 16384", meta.OutputLimit)
+	}
+}

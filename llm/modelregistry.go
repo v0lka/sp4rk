@@ -1788,3 +1788,42 @@ func BuiltInModelNames(tokenizerType string) []string {
 	sort.Strings(names)
 	return names
 }
+
+// ResolveBuiltInModel resolves a model's metadata using ONLY the built-in
+// catalog — an exact case-insensitive lookup followed by the
+// separator-insensitive fuzzy match — with no network access and no
+// consideration of user overrides, the lazy cache, HuggingFace, or registered
+// sources. When the model is absent from the built-in catalog it returns the
+// same fallback metadata Resolve uses (ContextWindow=128000, OutputLimit=4096,
+// TokenizerType="approximate") with ok=false.
+//
+// It is intended for callers that need the "factory default" for a model
+// independent of any user override — e.g. to decide which fields of a config
+// override actually differ from the built-in values, or to merge a partial
+// override onto the built-in metadata at registry-construction time. Because it
+// never touches the network, it is safe to call from startup/seed paths.
+func ResolveBuiltInModel(model string) (ModelMetadata, bool) {
+	key := strings.ToLower(model)
+	builtIn := getBuiltInRegistry()
+	if meta, ok := builtIn[key]; ok {
+		meta.Family = resolveFamily(model, meta)
+		meta.Protocol = resolveProtocol(model, meta)
+		return meta, true
+	}
+	if want := normalizeModelID(model); want != "" {
+		if meta, ok := fuzzyMatchIn(builtIn, want); ok {
+			meta.Family = resolveFamily(model, meta)
+			meta.Protocol = resolveProtocol(model, meta)
+			return meta, true
+		}
+	}
+	meta := ModelMetadata{
+		ContextWindow: 128000,
+		OutputLimit:   4096,
+		TokenizerType: "approximate",
+		Capabilities:  defaultUnknownCapabilities(),
+	}
+	meta.Family = resolveFamily(model, meta)
+	meta.Protocol = resolveProtocol(model, meta)
+	return meta, false
+}
