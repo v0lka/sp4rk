@@ -19,11 +19,16 @@ import (
 const maxHuggingFaceConfigBytes = 1 << 20 // 1 MiB
 
 // ModelCapabilities describes what a model supports.
+//
+// The struct carries json+yaml struct tags so a single canonical type can be
+// serialized consistently in both the JSON API contract (GetModelConfig/
+// SetModelConfig) and config.yaml (ModelOverride) using snake_case keys,
+// without conversion boilerplate at every layer boundary.
 type ModelCapabilities struct {
-	Attachment  bool // image/PDF support
-	Reasoning   bool // reasoning/thinking mode
-	Temperature bool // accepts temperature parameter
-	ToolCall    bool // function calling support
+	Attachment  bool `json:"attachment" yaml:"attachment"`   // image/PDF support
+	Reasoning   bool `json:"reasoning" yaml:"reasoning"`     // reasoning/thinking mode
+	Temperature bool `json:"temperature" yaml:"temperature"` // accepts temperature parameter
+	ToolCall    bool `json:"tool_call" yaml:"tool_call"`     // function calling support
 }
 
 // ModelMetadata holds the capabilities and configuration for a language model.
