@@ -1,0 +1,14 @@
+# Enforce LF line endings on checkout for all text files, regardless of the
+# developer's (or CI runner's) core.autocrlf setting.
+#
+# Git for Windows (used by the windows-* GitHub Actions runners) ships with
+# core.autocrlf=true by default, which converts LF -> CRLF on checkout.
+# golangci-lint's gofmt then fails with "File is not properly formatted" on
+# every .go file — only the first 3 are surfaced due to max-same-issues: 3.
+# Pinning eol=lf here keeps checkouts byte-identical across OSes and resolves
+# the Windows-only lint failure. Existing Windows clones should run
+# `git add --renormalize .` once after pulling this file.
+* text=auto eol=lf
+
+# Go source must always use LF.
+*.go text eol=lf
