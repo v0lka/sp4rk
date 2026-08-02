@@ -60,12 +60,17 @@ Router.Call(ctx, req)
 ├─ Snapshot active (provider, model) under a read lock; release before the retry loop
 │      so SetModel is not blocked by backoff sleeps.
 ├─ Fill the bare model name when req.Model is empty; auto-detect family if empty.
+├─ Resolve model metadata at most once (a single Resolve honoring a tier-1 override); when the
+│      caller left req.Protocol empty, fill it from the resolved ModelMetadata.Protocol so a
+│      registry override steers routing regardless of the model name (the documented escape hatch).
+│      The resolved metadata is reused by applyDefaultTemperature and validateContextWindow so
+│      those helpers perform no registry I/O of their own.
 ├─ Apply family-aware default temperature (via SamplingFunc) unless req.Temperature is set;
 │      skip temperature entirely for models whose Capabilities.Temperature is false.
 ├─ Validate estimated tokens against the effective context window (SafetyMarginPercent +
 │      OutputTokenReserve); reject oversized requests with ErrContextWindowExceeded.
-├─ Dispatch to the active provider. The OpenAI provider selects the wire protocol per
-│      request via DetectProtocol(req.Model) (see [Multi-protocol routing](#multi-protocol-routing)):
+├─ Dispatch to the active provider. The OpenAI provider honors req.Protocol when set and otherwise
+│      falls back to DetectProtocol(req.Model) (see [Multi-protocol routing](#multi-protocol-routing)):
 │      Responses API for gpt-5/codex, /messages (co-located AnthropicProvider) for Claude,
 │      generateContent (googleCompletion) for Gemini/Gemma, /chat/completions for everything else.
 └─ Retry transient errors (HTTP 408/429/500/502/503/504/520–524/529, transient
@@ -84,15 +89,19 @@ A **composite model identifier** `"providerName/modelName"` is the internal sele
 
 `NewModelRegistry(overrides)` is thread-safe and lazily fetches external metadata. All map lookups (overrides, built-ins, cache) are **case-insensitive** (`strings.ToLower`), so a model ID differing only in casing from its canonical registry key (common with OpenAI-compatible hosts such as vLLM) still resolves. `Resolve(ctx, model)` uses a 6-tier resolution (first match wins): (1) user overrides; (2) built-in registry of well-known models; (2b) **fuzzy match** — vendor-prefix- and separator-insensitive lookup across overrides then built-ins; (3) cache; (4) external sources — HuggingFace API lookup (lazy, cached), then sources registered via `RegisterSource` (e.g. an LM Studio provider); (5) fallback defaults (`ContextWindow: 128000`, `OutputLimit: 4096`, `ok == false`). `Invalidate(model)` clears a cached entry; `SetHTTPClient` replaces the HF lookup client. `DetectFamily(modelID)` determines a model's family from its ID string, driving prompt and parameter adaptation (families: `anthropic`, `openai_flagship`/`openai_standard`/`openai_codex`, `google`, `mistral`, `deepseek`, `qwen`, `glm`, `kimi`, `default`).
 
+### Partial overrides
+
+A tier-1 override that pins only some fields — a **partial** override, e.g. a protocol-only auto-remap that injects `{Protocol: ChatCompletions}` for a Google-named checkpoint served by LM Studio/vLLM — inherits its unset scalar fields from the lower **non-network** tiers (built-in exact → built-in fuzzy → cache → fallback defaults). The inheritable fields are `ContextWindow`, `OutputLimit`, `TokenizerType`, and `Capabilities` (a zero-valued `ModelCapabilities` is treated as "unset", so a minimal protocol-pinning override no longer silently disables tool-calling, reasoning, or image uploads). A field already set in the override is authoritative; a fully-specified override (the common case: a `config.yaml` entry whose scalars are all populated) is returned verbatim. `Family` is derived by `resolveFamily`, and `Protocol` is always authoritative — pinning the protocol is precisely what a partial override exists to do. Network tiers (HuggingFace, registered sources) are deliberately skipped so an override lookup never performs I/O. The accepted tradeoff — mirroring the scalars — is that the zero value is reserved for "inherit", so there is no way to express "explicitly disable every capability" via a partial override.
+
 ### Fuzzy lookup
 
-The fuzzy tier (2b) bridges the cosmetic naming drift real-world model hosts introduce without the false-positive risk of edit-distance matching. `normalizeModelID` strips the org/vendor prefix (everything up to and including the first `/`) and removes separator punctuation (`.`, `-`, `_`), then lowercases; alphanumerics are never altered, so distinct model versions remain distinct (e.g. `qwen3.6` and `qwen3.7` normalize to `qwen36` and `qwen37`). Discarding the vendor prefix lets a bare query like `GLM-5.2-FP8` match a prefixed key such as `zai-org/glm-5.2-fp8`, and vice versa. When several entries normalize to the same form, the lexicographically smallest key wins (deterministic). A fuzzy hit is cached under the query key so repeat resolves take the fast path.
+The fuzzy tier (2b) bridges the cosmetic naming drift real-world model hosts introduce without the false-positive risk of edit-distance matching. `normalizeModelID` strips the org/vendor prefix (everything up to and including the first `/`) and removes separator punctuation (`.`, `-`, `_`), then lowercases; alphanumerics are never altered, so distinct model versions remain distinct (e.g. `qwen3.6` and `qwen3.7` normalize to `qwen36` and `qwen37`). Discarding the vendor prefix lets a bare query like `GLM-5.2-FP8` match a prefixed key such as `zai-org/glm-5.2-fp8`, and vice versa. When several entries normalize to the same form, the lexicographically smallest key wins (deterministic). A fuzzy hit is cached under the query key so repeat resolves take the fast path. Lookups are O(1) map reads against normalized-ID indexes (`builtInIndex`, `overridesIndex`) built once at registry construction — the shared built-in catalog index is initialized lazily via a `sync.Once` — replacing the former per-call O(n) scan.
 
 ### ResolveBuiltInModel / SetCachedMetadata
 
 `ResolveBuiltInModel(model)` resolves metadata using **only** the built-in catalog (exact case-insensitive then fuzzy) with no network access and no consideration of overrides, cache, HuggingFace, or registered sources. It returns the fallback defaults with `ok == false` when the model is absent. It is intended for callers needing the "factory default" independent of a user override — e.g. to compare which fields of a config override differ, or to merge a partial override onto built-in metadata at registry-construction time. It never touches the network, so it is safe to call from startup paths.
 
-`SetCachedMetadata(model, meta)` stores a late-learned metadata entry at tier 3 (the cache). It lets a caller that discovers a model's real context window after construction — e.g. a lazy probe of a local OpenAI-compatible server — populate the result so subsequent `Resolve` calls return it without re-querying the network. Because it is tier 3, it takes effect only when no user override (tier 1) or built-in entry (tier 2) exists, so config overrides and well-known models are never silently clobbered.
+`SetCachedMetadata(model, meta)` stores a late-learned metadata entry at tier 3 (the cache). It lets a caller that discovers a model's real context window after construction — e.g. a lazy probe of a local OpenAI-compatible server — populate the result so subsequent `Resolve` calls return it without re-querying the network. Because it is tier 3, it takes effect only when no user override (tier 1) or built-in entry (tier 2) exists, so config overrides and well-known models are never silently clobbered. A **partial** override that leaves its `ContextWindow` at zero inherits the cache-tier value once it arrives, so a lazy local-model probe (notably a HuggingFace probe for a custom-served model) is not shadowed by a non-zero fallback window baked into the override.
 
 ## Token counting & usage tracking
 
@@ -113,9 +122,9 @@ Both counters account for structured content blocks: when a message carries non-
 | `ProtocolGoogle` | `POST /models/{model}:generateContent` | Gemini and Gemma |
 | `ProtocolChatCompletions` | `POST /chat/completions` | everything else (default) |
 
-A single OpenAI-compatible `ProviderEntry` (e.g. a multi-model gateway like Zen) dispatches to all four: the OpenAI provider's `Call` switches on `DetectProtocol(req.Model)` — Responses to the Responses API, `ProtocolAnthropic` to a **co-located `AnthropicProvider`** built with the same `baseURL`/`apiKey`/`HTTPClient`/`logger` (`anthropicDelegate`), `ProtocolGoogle` to the `googleCompletion` function (POSTs the Google `contents`/`parts` format), and `ProtocolChatCompletions` to the Chat Completions endpoint. A 404/405 on `/responses` surfaces a clear error rather than silently falling back to Chat Completions. No new `ProviderType` is introduced — Google and Anthropic models behind an OpenAI-compatible host are reached by delegation, not by a new registry type.
+A single OpenAI-compatible `ProviderEntry` (e.g. a multi-model gateway like Zen) dispatches to all four: the OpenAI provider's `Call` honors `req.Protocol` when set (the router fills it from the registry-resolved metadata, which honors an explicit override) and otherwise falls back to `DetectProtocol(req.Model)` — Responses to the Responses API, `ProtocolAnthropic` to a **co-located `AnthropicProvider`** built with the same `baseURL`/`apiKey`/`HTTPClient`/`logger` (`anthropicDelegate`), `ProtocolGoogle` to the `googleCompletion` function (POSTs the Google `contents`/`parts` format), and `ProtocolChatCompletions` to the Chat Completions endpoint. A 404/405 on `/responses` surfaces a clear error rather than silently falling back to Chat Completions. No new `ProviderType` is introduced — Google and Anthropic models behind an OpenAI-compatible host are reached by delegation, not by a new registry type.
 
-The protocol cannot be derived from `ModelFamily` alone: `FamilyOpenAIFlagship` spans both protocols (gpt-4o/o-series use Chat Completions, gpt-5 uses Responses), so independent model-ID detection is required. Because detection is substring-based, a locally-served model whose name contains a family token but speaks a different protocol (e.g. a vLLM model named `gemini-finetune` served over `/chat/completions`) would be misrouted. For such models the caller sets `ModelMetadata.Protocol` (via the overrides map, a registered source, or a built-in entry): `resolveProtocol` honors an explicit `Protocol` and only falls back to `DetectProtocol` when it is unset.
+The protocol cannot be derived from `ModelFamily` alone: `FamilyOpenAIFlagship` spans both protocols (gpt-4o/o-series use Chat Completions, gpt-5 uses Responses), so independent model-ID detection is required. Because detection is substring-based, a locally-served model whose name contains a family token but speaks a different protocol (e.g. a vLLM model named `gemini-finetune` served over `/chat/completions`) would be misrouted. For such models the caller sets `ModelMetadata.Protocol` (via the overrides map, a registered source, or a built-in entry): `resolveProtocol` honors an explicit `Protocol` and only falls back to `DetectProtocol` when it is unset. The router's `prepareRequest` threads the resolved protocol into `ChatRequest.Protocol`, and the OpenAI provider honors `req.Protocol` over its own `DetectProtocol` — so a tier-1 override takes effect even when the caller invokes the provider through the router. A partial (protocol-only) override now inherits the model's real `ContextWindow`/`OutputLimit`/`TokenizerType`/`Capabilities` from the lower tiers (see [Partial overrides](#partial-overrides)), so pinning the protocol no longer collapses the context window or disables capabilities.
 
 ## Multimodal content blocks
 
@@ -130,11 +139,13 @@ The Conductor accepts a multimodal task via `ConductorConfig.ContentBlocks`: whe
 
 - The Router is safe for concurrent use; `SetModel` takes a write lock, `Call` snapshots under a read lock and releases before backoff.
 - `Resolve` always returns usable metadata, even for unknown models (fallback defaults with optimistic `Attachment` capability).
+- A partial override (one that leaves some scalar fields unset) inherits its unset fields from the lower non-network tiers; a fully-specified override is returned verbatim.
+- `prepareRequest` resolves model metadata at most once per call and reuses it for protocol resolution, default temperature, and context-window validation.
 - Model-registry lookups (overrides, built-ins, cache) are case-insensitive.
 - `NewTokenCounter` always returns a non-nil counter.
 - Pre-call validation rejects oversized requests with `ErrContextWindowExceeded` (detectable via `errors.Is`); this is independent of the agent loop's ongoing context-fill tracking.
 - Retryable errors are classified by `WrapProviderError` (HTTP 408/429/500/502/503/504/520–524/529 — request timeout, rate limit, upstream server/gateway faults, Cloudflare edge errors, Anthropic overload — plus transient network errors); `IsRetryable` reports whether a chain contains a retryable `*Error`.
-- An explicit `ModelMetadata.Protocol` is always honored over substring `DetectProtocol` detection.
+- An explicit `ModelMetadata.Protocol` is always honored over substring `DetectProtocol` detection; the router threads the resolved protocol into `ChatRequest.Protocol`, and the provider honors `req.Protocol` when set.
 
 ## Configuration
 

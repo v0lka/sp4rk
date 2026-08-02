@@ -154,9 +154,9 @@ protocol := llm.DetectProtocol("gpt-5.6") // ProtocolResponses
 
 The protocol cannot be derived from `ModelFamily` alone: `FamilyOpenAIFlagship` spans both Chat Completions (gpt-4o / o-series) and Responses (gpt-5), so independent model-ID detection is required.
 
-A single OpenAI-compatible `ProviderEntry` dispatches to all four protocols. The OpenAI provider's `Call` switches on `DetectProtocol(req.Model)`: Responses → the Responses API; Anthropic → a co-located `AnthropicProvider` (built from the same `BaseURL`/`APIKey`/`HTTPClient`/`Logger`); Google → the `googleCompletion` function (POSTs `{baseURL}/models/{model}:generateContent` with the Google contents/parts format); otherwise Chat Completions. GPT-5.x flagships route to the Responses API (alongside Codex); when `/responses` is genuinely missing (HTTP 404/405) a clear error is surfaced rather than a silent fallback to Chat Completions.
+A single OpenAI-compatible `ProviderEntry` dispatches to all four protocols. The OpenAI provider's `Call` honors `req.Protocol` when set (the router fills it from the registry-resolved metadata, which honors an explicit `ModelMetadata.Protocol` override) and otherwise falls back to `DetectProtocol(req.Model)`: Responses → the Responses API; Anthropic → a co-located `AnthropicProvider` (built from the same `BaseURL`/`APIKey`/`HTTPClient`/`Logger`); Google → the `googleCompletion` function (POSTs `{baseURL}/models/{model}:generateContent` with the Google contents/parts format); otherwise Chat Completions. GPT-5.x flagships route to the Responses API (alongside Codex); when `/responses` is genuinely missing (HTTP 404/405) a clear error is surfaced rather than a silent fallback to Chat Completions.
 
-`ModelMetadata.Protocol` is an override escape-hatch. `resolveProtocol` honors an explicit `Protocol` value and only falls back to `DetectProtocol` when it is unset — needed for locally-served models whose name contains a family token but speak a different protocol (e.g. a vLLM model named `gemini-finetune` served over `/chat/completions`). Set it via the `NewModelRegistry` overrides map, a registered source, or a built-in entry.
+`ModelMetadata.Protocol` is an override escape-hatch. `resolveProtocol` honors an explicit `Protocol` value and only falls back to `DetectProtocol` when it is unset — needed for locally-served models whose name contains a family token but speak a different protocol (e.g. a vLLM model named `gemini-finetune` served over `/chat/completions`). Set it via the `NewModelRegistry` overrides map, a registered source, or a built-in entry. The router's `prepareRequest` resolves model metadata once and threads the resolved protocol into `ChatRequest.Protocol`; the OpenAI provider honors `req.Protocol` over its own `DetectProtocol`, so a tier-1 override takes effect for router-driven calls (direct provider use without a router falls back to name-based detection). A protocol-only partial override inherits the model's real `ContextWindow`/`OutputLimit`/`TokenizerType`/`Capabilities` from the lower tiers (see [Partial overrides](#partial-overrides)), so pinning the protocol no longer collapses the context window or disables capabilities.
 
 ## Multi-provider configuration
 
@@ -247,7 +247,7 @@ Resolution order (first match wins; every map lookup uses the lowercased key):
 
 1. **User overrides** — from the `overrides` map passed to `NewModelRegistry`.
 2. **Built-in registry** — a hardcoded table of well-known models (OpenAI, Anthropic, Google, DeepSeek, Qwen, GLM, Kimi, xAI Grok, …).
-2b. **Fuzzy match** — a vendor-prefix- and separator-insensitive lookup across overrides then built-ins. `normalizeModelID` strips the org/vendor prefix up to the first `/`, lowercases the result, and removes `.`/`-`/`_` punctuation (alphanumerics are never altered, so distinct versions stay distinct — unlike edit-distance it cannot collapse versions); on a multi-match the lexicographically smallest key wins; the hit is cached under the query key. Bridges naming drift between hosts and the registry, e.g. `"gpt4o"` matches `"gpt-4o"`, a bare `"glm-5.2-fp8"` matches the prefixed `"zai-org/glm-5.2-fp8"`.
+2b. **Fuzzy match** — a vendor-prefix- and separator-insensitive lookup across overrides then built-ins. `normalizeModelID` strips the org/vendor prefix up to the first `/`, lowercases the result, and removes `.`/`-`/`_` punctuation (alphanumerics are never altered, so distinct versions stay distinct — unlike edit-distance it cannot collapse versions); on a multi-match the lexicographically smallest key wins; the hit is cached under the query key. Lookups are O(1) reads against normalized-ID indexes built once at registry construction. Bridges naming drift between hosts and the registry, e.g. `"gpt4o"` matches `"gpt-4o"`, a bare `"glm-5.2-fp8"` matches the prefixed `"zai-org/glm-5.2-fp8"`.
 3. **Cache** — results from previous external lookups.
 4. **External sources** — HuggingFace API lookup (lazy, cached), then any sources registered via `RegisterSource` (e.g. an LM Studio provider).
 5. **Fallback defaults** — `ContextWindow: 128000`, `OutputLimit: 4096`, `TokenizerType: "approximate"`; `ok` is false. Unknown and HuggingFace-resolved models default to attachment-capable (`defaultUnknownCapabilities` sets `Attachment: true`) — a runtime provider error is preferred over silently denying image uploads for a model the registry does not know.
@@ -256,9 +256,27 @@ Additional methods:
 
 - `RegisterSource(src ModelMetadataSource)` — add a custom metadata source. Sources are called in order after the HuggingFace lookup fails.
 - `Invalidate(model)` — remove a cached entry (e.g. on a mid-session model change).
-- `SetCachedMetadata(model, meta)` — store a late-learned entry at tier 3 (the cache). Lets a caller that discovers a model's real context window after construction (e.g. a lazy probe of a local server) populate it. Takes effect only when no tier-1 override or tier-2 built-in exists, so overrides and well-known specs are never silently clobbered.
+- `SetCachedMetadata(model, meta)` — store a late-learned entry at tier 3 (the cache). Lets a caller that discovers a model's real context window after construction (e.g. a lazy probe of a local server) populate it. Takes effect only when no tier-1 override or tier-2 built-in exists, so overrides and well-known specs are never silently clobbered. A partial override that leaves its `ContextWindow` at zero inherits the cache-tier value once it arrives, so a lazy local-model probe is not shadowed by a non-zero fallback window baked into the override.
 - `SetHTTPClient(client)` — replace the HTTP client used for HuggingFace lookups.
 - `ResolveBuiltInModel(model)` — a package-level function that resolves using **only** the built-in catalog (exact case-insensitive, then fuzzy), with no network access and no overrides/cache/HF/sources; returns the fallback defaults with `ok=false` when absent. Safe for startup paths, e.g. to compare a config override against the built-in values or to merge a partial override onto built-in metadata at construction time.
+
+#### Partial overrides
+
+A tier-1 override that pins only some fields — a **partial** override — inherits its unset scalar fields from the lower non-network tiers (built-in → cache → fallback). The inheritable fields are `ContextWindow`, `OutputLimit`, `TokenizerType`, and `Capabilities`. This closes two footguns:
+
+- A protocol-only override (e.g. `{Protocol: ChatCompletions}` for a Google-named checkpoint served locally) previously left `ContextWindow`/`OutputLimit` at zero, collapsing the context window and rejecting requests, and left `Capabilities` all-false, silently disabling tool-calling, reasoning, and image uploads. A zero-valued `ModelCapabilities` is now treated as "unset" and inherited, exactly like a zero `ContextWindow`.
+- A protocol-only override that also carried a fallback `ContextWindow: 128000` shadowed a lazy local-model probe writing the model's real window to the cache tier via `SetCachedMetadata`. Keeping the override's window at zero lets the cache-tier probe result take effect once it arrives.
+
+A field already set in the override is authoritative; a fully-specified override (the common case: a `config.yaml` entry whose scalars are all populated) is returned verbatim. `Family` is derived, and `Protocol` is always authoritative — pinning it is precisely what a partial override exists to do. The accepted tradeoff is that the zero value is reserved for "inherit", so there is no way to express "explicitly disable every capability" via a partial override.
+
+```go
+registry := llm.NewModelRegistry(map[string]llm.ModelMetadata{
+    // Protocol-only partial override: ContextWindow/OutputLimit/Capabilities
+    // are inherited from the built-in catalog, so this local server is treated
+    // like the real model except for the forced wire protocol.
+    "gemma-finetune": {Protocol: llm.ProtocolChatCompletions},
+})
+```
 
 ### ModelMetadata
 
@@ -434,6 +452,7 @@ router, err := llm.NewRouter(ctx, llm.RouterConfig{
 type ChatRequest struct {
     Model           string           // bare model name (filled from active model only when empty)
     ModelFamily     string           // family hint; auto-detected if empty
+    Protocol        APIProtocol      // wire protocol; auto-resolved from the registry when empty, else DetectProtocol
     Messages        []Message
     Tools           []ToolDefinition
     MaxTokens       int
@@ -456,7 +475,7 @@ type TokenUsage struct {
 }
 ```
 
-`Router.Call` fills in the active bare model when `Model` is empty, applies the default temperature, validates the context window, then sends the request. On success it ensures `Model` and `Family` are set on the response and trims trailing whitespace from content and reasoning fields.
+`Router.Call` fills in the active bare model when `Model` is empty, resolves the model metadata once (threading the resolved protocol into `Protocol` and reusing the metadata for default temperature and context-window validation), validates the context window, then sends the request. On success it ensures `Model` and `Family` are set on the response and trims trailing whitespace from content and reasoning fields.
 
 ### Forcing a specific model without switching providers
 
