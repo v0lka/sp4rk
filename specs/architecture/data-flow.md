@@ -16,10 +16,11 @@ sp4rk root orchestration layer (TaskBuilder, in the root package)
   │  composes the Plan&Execute pipeline and drives it end-to-end:
   │
   ├─ 1. (optional) CLASSIFY: agent/router.Router.Route(ctx, msg, tools, history, skills)
-  │      → RoutingDecision {Domain, Complexity, MatchedSkills, NeedsClarification}
+  │      → RoutingDecision {Domain, Complexity, MatchedSkills, NeedsClarification, MatchedTools*}
   │      → drives compaction-strategy and planner-mode selection
   │        (code → sliding_window, research → summarization,
   │         general/mixed <4 → sliding_window, ≥4 → hierarchical)
+  │      (* MatchedTools is populated only when semantic tool selection is enabled.)
   │
   ├─ 2. PLAN: planner.Planner.Plan → Plan (DAG of PlanSteps)
   │      → events: PlanGenerated(stepCount, steps) via orchestration.Events

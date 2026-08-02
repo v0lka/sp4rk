@@ -195,6 +195,7 @@ The `agent/router` package provides a `Router` that classifies user requests bef
 - **Domain** — `"code"` (source modification, build/test), `"research"` (information gathering), `"general"` (default), or `"mixed"`.
 - **Complexity** — an integer from 1 (trivial) to 5 (highly complex).
 - **Matched skills** — skill names selected from the available skill pool.
+- **Matched tools** *(optional)* — tool names selected from the available tools. Only populated when semantic tool selection is enabled (`Config.ToolMatching` / `SetToolMatching(true)`); see [Semantic tool matching](#semantic-tool-matching).
 - **Needs clarification** — whether the request is ambiguous and requires user input before proceeding.
 
 The routing decision drives two downstream behaviours:
@@ -223,9 +224,27 @@ rt := router.New(llmCaller, router.Config{
 
 decision, err := rt.Route(ctx, userMessage, availableTools, history, skillDescriptors)
 // decision.Domain, decision.Complexity, decision.MatchedSkills, decision.NeedsClarification
+// decision.MatchedTools is populated only when tool matching is enabled.
 // The host maps decision.Domain/decision.Complexity to a compaction strategy
 // ("sliding_window" | "summarization" | "hierarchical") per the table above.
 ```
+
+### Semantic tool matching
+
+By default the Router only classifies domain, complexity, and skills. Semantic **tool** matching is opt-in: enable it at construction with `Config{ToolMatching: true}` or at any time with `rt.SetToolMatching(true)`.
+
+```go
+rt := router.New(llmCaller, router.Config{
+    SystemPrompt:  "Classify the user's request ... {{JSON-OUTPUT-SCHEMA}}\n{{TOOL-MATCHING}}",
+    HistoryWindow: 10,
+    ToolMatching:  true, // enables semantic tool selection
+})
+
+decision, _ := rt.Route(ctx, userMessage, availableTools, history, skillDescriptors)
+// decision.MatchedTools — tool names the router judged relevant
+```
+
+When enabled, the router prompt gains a tool-selection instruction (substituted via a `TOOL-MATCHING` placeholder) and the JSON output schema (the `JSON-OUTPUT-SCHEMA` placeholder) gains a `matched_tools` array. The host can use `decision.MatchedTools` to narrow the tool pool handed to a step. When disabled, both placeholders resolve to their defaults and behavior is unchanged — a prompt that omits them entirely is also fine (an absent placeholder is a no-op). `MatchedTools` is deduplicated and trimmed during validation, exactly like `MatchedSkills`.
 
 ## Key interfaces
 

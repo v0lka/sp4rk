@@ -26,7 +26,7 @@ Formal design specifications live in [`specs/`](specs/) (architecture, domains, 
 | `github.com/v0lka/sp4rk` | Top-level `Framework`, `Config`, `New`, `Execute`, `NewConductor`, `Shutdown`; fluent builders `NewF`/`RunF`/`TaskF` plus option/tool/MCP helpers (recommended entry point) |
 | `…/agent` | ReAct `Executor` loop, `Events`, `HITLHandler`, `FinishTool`, `RunSubAgent`, tool-result cache |
 | `…/agent/reflector` | `Reflector` for execution failure analysis and self-correction |
-| `…/agent/router` | `Router` that classifies requests by domain and complexity |
+| `…/agent/router` | `Router` that classifies requests by domain, complexity, and matched skills (optional semantic tool matching via `SetToolMatching`) |
 | `…/llm` | `Router`, `Provider`, `ProviderEntry`, `ModelRegistry`, token counting, OpenAI/Anthropic/Google providers, multi-protocol routing (`APIProtocol`/`DetectProtocol`), multimodal `ContentBlock` |
 | `…/tools` | `Tool` interface, `BaseTool`, thread-safe `ToolRegistry`, `ToolPolicy`, `ToolDescriptor` |
 | `…/tools/builtins` | Built-in tools: file I/O, shell, glob, ripgrep, web fetch, vector search, facts, checklist |

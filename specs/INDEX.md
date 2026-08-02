@@ -92,7 +92,7 @@ See [META.md](META.md) for document templates, naming rules, and update protocol
 - [README.md](domains/orchestration/README.md) - Orchestration domain overview (Conductor pipeline)
 - [conductor.md](domains/orchestration/conductor.md) - Conductor that runs a single task end-to-end
 - [executor.md](domains/orchestration/executor.md) - Executor ReAct loop primitive (shared by Conductor and subagents)
-- [router.md](domains/orchestration/router.md) - Request classification and skill matching
+- [router.md](domains/orchestration/router.md) - Request classification, skill matching, and optional semantic tool matching
 - [planner.md](domains/orchestration/planner.md) - Plan generation, DAG, replan
 - [reflector.md](domains/orchestration/reflector.md) - Failure analysis and retry/replan/abort
 - [subagents.md](domains/orchestration/subagents.md) - Subagent delegation and parallel step execution

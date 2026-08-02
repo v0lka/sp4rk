@@ -8,7 +8,7 @@ The orchestration domain turns a single ReAct agent loop into a multi-step, self
 
 - `github.com/v0lka/sp4rk/orchestration` — Conductor, ConductorConfig, Blackboard interface + MapBlackboard, Plan/PlanStep data model, ExecutionStatus/ExecutionResult, DAG utilities, Checkpointer persistence
 - `github.com/v0lka/sp4rk/agent` — Executor (the ReAct loop primitive), Events, HITLHandler, FinishTool, RunSubAgent/RunSubAgentsParallel, trajectory + store context helpers
-- `github.com/v0lka/sp4rk/agent/router` — request classification (domain, complexity, skills)
+- `github.com/v0lka/sp4rk/agent/router` — request classification (domain, complexity, skills; optional semantic tool matching)
 - `github.com/v0lka/sp4rk/agent/reflector` — failure analysis producing a `Reflection`
 - `github.com/v0lka/sp4rk/planner` — DAG plan generation, replanning, continuation
 - `github.com/v0lka/sp4rk/agents` — Subagent Profile discovery/parsing (`AgentManager`), referenced when a `PlanStep.Agent` targets a named profile
