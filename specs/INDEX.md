@@ -24,6 +24,7 @@
 | Context window, compaction strategies                         | [domains/memory/compaction.md](domains/memory/compaction.md)                    |
 | Blackboard, shared state, facts, attachments                  | [domains/memory/blackboard.md](domains/memory/blackboard.md)                    |
 | LLM providers, router, model registry, tokens                 | [domains/llm-providers.md](domains/llm-providers.md)                            |
+| Multi-protocol routing (Responses/Anthropic/Google/Chat), multimodal content blocks | [domains/llm-providers.md](domains/llm-providers.md)                            |
 | Skill system, activation, resources                           | [domains/skills.md](domains/skills.md)                                          |
 | Subagent Profiles, AGENT.md discovery, per-agent model/tools  | [domains/agents.md](domains/agents.md)                                          |
 | Prompt builder, system-prompt composition                     | [domains/prompt-building.md](domains/prompt-building.md)                        |

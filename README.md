@@ -57,7 +57,7 @@ Detailed guides live in [`docs/`](docs/):
 - [Orchestration](docs/orchestration.md) — Plan & Execute mode
 - [Planner](docs/planner.md) — plan generation
 - [Reflector](docs/reflector.md) — self-reflection
-- [LLM providers](docs/llm-providers.md) — Anthropic, OpenAI Chat Completions, OpenAI Responses API, and OpenAI-compatible endpoints
+- [LLM providers](docs/llm-providers.md) — Anthropic, OpenAI (Chat Completions + Responses), Google (Gemini/Gemma), OpenAI-compatible endpoints, multi-protocol routing, and multimodal content blocks
 - [Tools](docs/tools.md) — built-in tools and the registry
 - [MCP integration](docs/mcp-integration.md) — Model Context Protocol gateway
 - [Memory](docs/memory.md) — compaction and persistence

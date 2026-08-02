@@ -15,10 +15,12 @@ The host application consumes the LLM types from `github.com/v0lka/sp4rk/llm` di
 | `Router` | llm | Constructed by host | Routes calls to the active provider; retry/backoff, context-window validation, family-aware sampling; satisfies `LLMCaller` |
 | `RouterConfig` | llm | Built by host | Pre-resolved router config: providers, retries, backoffs, safety margin, HTTP client, sampling func, logger |
 | `ProviderEntry` | llm | Built by host | One enabled provider: logical name, type, expanded API key/base URL, enabled models |
-| `ModelRegistry` | llm | Constructed by host | 5-tier model metadata resolution (overrides → built-in → HuggingFace → registered sources → fallback) |
-| `ModelMetadata` | llm | Consumed by host/executor | Context window, output limit, tokenizer type, family, capabilities |
-| `ModelCapabilities` | llm | Consumed by host | `Attachment`, `Reasoning`, `Temperature`, `ToolCall` flags |
-| `Message` | llm | Consumed by host | LLM message unit (role, content, reasoning, tool calls, reasoning items) |
+| `ModelRegistry` | llm | Constructed by host | 6-tier model metadata resolution (overrides → built-in → fuzzy → cache → HuggingFace/registered sources → fallback) |
+| `ModelMetadata` | llm | Consumed by host/executor | Context window, output limit, tokenizer type, family, protocol, capabilities |
+| `ModelCapabilities` | llm | Consumed by host | `Attachment`, `Reasoning`, `Temperature`, `ToolCall` flags (JSON+YAML-tagged; serialized in the JSON API contract and config.yaml) |
+| `APIProtocol` / `DetectProtocol` | llm | Consumed by Router/provider | Wire-protocol selection per model ID (`ProtocolChatCompletions`/`ProtocolResponses`/`ProtocolAnthropic`/`ProtocolGoogle`); the protocol-level analogue of `DetectFamily` |
+| `Message` | llm | Consumed by host | LLM message unit (role, content, content blocks, reasoning, tool calls, reasoning items) |
+| `ContentBlock` | llm | Consumed by host | Structured content element: `text` or `image` block; rendered by providers when `Message.ContentBlocks` is non-empty |
 | `ChatRequest` | llm | Consumed by host/executor | Request: model, family hint, messages, tools, max tokens, temperature, reasoning effort |
 | `ChatResponse` | llm | Consumed by host/executor | Response: model, family, message, reasoning, `TokenUsage`, stop reason |
 | `TokenCounter` | llm | Implemented by built-ins / host | Token counting for context budget: `Count(string)int`, `CountMessages([]Message)int` |
@@ -40,10 +42,10 @@ At startup the host assembles the LLM surface in this order:
 - **Host → Router (in):** `RouterConfig` (providers, HTTP client, retry/backoff, sampling) and a `*ModelRegistry`.
 - **Host → Router (runtime):** `SetModel(ctx, compositeModelID)` selects the active provider+model; `ActiveModel()` returns the composite ID (`"provider/model"`).
 - **executor → Router:** `Call(ctx, ChatRequest)` — messages, tools, max tokens, temperature, reasoning effort. When `ChatRequest.Model` is empty the router fills it with the active bare model snapshot (`prepareRequest` sets `req.Model = bareModel` only when `req.Model == ""`); a pre-set `req.Model` is preserved and sent to the active provider unchanged. This lets a caller force a specific model without switching providers — `agent.NewModelOverrideCaller` wraps an `LLMCaller` to set `req.Model` on every call, relying on this "fill only when empty" rule. The provider that handles the call is always the active one (`r.activeProvider`); the override changes the model string, not provider routing.
-- **Router → Provider:** an internally-built provider request derived from the `ChatRequest` (provider-specific mapping).
+- **Router → Provider:** an internally-built provider request derived from the `ChatRequest` (provider-specific mapping). The OpenAI provider selects the wire protocol per request via `DetectProtocol(req.Model)` — dispatching to the Responses API, a co-located Anthropic provider, or the Google `generateContent` path as appropriate (see [../domains/llm-providers.md](../domains/llm-providers.md#multi-protocol-routing)). When `Message.ContentBlocks` is non-empty, the provider renders the structured blocks (text + images) instead of the plain `Content` string.
 - **Provider → Router:** `*ChatResponse` (message, reasoning, usage, stop reason).
 - **Router → executor:** `*ChatResponse`, or a retryable-error path that re-attempts with backoff.
-- **ModelRegistry → Router/host:** `Resolve(ctx, model)` returns `ModelMetadata` + an `ok` flag indicating a known source (vs. fallback defaults).
+- **ModelRegistry → Router/host:** `Resolve(ctx, model)` returns `ModelMetadata` + an `ok` flag indicating a known source (vs. fallback defaults). `ResolveBuiltInModel(model)` resolves factory defaults from the catalog only (no network/overrides); `SetCachedMetadata(model, meta)` stores a late-learned entry at the cache tier.
 - **TokenCounter → Router/host:** message token counts used for pre-submission context-window validation and ongoing fill tracking.
 
 Data is plain Go values. The composite model-ID convention (`"provider/model"`) disambiguates models that share a bare name across multiple providers; `BareModel(ActiveModel())` yields the bare name sent to the LLM API.
@@ -63,8 +65,10 @@ Data is plain Go values. The composite model-ID convention (`"provider/model"`) 
 - If you change `Router.Call`, `SetModel`, or `ActiveModel` signatures, you MUST verify the router still satisfies `agent.LLMCaller` and update every host call site.
 - If you change `ChatRequest`/`ChatResponse`/`Message`, you MUST update the agent executor (prompt building, response parsing), every provider mapping, and serialization.
 - If you change the composite model-ID convention, you MUST update `SetModel` callers, `ActiveModel`/`BareModel` consumers, and persisted model selectors.
-- If you change `ModelMetadata`/`ModelCapabilities`, you MUST update metadata sources, context-window validation, prompt/parameter adaptation, and any host capability gating.
-- If you change the 5-tier `ModelRegistry.Resolve` ordering, you MUST document the new precedence and update host overrides expectations.
+- If you change `ModelMetadata`/`ModelCapabilities`, you MUST update metadata sources, context-window validation, prompt/parameter adaptation, and any host capability gating. (`ModelCapabilities` is serialized in both the JSON API contract and config.yaml via its struct tags.)
+- If you change the 6-tier `ModelRegistry.Resolve` ordering or the fuzzy `normalizeModelID` rule, you MUST document the new precedence and update host overrides expectations.
+- If you change `DetectProtocol` or the four `APIProtocol` constants, you MUST update the OpenAI provider dispatch, the Google `generateContent` path, the co-located Anthropic delegate, and any host relying on `ModelMetadata.Protocol` to force a protocol.
+- If you change `ContentBlock`, `NormalizeContentBlocks`, or `ValidateContentBlocks`, you MUST update every provider's block rendering, the token counters' per-image estimation, conversation-summarization block handling, and `memory.ContextWindow.SetTaskWithBlocks`.
 - If you change `TokenCounter`, you MUST update `SimpleTokenCounter`, `TiktokenCounter`, `NewTokenCounter`, and every counter consumer (router validation, context manager fill tracking).
 - If you alter retry/backoff defaults or the retryable-status-code set, you MUST document the latency impact on callers that rely on error propagation for compaction timing, circuit-breaker resets, or budget control.
 - If you change `prepareRequest`'s "fill `req.Model` only when empty" rule, you MUST update `agent.NewModelOverrideCaller` (which relies on it to force a per-agent model) and document the new contract for callers that pre-set `ChatRequest.Model`.

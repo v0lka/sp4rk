@@ -27,7 +27,7 @@ Formal design specifications live in [`specs/`](specs/) (architecture, domains, 
 | `…/agent` | ReAct `Executor` loop, `Events`, `HITLHandler`, `FinishTool`, `RunSubAgent`, tool-result cache |
 | `…/agent/reflector` | `Reflector` for execution failure analysis and self-correction |
 | `…/agent/router` | `Router` that classifies requests by domain and complexity |
-| `…/llm` | `Router`, `Provider`, `ProviderEntry`, `ModelRegistry`, token counting, Anthropic/OpenAI providers |
+| `…/llm` | `Router`, `Provider`, `ProviderEntry`, `ModelRegistry`, token counting, OpenAI/Anthropic/Google providers, multi-protocol routing (`APIProtocol`/`DetectProtocol`), multimodal `ContentBlock` |
 | `…/tools` | `Tool` interface, `BaseTool`, thread-safe `ToolRegistry`, `ToolPolicy`, `ToolDescriptor` |
 | `…/tools/builtins` | Built-in tools: file I/O, shell, glob, ripgrep, web fetch, vector search, facts, checklist |
 | `…/tools/mcp` | MCP `Gateway`, `Server`, `ServerEntry`, and tool proxying |
@@ -75,6 +75,9 @@ The root `Makefile` provides `build`, `test`, and `lint` targets; otherwise run 
 - **Path & string helpers:** use `pathutil` (`IsWithinPath`, `SplitPathComponents`, `ResolveExistingPrefix`) and `strutil` (`TruncateUTF8`) rather than hand-rolling path/string logic.
 - **Ignore filtering:** `glob` and `ripgrep` honour `.gitignore`/`.aiignore` through a single shared authority — the `tools.IgnoreChecker` plumbed through context by the host (typically `ignore.Multi` over the workspace + work-dir roots). `tools` never imports `ignore`: both define `Ignored(absPath, isDir) bool`, and `ignore.Resolver`/`ignore.Multi` satisfy `tools.IgnoreChecker` structurally. A `nil` checker (none attached) means **no** ignore filtering — the opt-in, no-regression default; `rg` still honours `.gitignore` natively. Negation patterns (`!`) are unsupported.
 - **Security:** untrusted tool output (web, MCP, filesystem) is wrapped in `<untrusted-content>` boundary tags via `security` (`WrapUntrustedContent` / `StripUntrustedTags`) before it enters LLM context.
+- **Multi-protocol routing:** a single OpenAI-compatible `ProviderEntry` dispatches each model to its native wire protocol via `DetectProtocol` — `/responses` (gpt-5/codex), `/messages` (Claude, via a co-located AnthropicProvider), `:generateContent` (Gemini/Gemma, via `googleCompletion`), or `/chat/completions` (default). There is no separate `"google"` `ProviderType`. For a locally-served model whose name matches a family token but speaks a different protocol, set `ModelMetadata.Protocol` to override substring detection.
+- **Multimodal content blocks:** `llm.Message.ContentBlocks` carries text/image blocks; providers render them when non-empty (`NormalizeContentBlocks` prepends task text when blocks lack a text block; `ValidateContentBlocks` enforces required fields). Feed a multimodal task via `ConductorConfig.ContentBlocks` → `BlockTaskAware.SetTaskWithBlocks`. Token counters estimate images at 765 tokens (default) / 85 (Anthropic-family).
+- **Model registry resolution:** `Resolve` is a 6-tier case-insensitive lookup (overrides → built-in → fuzzy vendor-prefix/separator-insensitive → cache → HuggingFace/registered sources → fallback with optimistic `Attachment`). `ResolveBuiltInModel` is catalog-only (no network); `SetCachedMetadata` stores late-learned metadata at the cache tier.
 - **ONNX Runtime is OPTIONAL:** only the local embedding subsystem (`embedding`) needs it. The rest of the framework runs without it. See [docs/embedding.md](docs/embedding.md).
 
 ## Pre-PR checklist

@@ -10,7 +10,7 @@ Manages the agent's working memory during execution: a managed representation of
 - `github.com/v0lka/sp4rk/memory` (compaction) — `CompactionStrategy` implementations (`SlidingWindowStrategy`, `SummarizationStrategy`, `HierarchicalStrategy`), `NewCompactionStrategy` factory, `CompactionConfig`, `CompactionDeps`
 - `github.com/v0lka/sp4rk/memory` — `CompactionThresholds`, `ToolOutputPruning`, `HistoryMutation`
 - `github.com/v0lka/sp4rk/security` — untrusted-content wrapping for tool output
-- `github.com/v0lka/sp4rk/llm` — `TokenCounter`, `ContextTokenTracker`, `ModelMetadata`, `Message`
+- `github.com/v0lka/sp4rk/llm` — `TokenCounter`, `ContextTokenTracker`, `ModelMetadata`, `Message`, `ContentBlock`
 - `github.com/v0lka/sp4rk/prompt` — `CacheBreakMarker` / `SplitCacheBreak`
 
 ## Core Types
@@ -106,7 +106,7 @@ When `InjectionDefenseEnabled` is `true`, tool outputs from untrusted sources (f
 - **Custom thresholds / pruning**: override compaction trigger percentages and `KeepLastN`/`ProtectedTools`.
 - **Alternative token counter**: swap the `llm.TokenCounter` implementation; the `ContextTokenTracker` corrects estimates with API-reported actuals.
 - **Per-step pruning overrides**: `PruningOverride` (carried through `ContextManagerFactory`) lets a step supply its own `KeepLastN`/`ProtectedTools`.
-- **Optional `ContextManager` capabilities**: `TaskAware` (`SetTask`), `ConversationAware` (`SetPriorConversation`), `TrackerProvider` (`ContextTracker`), and `StepSeedable` (`SeedSteps`) are type-asserted by the Conductor and wired when implemented. `SeedSteps` wholesale-replaces the step history and clears compaction state, enabling resume from a checkpoint; it is required when the Conductor's `ResumeSteps` is set.
+- **Optional `ContextManager` capabilities**: `TaskAware` (`SetTask`), `BlockTaskAware` (`SetTaskWithBlocks`), `ConversationAware` (`SetPriorConversation`), `TrackerProvider` (`ContextTracker`), and `StepSeedable` (`SeedSteps`) are type-asserted by the Conductor and wired when implemented. `BlockTaskAware` carries structured content blocks (text + images) for a multimodal user message — `BuildPrompt` emits a `Message` with `ContentBlocks` and `NormalizeContentBlocks` prepends the task text when the blocks lack a text block. `SeedSteps` wholesale-replaces the step history and clears compaction state, enabling resume from a checkpoint; it is required when the Conductor's `ResumeSteps` is set.
 
 ## Related Specs
 

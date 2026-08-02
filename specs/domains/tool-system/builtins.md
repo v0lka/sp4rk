@@ -7,6 +7,7 @@ The SDK ships a catalog of filesystem, search, web, execution, and agent-infrast
 ## Key Files
 
 - `github.com/v0lka/sp4rk/tools/builtins` — built-in tool implementations, `file_reader.go` (`ReadFileRange`, streaming O(1)-memory line reader), `limits.go` (per-tool truncation limit types)
+- `github.com/v0lka/sp4rk/tools` (names) — `ToolReadFile`/`ToolWriteFile`/`ToolBashExec`/… name constants mirroring registration names, and `IsShellExecTool` (classifies the shell-executing tools `bash_exec`/`posh_exec`)
 - `github.com/v0lka/sp4rk/tools/builtins` (web search) — `web_search/` provider abstraction (brave, duckduckgo, exa, tavily)
 - `github.com/v0lka/sp4rk/tools/builtins` (blackboard-backed) — `read_step_output`, `list_step_outputs`, `read_final_result`, `read_attachment`, `tool_result_read`, `update_checklist`
 - `github.com/v0lka/sp4rk/agent` — `FinishTool`
@@ -85,6 +86,7 @@ Blackboard-backed tools (`read_step_output`, `list_step_outputs`, `read_final_re
 - `read_skill_resource` resolves paths via `skills.SafeResolvePath` (path-traversal safe).
 - Untrusted-output tools always set `Untrusted: true` and are wrapped when injection defense is enabled.
 - `glob` and `ripgrep` share a single ignore authority (`IgnoreChecker` from context); a `nil` checker means no filtering (the opt-in, no-regression default).
+- Tool-name constants live in `tools` (`names.go`) and mirror the registration names used by `tools/builtins`; `IsShellExecTool` classifies `bash_exec`/`posh_exec` as the highest-uncertainty, intentionally deprioritized tools in grouped tool lists.
 
 ## Extension Guide
 

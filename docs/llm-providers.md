@@ -17,10 +17,12 @@ Key types:
 | `ProviderEntry` | Declarative description of a single provider and its models |
 | `Router` / `RouterConfig` | Routes calls to the active provider; holds retry config |
 | `Provider` | Unified interface implemented by every provider backend |
-| `ModelRegistry` / `ModelMetadata` | 5-tier metadata resolution for any model |
+| `ModelRegistry` / `ModelMetadata` | 6-tier metadata resolution for any model |
+| `APIProtocol` / `DetectProtocol` | Wire-protocol detection; routes a request to the right endpoint |
 | `TokenCounter` / `ContextTokenTracker` | Token estimation and API-corrected tracking |
 | `UsageTracker` / `TrackingCaller` | Per-session and per-step token accounting |
 | `ChatRequest` / `ChatResponse` / `Message` | Request/response types sent to providers |
+| `ContentBlock` | Structured content element (text/image) within a `Message` |
 
 ## ProviderEntry
 
@@ -37,7 +39,7 @@ type ProviderEntry struct {
 ```
 
 - **`Name`** — a logical, caller-chosen identifier used in logging, error reporting, and composite model IDs. It is *not* a hardcoded family name, so you can name compatible proxies anything you like (e.g. `"lmstudio"`, `"my-anthropic-proxy"`).
-- **`ProviderType`** — selects the backend implementation. Supported values: `"anthropic"` and `"openai"`. The `"openai"` type covers any OpenAI-compatible endpoint (set `BaseURL` to point at a proxy, LM Studio, vLLM, etc.).
+- **`ProviderType`** — selects the backend implementation. Supported values: `"anthropic"` and `"openai"`. The `"openai"` type covers any OpenAI-compatible endpoint (set `BaseURL` to point at a proxy, LM Studio, vLLM, etc.), and a single `"openai"`-typed provider can serve *all four* API protocols (Chat Completions, Responses, Anthropic Messages, Google generateContent) — Google and Anthropic models reached through an `"openai"` provider are handled by delegation *inside* the OpenAI provider, not by a new `ProviderType`.
 - **`APIKey`** / **`BaseURL`** — must be pre-resolved by the caller (environment variables expanded, etc.) before constructing the router.
 - **`Models`** — the bare model names enabled for this provider. The first provider's first model becomes the initial active model.
 
@@ -135,6 +137,27 @@ if err := router.SetModel(ctx, "claude-sonnet-4-5"); err != nil {
 }
 ```
 
+### Multi-protocol routing
+
+`DetectProtocol(modelID)` determines which wire protocol (and therefore which endpoint) a model speaks — the protocol-level analogue of `DetectFamily`, which adapts prompts and parameters. It is pure substring detection:
+
+| Model ID contains | Protocol | Endpoint |
+| --- | --- | --- |
+| `gpt-5` or `codex` | `ProtocolResponses` | `POST /responses` |
+| `claude` | `ProtocolAnthropic` | `POST /messages` |
+| `gemini` or `gemma` | `ProtocolGoogle` | `POST /models/{model}:generateContent` |
+| anything else | `ProtocolChatCompletions` (default) | `POST /chat/completions` |
+
+```go
+protocol := llm.DetectProtocol("gpt-5.6") // ProtocolResponses
+```
+
+The protocol cannot be derived from `ModelFamily` alone: `FamilyOpenAIFlagship` spans both Chat Completions (gpt-4o / o-series) and Responses (gpt-5), so independent model-ID detection is required.
+
+A single OpenAI-compatible `ProviderEntry` dispatches to all four protocols. The OpenAI provider's `Call` switches on `DetectProtocol(req.Model)`: Responses → the Responses API; Anthropic → a co-located `AnthropicProvider` (built from the same `BaseURL`/`APIKey`/`HTTPClient`/`Logger`); Google → the `googleCompletion` function (POSTs `{baseURL}/models/{model}:generateContent` with the Google contents/parts format); otherwise Chat Completions. GPT-5.x flagships route to the Responses API (alongside Codex); when `/responses` is genuinely missing (HTTP 404/405) a clear error is surfaced rather than a silent fallback to Chat Completions.
+
+`ModelMetadata.Protocol` is an override escape-hatch. `resolveProtocol` honors an explicit `Protocol` value and only falls back to `DetectProtocol` when it is unset — needed for locally-served models whose name contains a family token but speak a different protocol (e.g. a vLLM model named `gemini-finetune` served over `/chat/completions`). Set it via the `NewModelRegistry` overrides map, a registered source, or a built-in entry.
+
 ## Multi-provider configuration
 
 Configure multiple providers in a single `RouterConfig` to enable runtime model switching — for example, using a strong reasoning model for planning and a faster model for execution:
@@ -204,7 +227,7 @@ func main() {
 
 ## ModelRegistry
 
-`ModelRegistry` provides a 5-tier resolution system for model metadata. It is thread-safe and lazily fetches from external sources.
+`ModelRegistry` provides a 6-tier resolution system for model metadata. It is thread-safe and lazily fetches from external sources. All lookups are keyed case-insensitively (`strings.ToLower`) so model IDs that differ only in casing from their canonical registry keys resolve correctly.
 
 ```go
 registry := llm.NewModelRegistry(nil) // nil = no user overrides
@@ -212,7 +235,7 @@ registry := llm.NewModelRegistry(nil) // nil = no user overrides
 
 `NewModelRegistry` accepts an optional `overrides` map that is defensively copied at construction time, so callers (e.g. config reloads) can mutate their own map without racing the registry's concurrent readers.
 
-### 5-tier resolution
+### 6-tier resolution
 
 `Resolve(ctx, model)` returns `ModelMetadata` and a boolean indicating whether the model was found in a known source. When `ok` is false, the returned metadata contains usable fallback defaults.
 
@@ -220,19 +243,22 @@ registry := llm.NewModelRegistry(nil) // nil = no user overrides
 func (r *ModelRegistry) Resolve(ctx context.Context, model string) (ModelMetadata, bool)
 ```
 
-Resolution order (first match wins):
+Resolution order (first match wins; every map lookup uses the lowercased key):
 
 1. **User overrides** — from the `overrides` map passed to `NewModelRegistry`.
 2. **Built-in registry** — a hardcoded table of well-known models (OpenAI, Anthropic, Google, DeepSeek, Qwen, GLM, Kimi, xAI Grok, …).
+2b. **Fuzzy match** — a vendor-prefix- and separator-insensitive lookup across overrides then built-ins. `normalizeModelID` strips the org/vendor prefix up to the first `/`, lowercases the result, and removes `.`/`-`/`_` punctuation (alphanumerics are never altered, so distinct versions stay distinct — unlike edit-distance it cannot collapse versions); on a multi-match the lexicographically smallest key wins; the hit is cached under the query key. Bridges naming drift between hosts and the registry, e.g. `"gpt4o"` matches `"gpt-4o"`, a bare `"glm-5.2-fp8"` matches the prefixed `"zai-org/glm-5.2-fp8"`.
 3. **Cache** — results from previous external lookups.
 4. **External sources** — HuggingFace API lookup (lazy, cached), then any sources registered via `RegisterSource` (e.g. an LM Studio provider).
-5. **Fallback defaults** — `ContextWindow: 128000`, `OutputLimit: 4096`, `TokenizerType: "approximate"`; `ok` is false.
+5. **Fallback defaults** — `ContextWindow: 128000`, `OutputLimit: 4096`, `TokenizerType: "approximate"`; `ok` is false. Unknown and HuggingFace-resolved models default to attachment-capable (`defaultUnknownCapabilities` sets `Attachment: true`) — a runtime provider error is preferred over silently denying image uploads for a model the registry does not know.
 
 Additional methods:
 
 - `RegisterSource(src ModelMetadataSource)` — add a custom metadata source. Sources are called in order after the HuggingFace lookup fails.
 - `Invalidate(model)` — remove a cached entry (e.g. on a mid-session model change).
+- `SetCachedMetadata(model, meta)` — store a late-learned entry at tier 3 (the cache). Lets a caller that discovers a model's real context window after construction (e.g. a lazy probe of a local server) populate it. Takes effect only when no tier-1 override or tier-2 built-in exists, so overrides and well-known specs are never silently clobbered.
 - `SetHTTPClient(client)` — replace the HTTP client used for HuggingFace lookups.
+- `ResolveBuiltInModel(model)` — a package-level function that resolves using **only** the built-in catalog (exact case-insensitive, then fuzzy), with no network access and no overrides/cache/HF/sources; returns the fallback defaults with `ok=false` when absent. Safe for startup paths, e.g. to compare a config override against the built-in values or to merge a partial override onto built-in metadata at construction time.
 
 ### ModelMetadata
 
@@ -242,6 +268,7 @@ type ModelMetadata struct {
     OutputLimit   int
     TokenizerType string
     Family        string
+    Protocol      APIProtocol
     Capabilities  ModelCapabilities
 }
 ```
@@ -250,6 +277,7 @@ type ModelMetadata struct {
 - **`OutputLimit`** — maximum output tokens the model can produce.
 - **`TokenizerType`** — e.g. `"tiktoken/o200k_base"`, `"anthropic-api"`, `"approximate"`. Drives token counter selection.
 - **`Family`** — model family string used for prompt and parameter adaptation. Resolved from metadata or auto-detected via `DetectFamily`.
+- **`Protocol`** — wire protocol / canonical endpoint postfix the model speaks. Populated lazily by `resolveProtocol` at `Resolve` time from `DetectProtocol` (or an explicit override). See [Multi-protocol routing](#multi-protocol-routing).
 - **`Capabilities`** — see below.
 
 ### ModelCapabilities
@@ -262,6 +290,8 @@ type ModelCapabilities struct {
     ToolCall    bool // function calling support
 }
 ```
+
+`ModelCapabilities` carries `json` + `yaml` struct tags (snake_case) so a single canonical type serializes consistently in both the JSON API contract and `config.yaml` without conversion boilerplate at every layer boundary.
 
 The router uses `Capabilities.Temperature` to decide whether to send a temperature parameter at all — reasoning models that reject temperature are skipped automatically.
 
@@ -304,6 +334,8 @@ counter, err := llm.NewTokenCounter("tiktoken/o200k_base")
 // err is nil on success; non-nil means a fallback SimpleTokenCounter was used.
 n := counter.CountMessages(msgs)
 ```
+
+When a message carries image content blocks (see [Multimodal content blocks](#multimodal-content-blocks)), counters apply a per-image estimate: 765 tokens (`estimatedTokensPerImage`, the OpenAI-oriented conservative default — roughly what OpenAI's high-detail processing costs for a typical screenshot) and 85 tokens (`estimatedAnthropicTokensPerImage`) for Anthropic-family models. `NewTokenCounter` overrides the default to the Anthropic value for `tokenizerType == "anthropic-api"`, so image-heavy Anthropic conversations are not over-counted ~9× and do not trigger premature context compaction.
 
 ### ContextTokenTracker
 
@@ -437,7 +469,8 @@ The "fill only when empty" rule for `Model` is part of the router contract: a pr
 ```go
 type Message struct {
     Role             string          // "system" | "user" | "assistant" | "tool"
-    Content          string
+    Content          string          // text fallback when ContentBlocks has no text block
+    ContentBlocks    []ContentBlock  // structured content; when non-empty, providers render the blocks
     ReasoningContent string          // chain-of-thought (e.g. DeepSeek)
     ToolCalls        []ToolCall      // tool calls (for assistant)
     ToolCallID       string          // call ID (for tool responses)
@@ -470,6 +503,24 @@ type ToolDefinition struct {
     InputSchema json.RawMessage
 }
 ```
+
+### Multimodal content blocks
+
+`Message.ContentBlocks` carries an ordered list of structured content elements (text and/or images) instead of a plain `Content` string. When non-empty, providers render the blocks; when empty, `Content` is used as before (backward compatible for text-only messages).
+
+```go
+type ContentBlock struct {
+    Type      string // "text" | "image"
+    Text      string // text content (Type == "text")
+    ImageB64  string // base64 image data, WITHOUT the "data:" prefix (Type == "image")
+    MediaType string // MIME type, e.g. "image/png" (Type == "image")
+}
+```
+
+- **`NormalizeContentBlocks(msg)`** returns `nil` when `ContentBlocks` is empty (the legacy `Content` path). When the blocks lack a `"text"` block and `Content` is non-empty, it **prepends** a text block carrying `Content` — so a caller using image-only blocks still gets its instruction text to the model. The returned slice shares storage with `msg.ContentBlocks` when no prepend is needed.
+- **`ValidateContentBlocks(blocks)`** enforces that text blocks carry `Text`, and image blocks carry both `MediaType` and `ImageB64`. Providers call it before rendering so a missing field yields a clear local error instead of an opaque API 400.
+
+The memory layer attaches images via `ContextWindow.SetTaskWithBlocks(task, blocks)` (in the `memory` package); the Conductor invokes it when a task carries content blocks. Conversation summaries replace each image block with the literal `[image attached]` (text blocks are concatenated). Providers (Anthropic, OpenAI, Responses) render blocks and log unknown block types for diagnostics.
 
 ## Safety margin and output token reserve
 

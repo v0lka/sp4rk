@@ -29,8 +29,8 @@ conductor.Run(ctx, message, bb, availableTools, events, compactionStrategy)
 │      empty → "sliding_window").
 │
 ├─ 2. Build a ContextManager via ContextFactory (type-asserted against the
-│      optional TaskAware / ConversationAware / TrackerProvider capabilities;
-│      additionally asserted against StepSeedable when ResumeSteps is set).
+│      optional TaskAware / BlockTaskAware / ConversationAware / TrackerProvider
+│      capabilities; additionally asserted against StepSeedable when ResumeSteps is set).
 │
 ├─ 3. Inject blackboard-backed stores into ctx:
 │      ├─ StepOutputStore  (read_step_output / list_step_outputs)
@@ -69,14 +69,15 @@ type PendingDelegations interface {
 
 ### Optional ContextManager capabilities
 
-The Conductor type-asserts the `ContextManager` returned by the factory against four named capability interfaces (the SDK's `memory.ContextWindow` implements all four):
+The Conductor type-asserts the `ContextManager` returned by the factory against five named capability interfaces (the SDK's `memory.ContextWindow` implements all five):
 
 | Capability | Purpose |
 | ---------- | ------- |
-| `TaskAware` (`SetTask`) | Receives the formatted task content (the user message). |
+| `TaskAware` (`SetTask`) | Receives the formatted task content (the user message). Used when `ConductorConfig.ContentBlocks` is empty. |
+| `BlockTaskAware` (`SetTaskWithBlocks`) | Receives the formatted task text together with structured content blocks (text + images). Used when `ConductorConfig.ContentBlocks` is non-empty, giving the blocks precedence over the plain `Content` string so providers render a multimodal user message. |
 | `ConversationAware` (`SetPriorConversation`) | Receives prior conversation messages rendered before the current task, when `ConductorConfig.ConversationHistory` is set. Without this, a follow-up like "implement variant a" has no referent. |
 | `TrackerProvider` (`ContextTracker`) | Exposes the token tracker so API-reported token corrections flow back into fill accounting. |
-| `StepSeedable` (`SeedSteps`) | Receives prior ReAct steps when `ConductorConfig.ResumeSteps` is set, so a resumed run renders them in `BuildPrompt` as assistant+tool messages. Unlike the three above, this one is asserted only when `ResumeSteps` is non-empty and `Run` fails fast if it is absent (see [Resume from a checkpoint](#resume-from-a-checkpoint)). |
+| `StepSeedable` (`SeedSteps`) | Receives prior ReAct steps when `ConductorConfig.ResumeSteps` is set, so a resumed run renders them in `BuildPrompt` as assistant+tool messages. Unlike the four above, this one is asserted only when `ResumeSteps` is non-empty and `Run` fails fast if it is absent (see [Resume from a checkpoint](#resume-from-a-checkpoint)). |
 
 A custom `ContextManager` that does not implement these still works — the corresponding features are simply skipped, except `StepSeedable` which is required when resuming.
 
