@@ -326,6 +326,38 @@ func TestValidateRoutingDecision_MatchedSkills(t *testing.T) {
 	}
 }
 
+// TestValidateRoutingDecision_MatchedTools verifies that validateRoutingDecision
+// deduplicates and trims MatchedTools exactly like MatchedSkills, and is nil-safe.
+func TestValidateRoutingDecision_MatchedTools(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		input     []string
+		wantTools []string
+	}{
+		{"nil tools unchanged", nil, nil},
+		{"empty tools unchanged", []string{}, []string{}},
+		{"valid tools preserved", []string{"bash_exec", "read_file"}, []string{"bash_exec", "read_file"}},
+		{"duplicate tools deduped", []string{"bash_exec", "read_file", "bash_exec"}, []string{"bash_exec", "read_file"}},
+		{"empty strings removed", []string{"bash_exec", "", "read_file"}, []string{"bash_exec", "read_file"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := RoutingDecision{Domain: "code", Complexity: 3, MatchedTools: tt.input}
+			validateRoutingDecision(&d)
+			if len(d.MatchedTools) != len(tt.wantTools) {
+				t.Fatalf("got %d tools %v, want %d tools %v", len(d.MatchedTools), d.MatchedTools, len(tt.wantTools), tt.wantTools)
+			}
+			for i, got := range d.MatchedTools {
+				if got != tt.wantTools[i] {
+					t.Errorf("tool[%d] = %q, want %q", i, got, tt.wantTools[i])
+				}
+			}
+		})
+	}
+}
+
 func TestRoute_RetriesOnInvalidJSON(t *testing.T) {
 	callCount := 0
 	mock := &mockLLMCaller{
@@ -397,6 +429,60 @@ func TestRoute_NoReasoningEffortWhenEmpty(t *testing.T) {
 	if got != "" {
 		t.Errorf("expected empty ReasoningEffort, got %q", got)
 	}
+}
+
+// TestRoute_ToolMatchingInjectsSection verifies that SetToolMatching(true)
+// causes the Route system prompt to include the tool-selection instruction
+// section and the matched_tools field in the JSON output schema, and that the
+// default (disabled) prompt omits both.
+func TestRoute_ToolMatchingInjectsSection(t *testing.T) {
+	// Template includes the TOOL-MATCHING and JSON-OUTPUT-SCHEMA placeholders
+	// so their (conditionally-resolved) content lands in the rendered prompt.
+	const tmpl = "Tools: {{AVAILABLE-TOOLS}}\nSkills: {{AVAILABLE-SKILLS}}\n{{TOOL-MATCHING}}\n{{JSON-OUTPUT-SCHEMA}}"
+
+	newMock := func() *mockLLMCaller {
+		return &mockLLMCaller{
+			callFn: func(_ context.Context, _ llm.ChatRequest) (*llm.ChatResponse, error) {
+				return &llm.ChatResponse{Message: llm.Message{Role: "assistant", Content: `{"domain":"code","complexity":2}`}}, nil
+			},
+		}
+	}
+
+	t.Run("enabled injects tool selection instructions and matched_tools schema", func(t *testing.T) {
+		m := newMock()
+		r := New(m, Config{SystemPrompt: tmpl, HistoryWindow: 5})
+		r.SetToolMatching(true)
+
+		if _, err := r.Route(context.Background(), "test", nil, nil, nil); err != nil {
+			t.Fatalf("Route returned error: %v", err)
+		}
+
+		sys := m.lastCall().Messages[0].Content
+		if !strings.Contains(sys, "Tool Selection") {
+			t.Error("system prompt should contain the tool-selection instruction when tool matching is enabled")
+		}
+		if !strings.Contains(sys, "matched_tools") {
+			t.Error("system prompt should include matched_tools in the JSON schema when tool matching is enabled")
+		}
+	})
+
+	t.Run("disabled omits tool selection instructions and matched_tools", func(t *testing.T) {
+		m := newMock()
+		r := New(m, Config{SystemPrompt: tmpl, HistoryWindow: 5})
+		// SetToolMatching deliberately NOT called → defaults to false.
+
+		if _, err := r.Route(context.Background(), "test", nil, nil, nil); err != nil {
+			t.Fatalf("Route returned error: %v", err)
+		}
+
+		sys := m.lastCall().Messages[0].Content
+		if strings.Contains(sys, "Tool Selection") {
+			t.Error("system prompt should NOT contain the tool-selection instruction when tool matching is disabled")
+		}
+		if strings.Contains(sys, "matched_tools") {
+			t.Error("system prompt should NOT contain matched_tools when tool matching is disabled")
+		}
+	})
 }
 
 func TestRoute_AppendContextSections(t *testing.T) {

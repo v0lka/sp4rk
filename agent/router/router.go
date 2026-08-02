@@ -15,6 +15,26 @@ import (
 	"github.com/v0lka/sp4rk/tools"
 )
 
+// toolMatchingInstruction is the prompt section injected via the TOOL-MATCHING
+// placeholder when semantic tool selection is enabled (Router.toolMatching). It
+// directs the router LLM to pick the relevant tools from the available set and
+// return them in the matched_tools field of its JSON response.
+const toolMatchingInstruction = `## Tool Selection
+
+From the available tools listed above, select the ones most relevant to this request and return their exact names in the "matched_tools" array. Only include tools that are clearly needed; omit speculative or unrelated tools. Return an empty array when no tools apply.`
+
+// routingJSONSchemaDefault is the JSON output-format directive injected via the
+// JSON-OUTPUT-SCHEMA placeholder when tool matching is disabled. It mirrors the
+// RoutingDecision struct minus matched_tools.
+const routingJSONSchemaDefault = `Respond with ONLY a JSON object in this exact format:
+{"domain":"code","complexity":3,"needs_clarification":false,"matched_skills":[]}`
+
+// routingJSONSchemaWithTools is the JSON output-format directive injected via the
+// JSON-OUTPUT-SCHEMA placeholder when tool matching is enabled. It extends the
+// default schema with the matched_tools field.
+const routingJSONSchemaWithTools = `Respond with ONLY a JSON object in this exact format:
+{"domain":"code","complexity":3,"needs_clarification":false,"matched_skills":[],"matched_tools":[]}`
+
 // Config holds the configuration for a Router.
 type Config struct {
 	// SystemPrompt is the routing system prompt template.
@@ -28,6 +48,10 @@ type Config struct {
 	// AGENTS.md content so the router can consider project conventions when
 	// matching skills.
 	AppendContextSections func(ctx context.Context) string
+	// ToolMatching enables semantic tool selection: the router is instructed to
+	// pick relevant tools and return them in RoutingDecision.MatchedTools.
+	// Equivalent to calling Router.SetToolMatching(true). Defaults to false.
+	ToolMatching bool
 }
 
 // Router classifies user requests by domain and complexity.
@@ -37,6 +61,7 @@ type Router struct {
 	historyWindow         int
 	modelRegistry         *llm.ModelRegistry
 	reasoningEffort       string
+	toolMatching          bool
 	appendContextSections func(ctx context.Context) string
 }
 
@@ -50,6 +75,7 @@ func New(caller agent.LLMCaller, cfg Config) *Router {
 		llm:                   caller,
 		systemPrompt:          cfg.SystemPrompt,
 		historyWindow:         hw,
+		toolMatching:          cfg.ToolMatching,
 		appendContextSections: cfg.AppendContextSections,
 	}
 }
@@ -62,6 +88,14 @@ func (r *Router) SetModelRegistry(registry *llm.ModelRegistry) {
 // SetReasoningEffort sets the reasoning effort for the router.
 func (r *Router) SetReasoningEffort(effort string) {
 	r.reasoningEffort = effort
+}
+
+// SetToolMatching enables or disables semantic tool selection. When enabled,
+// the Route prompt includes a tool-selection instruction and the matched_tools
+// field in the JSON output schema; the router populates
+// RoutingDecision.MatchedTools. Defaults to false (disabled).
+func (r *Router) SetToolMatching(enabled bool) {
+	r.toolMatching = enabled
 }
 
 // Route analyzes the user's request and determines the best execution strategy.
@@ -85,8 +119,22 @@ func (r *Router) Route(ctx context.Context, userMessage string, availableTools [
 	// Tool/skill lists and project context (AGENTS.md etc.) are dynamic,
 	// externally-influenced values — substituted via ReplaceData so
 	// placeholder names inside them are never expanded.
+	//
+	// TOOL-MATCHING and JSON-OUTPUT-SCHEMA are trusted template constants
+	// (defined in-package), so they use Replace (iterative substitution).
+	// When tool matching is off, TOOL-MATCHING resolves to empty and
+	// JSON-OUTPUT-SCHEMA resolves to the default schema, leaving behavior
+	// identical to before this feature existed.
+	toolMatchingSection := ""
+	jsonSchema := routingJSONSchemaDefault
+	if r.toolMatching {
+		toolMatchingSection = toolMatchingInstruction
+		jsonSchema = routingJSONSchemaWithTools
+	}
 	builder := prompt.NewBuilder().
 		Core(r.systemPrompt).
+		Replace("TOOL-MATCHING", toolMatchingSection).
+		Replace("JSON-OUTPUT-SCHEMA", jsonSchema).
 		ReplaceData("AVAILABLE-TOOLS", toolListStr).
 		ReplaceData("AVAILABLE-SKILLS", skillListStr)
 	if strings.Contains(r.systemPrompt, "PROJECT-CONTEXT") {
@@ -140,8 +188,10 @@ func (r *Router) Route(ctx context.Context, userMessage string, availableTools [
 		copy(repairMessages, messages)
 		repairMessages[len(messages)] = llm.Message{Role: "assistant", Content: resp.Message.Content, ReasoningContent: resp.Message.ReasoningContent}
 		repairMessages[len(messages)+1] = llm.Message{
-			Role:    "user",
-			Content: "Your previous response was not valid JSON. Respond with ONLY a JSON object in this exact format:\n{\"domain\":\"general\",\"complexity\":1,\"needs_clarification\":false}",
+			Role: "user",
+			// The repair prompt echoes the schema the router was asked to produce,
+			// including matched_tools when tool matching is enabled.
+			Content: "Your previous response was not valid JSON. " + jsonSchema,
 		}
 
 		retryResp, retryErr := r.llm.Call(ctx, llm.ChatRequest{Messages: repairMessages, ReasoningEffort: r.reasoningEffort})
@@ -181,18 +231,28 @@ func validateRoutingDecision(d *RoutingDecision) {
 		d.Complexity = 5
 	}
 
-	// Deduplicate and trim matched_skills
-	if len(d.MatchedSkills) > 0 {
-		seen := make(map[string]bool, len(d.MatchedSkills))
-		clean := d.MatchedSkills[:0]
-		for _, s := range d.MatchedSkills {
-			if s != "" && !seen[s] {
-				seen[s] = true
-				clean = append(clean, s)
-			}
-		}
-		d.MatchedSkills = clean
+	// Deduplicate, trim, and order-preserve matched skills/tools.
+	d.MatchedSkills = dedupeAndTrimStrings(d.MatchedSkills)
+	d.MatchedTools = dedupeAndTrimStrings(d.MatchedTools)
+}
+
+// dedupeAndTrimStrings removes empty strings and collapses duplicates from
+// values, preserving first-occurrence order. It reuses the input's backing
+// array in place. A nil or empty input is returned unchanged so callers can
+// distinguish "not set" from an explicitly empty set.
+func dedupeAndTrimStrings(values []string) []string {
+	if len(values) == 0 {
+		return values
 	}
+	seen := make(map[string]bool, len(values))
+	clean := values[:0]
+	for _, v := range values {
+		if v != "" && !seen[v] {
+			seen[v] = true
+			clean = append(clean, v)
+		}
+	}
+	return clean
 }
 
 // formatSkillList formats available skill descriptors for the router prompt.

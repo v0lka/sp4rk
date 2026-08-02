@@ -29,6 +29,7 @@ type RoutingDecision struct {
 	Complexity         int      `json:"complexity"` // 1-5
 	NeedsClarification bool     `json:"needs_clarification"`
 	MatchedSkills      []string `json:"matched_skills,omitempty"` // skills selected by the router
+	MatchedTools       []string `json:"matched_tools,omitempty"`  // tools selected by the router (semantic tool selection)
 }
 
 // SkillDescriptor is the minimal skill metadata needed by the router.
