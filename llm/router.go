@@ -221,15 +221,16 @@ func retryBackoff(ctx context.Context, backoff time.Duration) bool {
 // validation passes or should be skipped (unknown model, zero context window,
 // nil registry).
 //
+// The caller resolves metadata once and passes it in (meta) so this method
+// performs no registry I/O of its own.
+//
 // NOTE: This is a pre-submission guard to reject obviously oversized requests.
 // It differs from ContextWindow.EffectiveMax() (which tracks ongoing fill during
 // the agent loop). The two calculations are intentionally independent.
-func (r *Router) validateContextWindow(ctx context.Context, model string, msgs []Message) error {
+func (r *Router) validateContextWindow(model string, msgs []Message, meta ModelMetadata) error {
 	if r.registry == nil || r.tokenCounter == nil {
 		return nil
 	}
-
-	meta, _ := r.registry.Resolve(ctx, model)
 
 	// Skip validation when metadata is a fallback or context window is 0
 	if meta.ContextWindow == 0 {
@@ -260,16 +261,15 @@ func (r *Router) validateContextWindow(ctx context.Context, model string, msgs [
 // applyDefaultTemperature sets a family-aware temperature default on the request
 // when no explicit temperature is provided. Skips models that don't support
 // the temperature parameter (e.g. reasoning models like o1, o3).
-func (r *Router) applyDefaultTemperature(ctx context.Context, req *ChatRequest) {
+//
+// The caller resolves metadata once and passes it in (meta) so this method
+// performs no registry I/O of its own.
+func (r *Router) applyDefaultTemperature(req *ChatRequest, meta ModelMetadata) {
 	if req.Temperature != nil {
 		return // caller set explicit temperature — respect it
 	}
 
-	// Resolve model metadata for capability check and family
-	var family string
 	if r.registry != nil {
-		meta, _ := r.registry.Resolve(ctx, req.Model)
-		family = meta.Family
 		if !meta.Capabilities.Temperature {
 			return // model doesn't accept temperature (e.g. reasoning models)
 		}
@@ -279,7 +279,7 @@ func (r *Router) applyDefaultTemperature(ctx context.Context, req *ChatRequest) 
 	// The sampling func is responsible for handling empty family
 	// (e.g. falling back to a default family or passing through).
 	if r.sampling != nil {
-		req.Temperature = r.sampling(family)
+		req.Temperature = r.sampling(meta.Family)
 		return
 	}
 
@@ -288,8 +288,13 @@ func (r *Router) applyDefaultTemperature(ctx context.Context, req *ChatRequest) 
 	req.Temperature = &temp
 }
 
-// prepareRequest fills defaults (model, temperature) and validates the context
-// window. Returns an error if the request would exceed the context window.
+// prepareRequest fills defaults (model, temperature, wire protocol) and
+// validates the context window. Returns an error if the request would exceed
+// the context window.
+//
+// The model registry is resolved at most once here; the resolved ModelMetadata
+// is threaded into applyDefaultTemperature and validateContextWindow so those
+// helpers never trigger their own Resolve (and thus no extra registry I/O).
 //
 // The bare model name (without provider prefix) is what is sent to the LLM API
 // and used for metadata lookups; the composite identifier is only the internal
@@ -302,8 +307,26 @@ func (r *Router) prepareRequest(ctx context.Context, req *ChatRequest, bareModel
 	if req.Model == "" {
 		req.Model = bareModel
 	}
-	r.applyDefaultTemperature(ctx, req)
-	return r.validateContextWindow(ctx, req.Model, req.Messages)
+
+	// Resolve the model metadata at most once. Resolve honors an explicit
+	// tier-1 override and only falls back to DetectProtocol when none is set,
+	// so a registry override can steer routing regardless of the model name
+	// (the documented escape hatch in protocol.go). When ok is false the
+	// returned metadata contains usable fallback defaults, so a single Resolve
+	// suffices for protocol, family/capabilities, and context-window lookups
+	// alike. For a model absent from every tier (notably a locally-served
+	// custom model), this also avoids repeated HuggingFace probes — previously
+	// each of protocol/family/context-window resolution issued its own Resolve.
+	var meta ModelMetadata
+	if r.registry != nil {
+		meta, _ = r.registry.Resolve(ctx, req.Model)
+		if req.Protocol == "" {
+			req.Protocol = meta.Protocol
+		}
+	}
+
+	r.applyDefaultTemperature(req, meta)
+	return r.validateContextWindow(req.Model, req.Messages, meta)
 }
 
 // Call sends a chat request to the active provider.

@@ -1666,3 +1666,129 @@ func TestOpenAIProvider_AllFourProtocolsRouteThroughSingleZenEntry(t *testing.T)
 		}
 	}
 }
+
+// TestRouter_RegistryProtocolOverrideRoutesGemmaToChatCompletions proves the
+// documented protocol-override escape hatch (protocol.go docstring: "caller
+// MUST override ModelMetadata.Protocol") is now functional end to end.
+//
+// DetectProtocol would route any "gemma"-named model to the Google
+// :generateContent endpoint. A tier-1 registry override forcing a different
+// APIProtocol must instead steer the request to that protocol's endpoint. The
+// override flows through the full chain: the router's prepareRequest resolves
+// it from the registry into req.Protocol, and the OpenAI provider honors
+// req.Protocol over DetectProtocol.
+//
+// The table covers an override to each non-default endpoint:
+//   - ProtocolChatCompletions → POST /chat/completions
+//   - ProtocolResponses       → POST /responses
+//   - ProtocolAnthropic       → POST /messages (delegated to AnthropicProvider)
+//
+// The control case (no override) confirms that, absent the override, the same
+// "gemma" model still defaults to :generateContent — i.e. the override is what
+// flips routing, not the model name.
+func TestRouter_RegistryProtocolOverrideRoutesGemmaToChatCompletions(t *testing.T) {
+	const gemmaModel = "gemma-3-27b-it"
+
+	cases := []struct {
+		name          string
+		overrideProto APIProtocol // "" (zero value) means no tier-1 override
+		wantSub       string      // path substring that MUST be present
+		notSub        string      // path substring that MUST NOT be present
+	}{
+		{
+			name:          "tier-1 override forces chat_completions",
+			overrideProto: ProtocolChatCompletions,
+			wantSub:       "chat/completions",
+			notSub:        "generateContent",
+		},
+		{
+			name:          "tier-1 override forces responses",
+			overrideProto: ProtocolResponses,
+			wantSub:       "responses",
+			notSub:        "generateContent",
+		},
+		{
+			name:          "tier-1 override forces anthropic",
+			overrideProto: ProtocolAnthropic,
+			wantSub:       "/messages",
+			notSub:        "generateContent",
+		},
+		{
+			name:    "no override defaults to generateContent",
+			wantSub: "generateContent",
+			notSub:  "chat/completions",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var path string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				path = r.URL.Path
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case strings.Contains(r.URL.Path, "responses"):
+					// OpenAI Responses API shape.
+					_, _ = w.Write([]byte(`{"id":"x","object":"response","created":1,"model":"m","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"status":"completed","usage":{"input_tokens":1,"output_tokens":1}}`))
+				case strings.Contains(r.URL.Path, "generateContent"):
+					// Google Generative Language shape.
+					_, _ = w.Write([]byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}`))
+				case strings.Contains(r.URL.Path, "/messages"):
+					// Anthropic Messages shape.
+					_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant","model":"claude","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+				default:
+					// OpenAI Chat Completions shape.
+					_, _ = w.Write([]byte(`{"id":"x","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+				}
+			}))
+			t.Cleanup(srv.Close)
+
+			// Build a registry whose tier-1 (override) tier is optionally
+			// populated for the gemma model. NewModelRegistry lowercases keys,
+			// so an exact-case match at Resolve time is not required.
+			overrides := map[string]ModelMetadata{}
+			if tc.overrideProto != "" {
+				overrides[gemmaModel] = ModelMetadata{Protocol: tc.overrideProto}
+			}
+			registry := NewModelRegistry(overrides)
+
+			p, err := NewOpenAIProvider(OpenAIProviderConfig{
+				Name:    "Zen",
+				APIKey:  "k",
+				BaseURL: srv.URL,
+				Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+			})
+			if err != nil {
+				t.Fatalf("NewOpenAIProvider: %v", err)
+			}
+
+			// Wire the provider and registry into a Router directly (mirrors
+			// newTestRouter). tokenCounter is left nil so validateContextWindow
+			// is a no-op; sampling is nil; maxRetries 0 → a single attempt.
+			router := &Router{
+				activeProvider:  p,
+				activeBareModel: gemmaModel,
+				registry:        registry,
+				logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+			}
+
+			resp, err := router.Call(context.Background(), ChatRequest{
+				Model:    gemmaModel,
+				Messages: []Message{{Role: "user", Content: "hi"}},
+			})
+			if err != nil {
+				t.Fatalf("router.Call failed: %v", err)
+			}
+			if resp == nil {
+				t.Fatalf("expected non-nil ChatResponse")
+			}
+
+			if !strings.Contains(path, tc.wantSub) {
+				t.Errorf("expected path to contain %q, got %q", tc.wantSub, path)
+			}
+			if tc.notSub != "" && strings.Contains(path, tc.notSub) {
+				t.Errorf("expected path NOT to contain %q, got %q", tc.notSub, path)
+			}
+		})
+	}
+}

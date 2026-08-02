@@ -105,8 +105,16 @@ type ToolCall struct {
 
 // ChatRequest — request to LLM.
 type ChatRequest struct {
-	Model           string           `json:"model"`
-	ModelFamily     string           `json:"model_family,omitempty"` // model family hint (e.g. "anthropic", "deepseek"); auto-detected if empty
+	Model       string `json:"model"`
+	ModelFamily string `json:"model_family,omitempty"` // model family hint (e.g. "anthropic", "deepseek"); auto-detected if empty
+	// Protocol is the wire protocol / endpoint postfix the model speaks (the
+	// protocol-level analogue of ModelFamily). When empty it is auto-detected
+	// — the router resolves it from the model registry (which honors an explicit
+	// override), and the provider falls back to DetectProtocol. Set it
+	// explicitly to force routing regardless of the model name, e.g. to serve a
+	// "gemma"-named local model over /chat/completions instead of
+	// :generateContent. See protocol.go.
+	Protocol        APIProtocol      `json:"protocol,omitempty"`
 	Messages        []Message        `json:"messages"`
 	Tools           []ToolDefinition `json:"tools,omitempty"`
 	MaxTokens       int              `json:"max_tokens"`

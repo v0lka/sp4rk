@@ -136,7 +136,16 @@ func (p *OpenAIProvider) ChatCompletion(ctx context.Context, req ChatRequest) (*
 	// (Gemini/Gemma) is delegated to googleCompletion, which POSTs
 	// {baseURL}/models/{model}:generateContent with the Google contents/parts
 	// format, reusing the same baseURL/apiKey/httpClient.
-	switch protocol := DetectProtocol(req.Model); protocol {
+	// Honor an explicit registry-resolved protocol when set (the documented
+	// escape hatch in protocol.go: a caller MAY override ModelMetadata.Protocol,
+	// which the router threads into req.Protocol). Fall back to name-based
+	// detection only when req.Protocol is empty (e.g. direct provider use
+	// without a router/registry), preserving backward compatibility.
+	protocol := req.Protocol
+	if protocol == "" {
+		protocol = DetectProtocol(req.Model)
+	}
+	switch protocol {
 	case ProtocolResponses:
 		resp, err := responsesAPICompletion(ctx, p.responsesClient, p.name, p.baseURL, req, p.logger)
 		if err == nil {
