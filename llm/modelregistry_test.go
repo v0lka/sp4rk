@@ -524,6 +524,126 @@ func TestModelRegistry_EmptyOverrides(t *testing.T) {
 	}
 }
 
+// TestModelRegistry_PartialOverrideInheritsProbeWindow is the regression test
+// for the lazy-probe shadowing bug. A protocol-only partial override (the kind
+// c0wrk's local Google-protocol remap injects for Gemma checkpoints served by
+// LM Studio) pins the protocol but leaves the scalar fields (context window,
+// output limit, tokenizer) at zero. The lazy local-model probe then discovers
+// the model's REAL context window and stores it in the cache tier via
+// SetCachedMetadata. Resolve must inherit the probed window (8192) from the
+// cache tier rather than collapsing to zero or to the 128000 fallback —
+// otherwise the context-fill accounting and compaction thresholds would be
+// computed against an inflated window forever.
+func TestModelRegistry_PartialOverrideInheritsProbeWindow(t *testing.T) {
+	registry := NewModelRegistry(map[string]ModelMetadata{
+		// A catalog-miss local model (no built-in entry). The override pins
+		// only the protocol, mirroring the auto-remap; its scalar fields are
+		// zero so they can be inherited.
+		"gemma-3-27b-it": {Protocol: ProtocolChatCompletions},
+	})
+
+	// Simulate the lazy probe landing its result in the cache tier.
+	registry.SetCachedMetadata("gemma-3-27b-it", ModelMetadata{
+		ContextWindow: 8192,
+		OutputLimit:   4096,
+		TokenizerType: "approximate",
+	})
+
+	meta, ok := registry.Resolve(context.Background(), "gemma-3-27b-it")
+	if !ok {
+		t.Fatal("expected ok=true for overridden model")
+	}
+	if meta.ContextWindow != 8192 {
+		t.Errorf("ContextWindow = %d, want 8192 (inherited from cache/probe, not 128000 fallback)", meta.ContextWindow)
+	}
+	if meta.Protocol != ProtocolChatCompletions {
+		t.Errorf("Protocol = %q, want %q (override must remain authoritative)", meta.Protocol, ProtocolChatCompletions)
+	}
+}
+
+// TestModelRegistry_PartialOverrideInheritsBuiltinScalar ensures a partial
+// override for a catalog-hit model inherits the built-in scalar fields it left
+// unset, while keeping its pinned protocol. gpt-4o has a built-in context
+// window; the override pins the protocol only and must inherit that window.
+func TestModelRegistry_PartialOverrideInheritsBuiltinScalar(t *testing.T) {
+	registry := NewModelRegistry(map[string]ModelMetadata{
+		"gpt-4o": {Protocol: ProtocolChatCompletions},
+	})
+
+	meta, ok := registry.Resolve(context.Background(), "gpt-4o")
+	if !ok {
+		t.Fatal("expected ok=true for overridden built-in model")
+	}
+	// Built-in gpt-4o context window (128000) must be inherited, not zero.
+	if meta.ContextWindow == 0 {
+		t.Errorf("ContextWindow = 0, want inherited built-in value (non-zero)")
+	}
+	if meta.Protocol != ProtocolChatCompletions {
+		t.Errorf("Protocol = %q, want %q (override authoritative)", meta.Protocol, ProtocolChatCompletions)
+	}
+}
+
+// TestModelRegistry_PartialOverrideInheritsBuiltinCapabilities ensures a partial
+// override for a catalog-hit model inherits the built-in Capabilities it left
+// unset (zero value), not just the scalar fields. gpt-4o declares
+// Attachment/Temperature/ToolCall; a protocol-only override must inherit those
+// rather than silently disabling image uploads, temperature, and tool calling.
+// This is the regression test for the Issue-1 footgun.
+func TestModelRegistry_PartialOverrideInheritsBuiltinCapabilities(t *testing.T) {
+	registry := NewModelRegistry(map[string]ModelMetadata{
+		"gpt-4o": {Protocol: ProtocolChatCompletions},
+	})
+
+	meta, ok := registry.Resolve(context.Background(), "gpt-4o")
+	if !ok {
+		t.Fatal("expected ok=true for overridden built-in model")
+	}
+	// Built-in gpt-4o capabilities must be inherited, not left all-false.
+	if !meta.Capabilities.Attachment || !meta.Capabilities.Temperature || !meta.Capabilities.ToolCall {
+		t.Errorf("expected inherited gpt-4o capabilities (Attachment, Temperature, ToolCall), got %+v", meta.Capabilities)
+	}
+	if meta.Protocol != ProtocolChatCompletions {
+		t.Errorf("Protocol = %q, want %q (override authoritative)", meta.Protocol, ProtocolChatCompletions)
+	}
+}
+
+// TestModelRegistry_FullySpecifiedOverrideNotEnriched guards that a fully
+// specified override (all three scalar fields AND Capabilities set) is returned
+// verbatim and is never silently merged with lower-tier data — the prior
+// behaviour relied on by TestModelRegistry_OverridePriority and real config.yaml
+// entries. Capabilities is now a first-class inheritable field, so it must be
+// populated for the override to count as fully specified; a zero Capabilities
+// would otherwise be inherited from the built-in entry.
+func TestModelRegistry_FullySpecifiedOverrideNotEnriched(t *testing.T) {
+	registry := NewModelRegistry(map[string]ModelMetadata{
+		"gpt-4o": {
+			ContextWindow: 999999,
+			OutputLimit:   8888,
+			TokenizerType: "custom-tokenizer",
+			Protocol:      ProtocolChatCompletions,
+			Capabilities:  ModelCapabilities{ToolCall: true},
+		},
+	})
+	// Seed a cache entry whose values differ; it must NOT bleed through.
+	registry.SetCachedMetadata("gpt-4o", ModelMetadata{
+		ContextWindow: 1,
+		OutputLimit:   1,
+		TokenizerType: "should-not-leak",
+		Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true},
+	})
+
+	meta, ok := registry.Resolve(context.Background(), "gpt-4o")
+	if !ok {
+		t.Fatal("expected ok=true for overridden model")
+	}
+	if meta.ContextWindow != 999999 || meta.OutputLimit != 8888 || meta.TokenizerType != "custom-tokenizer" {
+		t.Errorf("fully-specified override was enriched: got %+v", meta)
+	}
+	if meta.Capabilities != (ModelCapabilities{ToolCall: true}) {
+		t.Errorf("fully-specified override capabilities were enriched: got %+v", meta.Capabilities)
+	}
+}
+
 func TestModelRegistry_RegisteredSource(t *testing.T) {
 	// Create registry with no overrides and no built-in match for test model
 	registry := NewModelRegistry(nil)

@@ -56,12 +56,14 @@ type ModelMetadataSource func(model string) (ModelMetadata, bool)
 
 // ModelRegistry provides a 5-tier resolution system for model metadata.
 type ModelRegistry struct {
-	builtIn    map[string]ModelMetadata
-	overrides  map[string]ModelMetadata
-	cache      map[string]ModelMetadata
-	sources    []ModelMetadataSource // external metadata sources (e.g., LM Studio)
-	mu         sync.RWMutex
-	httpClient *http.Client
+	builtIn        map[string]ModelMetadata
+	builtInIndex   map[string]ModelMetadata // normalized-ID -> metadata index for fuzzy built-in lookup
+	overrides      map[string]ModelMetadata
+	overridesIndex map[string]ModelMetadata // normalized-ID -> metadata index for fuzzy override lookup
+	cache          map[string]ModelMetadata
+	sources        []ModelMetadataSource // external metadata sources (e.g., LM Studio)
+	mu             sync.RWMutex
+	httpClient     *http.Client
 }
 
 // NewModelRegistry creates a new registry with built-in data and optional user overrides.
@@ -77,10 +79,12 @@ func NewModelRegistry(overrides map[string]ModelMetadata) *ModelRegistry {
 		copied[strings.ToLower(k)] = v
 	}
 	return &ModelRegistry{
-		builtIn:    getBuiltInRegistry(),
-		overrides:  copied,
-		cache:      make(map[string]ModelMetadata),
-		httpClient: &http.Client{Timeout: 10 * time.Second},
+		builtIn:        getBuiltInRegistry(),
+		builtInIndex:   getBuiltInIndex(),
+		overrides:      copied,
+		overridesIndex: buildNormalizedIndex(copied),
+		cache:          make(map[string]ModelMetadata),
+		httpClient:     &http.Client{Timeout: 10 * time.Second},
 	}
 }
 
@@ -117,6 +121,11 @@ func (r *ModelRegistry) Resolve(ctx context.Context, model string) (ModelMetadat
 
 	// Priority 1: Check overrides (no lock needed for read-only map after construction)
 	if meta, ok := r.overrides[key]; ok {
+		// A partial override (one that pins only some fields, e.g. a
+		// protocol-only auto-remap) inherits its unset scalar fields from the
+		// lower non-network tiers so it does not collapse the context window
+		// or output limit to zero. See enrichPartialOverride.
+		meta = r.enrichPartialOverride(model, key, meta)
 		meta.Family = resolveFamily(model, meta)
 		meta.Protocol = resolveProtocol(model, meta)
 		return meta, true
@@ -244,6 +253,87 @@ func resolveProtocol(modelID string, meta ModelMetadata) APIProtocol {
 	return DetectProtocol(modelID)
 }
 
+// enrichPartialOverride fills the zero/empty scalar fields of a PARTIAL
+// override — one that pins only some dimensions, e.g. a protocol-only
+// auto-remap that injects {Protocol: ChatCompletions} for a local
+// Google-named checkpoint served by LM Studio/vLLM — by inheriting them from
+// the lower-priority NON-network tiers (built-in exact → built-in fuzzy →
+// cache → fallback defaults). Network tiers (HuggingFace, registered sources)
+// are deliberately skipped so an override lookup never performs I/O.
+//
+// A field already set in the override is authoritative and left untouched, so
+// a fully-specified override (the common case: config.yaml entries whose
+// ContextWindow/OutputLimit/TokenizerType/Capabilities are all populated at
+// registry construction) is returned verbatim. Only the inheritable fields
+// participate: Family is derived by resolveFamily, and Protocol is always
+// authoritative (that is precisely what a partial override exists to pin).
+//
+// The inheritable fields are ContextWindow, OutputLimit, TokenizerType, and
+// Capabilities. Capabilities joins the scalar set as a first-class inheritable
+// field: a zero-valued ModelCapabilities (all bools false) is treated as
+// "unset" and inherited from the lower tiers, exactly like a zero
+// ContextWindow. This closes the footgun where a minimal protocol-pinning
+// override of a well-known model (e.g. {"gpt-4o": {Protocol: ChatCompletions}})
+// silently disabled image uploads, reasoning, and tool-calling. The accepted
+// tradeoff — mirroring the scalars — is that there is no way to express
+// "explicitly disable every capability" via a partial override, since the zero
+// value is reserved for "inherit".
+//
+// The motivating bug: a protocol-only override that also carried a fallback
+// ContextWindow (128000) would shadow a lazy local-model probe writing the
+// model's REAL window to the cache tier (SetCachedMetadata), so the effective
+// window stayed at 128000 forever. Keeping the override's window at zero and
+// inheriting it here lets the cache-tier probe result take effect once it
+// arrives.
+func (r *ModelRegistry) enrichPartialOverride(model, key string, override ModelMetadata) ModelMetadata {
+	if override.ContextWindow != 0 && override.OutputLimit != 0 &&
+		override.TokenizerType != "" && override.Capabilities != (ModelCapabilities{}) {
+		return override
+	}
+	lower := r.resolveBuiltinOrCache(model, key)
+	if override.ContextWindow == 0 {
+		override.ContextWindow = lower.ContextWindow
+	}
+	if override.OutputLimit == 0 {
+		override.OutputLimit = lower.OutputLimit
+	}
+	if override.TokenizerType == "" {
+		override.TokenizerType = lower.TokenizerType
+	}
+	if override.Capabilities == (ModelCapabilities{}) {
+		override.Capabilities = lower.Capabilities
+	}
+	return override
+}
+
+// resolveBuiltinOrCache resolves a model using only the non-network,
+// already-resolved tiers plus the fallback defaults — built-in exact → built-in
+// fuzzy → cache → fallback — with no I/O. It is the "lower-tier" baseline used
+// by enrichPartialOverride to fill the unset scalar fields of a partial
+// override. r.builtIn/r.builtInIndex are immutable after construction (no lock
+// needed); r.cache is guarded by r.mu.
+func (r *ModelRegistry) resolveBuiltinOrCache(model, key string) ModelMetadata {
+	if meta, ok := r.builtIn[key]; ok {
+		return meta
+	}
+	if want := normalizeModelID(model); want != "" {
+		if meta, ok := r.builtInIndex[want]; ok {
+			return meta
+		}
+	}
+	r.mu.RLock()
+	meta, ok := r.cache[key]
+	r.mu.RUnlock()
+	if ok {
+		return meta
+	}
+	return ModelMetadata{
+		ContextWindow: 128000,
+		OutputLimit:   4096,
+		TokenizerType: "approximate",
+	}
+}
+
 // modelIDSeparators strips the punctuation real-world hosts use (or omit)
 // inconsistently between tokens of a model identifier.
 var modelIDSeparators = strings.NewReplacer(".", "", "-", "", "_", "")
@@ -267,29 +357,6 @@ func normalizeModelID(id string) string {
 	return modelIDSeparators.Replace(strings.ToLower(BareModel(id)))
 }
 
-// fuzzyMatchIn returns the entry in m whose normalized identifier equals want.
-// When several entries normalize to the same form (rare: usually aliases for
-// one model), the lexicographically smallest key wins so the result is
-// deterministic.
-func fuzzyMatchIn(m map[string]ModelMetadata, want string) (ModelMetadata, bool) {
-	var (
-		bestKey  string
-		bestMeta ModelMetadata
-		found    bool
-	)
-	for k, v := range m {
-		if normalizeModelID(k) != want {
-			continue
-		}
-		if !found || k < bestKey {
-			bestKey = k
-			bestMeta = v
-			found = true
-		}
-	}
-	return bestMeta, found
-}
-
 // fuzzyLookup performs a vendor-prefix- and separator-insensitive search across
 // user overrides and the built-in registry, used when the exact
 // (case-insensitive) lookup misses. It bridges the cosmetic naming differences
@@ -299,15 +366,61 @@ func fuzzyMatchIn(m map[string]ModelMetadata, want string) (ModelMetadata, bool)
 // query "GLM-5.2-FP8" (vendor prefix discarded). Overrides take priority over
 // built-ins, mirroring the exact-lookup tiers. Returns false when nothing
 // matches, so callers can fall through to network sources and the final default.
+//
+// Lookups are O(1) map reads against the normalized-ID indexes
+// (r.overridesIndex, r.builtInIndex) built once at registry construction — no
+// per-call normalization or full-table scan.
 func (r *ModelRegistry) fuzzyLookup(model string) (ModelMetadata, bool) {
 	want := normalizeModelID(model)
 	if want == "" {
 		return ModelMetadata{}, false
 	}
-	if meta, ok := fuzzyMatchIn(r.overrides, want); ok {
+	if meta, ok := r.overridesIndex[want]; ok {
 		return meta, true
 	}
-	return fuzzyMatchIn(r.builtIn, want)
+	meta, ok := r.builtInIndex[want]
+	return meta, ok
+}
+
+// buildNormalizedIndex returns a lookup table mapping each entry's normalized
+// identifier (see normalizeModelID) to its metadata. When two keys collapse to
+// the same normalized form (rare: usually aliases of one model), the
+// lexicographically smallest original key wins, preserving the deterministic
+// tie-break previously implemented imperatively by the per-call scan. Building
+// the index once — at registry construction for overrides, lazily for the
+// shared built-in catalog — turns every fuzzy lookup from an O(n) scan with
+// per-key normalization into an O(1) map read.
+func buildNormalizedIndex(m map[string]ModelMetadata) map[string]ModelMetadata {
+	index := make(map[string]ModelMetadata, len(m))
+	winners := make(map[string]string, len(m))
+	for k, v := range m {
+		norm := normalizeModelID(k)
+		if norm == "" {
+			continue
+		}
+		if winner, ok := winners[norm]; !ok || k < winner {
+			winners[norm] = k
+			index[norm] = v
+		}
+	}
+	return index
+}
+
+// builtInIndexOnce guards lazy initialization of the normalized-ID index over
+// the shared, immutable built-in catalog.
+var (
+	builtInIndexOnce  sync.Once
+	builtInIndexCache map[string]ModelMetadata
+)
+
+// getBuiltInIndex returns the cached normalized-ID index over the built-in
+// catalog, initializing it on first call. The underlying catalog is immutable
+// data, so the derived index is safe to share.
+func getBuiltInIndex() map[string]ModelMetadata {
+	builtInIndexOnce.Do(func() {
+		builtInIndexCache = buildNormalizedIndex(getBuiltInRegistry())
+	})
+	return builtInIndexCache
 }
 
 // defaultUnknownCapabilities is the capability assumption applied to models for
@@ -1826,7 +1939,7 @@ func ResolveBuiltInModel(model string) (ModelMetadata, bool) {
 		return meta, true
 	}
 	if want := normalizeModelID(model); want != "" {
-		if meta, ok := fuzzyMatchIn(builtIn, want); ok {
+		if meta, ok := getBuiltInIndex()[want]; ok {
 			meta.Family = resolveFamily(model, meta)
 			meta.Protocol = resolveProtocol(model, meta)
 			return meta, true
