@@ -1,6 +1,6 @@
 # Utilities
 
-The SDK ships small, dependency-light packages with reusable algorithms: `pathutil` for filesystem-path operations, `strutil` for string helpers, and `ignore` for multi-root `.gitignore`/`.aiignore` resolution.
+The SDK ships small, dependency-light packages with reusable algorithms: `pathutil` for filesystem-path operations, `strutil` for string helpers, `sysproc` for child-process console-window suppression, and `ignore` for multi-root `.gitignore`/`.aiignore` resolution.
 
 ## pathutil
 
@@ -196,6 +196,43 @@ func main() {
 	}
 }
 ```
+
+## sysproc
+
+```go
+import "github.com/v0lka/sp4rk/sysproc"
+```
+
+The `sysproc` package configures process-creation attributes for child processes spawned by host applications and the SDK's own helper processes. It exists because a Windows host built as a GUI-subsystem binary has no attached console, so any child started via `os/exec` allocates a fresh console window by default — a terminal that flashes or stays open on screen. `HideConsole` suppresses that window.
+
+The package is stdlib-only and has no engine imports; it is a near-leaf consumed by `tools`, `tools/builtins`, and `tools/mcp`. Callers apply it without their own platform build tags.
+
+### HideConsole
+
+```go
+func HideConsole(cmd *exec.Cmd)
+```
+
+`HideConsole` configures `cmd` so the child process does not allocate a visible console window. On Windows it OR-edits the `CREATE_NO_WINDOW` flag (0x08000000) into `cmd.SysProcAttr.CreationFlags`, preserving any flags the caller already set (e.g. `CREATE_NEW_PROCESS_GROUP`). On other platforms it is a no-op, so callers apply it unconditionally without branching on the OS. It must be called before `cmd.Start`/`cmd.Run`; mutating `SysProcAttr` after the process has started has no effect.
+
+```go
+cmd := exec.CommandContext(ctx, "rg", args...)
+sysproc.HideConsole(cmd)
+out, err := cmd.Output()
+```
+
+### When to call it
+
+Apply `HideConsole` to every `exec.Cmd` that is **not** an interactive pseudo-terminal (PTY/ConPTY) session:
+
+- `posh_exec` (PowerShell), `ripgrep` (the `rg` binary), and the env-info runtime version probes all call it before starting the child.
+- stdio MCP servers are spawned through a custom command factory that always calls it.
+
+Do **not** call it for an interactive PTY/ConPTY session, which routes the child's console through the pseudo terminal and must keep its default creation behaviour.
+
+### Why CREATE_NO_WINDOW, not HideWindow
+
+Go's `syscall.SysProcAttr.HideWindow` field hides a window that has already been created via `ShowWindow(SW_HIDE)` and still allows a brief flash. `CREATE_NO_WINDOW` suppresses console allocation entirely, so no window ever appears — including no flash.
 
 ## ignore
 

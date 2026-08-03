@@ -69,7 +69,7 @@ Detailed guides live in [`docs/`](docs/):
 - [Human-in-the-loop](docs/hitl.md) — confirmations and ask-user
 - [Events](docs/events.md) — streaming event types
 - [Prompt building](docs/prompt-building.md) — system prompt assembly
-- [Utilities](docs/utilities.md) — path and string helpers
+- [Utilities](docs/utilities.md) — path, string, process, and ignore helpers
 
 Runnable examples are in [`examples/`](examples/).
 

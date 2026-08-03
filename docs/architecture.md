@@ -30,7 +30,7 @@ The SDK is organized in four layers. Import direction flows downward — upper l
 | **Agent** | `agent` | The `Executor` runs the ReAct loop: think, call a tool, observe, repeat. Manages the step budget, circuit breakers, tool-result caching, and sub-agent parallelism. |
 | **Primitives** | `llm`, `tools`, `tools/builtins`, `tools/mcp` | The `Router` routes LLM calls to the active provider. The `ToolRegistry` holds and executes tools. Built-in tools cover file, shell, and search operations; the MCP gateway proxies external servers. |
 
-Supporting packages — `memory`, `prompt`, `skills`, `agents`, `security`, `embedding`, `pathutil`, `strutil`, `ignore` — are consumed across layers as needed.
+Supporting packages — `memory`, `prompt`, `skills`, `agents`, `security`, `embedding`, `pathutil`, `strutil`, `sysproc`, `ignore` — are consumed across layers as needed.
 
 ## Package dependency graph
 
@@ -84,12 +84,15 @@ tools
   ├──→ llm
   ├──→ pathutil
   ├──→ strutil
+  ├──→ sysproc
   └──→ tools/internal/judge_prompts
 
 tools/builtins
-  └──→ tools
+  ├──→ tools
+  └──→ sysproc
 tools/mcp
-  └──→ tools
+  ├──→ tools
+  └──→ sysproc
 
 skills
   ├──→ pathutil
@@ -98,11 +101,14 @@ skills
 agents
   (stdlib + yaml.v3 + log/slog only; no engine packages)
 
+sysproc
+  (stdlib only; no engine packages)
+
 ignore
   └──→ pathutil   (external doublestar only otherwise)
 ```
 
-The `tools` package is a near-leaf dependency — it imports `llm`, `pathutil`, `strutil`, and `tools/internal/judge_prompts` (for the LLM-backed `ToolJudge`). The `llm` package is similarly foundational. This keeps the primitive layers free of higher-level concerns and prevents import cycles.
+The `tools` package is a near-leaf dependency — it imports `llm`, `pathutil`, `strutil`, `sysproc`, and `tools/internal/judge_prompts` (for the LLM-backed `ToolJudge`). The `llm` package is similarly foundational. This keeps the primitive layers free of higher-level concerns and prevents import cycles.
 
 ## The ReAct loop
 

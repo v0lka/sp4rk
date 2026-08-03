@@ -8,6 +8,7 @@ Manages connections to external MCP (Model Context Protocol) servers, discovers 
 
 - `github.com/v0lka/sp4rk/tools/mcp` — `Gateway`, `GatewayConfig`, `ServerEntry`, `StartGateway`, `Server`, `Tool`, `SchemaSanitizer`, `ServerStatus`, error types (`StartError`/`StopError`/`ReconfigureError`)
 - `github.com/v0lka/sp4rk/tools` — `ToolRegistry`, `RegisterWithSource`, `RegisterWithSourceCategory`, `UnregisterBySource`, `StripParamsFromSchema`
+- `github.com/v0lka/sp4rk/sysproc` — `HideConsole` (applied to the stdio subprocess so a GUI-subsystem host spawns no console window)
 
 ## Behavior
 
@@ -42,6 +43,8 @@ StartGateway(ctx, cfg, registry, expandEnv, logger)
 | `http` | Connect to a remote server over HTTP | `URL`, `Headers`, `HTTPClient` |
 
 For HTTP, the client first tries the **Streamable HTTP** transport and falls back to **SSE** (Server-Sent Events) if initialization fails — compatible with both modern and legacy MCP HTTP servers.
+
+For stdio, the subprocess is always built through a custom command factory that merges `os.Environ()` with the configured `Env` (matching the transport's default merge), applies `WorkDir`/`DefaultWorkDir` when set, and calls `sysproc.HideConsole(cmd)` so a GUI-subsystem host application does not allocate a console window for the long-lived server process (`CREATE_NO_WINDOW` on Windows; no-op elsewhere). The factory is installed unconditionally — even when no `WorkDir` is set — so window suppression applies to every stdio server.
 
 ### Environment variable expansion
 

@@ -50,6 +50,7 @@ sp4rk is a reusable agent-execution engine. It is organized as a single Go modul
 │  embedding Embedder, chunker, ONNX runtime, tokenizer                │
 │  pathutil pure path algorithmic primitives                           │
 │  strutil  pure string utilities                                      │
+│  sysproc  child-process console-window suppression (Windows)         │
 │  ignore   multi-root .gitignore/.aiignore resolver                   │
 └──────────────────────────────────────────────────────────────────────┘
 ```
@@ -66,10 +67,10 @@ sp4rk is a reusable agent-execution engine. It is organized as a single Go modul
 | `agent/router`             | `agent`, `llm`, `prompt`, `tools`                                                           | `orchestration`, `planner`, root         |
 | `memory`                   | `agent`, `llm`, `prompt`, `security`, `strutil`                                             | `tools`, `orchestration`, root           |
 | `llm`                      | External libs only                                                                          | Any engine package                       |
-| `tools`                    | `llm`, `pathutil`, `strutil`, `tools/internal/judge_prompts`                                | `agent`, `memory`, `orchestration`, root |
-| `tools/builtins` | `tools`, `agent`, `pathutil` | `orchestration`, `planner`, root (intentional `agent` edge — see note) |
-| `tools/mcp`      | `tools` (and through it, `llm`, `pathutil`)                                              | siblings via the agent/orchestration layer |
-| `prompt`, `skills`, `agents`, `security`, `embedding`, `pathutil`, `strutil`, `ignore` | leaves / near-leaves only                                       | `tools`, `agent`, `orchestration`, root  |
+| `tools`                    | `llm`, `pathutil`, `strutil`, `sysproc`, `tools/internal/judge_prompts`                      | `agent`, `memory`, `orchestration`, root |
+| `tools/builtins` | `tools`, `agent`, `pathutil`, `sysproc` | `orchestration`, `planner`, root (intentional `agent` edge — see note) |
+| `tools/mcp`      | `tools` (and through it, `llm`, `pathutil`), `sysproc`                                  | siblings via the agent/orchestration layer |
+| `prompt`, `skills`, `agents`, `security`, `embedding`, `pathutil`, `strutil`, `sysproc`, `ignore` | leaves / near-leaves only                                       | `tools`, `agent`, `orchestration`, root  |
 
 > **Module boundary.** sp4rk is a standalone Go module. It cannot import any host-application package — an embedding application imports sp4rk, never the reverse. The import prohibitions on upward engine layers are enforced both by convention and by the import cycles they would otherwise create.
 
@@ -112,6 +113,7 @@ Coordinates multi-step tasks across the engine.
 - **`embedding`** — `Embedder` over ONNX Runtime; `chunker` for text segmentation; tokenizer. Thread-safe.
 - **`pathutil`** — pure path algorithmic primitives (containment checks, component splitting, prefix resolution). Zero engine-specific knowledge; usable from any layer.
 - **`strutil`** — pure string utilities.
+- **`sysproc`** — child-process console-window suppression for the SDK's spawned helper processes (`HideConsole`). On Windows it OR-edits `CREATE_NO_WINDOW` (0x08000000) into the child's `SysProcAttr.CreationFlags`, preventing a console window from flashing or staying open when a GUI-subsystem host spawns `posh_exec`/`ripgrep`, version probes (`envinfo`), or stdio MCP servers; on other platforms it is a no-op so callers apply it unconditionally without their own build tags. Imports only the Go standard library (`os/exec`, `syscall` under the `windows` build tag).
 - **`ignore`** — multi-root `.gitignore`/`.aiignore` resolver. `Resolver` (single root) and `Multi` (multi-root) walk a root once, collecting ignore files from the root and every nested directory, and answer whether an absolute path is ignored. Each compiled pattern records its source ignore file (`.gitignore` or `.aiignore`), so `IgnoredByAIIgnore` — on both `Resolver` and `Multi` — reports verdicts sourced exclusively from `.aiignore` rules, excluding `.gitignore` rules. This serves a caller that already obtains a `.gitignore` verdict from git itself, which honours negation and the global gitignore the resolver does not: layering only `.aiignore` rules on top preserves git's un-ignore semantics (an OR-merge). `IgnoredByAIIgnore` is a separate capability, not part of the `IgnoreChecker` interface. Both `Resolver` and `Multi` satisfy `IgnoreChecker`, which the `tools` package defines itself (so `tools` never imports `ignore`); the host wires `ignore.Multi` into tool context via `tools.WithIgnoreChecker`, and `glob`/`ripgrep` consult it. `NewMulti` builds a `Multi` from roots and fails the whole workspace on any load error; `NewMultiFromResolvers` wraps pre-built resolvers without re-walking, for per-root error handling (skip a vanished or unreadable root instead of failing), and references the input slice without copying. `load()` prunes any ignored directory, so a nested `.aiignore` beneath a directory ignored only by `.gitignore` is never collected — a safe false negative for the OR-merge consumer, since git covers those paths. Negation patterns are unsupported (silently skipped). Imports `pathutil` and an external glob library only.
 
 ## Key Boundary Packages
@@ -129,6 +131,7 @@ Coordinates multi-step tasks across the engine.
 - Import direction is strictly downward: orchestration → agent → primitives → supporting utilities.
 - `llm` and `tools` never import `agent`, `orchestration`, `planner`, or the root package.
 - `pathutil` and `strutil` are pure-logic leaves with no engine imports.
+- `sysproc.HideConsole` is applied to every `exec.Cmd` the SDK spawns that is not an interactive pseudo-terminal session, so GUI-subsystem host applications never flash or leave open a console window for `posh_exec`, `ripgrep`, env-info version probes, or stdio MCP servers.
 - `tools` never imports `ignore`; both packages define an `Ignored(absPath, isDir) bool` method/`IgnoreChecker` interface, and `ignore.Resolver`/`ignore.Multi` satisfy `tools.IgnoreChecker` structurally. The host (not the engine) wires the resolver into tool context.
 - The host application imports sp4rk; sp4rk never imports the host application.
 - The `Executor` consumes `llm` and `tools` only through the `LLMCaller`, `ToolExecutor`, and `ContextManager` interfaces, not concrete types.

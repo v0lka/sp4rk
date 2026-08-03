@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/v0lka/sp4rk/sysproc"
 	"github.com/v0lka/sp4rk/tools"
 )
 
@@ -214,6 +215,9 @@ func (t *RipgrepTool) Execute(ctx context.Context, input json.RawMessage) (tools
 	defer cancel()
 
 	cmd := exec.CommandContext(searchCtx, rgPath, args...)
+	// Suppress the console window a GUI-subsystem host would allocate for the
+	// child ripgrep process (CREATE_NO_WINDOW on Windows; no-op elsewhere).
+	sysproc.HideConsole(cmd)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	stdout, err := cmd.StdoutPipe()

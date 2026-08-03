@@ -69,9 +69,10 @@ sp4rk is a single Go module (`github.com/v0lka/sp4rk`). Arrows show import direc
    skills          → {pathutil, tools}
    agents          → {}                   (stdlib + yaml.v3 + log/slog only; no engine packages)
    ignore          → {pathutil}          (external doublestar only otherwise)
+   sysproc         → {}                   (stdlib only; Windows-only effect, no-op elsewhere)
 ```
 
-Supporting packages — `prompt`, `skills`, `agents`, `security`, `embedding`, `pathutil`, `strutil`, `ignore` — are consumed across layers as needed and have no upward dependencies.
+Supporting packages — `prompt`, `skills`, `agents`, `security`, `embedding`, `pathutil`, `strutil`, `sysproc`, `ignore` — are consumed across layers as needed and have no upward dependencies.
 
 Import rule: every arrow is one-way. `tools` and `llm` are near-leaf dependencies; they never import `agent`, `orchestration`, `planner`, or the root package. This keeps the primitive layers free of higher-level concerns and prevents import cycles.
 

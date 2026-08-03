@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/v0lka/sp4rk/sysproc"
 	"github.com/v0lka/sp4rk/tools"
 )
 
@@ -130,6 +131,10 @@ func (t *PoshExecTool) Execute(ctx context.Context, input json.RawMessage) (tool
 	// WaitDelay to drain any pipe readers. PowerShell -NonInteractive
 	// -Command typically does not spawn long-lived children that outlive it.
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNewProcessGroup}
+	// Suppress the console window that a GUI-subsystem host would otherwise
+	// allocate for the child process (CREATE_NO_WINDOW). This is OR-ed with
+	// createNewProcessGroup so both flags remain in effect.
+	sysproc.HideConsole(cmd)
 
 	// Cancel kills the parent process instead of just the parent.
 	cmd.Cancel = func() error {

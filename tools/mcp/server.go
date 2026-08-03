@@ -16,6 +16,8 @@ import (
 	mcpclient "github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/client/transport"
 	"github.com/mark3labs/mcp-go/mcp"
+
+	"github.com/v0lka/sp4rk/sysproc"
 )
 
 // ServerConfig defines how to launch an MCP server.
@@ -116,18 +118,26 @@ func (s *Server) connectStdio(ctx context.Context, cfg ServerConfig) (*mcpclient
 		env = append(env, fmt.Sprintf("%s=%s", key, value))
 	}
 
-	// Build stdio options (e.g., custom working directory)
-	var opts []transport.StdioOption
-	if cfg.WorkDir != "" {
-		workDir := cfg.WorkDir // capture for closure
-		opts = append(opts, transport.WithCommandFunc(
+	// Always install a custom command factory so the spawned MCP server process
+	// runs without a visible console window (CREATE_NO_WINDOW on Windows). The
+	// mcp-go transport's default path does not set this flag, which causes a
+	// console window to flash or stay open for every stdio MCP server under a
+	// GUI-subsystem host application. cmdEnv already carries os.Environ()+cfg.Env,
+	// matching the default merge performed by the transport, so behaviour is
+	// preserved apart from window suppression.
+	workDir := cfg.WorkDir
+	opts := []transport.StdioOption{
+		transport.WithCommandFunc(
 			func(cmdCtx context.Context, command string, cmdEnv []string, args []string) (*exec.Cmd, error) {
 				cmd := exec.CommandContext(cmdCtx, command, args...)
 				cmd.Env = cmdEnv
-				cmd.Dir = workDir
+				if workDir != "" {
+					cmd.Dir = workDir
+				}
+				sysproc.HideConsole(cmd)
 				return cmd, nil
 			},
-		))
+		),
 	}
 
 	// Create stdio MCP client

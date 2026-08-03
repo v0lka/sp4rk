@@ -12,6 +12,7 @@ The SDK ships a catalog of filesystem, search, web, execution, and agent-infrast
 - `github.com/v0lka/sp4rk/tools/builtins` (blackboard-backed) — `read_step_output`, `list_step_outputs`, `read_final_result`, `read_attachment`, `tool_result_read`, `update_checklist`
 - `github.com/v0lka/sp4rk/agent` — `FinishTool`
 - `github.com/v0lka/sp4rk/skills` — `ReadSkillResourceTool`
+- `github.com/v0lka/sp4rk/sysproc` — `HideConsole` (suppresses console windows for `posh_exec`, `ripgrep`, and env-info version probes under a GUI-subsystem host)
 
 ## Behavior
 
@@ -65,6 +66,10 @@ File tools resolve paths via context helpers (`WorkspacePathFrom`/`TempDirFrom`)
 
 - **glob** resolves each `doublestar.GlobWalk` entry to an absolute path and drops it when `checker.Ignored(absEntry, isDir)` is true. An ignored directory is skipped, and its file children are skipped too because the checker considers ancestor directories when deciding whether a path is ignored.
 - **ripgrep** relies on `rg`'s native `.gitignore` handling and additionally **post-filters** every emitted match *and* context-line path through the same `IgnoreChecker` (via `isIgnoredPath`). This catches `.aiignore` rules (root *and* nested) and any resolver-only rule `rg` cannot see. The trade-off is that `rg` searches (and the tool then discards) `.aiignore`-matched files; for the typical secret-suppression use case these are few, so the cost is negligible. Nested `.aiignore` files are fully honoured (a prior limitation, now resolved).
+
+### Windows console suppression
+
+The tools that shell out to a child process — `posh_exec` (PowerShell), `ripgrep` (the `rg` binary), and the env-info runtime version probes — call `sysproc.HideConsole(cmd)` before starting it. When the host application is a Windows GUI-subsystem binary with no attached console, every child otherwise allocates a fresh console window that flashes or stays open on screen; `HideConsole` OR-edits `CREATE_NO_WINDOW` (0x08000000) into the child's `SysProcAttr.CreationFlags`, preserving any flags already set (e.g. `CREATE_NEW_PROCESS_GROUP` for `posh_exec`). The call is a no-op on non-Windows platforms, so the tools apply it unconditionally without platform branches. `bash_exec` is unaffected: it runs an already-attached interactive shell and is not invoked from this code path.
 
 ### Agent-infrastructure tools
 

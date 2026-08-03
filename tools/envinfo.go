@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/v0lka/sp4rk/sysproc"
 )
 
 // EnvInfo holds static environment information collected once at application startup.
@@ -212,6 +214,9 @@ func runVersionCmd(name string, args ...string) string {
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = nil
+	// Suppress the console window a GUI-subsystem host would allocate for the
+	// child version-probe process (CREATE_NO_WINDOW on Windows; no-op elsewhere).
+	sysproc.HideConsole(cmd)
 
 	if err := cmd.Run(); err != nil {
 		return ""
@@ -229,6 +234,9 @@ func runVersionCmdCombined(name string, args ...string) string {
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
+	// Suppress the console window a GUI-subsystem host would allocate for the
+	// child version-probe process (CREATE_NO_WINDOW on Windows; no-op elsewhere).
+	sysproc.HideConsole(cmd)
 
 	if err := cmd.Run(); err != nil {
 		return ""
