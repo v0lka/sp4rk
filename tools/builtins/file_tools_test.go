@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -238,8 +239,14 @@ func TestWriteFileTool_PreservesExistingPermissions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to stat written file: %v", err)
 	}
-	if perm := info.Mode().Perm(); perm != 0o755 {
-		t.Errorf("expected existing perms 0o755 to be preserved, got %v", perm)
+	// Unix permission bits are not meaningful on Windows — os.Chmod only
+	// affects the read-only attribute and os.Stat().Mode().Perm() returns
+	// synthetic values (typically 0o666) that don't reflect the original
+	// 0o755. Skip the permission-preservation check on Windows.
+	if runtime.GOOS != "windows" {
+		if perm := info.Mode().Perm(); perm != 0o755 {
+			t.Errorf("expected existing perms 0o755 to be preserved, got %v", perm)
+		}
 	}
 
 	// A successful atomic write must not leave temp files behind.
