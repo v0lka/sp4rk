@@ -9,7 +9,7 @@ import (
 )
 
 func TestHideConsole_Windows(t *testing.T) {
-	cmd := exec.Command("cmd", "/c", "echo test")
+	cmd := exec.CommandContext(t.Context(), "cmd", "/c", "echo test")
 
 	HideConsole(cmd)
 
@@ -23,7 +23,7 @@ func TestHideConsole_Windows(t *testing.T) {
 
 func TestHideConsole_PreservesExistingFlags(t *testing.T) {
 	const newProcessGroup = 0x00000200
-	cmd := exec.Command("cmd", "/c", "echo test")
+	cmd := exec.CommandContext(t.Context(), "cmd", "/c", "echo test")
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		CreationFlags: newProcessGroup,
 	}
