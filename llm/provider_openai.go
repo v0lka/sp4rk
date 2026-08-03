@@ -184,7 +184,12 @@ func (p *OpenAIProvider) ChatCompletion(ctx context.Context, req ChatRequest) (*
 		// with the Google contents/parts format. The delegate reuses this
 		// provider's baseURL/apiKey/httpClient; error wrapping and body capture
 		// happen inside the delegate, with the provider name inherited here.
-		return googleCompletion(ctx, p.httpClient, p.baseURL, p.apiKey, p.name, req)
+		return googleCompletion(ctx, googleCompletionConfig{
+			HTTPClient:   p.httpClient,
+			BaseURL:      p.baseURL,
+			APIKey:       p.apiKey,
+			ProviderName: p.name,
+		}, req)
 	case ProtocolChatCompletions:
 		// Handled by the shared Chat Completions path below.
 	}

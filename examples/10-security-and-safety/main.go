@@ -3,12 +3,13 @@
 // Example 10 — Security & Tool-Safety (Classic API)
 //
 // Demonstrates the two SDK safety subsystems that no other example covers:
-//   (a) Prompt-injection defense — a custom tool returns UNTRUSTED content
-//       (simulating web/MCP) and wraps it with security.WrapUntrustedContent
-//       before it can reach the LLM, neutralizing an embedded injection.
-//   (b) Tool-safety — a mutating tool opts into PolicyAlwaysAllow and
-//       implements tools.ToolJudger; the registry auto-escalates flagged calls
-//       to a ConfirmFunc (fail-closed to DENY if none is configured).
+//
+//	(a) Prompt-injection defense — a custom tool returns UNTRUSTED content
+//	    (simulating web/MCP) and wraps it with security.WrapUntrustedContent
+//	    before it can reach the LLM, neutralizing an embedded injection.
+//	(b) Tool-safety — a mutating tool opts into PolicyAlwaysAllow and
+//	    implements tools.ToolJudger; the registry auto-escalates flagged calls
+//	    to a ConfirmFunc (fail-closed to DENY if none is configured).
 //
 // The deterministic demo (runSecurityDemos) needs NO API key and always shows
 // both mechanisms. The short live agent below shows the untrusted tool flowing

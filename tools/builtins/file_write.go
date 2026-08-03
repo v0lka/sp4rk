@@ -93,7 +93,7 @@ func (t *WriteFileTool) Execute(ctx context.Context, input json.RawMessage) (too
 		return tools.ToolResult{Content: fmt.Sprintf("failed to create directories: %v", err), IsError: true}, nil
 	}
 
-	if err := os.WriteFile(params.Path, []byte(params.Content), 0o644); err != nil {
+	if err := atomicWriteFile(params.Path, []byte(params.Content)); err != nil {
 		return tools.ToolResult{Content: fmt.Sprintf("failed to write file: %v", err), IsError: true}, nil
 	}
 

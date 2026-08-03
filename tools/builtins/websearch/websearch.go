@@ -38,7 +38,7 @@ type SearchProvider interface {
 	Name() string
 }
 
-// Limits is an alias for builtins.WebSearchLimits.
+// Limits holds the per-tool web search limits configuration.
 type Limits = builtins.WebSearchLimits
 
 // --- Tool ---
@@ -79,37 +79,34 @@ func NewTool(provider SearchProvider, limits Limits) *Tool {
 	}
 }
 
-// webSearchInput represents the input parameters for web search.
-type webSearchInput struct {
-	Query      string `json:"query"`
-	MaxResults int    `json:"max_results"`
-}
-
-// Execute performs a web search and returns the results.
+// Execute performs the web search by parsing the input and delegating to
+// the configured provider. The query parameter is required; max_results
+// defaults to the configured limit when omitted or non-positive.
 func (t *Tool) Execute(ctx context.Context, input json.RawMessage) (tools.ToolResult, error) {
-	var params webSearchInput
-	if err := json.Unmarshal(input, &params); err != nil {
+	// Unmarshal once into a raw map so fallback extraction does not re-parse.
+	var raw map[string]any
+	if err := json.Unmarshal(input, &raw); err != nil {
 		return tools.ParseInputError(err)
 	}
 
-	// Fallback extraction for common model-generated parameter variations.
-	if params.Query == "" {
-		params.Query = extractQueryFallback(input)
+	query, _ := raw["query"].(string)
+	if query == "" {
+		query = extractQueryFallback(raw)
 	}
 
 	// Validate query parameter
-	if params.Query == "" {
+	if query == "" {
 		return tools.ToolResult{Content: "query parameter is required", IsError: true}, nil
 	}
 
 	// Set default max_results if not provided
-	maxResults := params.MaxResults
+	maxResults := intFromRaw(raw, "max_results")
 	if maxResults <= 0 {
 		maxResults = t.limits.MaxResults
 	}
 
 	// Perform the search
-	results, err := t.provider.Search(ctx, params.Query, maxResults)
+	results, err := t.provider.Search(ctx, query, maxResults)
 	if err != nil {
 		return tools.ToolResult{Content: fmt.Sprintf("search failed: %v", err), IsError: true}, nil
 	}
@@ -122,6 +119,24 @@ func (t *Tool) Execute(ctx context.Context, input json.RawMessage) (tools.ToolRe
 	// Format results
 	output := formatResults(results)
 	return tools.ToolResult{Content: output, IsError: false}, nil
+}
+
+// intFromRaw extracts an int value from a raw map, handling float64 coercion
+// (all JSON numbers unmarshal to float64 in map[string]any).
+func intFromRaw(raw map[string]any, key string) int {
+	val, ok := raw[key]
+	if !ok {
+		return 0
+	}
+	switch v := val.(type) {
+	case float64:
+		return int(v)
+	case int:
+		return v
+	case int64:
+		return int(v)
+	}
+	return 0
 }
 
 // formatResults formats the search results as a readable string.
@@ -138,12 +153,8 @@ func formatResults(results []SearchResult) string {
 
 // extractQueryFallback attempts to extract a query string from common
 // parameter variations that models may produce (e.g. "queries", "search_query").
-func extractQueryFallback(input json.RawMessage) string {
-	var raw map[string]any
-	if err := json.Unmarshal(input, &raw); err != nil {
-		return ""
-	}
-
+// raw is the already-unmarshalled input map to avoid re-parsing the JSON.
+func extractQueryFallback(raw map[string]any) string {
 	for _, key := range []string{"queries", "search_query"} {
 		val, ok := raw[key]
 		if !ok {

@@ -4,10 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/v0lka/sp4rk/pathutil"
-	"github.com/v0lka/sp4rk/tools"
 	"os"
 	"path/filepath"
+
+	"github.com/v0lka/sp4rk/pathutil"
+	"github.com/v0lka/sp4rk/tools"
 )
 
 // resolvePath resolves a file path against the session roots (workspace and

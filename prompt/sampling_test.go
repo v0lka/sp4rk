@@ -21,43 +21,43 @@ func TestDefaultSampling(t *testing.T) {
 		{
 			name:     "openai_flagship returns 0.3 temperature",
 			family:   "openai_flagship",
-			wantTemp: pfloat(0.3),
+			wantTemp: fp(0.3),
 			wantTopP: nil,
 		},
 		{
 			name:     "openai_standard returns 0.3 temperature",
 			family:   "openai_standard",
-			wantTemp: pfloat(0.3),
+			wantTemp: fp(0.3),
 			wantTopP: nil,
 		},
 		{
 			name:     "google returns 1.0 temperature",
 			family:   "google",
-			wantTemp: pfloat(1.0),
+			wantTemp: fp(1.0),
 			wantTopP: nil,
 		},
 		{
 			name:     "mistral returns 0.3 temperature",
 			family:   "mistral",
-			wantTemp: pfloat(0.3),
+			wantTemp: fp(0.3),
 			wantTopP: nil,
 		},
 		{
 			name:     "deepseek returns 0.0 temperature",
 			family:   "deepseek",
-			wantTemp: pfloat(0.0),
+			wantTemp: fp(0.0),
 			wantTopP: nil,
 		},
 		{
 			name:     "qwen returns 0.6 temperature",
 			family:   "qwen",
-			wantTemp: pfloat(0.6),
+			wantTemp: fp(0.6),
 			wantTopP: nil,
 		},
 		{
 			name:     "glm returns 0.2 temperature",
 			family:   "glm",
-			wantTemp: pfloat(0.2),
+			wantTemp: fp(0.2),
 			wantTopP: nil,
 		},
 		{
@@ -69,20 +69,20 @@ func TestDefaultSampling(t *testing.T) {
 		{
 			name:     "default family returns 0.5 temp and 0.95 topP",
 			family:   "default",
-			wantTemp: pfloat(0.5),
-			wantTopP: pfloat(0.95),
+			wantTemp: fp(0.5),
+			wantTopP: fp(0.95),
 		},
 		{
 			name:     "unknown family falls back to default",
 			family:   "unknown_provider",
-			wantTemp: pfloat(0.5),
-			wantTopP: pfloat(0.95),
+			wantTemp: fp(0.5),
+			wantTopP: fp(0.95),
 		},
 		{
 			name:     "empty family falls back to default",
 			family:   "",
-			wantTemp: pfloat(0.5),
-			wantTopP: pfloat(0.95),
+			wantTemp: fp(0.5),
+			wantTopP: fp(0.95),
 		},
 	}
 
@@ -126,6 +126,3 @@ func TestDefaultSampling(t *testing.T) {
 		})
 	}
 }
-
-// pfloat is a test helper that returns a pointer to a float64.
-func pfloat(v float64) *float64 { return &v }

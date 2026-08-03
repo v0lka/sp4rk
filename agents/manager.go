@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 )
 
@@ -114,6 +115,9 @@ func (m *AgentManager) List() []AgentDescriptor {
 	for _, a := range m.agents {
 		result = append(result, a.Descriptor())
 	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Name < result[j].Name
+	})
 	return result
 }
 

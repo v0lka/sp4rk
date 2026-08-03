@@ -160,7 +160,7 @@ func TestReflector_Reflect_LLMError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when LLM fails")
 	}
-	if err.Error() != "reflector LLM call failed: llm connection failed" {
+	if !strings.Contains(err.Error(), "reflector LLM call failed") {
 		t.Errorf("unexpected error message: %v", err)
 	}
 }

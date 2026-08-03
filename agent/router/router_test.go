@@ -210,32 +210,6 @@ func TestRoute_HandlesJSONInCodeBlocks(t *testing.T) {
 	}
 }
 
-func TestApplyCompactionStrategy(t *testing.T) {
-	tests := []struct {
-		domain     string
-		complexity int
-		expected   string
-	}{
-		{"code", 1, "sliding_window"},
-		{"code", 5, "sliding_window"},
-		{"research", 1, "summarization"},
-		{"research", 5, "summarization"},
-		{"mixed", 3, "sliding_window"},
-		{"mixed", 4, "hierarchical"},
-		{"general", 3, "sliding_window"},
-		{"general", 5, "hierarchical"},
-		{"unknown", 1, "sliding_window"},
-	}
-
-	for _, tt := range tests {
-		result := applyCompactionStrategy(tt.domain, tt.complexity)
-		if result != tt.expected {
-			t.Errorf("applyCompactionStrategy(%s, %d) = %s, expected %s",
-				tt.domain, tt.complexity, result, tt.expected)
-		}
-	}
-}
-
 func TestRoute_UsesRouterRole(t *testing.T) {
 	mock := &mockLLMCaller{
 		callFn: func(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
@@ -542,19 +516,6 @@ func TestRoute_AppendContextSections_Nil(t *testing.T) {
 	systemMsg := mock.lastCall().Messages[0]
 	if strings.Contains(systemMsg.Content, "AGENTS.md") {
 		t.Error("system prompt should NOT contain AGENTS.md when AppendContextSections is nil")
-	}
-}
-
-func TestSetModelRegistry(t *testing.T) {
-	mock := &mockLLMCaller{}
-	r := New(mock, Config{HistoryWindow: 5})
-	if r.modelRegistry != nil {
-		t.Error("modelRegistry should be nil initially")
-	}
-	reg := &llm.ModelRegistry{}
-	r.SetModelRegistry(reg)
-	if r.modelRegistry != reg {
-		t.Error("modelRegistry should be set by SetModelRegistry")
 	}
 }
 

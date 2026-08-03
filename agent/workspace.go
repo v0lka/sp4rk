@@ -62,18 +62,16 @@ type FactEntry struct {
 	Author   string
 }
 
-type factStoreKeyType struct{}
-
-var factStoreKey = factStoreKeyType{}
+type factStoreKey struct{}
 
 // WithFactStore returns a context carrying the given FactStore.
 func WithFactStore(ctx context.Context, fs FactStore) context.Context {
-	return context.WithValue(ctx, factStoreKey, fs)
+	return context.WithValue(ctx, factStoreKey{}, fs)
 }
 
 // FactStoreFromContext returns the FactStore from context, or nil.
 func FactStoreFromContext(ctx context.Context) FactStore {
-	fs, _ := ctx.Value(factStoreKey).(FactStore)
+	fs, _ := ctx.Value(factStoreKey{}).(FactStore)
 	return fs
 }
 
@@ -99,18 +97,16 @@ type AttachmentEntry struct {
 	AttachedAt      time.Time
 }
 
-type attachmentStoreKeyType struct{}
-
-var attachmentStoreKey = attachmentStoreKeyType{}
+type attachmentStoreKey struct{}
 
 // WithAttachmentStore returns a context carrying the given AttachmentStore.
 func WithAttachmentStore(ctx context.Context, store AttachmentStore) context.Context {
-	return context.WithValue(ctx, attachmentStoreKey, store)
+	return context.WithValue(ctx, attachmentStoreKey{}, store)
 }
 
 // AttachmentStoreFromContext returns the AttachmentStore from context, or nil.
 func AttachmentStoreFromContext(ctx context.Context) AttachmentStore {
-	store, _ := ctx.Value(attachmentStoreKey).(AttachmentStore)
+	store, _ := ctx.Value(attachmentStoreKey{}).(AttachmentStore)
 	return store
 }
 
@@ -189,18 +185,16 @@ type TodoItem struct {
 // StepTodoUpdateFunc is the callback signature for emitting to-do updates.
 type StepTodoUpdateFunc func(stepID string, items []TodoItem)
 
-type todoUpdateFuncKeyType struct{}
-
-var todoUpdateFuncKey = todoUpdateFuncKeyType{}
+type todoUpdateFuncKey struct{}
 
 // WithStepTodoUpdateFunc returns a context carrying the given to-do update callback.
 func WithStepTodoUpdateFunc(ctx context.Context, fn StepTodoUpdateFunc) context.Context {
-	return context.WithValue(ctx, todoUpdateFuncKey, fn)
+	return context.WithValue(ctx, todoUpdateFuncKey{}, fn)
 }
 
 // StepTodoUpdateFuncFromContext returns the StepTodoUpdateFunc from context, or nil.
 func StepTodoUpdateFuncFromContext(ctx context.Context) StepTodoUpdateFunc {
-	fn, _ := ctx.Value(todoUpdateFuncKey).(StepTodoUpdateFunc)
+	fn, _ := ctx.Value(todoUpdateFuncKey{}).(StepTodoUpdateFunc)
 	return fn
 }
 
@@ -217,17 +211,15 @@ func StepTodoUpdateFuncFromContext(ctx context.Context) StepTodoUpdateFunc {
 // standalone (plan-less) checklist.
 type ChecklistGuardFunc func(stepID string) string
 
-type checklistGuardKeyType struct{}
-
-var checklistGuardKey = checklistGuardKeyType{}
+type checklistGuardKey struct{}
 
 // WithChecklistGuard returns a context carrying the given checklist guard.
 func WithChecklistGuard(ctx context.Context, guard ChecklistGuardFunc) context.Context {
-	return context.WithValue(ctx, checklistGuardKey, guard)
+	return context.WithValue(ctx, checklistGuardKey{}, guard)
 }
 
 // ChecklistGuardFromContext returns the ChecklistGuardFunc from context, or nil.
 func ChecklistGuardFromContext(ctx context.Context) ChecklistGuardFunc {
-	g, _ := ctx.Value(checklistGuardKey).(ChecklistGuardFunc)
+	g, _ := ctx.Value(checklistGuardKey{}).(ChecklistGuardFunc)
 	return g
 }

@@ -28,6 +28,9 @@ type Config struct {
 	SystemPrompt string
 	// AnalyzeFooter is appended to the user message. Defaults to a standard analysis request.
 	AnalyzeFooter string
+	// ReasoningEffort sets the initial LLM reasoning effort for reflection
+	// calls. May be changed at runtime via SetReasoningEffort.
+	ReasoningEffort string
 }
 
 // Reflector analyzes execution trajectory to produce structured self-correction insights.
@@ -35,7 +38,7 @@ type Reflector struct {
 	llm             agent.LLMCaller
 	systemPrompt    string
 	analyzeFooter   string
-	reasoningEffort string
+	reasoningEffort string // read by Reflect; must not be set concurrently with Reflect
 }
 
 // New creates a new Reflector with the given caller and config.
@@ -45,13 +48,17 @@ func New(caller agent.LLMCaller, cfg Config) *Reflector {
 		footer = defaultAnalyzeFooter
 	}
 	return &Reflector{
-		llm:           caller,
-		systemPrompt:  cfg.SystemPrompt,
-		analyzeFooter: footer,
+		llm:             caller,
+		systemPrompt:    cfg.SystemPrompt,
+		analyzeFooter:   footer,
+		reasoningEffort: cfg.ReasoningEffort,
 	}
 }
 
 // SetReasoningEffort sets the reasoning effort for the reflector.
+// Must not be called concurrently with Reflect; callers using a shared
+// Reflector across goroutines should serialize access (e.g. via a mutex
+// or by sequencing all calls on the same goroutine).
 func (r *Reflector) SetReasoningEffort(effort string) {
 	r.reasoningEffort = effort
 }
@@ -62,7 +69,7 @@ func (r *Reflector) Reflect(
 	trajectory []agent.Step,
 	plan *orchestration.Plan,
 	prevReflections []orchestration.Reflection,
-) (reflection *orchestration.Reflection, err error) {
+) (*orchestration.Reflection, error) {
 	systemPrompt := prompt.NewBuilder().
 		Core(r.systemPrompt).
 		Build()
@@ -92,7 +99,7 @@ func (r *Reflector) Reflect(
 		return nil, errors.New("reflector LLM call returned nil response")
 	}
 
-	reflection, err = r.parseReflectionResponse(resp.Message.Content)
+	reflection, err := r.parseReflectionResponse(resp.Message.Content)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse reflection response: %w", err)
 	}

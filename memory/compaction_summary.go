@@ -143,7 +143,7 @@ func (s *SummarizationStrategy) buildBlockText(steps []sdkagent.Step) string {
 			// Truncate long observations
 			obs := step.Observation
 			if len(obs) > s.observationTruncate {
-				obs = strutil.TruncateUTF8(obs, s.observationTruncate) + "..."
+				obs = strutil.TruncateUTF8(obs, s.observationTruncate)
 			}
 			stepText += fmt.Sprintf("  Observation: %s\n", obs)
 		}

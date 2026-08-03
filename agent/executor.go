@@ -522,8 +522,17 @@ func (e *Executor) SetToolCache(cache *ToolResultCache) {
 }
 
 // SetPerToolTruncation sets per-tool truncation defaults for Stage 1 (line/byte-based).
+// The provided map is deep-copied so the caller may freely mutate it after the call.
 func (e *Executor) SetPerToolTruncation(cfg map[string]ToolTruncationConfig) {
-	e.perToolTruncation = cfg
+	if cfg == nil {
+		e.perToolTruncation = nil
+		return
+	}
+	cloned := make(map[string]ToolTruncationConfig, len(cfg))
+	for k, v := range cfg {
+		cloned[k] = v
+	}
+	e.perToolTruncation = cloned
 }
 
 // AddNonCacheableTools adds tool names to the set of tools whose results are
@@ -802,7 +811,7 @@ func (e *Executor) Run(ctx context.Context, taskTools []tools.ToolDescriptor, cw
 
 	for state.stepNum = startStep; state.unlimitedSteps || state.stepNum <= state.effectiveMaxSteps+1; state.stepNum++ {
 		// Sync trajectory to the store so tools (e.g. reflect) can access it.
-		if ts := TrajectoryStoreFrom(ctx); ts != nil {
+		if ts := TrajectoryStoreFromContext(ctx); ts != nil {
 			ts.Sync(state.allSteps)
 		}
 

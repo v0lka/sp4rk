@@ -207,6 +207,55 @@ func TestWriteFileTool_WriteFile_NestedPath(t *testing.T) {
 	}
 }
 
+// TestWriteFileTool_PreservesExistingPermissions is a regression test for the
+// atomic write fix. Previously write_file used os.WriteFile with a hardcoded
+// 0o644 mode, which silently reset an existing executable (0o755) or otherwise
+// restricted file to 0o644 on overwrite. The atomic temp-file+rename helper
+// (shared with edit_file) preserves the existing permission bits. It also must
+// not leave temp files behind on success.
+func TestWriteFileTool_PreservesExistingPermissions(t *testing.T) {
+	tool := NewWriteFileTool()
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+
+	testFile := filepath.Join(tmpDir, "script.sh")
+	// Pre-create the file as executable so the regression (0o644 reset) is
+	// detectable.
+	if err := os.WriteFile(testFile, []byte("old"), 0o755); err != nil {
+		t.Fatalf("setup write failed: %v", err)
+	}
+
+	input, _ := json.Marshal(map[string]string{"path": testFile, "content": "new"})
+	result, err := tool.Execute(ctx, input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("expected success, got error: %s", result.Content)
+	}
+
+	info, err := os.Stat(testFile)
+	if err != nil {
+		t.Fatalf("failed to stat written file: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o755 {
+		t.Errorf("expected existing perms 0o755 to be preserved, got %v", perm)
+	}
+
+	// A successful atomic write must not leave temp files behind.
+	entries, err := os.ReadDir(tmpDir)
+	if err != nil {
+		t.Fatalf("failed to read dir: %v", err)
+	}
+	if len(entries) != 1 {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("expected exactly 1 file (no temp leftovers), got %d: %v", len(entries), names)
+	}
+}
+
 // --- Edit tests ---
 
 func TestEditFileTool_EditFile_UniqueMatch(t *testing.T) {

@@ -119,8 +119,10 @@ func TestExtractTextFromContent_EmptyText(t *testing.T) {
 	content := mcp.NewTextContent("")
 	// Empty text from GetTextFromContent, then AsTextContent also empty, then falls through to JSON marshal
 	result := extractTextFromContent(content)
-	// Result should be a JSON marshaling of the content struct or empty - both acceptable
-	_ = result
+	// Result is empty for empty text content — function handles this gracefully without panicking.
+	if result != "" {
+		t.Errorf("expected empty result for empty text content, got %q", result)
+	}
 }
 
 func TestExtractTextFromContent_ImageContent(t *testing.T) {

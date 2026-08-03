@@ -253,8 +253,16 @@ func New(cfg Config) (*Framework, error) {
 
 	// Apply defaults for zero-value fields. Negative values are documented
 	// sentinels meaning "explicitly 0/disabled" (see field doc comments).
+	//
+	// Group 1 — fields that support explicit "0/disabled" via negative sentinels:
+	//   resolveIntSentinel(0, def) → def   (zero means "use default")
+	//   resolveIntSentinel(<0, def) → 0     (negative means "explicitly disable")
+	//   resolveIntSentinel(>0, def) → value (positive means "use as-is")
 	cfg.Execution.MaxSteps = resolveIntSentinel(cfg.Execution.MaxSteps, 50)
 	cfg.Execution.MaxRetries = resolveIntSentinel(cfg.Execution.MaxRetries, 2)
+	// Group 2 — fields where zero is always the "unset" sentinel and there is
+	// no meaningful "explicitly 0/disabled" value (negative makes no semantic
+	// sense for safety margins, thresholds, percentages, or strings).
 	if cfg.Execution.SafetyMarginPercent == 0 {
 		cfg.Execution.SafetyMarginPercent = 5
 	}
@@ -293,7 +301,7 @@ func New(cfg Config) (*Framework, error) {
 	maxRetries := cfg.LLM.MaxRetries
 	outputReserve := cfg.LLM.OutputTokenReserve
 	if outputReserve == 0 {
-		outputReserve = llm.DefaultRouterConfig().OutputTokenReserve
+		outputReserve = llm.DefaultOutputTokenReserve
 	}
 
 	// Build LLM router
@@ -404,6 +412,8 @@ func (fw *Framework) NewConductor(systemPrompt orchestration.SystemPromptFactory
 func (fw *Framework) buildContextWindow(sysPrompt string, meta llm.ModelMetadata, compactStrategy string, pruningOverrides ...orchestration.PruningOverride) agent.ContextManager {
 	counter, err := llm.NewTokenCounter(meta.TokenizerType)
 	if err != nil {
+		fw.logger.Warn("token counter init failed, falling back to simple counter",
+			"tokenizer", meta.TokenizerType, "error", err)
 		counter = llm.NewSimpleTokenCounter()
 	}
 	tracker := llm.NewContextTokenTracker(counter)

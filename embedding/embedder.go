@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"sync"
 
 	chromem "github.com/philippgille/chromem-go"
@@ -49,7 +48,7 @@ type EmbedderConfig struct {
 	// the field is not validated, so callers should pass a non-negative value.
 	IntraOpThreads int
 
-	// Logger for structured logging. If nil, a no-op logger is used.
+	// Logger for structured logging. If nil, a discard logger is used.
 	Logger *slog.Logger
 }
 
@@ -99,7 +98,7 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 
 	logger := cfg.Logger
 	if logger == nil {
-		logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
+		logger = slog.New(slog.DiscardHandler)
 	}
 
 	logger.Info("initializing ONNX Runtime", "library", cfg.LibraryPath)
@@ -183,7 +182,10 @@ func (e *Embedder) EmbedDocuments(ctx context.Context, texts []string) ([][]floa
 	}
 
 	batchSize := len(texts)
-	inputIDs, attentionMask, tokenTypeIDs := e.tokenizer.EncodeBatch(texts, e.maxSeqLen)
+	inputIDs, attentionMask, tokenTypeIDs, err := e.tokenizer.EncodeBatch(texts, e.maxSeqLen)
+	if err != nil {
+		return nil, fmt.Errorf("embedding documents: tokenizer encode: %w", err)
+	}
 
 	// Fast path: use the persistent session for single-text embedding.
 	// This is the common case when chromem-go calls EmbeddingFunc one text at a time.

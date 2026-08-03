@@ -444,17 +444,10 @@ func GenerateSummary(output string, maxLen int) string {
 
 	// Take whichever is shorter: paragraph or maxLen chars.
 	// TruncateUTF8 cuts at a rune boundary so multi-byte characters
-	// are never split mid-sequence.
+	// are never split mid-sequence, and appends "…" when truncated.
 	result := paragraph
-	truncated := false
 	if len(result) > maxLen {
 		result = strutil.TruncateUTF8(result, maxLen)
-		truncated = true
-	}
-
-	// Mark as truncated if we used a shorter version than original.
-	if truncated {
-		result += "..."
 	}
 
 	return result

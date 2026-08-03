@@ -137,8 +137,11 @@ func TestIsWithinPath_DifferentVolumes(t *testing.T) {
 	ok, err := IsWithinPath(parent, child)
 	if err == nil {
 		// Same volume (e.g. Unix): containment is a plain prefix check with no
-		// error — the volume-mismatch contract is not exercisable here.
-		_ = ok
+		// error — the volume-mismatch contract is not exercisable here, but
+		// the path is still not contained.
+		if ok {
+			t.Error("ok should be false when child is not a descendant of parent (same volume)")
+		}
 		return
 	}
 	if ok {

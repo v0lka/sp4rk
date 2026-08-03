@@ -185,7 +185,7 @@ const (
 // Concurrency: the executor calls Sync/Steps from the ReAct loop goroutine.
 // When sub-agents run in parallel, each has its own executor and thus its own
 // store, so cross-goroutine access is uncommon — but tools reading the store
-// via TrajectoryStoreFrom may run on a different goroutine. Implementations
+// via TrajectoryStoreFromContext may run on a different goroutine. Implementations
 // that share state across goroutines MUST be safe for concurrent use.
 type TrajectoryStore interface {
 	Sync(steps []Step)
@@ -199,8 +199,8 @@ func WithTrajectoryStore(ctx context.Context, store TrajectoryStore) context.Con
 	return context.WithValue(ctx, trajectoryStoreKey{}, store)
 }
 
-// TrajectoryStoreFrom extracts the TrajectoryStore from the context, or returns nil.
-func TrajectoryStoreFrom(ctx context.Context) TrajectoryStore {
+// TrajectoryStoreFromContext extracts the TrajectoryStore from the context, or returns nil.
+func TrajectoryStoreFromContext(ctx context.Context) TrajectoryStore {
 	if v, ok := ctx.Value(trajectoryStoreKey{}).(TrajectoryStore); ok {
 		return v
 	}

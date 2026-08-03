@@ -125,17 +125,6 @@ func (t *EditFileTool) Execute(ctx context.Context, input json.RawMessage) (tool
 		return tools.ToolResult{Content: err.Error(), IsError: true}, nil
 	}
 
-	// Coherence check: block edit if file was modified since this session's last read.
-	checker := tools.CoherenceFrom(ctx)
-	if checker != nil {
-		checker.Lock(params.Path)
-		if conflict := checker.CheckWrite(ctx, params.Path); conflict != nil {
-			checker.Unlock(params.Path)
-			return tools.ToolResult{Content: formatWriteConflict(conflict), IsError: true}, nil
-		}
-		defer checker.Unlock(params.Path)
-	}
-
 	// If the target is a symlink, resolve it and write to the resolved path.
 	// This preserves write-through-symlink semantics: an atomic rename on the
 	// symlink path itself would replace the symlink instead of its target.
@@ -143,6 +132,17 @@ func (t *EditFileTool) Execute(ctx context.Context, input json.RawMessage) (tool
 	writePath := params.Path
 	if resolved, evalErr := filepath.EvalSymlinks(params.Path); evalErr == nil {
 		writePath = resolved
+	}
+
+	// Coherence check: block edit if file was modified since this session's last read.
+	checker := tools.CoherenceFrom(ctx)
+	if checker != nil {
+		checker.Lock(writePath)
+		if conflict := checker.CheckWrite(ctx, writePath); conflict != nil {
+			checker.Unlock(writePath)
+			return tools.ToolResult{Content: formatWriteConflict(conflict), IsError: true}, nil
+		}
+		defer checker.Unlock(writePath)
 	}
 
 	data, err := os.ReadFile(writePath)
@@ -168,7 +168,7 @@ func (t *EditFileTool) Execute(ctx context.Context, input json.RawMessage) (tool
 	}
 
 	if checker != nil {
-		checker.RecordWrite(ctx, params.Path)
+		checker.RecordWrite(ctx, writePath)
 	}
 
 	return tools.ToolResult{Content: "successfully edited file", IsError: false}, nil

@@ -204,7 +204,7 @@ func (h *HierarchicalStrategy) buildBlockText(steps []sdkagent.Step, zoneName st
 			}
 			obs := step.Observation
 			if len(obs) > maxLen {
-				obs = strutil.TruncateUTF8(obs, maxLen) + "..."
+				obs = strutil.TruncateUTF8(obs, maxLen)
 			}
 			stepText += "\n  Observation: " + obs
 		}

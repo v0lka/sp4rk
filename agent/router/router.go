@@ -35,6 +35,12 @@ const routingJSONSchemaDefault = `Respond with ONLY a JSON object in this exact 
 const routingJSONSchemaWithTools = `Respond with ONLY a JSON object in this exact format:
 {"domain":"code","complexity":3,"needs_clarification":false,"matched_skills":[],"matched_tools":[]}`
 
+// projectContextMarker is a stable, unique marker injected right after the
+// JSON-OUTPUT-SCHEMA replacement in the assembled system prompt. It serves as
+// the insertion point for project context (AGENTS.md) so the code does not
+// depend on the exact text of routingJSONSchemaDefault / routingJSONSchemaWithTools.
+const projectContextMarker = "\x00PROJECTCTXINS\x00"
+
 // Config holds the configuration for a Router.
 type Config struct {
 	// SystemPrompt is the routing system prompt template.
@@ -59,7 +65,6 @@ type Router struct {
 	llm                   agent.LLMCaller
 	systemPrompt          string
 	historyWindow         int
-	modelRegistry         *llm.ModelRegistry
 	reasoningEffort       string
 	toolMatching          bool
 	appendContextSections func(ctx context.Context) string
@@ -78,11 +83,6 @@ func New(caller agent.LLMCaller, cfg Config) *Router {
 		toolMatching:          cfg.ToolMatching,
 		appendContextSections: cfg.AppendContextSections,
 	}
-}
-
-// SetModelRegistry sets the model registry for model metadata resolution.
-func (r *Router) SetModelRegistry(registry *llm.ModelRegistry) {
-	r.modelRegistry = registry
 }
 
 // SetReasoningEffort sets the reasoning effort for the router.
@@ -134,15 +134,29 @@ func (r *Router) Route(ctx context.Context, userMessage string, availableTools [
 	builder := prompt.NewBuilder().
 		Core(r.systemPrompt).
 		Replace("TOOL-MATCHING", toolMatchingSection).
-		Replace("JSON-OUTPUT-SCHEMA", jsonSchema).
+		Replace("JSON-OUTPUT-SCHEMA", jsonSchema+projectContextMarker).
 		ReplaceData("AVAILABLE-TOOLS", toolListStr).
 		ReplaceData("AVAILABLE-SKILLS", skillListStr)
 	if strings.Contains(r.systemPrompt, "PROJECT-CONTEXT") {
 		builder = builder.ReplaceData("PROJECT-CONTEXT", projectContext)
 	}
 	systemPrompt := builder.Build()
-	if projectContext != "" && !strings.Contains(r.systemPrompt, "PROJECT-CONTEXT") {
-		systemPrompt += projectContext
+	// When the template lacks PROJECT-CONTEXT, insert the context at the
+	// projectContextMarker (right after JSON-OUTPUT-SCHEMA) rather than
+	// appending at the very end. This avoids recency bias where the project's
+	// conventions are the last thing the LLM sees before producing its routing
+	// decision.
+	if projectContext != "" {
+		if idx := strings.Index(systemPrompt, projectContextMarker); idx >= 0 {
+			systemPrompt = systemPrompt[:idx] + projectContext + "\n\n" + systemPrompt[idx+len(projectContextMarker):]
+		} else {
+			// Template lacks both PROJECT-CONTEXT placeholder and the marker;
+			// fall back to prepending.
+			systemPrompt = projectContext + "\n\n" + systemPrompt
+		}
+	} else {
+		// Remove the marker when there's no project context.
+		systemPrompt = strings.ReplaceAll(systemPrompt, projectContextMarker, "")
 	}
 
 	// Build messages for the request
@@ -237,9 +251,10 @@ func validateRoutingDecision(d *RoutingDecision) {
 }
 
 // dedupeAndTrimStrings removes empty strings and collapses duplicates from
-// values, preserving first-occurrence order. It reuses the input's backing
-// array in place. A nil or empty input is returned unchanged so callers can
-// distinguish "not set" from an explicitly empty set.
+// values, preserving first-occurrence order. It trims whitespace from each
+// value before deduplication. It reuses the input's backing array in place.
+// A nil or empty input is returned unchanged so callers can distinguish "not
+// set" from an explicitly empty set.
 func dedupeAndTrimStrings(values []string) []string {
 	if len(values) == 0 {
 		return values
@@ -247,6 +262,7 @@ func dedupeAndTrimStrings(values []string) []string {
 	seen := make(map[string]bool, len(values))
 	clean := values[:0]
 	for _, v := range values {
+		v = strings.TrimSpace(v)
 		if v != "" && !seen[v] {
 			seen[v] = true
 			clean = append(clean, v)

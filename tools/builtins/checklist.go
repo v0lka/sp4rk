@@ -74,7 +74,7 @@ func parseAndValidateTodoList(input string) todoParseResult {
 		nonEmptyCount++
 
 		// Detect nested lists (leading whitespace before '-')
-		if trimmed != "" && (trimmed[0] == ' ' || trimmed[0] == '\t') {
+		if trimmed[0] == ' ' || trimmed[0] == '\t' {
 			errors = append(errors, fmt.Sprintf("line %d: nested lists are not allowed", i+1))
 			continue
 		}

@@ -65,7 +65,7 @@ After connecting, each server is queried with `tools/list`. Returned tools becom
 
 ### Reconfigure
 
-`Gateway.Reconfigure(ctx, newConfig, registry, expandEnv, logger)` updates server connections based on a new config while preserving unchanged connections: removed servers are unregistered (`UnregisterBySource`) and closed; added servers are connected/discovered/registered; changed servers get a fresh connection; unchanged servers are left alive. Config comparison uses the *expanded* config.
+`Gateway.Reconfigure(ctx, newConfig, registry, expandEnv)` updates server connections based on a new config while preserving unchanged connections: removed servers are unregistered (`UnregisterBySource`) and closed; added servers are connected/discovered/registered; changed servers get a fresh connection; unchanged servers are left alive. Config comparison uses the *expanded* config.
 
 ### Status & introspection
 

@@ -159,7 +159,7 @@ func TestGlobTool_HonorsIgnoreAtWorkDirRoot(t *testing.T) {
 	if err != nil {
 		wdResolved = workDir
 	}
-	checker, err := ignore.NewMulti(wsResolved, wdResolved)
+	checker, err := ignore.NewMulti(nil, wsResolved, wdResolved)
 	if err != nil {
 		t.Fatalf("ignore.NewMulti: %v", err)
 	}

@@ -301,5 +301,5 @@ func trunc(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return strutil.TruncateUTF8(s, n-1) + "…"
+	return strutil.TruncateUTF8(s, n)
 }

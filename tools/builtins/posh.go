@@ -5,6 +5,7 @@ package builtins
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os/exec"
 	"regexp"
@@ -168,7 +169,7 @@ func (t *PoshExecTool) Execute(ctx context.Context, input json.RawMessage) (tool
 
 	if err != nil {
 		result := string(output) + "\n" + err.Error()
-		if timeoutCtx.Err() == context.DeadlineExceeded {
+		if errors.Is(timeoutCtx.Err(), context.DeadlineExceeded) {
 			result += "\n[Process killed: timeout exceeded]"
 		}
 		return tools.ToolResult{

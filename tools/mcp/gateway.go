@@ -49,6 +49,15 @@ func (g *Gateway) SetDefaultWorkDir(dir string) {
 	g.defaultWorkDir = dir
 }
 
+// defaultWorkDirForLocked returns dir if non-empty, otherwise g.defaultWorkDir.
+// Caller must hold g.mu.
+func (g *Gateway) defaultWorkDirForLocked(dir string) string {
+	if dir != "" {
+		return dir
+	}
+	return g.defaultWorkDir
+}
+
 // Start connects to all configured MCP servers and discovers their tools.
 // It returns an error if any server fails to connect, but continues
 // connecting to remaining servers.
@@ -60,9 +69,7 @@ func (g *Gateway) Start(ctx context.Context, configs map[string]ServerConfig) er
 
 	for name, cfg := range configs {
 		// Apply default working directory if not explicitly set
-		if cfg.WorkDir == "" && g.defaultWorkDir != "" {
-			cfg.WorkDir = g.defaultWorkDir
-		}
+		cfg.WorkDir = g.defaultWorkDirForLocked(cfg.WorkDir)
 		server := newServer(name)
 		server.logger = g.logger
 
@@ -142,7 +149,7 @@ func (g *Gateway) Stop() error {
 // Reconfigure updates the gateway's server connections based on a new configuration.
 // It handles added, removed, and changed servers while preserving unchanged connections.
 func (g *Gateway) Reconfigure(ctx context.Context, newConfig GatewayConfig,
-	registry *sdktools.ToolRegistry, expandEnv func(string) string, logger *slog.Logger) error {
+	registry *sdktools.ToolRegistry, expandEnv func(string) string) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
@@ -177,9 +184,7 @@ func (g *Gateway) Reconfigure(ctx context.Context, newConfig GatewayConfig,
 
 		delete(g.servers, name)
 		delete(g.expandedConfigs, name)
-		if logger != nil {
-			logger.Debug("MCP server removed", "server", name)
-		}
+		g.log().Debug("MCP server removed", "server", name)
 	}
 
 	// Process added and changed servers
@@ -195,10 +200,7 @@ func (g *Gateway) Reconfigure(ctx context.Context, newConfig GatewayConfig,
 			headers[hk] = expandEnv(hv)
 		}
 
-		workDir := entry.WorkDir
-		if workDir == "" {
-			workDir = g.defaultWorkDir
-		}
+		workDir := g.defaultWorkDirForLocked(entry.WorkDir)
 		newCfg := ServerConfig{
 			Transport:  entry.Transport,
 			Command:    entry.Command,
@@ -227,9 +229,18 @@ func (g *Gateway) Reconfigure(ctx context.Context, newConfig GatewayConfig,
 				errs = append(errs, fmt.Errorf("server %s: disconnect: %w", name, err))
 			}
 
-			if logger != nil {
-				logger.Debug("MCP server config changed, reconnecting", "server", name)
-			}
+			// Drop the stale entries immediately so a failed reconnect leaves
+			// the gateway in a clean state (no dead server, no stale config).
+			// This mirrors the brand-new-server path, where a connect failure
+			// leaves nothing behind. Without it, a changed server whose new
+			// connection fails would leave a closed server in g.servers and
+			// the old config in g.expandedConfigs, so Status() would report a
+			// dead server and the next Reconfigure's diffing would operate on
+			// stale data. On success the entries are repopulated below.
+			delete(g.servers, name)
+			delete(g.expandedConfigs, name)
+
+			g.log().Debug("MCP server config changed, reconnecting", "server", name)
 		}
 
 		// Connect new server
@@ -257,18 +268,14 @@ func (g *Gateway) Reconfigure(ctx context.Context, newConfig GatewayConfig,
 		for _, toolInfo := range server.Tools() {
 			mcpTool := NewTool(server, toolInfo, g.schemaSanitizer)
 			if err := registry.RegisterWithSourceCategory(mcpTool, name, sdktools.SourceCategoryMCP); err != nil {
-				if logger != nil {
-					logger.Warn("MCP tool registration rejected", "server", name, "tool", mcpTool.Name(), "error", err)
-				}
+				g.log().Warn("MCP tool registration rejected", "server", name, "tool", mcpTool.Name(), "error", err)
 			}
 		}
 
-		if logger != nil {
-			if currentNames[name] {
-				logger.Debug("MCP server reconnected", "server", name, "tools", len(server.Tools()))
-			} else {
-				logger.Debug("MCP server added", "server", name, "tools", len(server.Tools()))
-			}
+		if currentNames[name] {
+			g.log().Debug("MCP server reconnected", "server", name, "tools", len(server.Tools()))
+		} else {
+			g.log().Debug("MCP server added", "server", name, "tools", len(server.Tools()))
 		}
 	}
 

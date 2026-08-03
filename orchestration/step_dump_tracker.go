@@ -15,19 +15,24 @@ type StepDumpTracker struct {
 	dir    string
 	files  map[string]*os.File
 	closed bool
+	logger *slog.Logger
 }
 
 // NewStepDumpTracker creates a tracker for per-step dump files.
 // Creates dir via os.MkdirAll; logs a warning on failure but does not
 // return an error (dumps are best-effort debugging aids).
-func NewStepDumpTracker(dir string) *StepDumpTracker {
+func NewStepDumpTracker(dir string, logger *slog.Logger) *StepDumpTracker {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		slog.Default().Warn("step_dump_tracker: failed to create directory",
+		logger.Warn("step_dump_tracker: failed to create directory",
 			"dir", dir, "error", err)
 	}
 	return &StepDumpTracker{
-		dir:   dir,
-		files: make(map[string]*os.File),
+		dir:    dir,
+		files:  make(map[string]*os.File),
+		logger: logger,
 	}
 }
 
@@ -55,7 +60,7 @@ func (t *StepDumpTracker) OpenStepDump(stepID string) io.Writer {
 	f, err := os.OpenFile(filepath.Join(t.dir, filename),
 		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
-		slog.Default().Warn("step_dump_tracker: failed to open dump file",
+		t.logger.Warn("step_dump_tracker: failed to open dump file",
 			"filename", filename, "error", err)
 		return nil
 	}

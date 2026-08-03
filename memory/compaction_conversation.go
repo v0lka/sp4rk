@@ -97,14 +97,16 @@ func compactConversationHistory(messages []llm.Message, budgetTokens int, tokenC
 	}
 
 	// If still over budget and recent is empty/1, truncate the summary.
-	// Always halve the summary so the last-resort path makes progress toward
-	// the budget; the previous `half < 100 → half = len(summary)` guard
-	// produced a no-op for short summaries that still exceeded the budget.
-	if resultTokens > budgetTokens {
+	// Halve the summary iteratively until the budget is met or the summary
+	// becomes too short to halve further.
+	for resultTokens > budgetTokens {
 		half := len(summary) / 2
-		if half > 0 {
-			result[0].Content = strutil.TruncateUTF8(summary, half)
+		if half == 0 {
+			break // summary is too short to truncate further
 		}
+		summary = strutil.TruncateUTF8(summary, half)
+		result[0].Content = summary
+		resultTokens = tokenCounter.CountMessages(result)
 	}
 
 	return result, nil
@@ -182,24 +184,8 @@ func userMessageText(msg llm.Message) string {
 	return b.String()
 }
 
-// truncateSummaryContent truncates text to maxChars, breaking at word boundaries.
-// The returned string includes "..." suffix, so the total length is at most maxChars.
+// truncateSummaryContent truncates text to maxChars, appending "…" when truncated.
 // Truncation is UTF-8 aware: it never splits a multi-byte rune.
 func truncateSummaryContent(text string, maxChars int) string {
-	if len(text) <= maxChars {
-		return text
-	}
-	suffix := "..."
-	if maxChars <= len(suffix) {
-		// Budget is too small for meaningful text + suffix.
-		return strutil.TruncateUTF8(text, maxChars)
-	}
-	contentMax := maxChars - len(suffix)
-	truncated := strutil.TruncateUTF8(text, contentMax)
-	if idx := strings.LastIndexAny(truncated, " .\n"); idx > contentMax/2 {
-		// idx points to an ASCII char (space/dot/newline), which is always a
-		// valid rune boundary, so text[:idx] is safe UTF-8.
-		return text[:idx] + suffix
-	}
-	return truncated + suffix
+	return strutil.TruncateUTF8(text, maxChars)
 }

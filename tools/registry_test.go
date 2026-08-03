@@ -88,7 +88,7 @@ func TestRegisterDuplicate(t *testing.T) {
 func TestRegisterWithSource(t *testing.T) {
 	reg := NewToolRegistry()
 	tool := newMockTool("ext_tool", "external")
-	reg.RegisterWithSource(tool, "external")
+	_ = reg.RegisterWithSource(tool, "external")
 
 	descriptors := reg.List()
 	if len(descriptors) != 1 {
@@ -102,7 +102,7 @@ func TestRegisterWithSource(t *testing.T) {
 func TestUnregister(t *testing.T) {
 	reg := NewToolRegistry()
 	tool := newMockTool("removeme", "temp")
-	reg.RegisterWithSource(tool, "mcp")
+	_ = reg.RegisterWithSource(tool, "mcp")
 	reg.Unregister("removeme")
 
 	_, ok := reg.Get("removeme")
@@ -122,9 +122,9 @@ func TestUnregisterNonExistent(t *testing.T) {
 
 func TestUnregisterBySource(t *testing.T) {
 	reg := NewToolRegistry()
-	reg.RegisterWithSource(newMockTool("tool1", "first"), "server-a")
-	reg.RegisterWithSource(newMockTool("tool2", "second"), "server-a")
-	reg.RegisterWithSource(newMockTool("tool3", "third"), "server-b")
+	_ = reg.RegisterWithSource(newMockTool("tool1", "first"), "server-a")
+	_ = reg.RegisterWithSource(newMockTool("tool2", "second"), "server-a")
+	_ = reg.RegisterWithSource(newMockTool("tool3", "third"), "server-b")
 
 	// Remove all tools from server-a
 	reg.UnregisterBySource("server-a")
@@ -150,7 +150,7 @@ func TestUnregisterBySource(t *testing.T) {
 
 func TestUnregisterBySourceNonExistent(t *testing.T) {
 	reg := NewToolRegistry()
-	reg.RegisterWithSource(newMockTool("tool1", "test"), "server-a")
+	_ = reg.RegisterWithSource(newMockTool("tool1", "test"), "server-a")
 
 	// Unregistering a non-existent source should be a no-op
 	reg.UnregisterBySource("nonexistent")
@@ -170,7 +170,7 @@ func TestUnregisterBySourceEmptyRegistry(t *testing.T) {
 func TestListDescriptors(t *testing.T) {
 	reg := NewToolRegistry()
 	reg.Register(newMockTool("a", "tool a"))
-	reg.RegisterWithSource(newMockTool("b", "tool b"), "mcp")
+	_ = reg.RegisterWithSource(newMockTool("b", "tool b"), "mcp")
 
 	list := reg.List()
 	if len(list) != 2 {
@@ -321,7 +321,7 @@ func TestListFiltered_ExcludeAll(t *testing.T) {
 
 func TestListFiltered_MCPSource(t *testing.T) {
 	reg := NewToolRegistry()
-	reg.RegisterWithSource(newMockTool("mcp_tool", "mcp tool"), "mcp:server")
+	_ = reg.RegisterWithSource(newMockTool("mcp_tool", "mcp tool"), "mcp:server")
 
 	list := reg.ListFiltered(map[string]bool{})
 	if len(list) != 1 {
@@ -349,7 +349,7 @@ func TestGetToolSource_NoSource(t *testing.T) {
 
 func TestGetToolSource_WithSource(t *testing.T) {
 	reg := NewToolRegistry()
-	reg.RegisterWithSource(newMockTool("ext", "external"), "mcp:server")
+	_ = reg.RegisterWithSource(newMockTool("ext", "external"), "mcp:server")
 	if src := reg.GetToolSource("ext"); src != "mcp:server" {
 		t.Errorf("expected 'mcp:server', got %q", src)
 	}
@@ -386,7 +386,7 @@ func TestIsToolUntrusted_MCPSource(t *testing.T) {
 	reg := NewToolRegistry()
 	tool := newMockTool("mcp_tool", "mcp tool")
 	tool.Untrusted = false // tool claims trusted, but MCP source overrides
-	reg.RegisterWithSource(tool, "mcp:server")
+	_ = reg.RegisterWithSource(tool, "mcp:server")
 	if !reg.IsToolUntrusted("mcp_tool") {
 		t.Error("expected true for MCP-sourced tool regardless of IsUntrusted()")
 	}

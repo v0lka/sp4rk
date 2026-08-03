@@ -53,13 +53,6 @@ func (r *ToolRegistry) SetLogger(l *slog.Logger) {
 	r.logger = l
 }
 
-func (r *ToolRegistry) log() *slog.Logger {
-	if r.logger != nil {
-		return r.logger
-	}
-	return slog.Default()
-}
-
 // SetConfirmFunc sets the confirmation callback consulted for tools whose
 // effective policy is PolicyUserConfirm (and for judge-escalated calls).
 // If no ConfirmFunc is configured, such calls are DENIED (fail-closed).
@@ -121,6 +114,8 @@ func (r *ToolRegistry) registerLocked(tool Tool, source string, hasSource bool, 
 		// left by a previous RegisterWithSource for the same name.
 		delete(r.toolSources, name)
 	}
+	// Clear any stale policy override so the new tool starts with a clean slate.
+	delete(r.policyOverrides, name)
 	r.toolCategories[name] = category
 	return true
 }
@@ -140,8 +135,8 @@ func (r *ToolRegistry) Register(tool Tool) {
 // registers MCP tools should prefer RegisterWithSourceCategory so the
 // category does not depend on the server name.
 // If the inferred category is MCP and the name is already taken by a non-MCP
-// tool, the registration is skipped with a warning (no shadowing).
-func (r *ToolRegistry) RegisterWithSource(tool Tool, source string) {
+// tool, the registration is skipped and an error is returned (no shadowing).
+func (r *ToolRegistry) RegisterWithSource(tool Tool, source string) error {
 	category := SourceCategoryCore
 	if strings.HasPrefix(source, "mcp") {
 		category = SourceCategoryMCP
@@ -150,9 +145,9 @@ func (r *ToolRegistry) RegisterWithSource(tool Tool, source string) {
 	ok := r.registerLocked(tool, source, true, category)
 	r.mu.Unlock()
 	if !ok {
-		r.log().Warn("MCP tool registration skipped: name shadows a non-MCP tool",
-			"tool", tool.Name(), "source", source)
+		return fmt.Errorf("tool %q from source %q not registered: MCP tools may not shadow non-MCP tools", tool.Name(), source)
 	}
+	return nil
 }
 
 // RegisterWithSourceCategory adds a tool with an explicit source tag and an
@@ -172,12 +167,14 @@ func (r *ToolRegistry) RegisterWithSourceCategory(tool Tool, source string, cate
 }
 
 // Unregister removes a tool from the registry by name.
+// Any policy override for this tool is also removed.
 func (r *ToolRegistry) Unregister(name string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.tools, name)
 	delete(r.toolSources, name)
 	delete(r.toolCategories, name)
+	delete(r.policyOverrides, name)
 }
 
 // UnregisterBySource removes all tools that were registered with the given source.
@@ -189,6 +186,7 @@ func (r *ToolRegistry) UnregisterBySource(source string) {
 			delete(r.tools, name)
 			delete(r.toolSources, name)
 			delete(r.toolCategories, name)
+			delete(r.policyOverrides, name)
 		}
 	}
 }

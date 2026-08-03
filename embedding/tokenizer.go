@@ -7,6 +7,12 @@ import (
 	"github.com/sugarme/tokenizer/pretrained"
 )
 
+// CLS token ID (101) and SEP token ID (102) for BERT-family tokenizers.
+const (
+	clsTokenID = 101
+	sepTokenID = 102
+)
+
 // Tokenizer wraps a HuggingFace-compatible WordPiece tokenizer loaded from
 // a tokenizer.json file. It produces input_ids, attention_mask, and
 // token_type_ids suitable for BERT-family models like jina-embeddings-v2-small-en.
@@ -26,25 +32,16 @@ func NewTokenizer(path string) (*Tokenizer, error) {
 // Encode tokenizes a single text string and returns padded/truncated tensors
 // ready for ONNX inference. maxLen controls the maximum sequence length
 // (including [CLS] and [SEP] special tokens).
-func (t *Tokenizer) Encode(text string, maxLen int) (inputIDs, attentionMask, tokenTypeIDs []int64) {
+// Returns an error when encoding fails, e.g. due to a corrupted tokenizer.
+func (t *Tokenizer) Encode(text string, maxLen int) (inputIDs, attentionMask, tokenTypeIDs []int64, err error) {
 	// Guard against zero or too-small maxLen which would cause index-out-of-range.
 	if maxLen < 2 {
-		// Return empty slices; caller must provide a valid maxLen >= 2.
-		return nil, nil, nil
+		return nil, nil, nil, fmt.Errorf("maxLen must be >= 2, got %d", maxLen)
 	}
 
 	en, err := t.inner.EncodeSingle(text, true)
 	if err != nil {
-		// Return a minimal valid encoding on error (just [CLS][SEP]).
-		// This is a best-effort fallback; the caller receives a valid but empty embedding.
-		inputIDs = make([]int64, maxLen)
-		attentionMask = make([]int64, maxLen)
-		tokenTypeIDs = make([]int64, maxLen)
-		inputIDs[0] = 101 // [CLS]
-		inputIDs[1] = 102 // [SEP]
-		attentionMask[0] = 1
-		attentionMask[1] = 1
-		return inputIDs, attentionMask, tokenTypeIDs
+		return nil, nil, nil, fmt.Errorf("tokenizer encode: %w", err)
 	}
 
 	ids := en.GetIds()
@@ -78,12 +75,13 @@ func (t *Tokenizer) Encode(text string, maxLen int) (inputIDs, attentionMask, to
 		tokenTypeIDs[i] = int64(typeIDs[i])
 	}
 
-	return inputIDs, attentionMask, tokenTypeIDs
+	return inputIDs, attentionMask, tokenTypeIDs, nil
 }
 
 // EncodeBatch tokenizes multiple texts and returns batched tensors.
 // Each returned slice is flattened in row-major order: [batch_size * maxLen].
-func (t *Tokenizer) EncodeBatch(texts []string, maxLen int) (inputIDs, attentionMask, tokenTypeIDs []int64) {
+// Returns an error if any text fails to encode.
+func (t *Tokenizer) EncodeBatch(texts []string, maxLen int) (inputIDs, attentionMask, tokenTypeIDs []int64, err error) {
 	batchSize := len(texts)
 	totalLen := batchSize * maxLen
 
@@ -92,12 +90,15 @@ func (t *Tokenizer) EncodeBatch(texts []string, maxLen int) (inputIDs, attention
 	tokenTypeIDs = make([]int64, totalLen)
 
 	for i, text := range texts {
-		ids, mask, types := t.Encode(text, maxLen)
+		ids, mask, types, e := t.Encode(text, maxLen)
+		if e != nil {
+			return nil, nil, nil, fmt.Errorf("batch encode text %d: %w", i, e)
+		}
 		offset := i * maxLen
 		copy(inputIDs[offset:offset+maxLen], ids)
 		copy(attentionMask[offset:offset+maxLen], mask)
 		copy(tokenTypeIDs[offset:offset+maxLen], types)
 	}
 
-	return inputIDs, attentionMask, tokenTypeIDs
+	return inputIDs, attentionMask, tokenTypeIDs, nil
 }

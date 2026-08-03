@@ -423,12 +423,6 @@ func (cw *ContextWindow) BuildPrompt() []llm.Message {
 	return messages
 }
 
-// invisibleChars is the cutset of trailing invisible characters to trim from message content.
-// Includes: spaces, tabs, newlines, carriage returns, null, zero-width space,
-// zero-width non-joiner, zero-width joiner, and BOM.
-// Contains: ' ', '\t', '\n', '\r', '\x00', U+200B, U+200C, U+200D, U+FEFF.
-const invisibleChars = " \t\n\r\x00\u200b\u200c\u200d\ufeff"
-
 // buildStepMessages returns messages for the step history.
 // If compaction has occurred, the frozen compactedMessages prefix is combined
 // with freshly-built messages for the tail (steps[compactedThroughIndex:]) —
@@ -548,7 +542,7 @@ func (cw *ContextWindow) buildStandaloneMessages(step sdkagent.Step, i int, prot
 func (cw *ContextWindow) buildAssistantMsg(thought, reasoningContent string, reasoningItems []llm.ReasoningItem) llm.Message {
 	msg := llm.Message{
 		Role:             "assistant",
-		Content:          strings.TrimRight(thought, invisibleChars),
+		Content:          strings.TrimRight(thought, strutil.InvisibleTrimSet),
 		ReasoningContent: reasoningContent,
 		ReasoningItems:   reasoningItems,
 	}
@@ -563,7 +557,7 @@ func (cw *ContextWindow) buildAssistantMsg(thought, reasoningContent string, rea
 // step-status eviction, dedup) runs first, then pruning (fill-based placeholder),
 // then injection defense wrapping.
 func (cw *ContextWindow) buildToolMsg(step sdkagent.Step, idx int, protectedIndices map[int]struct{}) llm.Message {
-	observation := strings.TrimRight(step.Observation, invisibleChars)
+	observation := strings.TrimRight(step.Observation, strutil.InvisibleTrimSet)
 	if observation == "" {
 		observation = "(no output)"
 	}
@@ -657,19 +651,25 @@ func (cw *ContextWindow) isProtectedTool(toolName string) bool {
 }
 
 // isEarlierDuplicateHash checks if a step before idx has the same CacheHash.
+// Uses a map for O(N) lookup per call, avoiding the previous O(N²) linear scan.
 func (cw *ContextWindow) isEarlierDuplicateHash(idx int, hash string) bool {
+	if hash == "" {
+		return false
+	}
+	seen := make(map[string]struct{}, idx)
 	for i := 0; i < idx; i++ {
-		if cw.steps[i].CacheHash == hash && cw.steps[i].CacheHash != "" {
-			return true
+		if cw.steps[i].CacheHash != "" {
+			seen[cw.steps[i].CacheHash] = struct{}{}
 		}
 	}
-	return false
+	_, ok := seen[hash]
+	return ok
 }
 
 // buildNudgeMsg creates a user message for step-limit/retry nudges.
 // Returns the message and true if the nudge has non-empty content.
 func (cw *ContextWindow) buildNudgeMsg(nudge string) (llm.Message, bool) {
-	content := strings.TrimRight(nudge, invisibleChars)
+	content := strings.TrimRight(nudge, strutil.InvisibleTrimSet)
 	if content == "" {
 		return llm.Message{}, false
 	}
@@ -804,7 +804,7 @@ func extractInputHint(input json.RawMessage) string {
 			if len(s) > 60 {
 				// TruncateUTF8 avoids splitting a multi-byte rune at the
 				// byte boundary, which would produce invalid UTF-8.
-				return strutil.TruncateUTF8(s, 57) + "..."
+				return strutil.TruncateUTF8(s, 60)
 			}
 			return s
 		}

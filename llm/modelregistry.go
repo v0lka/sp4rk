@@ -327,10 +327,17 @@ func (r *ModelRegistry) resolveBuiltinOrCache(model, key string) ModelMetadata {
 	if ok {
 		return meta
 	}
+	// Match Resolve's tier-5 fallback exactly, including the optimistic
+	// Capabilities. enrichPartialOverride inherits unset scalar fields from
+	// this value; if Capabilities were left at the zero value here, a
+	// protocol-only partial override for a catalog-MISS model would silently
+	// disable Attachment (and every other capability) — the same footgun the
+	// built-in inheritance path already guards against for catalog-HIT models.
 	return ModelMetadata{
 		ContextWindow: 128000,
 		OutputLimit:   4096,
 		TokenizerType: "approximate",
+		Capabilities:  defaultUnknownCapabilities(),
 	}
 }
 

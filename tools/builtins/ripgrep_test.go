@@ -273,3 +273,36 @@ func TestRipgrepTool_NoPathNoWorkspace(t *testing.T) {
 		t.Error("expected error when no path and no workspace")
 	}
 }
+
+// TestRipgrepTool_LineExceedsScanBuffer is a regression test for the
+// scanner.Err() surfacing fix. The JSON-line scanner is capped at 4 MiB per
+// token; a single match line larger than that caused scanner.Scan() to return
+// false with ErrTooLong, silently truncating results with no indication.
+// After the fix, an explicit incompleteness marker is appended.
+func TestRipgrepTool_LineExceedsScanBuffer(t *testing.T) {
+	base := t.TempDir()
+	tool := NewRipgrepTool()
+
+	// A single line well over the 4 MiB scanner cap, containing the pattern.
+	// rg --json emits one giant match-event line that the scanner cannot buffer.
+	bigFile := filepath.Join(base, "big.txt")
+	line := "TARGETPATTERN" + strings.Repeat("x", 5*1024*1024)
+	if err := os.WriteFile(bigFile, []byte(line), 0o644); err != nil {
+		t.Fatalf("failed to write big file: %v", err)
+	}
+
+	input, _ := json.Marshal(RipgrepInput{
+		Pattern: "TARGETPATTERN",
+		Path:    base,
+	})
+
+	result, err := tool.Execute(context.Background(), input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	const marker = "[some results omitted — a line exceeded the scan buffer]"
+	if !strings.Contains(result.Content, marker) {
+		t.Errorf("expected scan-buffer truncation marker in result, got: %s", result.Content)
+	}
+}

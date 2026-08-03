@@ -447,7 +447,7 @@ Inject and retrieve a store through the context:
 ```go
 ctx = agent.WithTrajectoryStore(ctx, &myTrajectoryStore{})
 // ... inside a tool:
-if ts := agent.TrajectoryStoreFrom(ctx); ts != nil {
+if ts := agent.TrajectoryStoreFromContext(ctx); ts != nil {
     steps := ts.Steps()
 }
 ```
@@ -504,7 +504,7 @@ The executor reads several optional values from the context. These are injected 
 | Helper | Purpose |
 |--------|---------|
 | `WithStepID(ctx, id)` / `StepIDFromContext(ctx)` | Attaches the current plan-step ID. |
-| `WithTrajectoryStore(ctx, store)` / `TrajectoryStoreFrom(ctx)` | Injects a trajectory store. |
+| `WithTrajectoryStore(ctx, store)` / `TrajectoryStoreFromContext(ctx)` | Injects a trajectory store. |
 | `WithToolResultCache(ctx, cache)` / `ToolResultCacheFromContext(ctx)` | Makes the cache available to the `tool_result_read` tool. |
 | `WithPerToolTruncation(ctx, cfg)` / `PerToolTruncationFromContext(ctx)` | Shares truncation config with `tool_result_read` for `num_lines` enforcement. |
 | `WithStepTodoUpdateFunc(ctx, fn)` / `StepTodoUpdateFuncFromContext(ctx)` | Callback for checklist/to-do updates. |

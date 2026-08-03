@@ -432,7 +432,7 @@ import (
 )
 
 // Build a multi-root resolver over the workspace and a work directory.
-checker, err := ignore.NewMulti(workspace, workDir)
+checker, err := ignore.NewMulti(logger, workspace, workDir)
 if err != nil {
     return err
 }

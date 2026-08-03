@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 
 	"github.com/v0lka/sp4rk/pathutil"
@@ -97,7 +98,7 @@ func (m *SkillManager) scanDir(dir string) {
 	}
 }
 
-// List returns lightweight descriptors for all discovered skills (discovery phase).
+// List returns lightweight descriptors for all discovered skills, sorted by name.
 func (m *SkillManager) List() []SkillDescriptor {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -106,6 +107,7 @@ func (m *SkillManager) List() []SkillDescriptor {
 	for _, s := range m.skills {
 		result = append(result, s.Descriptor())
 	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
 	return result
 }
 

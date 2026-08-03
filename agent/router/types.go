@@ -37,21 +37,3 @@ type SkillDescriptor struct {
 	Name        string
 	Description string
 }
-
-// applyCompactionStrategy returns the compaction strategy name based on
-// domain and complexity.
-func applyCompactionStrategy(domain string, complexity int) string {
-	switch domain {
-	case DomainCode:
-		return "sliding_window"
-	case DomainResearch:
-		return "summarization"
-	case DomainMixed, DomainGeneral:
-		if complexity >= 4 {
-			return "hierarchical"
-		}
-		return "sliding_window"
-	default:
-		return "sliding_window"
-	}
-}

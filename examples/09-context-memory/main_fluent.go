@@ -49,7 +49,7 @@ func run() error {
 	fw, err := sp4rk.NewF().
 		Anthropic(os.Getenv("ANTHROPIC_API_KEY"), "claude-sonnet-4-5").
 		Config(base).
-		FileTools().  // read_file / list_directory / glob for context accumulation
+		FileTools(). // read_file / list_directory / glob for context accumulation
 		AutoApprove().
 		MaxSteps(30).
 		Build()

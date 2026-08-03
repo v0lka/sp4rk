@@ -106,7 +106,10 @@ func (p *Planner) getFamily(ctx context.Context) string {
 	if p.Cfg.ModelRegistry == nil {
 		return "default"
 	}
-	meta, _ := p.Cfg.ModelRegistry.Resolve(ctx, p.Cfg.Model)
+	meta, ok := p.Cfg.ModelRegistry.Resolve(ctx, p.Cfg.Model)
+	if !ok {
+		p.log().Debug("planner: model not found in registry, defaulting family", "model", p.Cfg.Model)
+	}
 	if meta.Family == "" {
 		return "default"
 	}
@@ -289,6 +292,8 @@ func (p *Planner) PlanContinuation(
 // Direct planning (one-shot LLM call)
 // ---------------------------------------------------------------------------
 
+// planDirect generates a plan via a single, non-exploratory LLM call.
+// It is used when the domain complexity is low or planner tools are unavailable.
 func (p *Planner) planDirect(
 	ctx context.Context,
 	task string,
@@ -344,6 +349,7 @@ func (p *Planner) getPlannerTools() []tools.ToolDescriptor {
 // Informed planner system prompt (exploration loop)
 // ---------------------------------------------------------------------------
 
+// buildInformedPlanSystemPrompt builds the system prompt for the exploration-informed planning path.
 func (p *Planner) buildInformedPlanSystemPrompt(
 	ctx context.Context,
 	mode planPromptMode,
@@ -355,6 +361,8 @@ func (p *Planner) buildInformedPlanSystemPrompt(
 	return p.buildSystemPromptFromMode(ctx, mode, p.Cfg.Prompts.InformedPrompt, availableTools, reflections, availableSkills, conversationSubstitutions(conversationHistory))
 }
 
+// planWithExploration generates a plan after running a brief exploration executor
+// that researches the codebase before finalizing the plan structure.
 func (p *Planner) planWithExploration(
 	ctx context.Context,
 	task string,
@@ -370,7 +378,11 @@ func (p *Planner) planWithExploration(
 
 	var modelMeta llm.ModelMetadata
 	if p.Cfg.ModelRegistry != nil {
-		modelMeta, _ = p.Cfg.ModelRegistry.Resolve(ctx, p.Cfg.Model)
+		var ok bool
+		modelMeta, ok = p.Cfg.ModelRegistry.Resolve(ctx, p.Cfg.Model)
+		if !ok {
+			p.log().Debug("planner: model not found in registry, using defaults", "model", p.Cfg.Model)
+		}
 	}
 	if modelMeta.ContextWindow == 0 {
 		modelMeta.ContextWindow = 200000
@@ -457,6 +469,9 @@ func (p *Planner) planWithExploration(
 // Unified prompt builder
 // ---------------------------------------------------------------------------
 
+// buildSystemPromptFromMode assembles the full planner system prompt by applying
+// mode-varying parts, family-specific prompts, and dynamic data substitutions
+// (tools, skills, reflections, conversation history) to a base template.
 func (p *Planner) buildSystemPromptFromMode(
 	ctx context.Context,
 	mode planPromptMode,
@@ -512,6 +527,7 @@ func (p *Planner) buildSystemPromptFromMode(
 	return p.Cfg.AppendContextSections(ctx, result)
 }
 
+// buildPlanSystemPrompt builds the system prompt for direct (non-exploratory) planning.
 func (p *Planner) buildPlanSystemPrompt(
 	ctx context.Context,
 	mode planPromptMode,
@@ -544,6 +560,8 @@ type replanContext struct {
 	availableSkills    []skills.SkillDescriptor
 }
 
+// buildReplanSystemPrompt builds the system prompt for replanning after a step failure.
+// It includes the original plan, completed steps, the failed step, and reflections.
 func (p *Planner) buildReplanSystemPrompt(ctx context.Context, rc replanContext) string {
 	var originalPlanStr string
 	planJSON, err := json.MarshalIndent(rc.originalPlan, "", "  ")
@@ -604,6 +622,8 @@ func (p *Planner) buildReplanSystemPrompt(ctx context.Context, rc replanContext)
 // Continuation prompt
 // ---------------------------------------------------------------------------
 
+// buildContinuationSystemPrompt builds the system prompt for generating a continuation plan
+// after the initial plan's completion or a follow-up user message.
 func (p *Planner) buildContinuationSystemPrompt(
 	ctx context.Context,
 	mode planPromptMode,
@@ -705,10 +725,10 @@ func (p *Planner) callAndParsePlan(
 
 		resp, err := p.llm.Call(ctx, req)
 		if err != nil {
-			return nil, fmt.Errorf("planner LLM call failed: %w", err)
+			return nil, fmt.Errorf("planner: LLM call failed: %w", err)
 		}
 		if resp == nil {
-			return nil, errors.New("planner LLM call returned nil response")
+			return nil, errors.New("planner: LLM call returned nil response")
 		}
 
 		plan, err := p.parsePlanResponse(resp.Message.Content, availableSkills)
@@ -763,20 +783,23 @@ func (p *Planner) callAndParsePlan(
 		)
 	}
 
-	return nil, fmt.Errorf("failed to parse plan response after %d attempts: %w", parsePlanMaxRetries, lastParseErr)
+	return nil, fmt.Errorf("planner: failed to parse plan response after %d attempts: %w", parsePlanMaxRetries, lastParseErr)
 }
 
+// parsePlanResponse extracts a valid plan from LLM response content. It handles
+// markdown fences, validates the DAG (unique IDs, valid dependencies, no cycles),
+// and converts skill names found in step profiles into strongly-typed AgentProfile structs.
 func (p *Planner) parsePlanResponse(content string, availableSkills []skills.SkillDescriptor) (*orchestration.Plan, error) {
 	// Robust JSON extraction: handles markdown code fences and surrounding
 	// prose, and finds the last valid JSON object in the response.
 	jsonContent := llm.ExtractJSON(content)
 	if !strings.HasPrefix(strings.TrimSpace(jsonContent), "{") {
-		return nil, errors.New("no valid JSON object found in response")
+		return nil, errors.New("planner: no valid JSON object found in response")
 	}
 
 	var plan orchestration.Plan
 	if err := json.Unmarshal([]byte(jsonContent), &plan); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal plan JSON: %w", err)
+		return nil, fmt.Errorf("planner: failed to unmarshal plan JSON: %w", err)
 	}
 
 	if err := validatePlanDAG(&plan); err != nil {
@@ -801,7 +824,7 @@ func (p *Planner) parsePlanResponse(content string, availableSkills []skills.Ski
 		}
 		raw, err := json.Marshal(profileMap)
 		if err != nil {
-			p.log().Debug("planner: re-marshal profile failed", "step", step.ID, "error", err)
+			p.log().Warn("planner: re-marshal profile failed", "step", step.ID, "error", err)
 			step.Profile = nil
 			continue
 		}
@@ -899,6 +922,8 @@ func validatePlanDAG(plan *orchestration.Plan) error {
 // Shared formatting helpers
 // ---------------------------------------------------------------------------
 
+// formatPlanReflections formats a list of orchestration reflections into a
+// human-readable string for inclusion in planner system prompts.
 func formatPlanReflections(reflections []orchestration.Reflection) string {
 	if len(reflections) == 0 {
 		return ""
@@ -956,6 +981,8 @@ func findTerminalSteps(plan *orchestration.Plan) []string {
 }
 
 // summarizeExplorationSteps extracts a concise summary from exploration ReAct steps.
+// summarizeExplorationSteps extracts a concise summary from exploration ReAct steps
+// for inclusion in the planner's ExplorationContext field.
 func summarizeExplorationSteps(steps []agent.Step) string {
 	const maxExplorationContextLen = 4000
 

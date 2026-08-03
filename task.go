@@ -28,8 +28,8 @@ type trajectoryStore struct {
 
 func (s *trajectoryStore) Sync(steps []agent.Step) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.steps = steps
-	s.mu.Unlock()
 }
 
 func (s *trajectoryStore) Steps() []agent.Step {
@@ -72,6 +72,19 @@ type TaskBuilder struct {
 	err error // set by pipeline transition when the framework build failed
 }
 
+// newTaskBuilder returns a TaskBuilder with the common defaults (maxRetries=2,
+// compaction="sliding_window"). Every construction path should go through here
+// to keep defaults in one place.
+func newTaskBuilder(ctx context.Context, task string, fw *Framework) *TaskBuilder {
+	return &TaskBuilder{
+		ctx:        ctx,
+		fw:         fw,
+		task:       task,
+		maxRetries: 2,
+		compaction: "sliding_window",
+	}
+}
+
 // TaskF starts a fluent orchestrated execution over fw for the given task. The
 // chain is terminated by [TaskBuilder.Execute], which returns the original
 // [*orchestration.ExecutionResult].
@@ -80,13 +93,7 @@ type TaskBuilder struct {
 // without [TaskBuilder.Plan] it runs a single ReAct loop, with [TaskBuilder.Plan]
 // it builds a DAG with retry and (optionally) reflection.
 func (fw *Framework) TaskF(ctx context.Context, task string) *TaskBuilder {
-	return &TaskBuilder{
-		ctx:        ctx,
-		fw:         fw,
-		task:       task,
-		maxRetries: 2,
-		compaction: "sliding_window",
-	}
+	return newTaskBuilder(ctx, task, fw)
 }
 
 // Task is a pipeline transition on [FrameworkBuilder]: it builds the framework
@@ -102,13 +109,9 @@ func (fw *Framework) TaskF(ctx context.Context, task string) *TaskBuilder {
 func (b *FrameworkBuilder) Task(ctx context.Context, task string) *TaskBuilder {
 	fw, err := b.build()
 	if err != nil {
-		return &TaskBuilder{
-			ctx:        ctx,
-			task:       task,
-			maxRetries: 2,
-			compaction: "sliding_window",
-			err:        err,
-		}
+		tb := newTaskBuilder(ctx, task, nil)
+		tb.err = err
+		return tb
 	}
 	return fw.TaskF(ctx, task)
 }
@@ -289,7 +292,11 @@ func (b *TaskBuilder) runPlanned(
 	var reflections []orchestration.Reflection
 	aborted := false
 
-	for {
+	// Honour context cancellation between waves: without this check a
+	// cancelled context causes the loop to grind through every remaining
+	// ready step (each conductor.Run failing with a context error) and
+	// misreport them as failures rather than recognising the cancellation.
+	for ctx.Err() == nil {
 		ready := orchestration.FindReadySteps(plan, completed)
 		if len(ready) == 0 {
 			break
@@ -451,6 +458,12 @@ func (b *TaskBuilder) runStep(
 			lastErrMsg = runErr.Error()
 		} else if result != nil {
 			lastErrMsg = result.Output
+		}
+
+		// Stop retrying on a cancelled context — re-attempts cannot succeed and
+		// would just burn the remaining retry budget on immediate failures.
+		if ctx.Err() != nil {
+			break
 		}
 
 		if attempt <= b.maxRetries && rf != nil {

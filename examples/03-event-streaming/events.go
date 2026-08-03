@@ -100,13 +100,13 @@ func (e *PrintingEvents) SubAgentComplete(stepID string, success bool, duration 
 	fmt.Printf("│ 📥 SubAgent %s %s (%v)\n", stepID, status, duration)
 }
 
-// truncate shortens a string to maxLen bytes, flattening newlines and
-// appending "…" if truncated. The cut is UTF-8-safe (delegates to
-// strutil.TruncateUTF8) so multi-byte runes are never split.
+// truncate shortens a string to maxLen bytes, flattening newlines.
+// The cut is UTF-8-safe (delegates to strutil.TruncateUTF8, which
+// appends "…" when truncated).
 func truncate(s string, maxLen int) string {
 	s = strings.ReplaceAll(s, "\n", " ")
 	if len(s) <= maxLen {
 		return s
 	}
-	return strutil.TruncateUTF8(s, maxLen-1) + "…"
+	return strutil.TruncateUTF8(s, maxLen)
 }

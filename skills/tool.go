@@ -55,6 +55,10 @@ type readSkillResourceInput struct {
 
 // Execute reads the requested resource file from the skill directory.
 func (t *ReadSkillResourceTool) Execute(ctx context.Context, input json.RawMessage) (sdktools.ToolResult, error) {
+	if t.resolvePath == nil {
+		return sdktools.ErrorResult("skill resolver is not available"), nil
+	}
+
 	var parsed readSkillResourceInput
 	if err := json.Unmarshal(input, &parsed); err != nil {
 		return sdktools.ParseInputError(err)

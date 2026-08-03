@@ -243,7 +243,7 @@ trajectory := store.Steps()
 Retrieve the store from inside a tool via the context:
 
 ```go
-if ts := agent.TrajectoryStoreFrom(ctx); ts != nil {
+if ts := agent.TrajectoryStoreFromContext(ctx); ts != nil {
     for _, step := range ts.Steps() {
         // inspect thought, action, observation...
     }

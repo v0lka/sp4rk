@@ -25,7 +25,7 @@ func (m *mockSearchProvider) Search(_ context.Context, _ string, _ int) ([]Searc
 func (m *mockSearchProvider) Name() string { return m.name }
 
 func TestTool_Descriptor(t *testing.T) {
-	tool := NewTool(&mockSearchProvider{name: "mock"}, builtins.DefaultWebSearchLimits())
+	tool := NewTool(&mockSearchProvider{name: "mock"}, Limits(builtins.DefaultWebSearchLimits()))
 
 	if tool.Name() != "web_search" {
 		t.Errorf("Name() = %q, want %q", tool.Name(), "web_search")
@@ -71,7 +71,7 @@ func TestTool_Descriptor(t *testing.T) {
 }
 
 func TestTool_MissingQuery(t *testing.T) {
-	tool := NewTool(&mockSearchProvider{name: "mock"}, builtins.DefaultWebSearchLimits())
+	tool := NewTool(&mockSearchProvider{name: "mock"}, Limits(builtins.DefaultWebSearchLimits()))
 
 	// Test with empty query
 	input := json.RawMessage(`{"query": ""}`)
@@ -134,7 +134,7 @@ func TestTool_FormatResults(t *testing.T) {
 }
 
 func TestTool_InvalidJSON(t *testing.T) {
-	tool := NewTool(&mockSearchProvider{name: "mock"}, builtins.DefaultWebSearchLimits())
+	tool := NewTool(&mockSearchProvider{name: "mock"}, Limits(builtins.DefaultWebSearchLimits()))
 
 	input := json.RawMessage(`{invalid json}`)
 	result, err := tool.Execute(context.Background(), input)
@@ -151,7 +151,7 @@ func TestTool_InvalidJSON(t *testing.T) {
 }
 
 func TestTool_DefaultPolicy(t *testing.T) {
-	tool := NewTool(&mockSearchProvider{name: "mock"}, builtins.DefaultWebSearchLimits())
+	tool := NewTool(&mockSearchProvider{name: "mock"}, Limits(builtins.DefaultWebSearchLimits()))
 	if tool.DefaultPolicy() != tools.PolicyAlwaysAllow {
 		t.Errorf("expected DefaultPolicy() to return PolicyAlwaysAllow, got %v", tool.DefaultPolicy())
 	}
@@ -159,7 +159,7 @@ func TestTool_DefaultPolicy(t *testing.T) {
 
 func TestTool_ProviderError(t *testing.T) {
 	provider := &mockSearchProvider{name: "mock", err: errors.New("provider failure")}
-	tool := NewTool(provider, builtins.DefaultWebSearchLimits())
+	tool := NewTool(provider, Limits(builtins.DefaultWebSearchLimits()))
 	input := json.RawMessage(`{"query": "test"}`)
 	result, err := tool.Execute(context.Background(), input)
 	if err != nil {

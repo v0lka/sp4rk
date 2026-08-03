@@ -6,6 +6,7 @@ import (
 	"errors"
 	"testing"
 
+	mcpclient "github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/mcp"
 	sdktools "github.com/v0lka/sp4rk/tools"
 )
@@ -644,7 +645,7 @@ func TestGateway_Reconfigure_AddServer(t *testing.T) {
 		},
 	}
 
-	err := gateway.Reconfigure(context.Background(), newConfig, registry, func(s string) string { return s }, nil)
+	err := gateway.Reconfigure(context.Background(), newConfig, registry, func(s string) string { return s })
 
 	// Should get an error for the failed connection to server2
 	if err == nil {
@@ -704,7 +705,7 @@ func TestGateway_Reconfigure_RemoveServer(t *testing.T) {
 		},
 	}
 
-	err := gateway.Reconfigure(context.Background(), newConfig, registry, func(s string) string { return s }, nil)
+	err := gateway.Reconfigure(context.Background(), newConfig, registry, func(s string) string { return s })
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -758,7 +759,7 @@ func TestGateway_Reconfigure_UnchangedServer(t *testing.T) {
 		},
 	}
 
-	err := gateway.Reconfigure(context.Background(), newConfig, registry, func(s string) string { return s }, nil)
+	err := gateway.Reconfigure(context.Background(), newConfig, registry, func(s string) string { return s })
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -803,7 +804,7 @@ func TestGateway_Reconfigure_EmptyConfig(t *testing.T) {
 		Servers: map[string]ServerEntry{},
 	}
 
-	err := gateway.Reconfigure(context.Background(), newConfig, registry, func(s string) string { return s }, nil)
+	err := gateway.Reconfigure(context.Background(), newConfig, registry, func(s string) string { return s })
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -852,7 +853,7 @@ func TestGateway_Reconfigure_ChangedConfig(t *testing.T) {
 		},
 	}
 
-	err := gateway.Reconfigure(context.Background(), newConfig, registry, func(s string) string { return s }, nil)
+	err := gateway.Reconfigure(context.Background(), newConfig, registry, func(s string) string { return s })
 
 	// Should get an error for the failed connection
 	if err == nil {
@@ -867,6 +868,17 @@ func TestGateway_Reconfigure_ChangedConfig(t *testing.T) {
 	// tool1 should be unregistered (old server was closed)
 	if _, ok := registry.Get("tool1"); ok {
 		t.Error("tool1 should be unregistered")
+	}
+
+	// A failed reconnect must leave the gateway in a clean state: no closed
+	// server lingering in the map (it would otherwise be reported by Status
+	// and re-closed on the next Reconfigure), and no stale expanded config
+	// (configChanged would otherwise diff against the pre-change values).
+	if _, ok := gateway.servers["server1"]; ok {
+		t.Error("server1 should be removed from the servers map after a failed reconnect")
+	}
+	if _, ok := gateway.expandedConfigs["server1"]; ok {
+		t.Error("server1 stale config should be removed from expandedConfigs after a failed reconnect")
 	}
 }
 
@@ -1020,14 +1032,14 @@ func TestGateway_Status_ConnectedServers(t *testing.T) {
 		{Name: "tool1", Description: "first tool", InputSchema: json.RawMessage(`{"type":"object"}`)},
 		{Name: "tool2", Description: "second tool", InputSchema: json.RawMessage(`{"type":"object"}`)},
 	}
-	server1.connected = true
+	server1.client = &mcpclient.Client{}
 	server1.transportType = "stdio"
 
 	server2 := newServer("beta")
 	server2.tools = []ToolInfo{
 		{Name: "tool3", Description: "third tool", InputSchema: json.RawMessage(`{"type":"object"}`)},
 	}
-	server2.connected = true
+	server2.client = &mcpclient.Client{}
 	server2.transportType = "http"
 
 	gateway.servers["alpha"] = server1
@@ -1077,7 +1089,7 @@ func TestGateway_Status_DisconnectedServer(t *testing.T) {
 
 	// Add a server that failed to connect
 	server := newServer("failed-server")
-	server.connected = false
+	server.client = nil
 	server.transportType = "stdio"
 	server.lastError = "connection refused"
 
@@ -1106,7 +1118,7 @@ func TestGateway_Status_SortedByName(t *testing.T) {
 	names := []string{"zebra", "alpha", "mike"}
 	for _, name := range names {
 		server := newServer(name)
-		server.connected = true
+		server.client = &mcpclient.Client{}
 		server.transportType = "stdio"
 		gateway.servers[name] = server
 	}
@@ -1131,7 +1143,7 @@ func TestServer_Status(t *testing.T) {
 		{Name: "read_file", Description: "Read a file", InputSchema: json.RawMessage(`{"type":"object"}`)},
 		{Name: "write_file", Description: "Write a file", InputSchema: json.RawMessage(`{"type":"object"}`)},
 	}
-	server.connected = true
+	server.client = &mcpclient.Client{}
 	server.transportType = "http"
 
 	status := server.Status()
@@ -1163,7 +1175,7 @@ func TestServer_Status(t *testing.T) {
 
 func TestServer_Status_NoTools(t *testing.T) {
 	server := newServer("empty-server")
-	server.connected = true
+	server.client = &mcpclient.Client{}
 	server.transportType = "stdio"
 
 	status := server.Status()
@@ -1178,7 +1190,7 @@ func TestServer_Status_NoTools(t *testing.T) {
 
 func TestServer_Status_WithError(t *testing.T) {
 	server := newServer("error-server")
-	server.connected = false
+	server.client = nil
 	server.lastError = "failed to connect: connection refused"
 
 	status := server.Status()

@@ -80,7 +80,7 @@ func TestServer_DiscoverTools_NilClient(t *testing.T) {
 	}
 }
 
-func TestServer_Close_NilClient(t *testing.T) {
+func TestServer_Close_NilClient_PreservesTools(t *testing.T) {
 	s := newServer("test")
 
 	// Closing a server with no client should return nil

@@ -152,7 +152,9 @@ func TestAgentManager_RescanClears(t *testing.T) {
 
 	// Rescan with an empty dir set: previous agents must be cleared.
 	mgr2 := NewAgentManager([]string{t.TempDir()}, nil)
-	_ = mgr2.Scan()
+	if err := mgr2.Scan(); err != nil {
+		t.Fatalf("Scan on empty dir: %v", err)
+	}
 	if _, ok := mgr2.Get("first"); ok {
 		t.Error("expected 'first' to be gone after rescan on different (empty) dir")
 	}

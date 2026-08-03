@@ -58,7 +58,10 @@ func TestTokenizer_Encode(t *testing.T) {
 		t.Fatalf("NewTokenizer() error = %v", err)
 	}
 
-	ids, mask, typeIDs := tok.Encode("hello world", 16)
+	ids, mask, typeIDs, err := tok.Encode("hello world", 16)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Should have maxLen elements.
 	if len(ids) != 16 {
@@ -72,8 +75,8 @@ func TestTokenizer_Encode(t *testing.T) {
 	}
 
 	// First token should be [CLS] (101) for BERT-style tokenizers.
-	if ids[0] != 101 {
-		t.Errorf("first token = %d, want 101 ([CLS])", ids[0])
+	if ids[0] != clsTokenID {
+		t.Errorf("first token = %d, want %d ([CLS])", ids[0], clsTokenID)
 	}
 
 	// Attention mask should be 1 for real tokens, 0 for padding.
@@ -99,7 +102,10 @@ func TestTokenizer_EncodeBatch(t *testing.T) {
 	}
 
 	texts := []string{"hello", "world"}
-	ids, mask, typeIDs := tok.EncodeBatch(texts, 8)
+	ids, mask, typeIDs, err := tok.EncodeBatch(texts, 8)
+	if err != nil {
+		t.Fatalf("EncodeBatch error: %v", err)
+	}
 
 	// Should be flattened: 2 * 8 = 16 elements.
 	if len(ids) != 16 {
@@ -305,41 +311,26 @@ func TestEmbedder_EndToEnd(t *testing.T) {
 // --- Tokenizer edge cases (no tokenizer file needed) ---
 
 func TestTokenizer_Encode_MaxLenZero(t *testing.T) {
-	// maxLen=0 triggers the early-return guard (maxLen < 2) before
+	// maxLen=0 triggers the error guard (maxLen < 2) before
 	// accessing the inner tokenizer, so nil inner is safe.
 	tok := &Tokenizer{inner: nil}
-	ids, mask, typeIDs := tok.Encode("hello world", 0)
-
-	if ids != nil {
-		t.Errorf("inputIDs = %v, want nil (maxLen=0 should return nil slice)", ids)
-	}
-	if mask != nil {
-		t.Errorf("attentionMask = %v, want nil (maxLen=0 should return nil slice)", mask)
-	}
-	if typeIDs != nil {
-		t.Errorf("tokenTypeIDs = %v, want nil (maxLen=0 should return nil slice)", typeIDs)
+	_, _, _, err := tok.Encode("hello world", 0)
+	if err == nil {
+		t.Error("expected error for maxLen=0")
 	}
 }
 
 func TestTokenizer_Encode_MaxLenOne(t *testing.T) {
-	// maxLen=1 also triggers the early-return guard (maxLen < 2).
 	tok := &Tokenizer{inner: nil}
-	ids, mask, typeIDs := tok.Encode("hello world", 1)
-
-	if ids != nil {
-		t.Errorf("inputIDs = %v, want nil (maxLen=1 should return nil slice)", ids)
-	}
-	if mask != nil {
-		t.Errorf("attentionMask = %v, want nil (maxLen=1 should return nil slice)", mask)
-	}
-	if typeIDs != nil {
-		t.Errorf("tokenTypeIDs = %v, want nil (maxLen=1 should return nil slice)", typeIDs)
+	_, _, _, err := tok.Encode("hello world", 1)
+	if err == nil {
+		t.Error("expected error for maxLen=1")
 	}
 }
 
 func TestTokenizer_EncodeBatch_EmptyTexts(t *testing.T) {
 	tok := &Tokenizer{inner: nil}
-	ids, mask, typeIDs := tok.EncodeBatch([]string{}, 16)
+	ids, mask, typeIDs, _ := tok.EncodeBatch([]string{}, 16)
 
 	if len(ids) != 0 {
 		t.Errorf("inputIDs length = %d, want 0 (empty texts should produce empty batch)", len(ids))
@@ -354,7 +345,7 @@ func TestTokenizer_EncodeBatch_EmptyTexts(t *testing.T) {
 
 func TestTokenizer_EncodeBatch_EmptyTexts_MaxLenZero(t *testing.T) {
 	tok := &Tokenizer{inner: nil}
-	ids, mask, typeIDs := tok.EncodeBatch([]string{}, 0)
+	ids, mask, typeIDs, _ := tok.EncodeBatch([]string{}, 0)
 
 	if len(ids) != 0 {
 		t.Errorf("inputIDs length = %d, want 0", len(ids))

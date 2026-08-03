@@ -221,7 +221,9 @@ func (p *AnthropicProvider) buildRequest(req ChatRequest) (*anthropic.MessagesRe
 		// Skip messages with no renderable content (Anthropic API rejects empty
 		// messages). ContentBlocks are included so an image-only user message
 		// (empty Content, non-empty ContentBlocks) is not silently dropped.
-		if msg.Content == "" && len(msg.ContentBlocks) == 0 && len(msg.ToolCalls) == 0 && msg.ToolCallID == "" {
+		// ReasoningContent is also checked so an assistant message carrying only
+		// reasoning is not silently dropped.
+		if msg.Content == "" && len(msg.ContentBlocks) == 0 && len(msg.ToolCalls) == 0 && msg.ToolCallID == "" && msg.ReasoningContent == "" {
 			continue
 		}
 		anthropicMsg, err := p.convertMessage(msg)

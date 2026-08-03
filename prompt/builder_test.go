@@ -422,3 +422,91 @@ func TestReplaceData_CacheBreakParts(t *testing.T) {
 		t.Errorf("dynamic = %q", dynamic)
 	}
 }
+
+func TestReplaceDataAll(t *testing.T) {
+	t.Parallel()
+
+	result := NewBuilder().
+		Core("Hello {{NAME}}, you are {{ROLE}}.").
+		ReplaceDataAll(map[string]string{
+			"{{NAME}}": "Alice",
+			"{{ROLE}}": "admin",
+		}).
+		Build()
+
+	want := "Hello Alice, you are admin."
+	if result != want {
+		t.Errorf("Build() = %q, want %q", result, want)
+	}
+}
+
+func TestReplaceDataAll_SinglePass(t *testing.T) {
+	t.Parallel()
+
+	// Data substitutions must not re-scan: a data value containing a
+	// placeholder must NOT be expanded.
+	result := NewBuilder().
+		Core("{{A}}").
+		ReplaceDataAll(map[string]string{
+			"{{A}}": "value with {{B}}",
+			"{{B}}": "should not appear",
+		}).
+		Build()
+
+	want := "value with {{B}}"
+	if result != want {
+		t.Errorf("Build() = %q, want %q (data substitutions must not re-scan)", result, want)
+	}
+}
+
+func TestSystemPromptBuilder(t *testing.T) {
+	t.Parallel()
+
+	result := NewSystemPromptBuilder().
+		Core("You are a helpful {{ROLE}}.").
+		Replace("{{ROLE}}", "assistant").
+		ReplaceAll(map[string]string{
+			"{{VERB}}": "analyse",
+			"{{LANG}}": "English",
+		}).
+		CacheBreak().
+		Dynamic("Current time: {{TIME}}").
+		ReplaceData("{{TIME}}", "2025-01-15").
+		ReplaceDataAll(map[string]string{
+			"{{EXTRA}}": "extra-value",
+		}).
+		Build()
+
+	// Build() includes the cache-break marker.
+	if !strings.Contains(result, CacheBreakMarker) {
+		t.Error("Build() should contain CacheBreakMarker")
+	}
+
+	// Split and verify parts.
+	parts := SplitCacheBreak(result)
+	if len(parts) != 2 {
+		t.Fatalf("SplitCacheBreak returned %d parts, want 2", len(parts))
+	}
+	if want := "You are a helpful assistant."; parts[0] != want {
+		t.Errorf("stable part = %q, want %q", parts[0], want)
+	}
+	if want := "Current time: 2025-01-15"; parts[1] != want {
+		t.Errorf("dynamic part = %q, want %q", parts[1], want)
+	}
+}
+
+func TestSystemPromptBuilder_DynamicReplacesData(t *testing.T) {
+	t.Parallel()
+
+	result := NewSystemPromptBuilder().
+		Core("System ready.").
+		CacheBreak().
+		Dynamic("User: {{USER}}").
+		ReplaceData("{{USER}}", "Charlie").
+		Build()
+
+	want := "System ready." + CacheBreakMarker + "User: Charlie"
+	if result != want {
+		t.Errorf("Build() = %q, want %q", result, want)
+	}
+}

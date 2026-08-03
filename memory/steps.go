@@ -34,7 +34,7 @@ func stepsToMessages(steps []sdkagent.Step) []llm.Message {
 			// Build ONE assistant message with all tool calls
 			assistantMsg := llm.Message{
 				Role:             "assistant",
-				Content:          strings.TrimRight(groupSteps[0].Thought, invisibleChars),
+				Content:          strings.TrimRight(groupSteps[0].Thought, strutil.InvisibleTrimSet),
 				ReasoningContent: groupSteps[0].ReasoningContent,
 			}
 			for _, gs := range groupSteps {
@@ -43,7 +43,7 @@ func stepsToMessages(steps []sdkagent.Step) []llm.Message {
 				}
 			}
 			// UserNudge only on last step of group (mirrors buildGroupedMessages)
-			nudge := strings.TrimRight(groupSteps[len(groupSteps)-1].UserNudge, invisibleChars)
+			nudge := strings.TrimRight(groupSteps[len(groupSteps)-1].UserNudge, strutil.InvisibleTrimSet)
 			if assistantMsg.Content == "" && len(assistantMsg.ToolCalls) == 0 {
 				if nudge == "" {
 					assistantMsg.Content = "(proceeding)"
@@ -57,7 +57,7 @@ func stepsToMessages(steps []sdkagent.Step) []llm.Message {
 			// Add individual tool result messages
 			for _, gs := range groupSteps {
 				if gs.Action.ID != "" {
-					observation := strings.TrimRight(gs.Observation, invisibleChars)
+					observation := strings.TrimRight(gs.Observation, strutil.InvisibleTrimSet)
 					if observation == "" {
 						observation = "(no output)"
 					}
@@ -78,13 +78,13 @@ func stepsToMessages(steps []sdkagent.Step) []llm.Message {
 			// Original logic for standalone steps
 			assistantMsg := llm.Message{
 				Role:             "assistant",
-				Content:          strings.TrimRight(step.Thought, invisibleChars),
+				Content:          strings.TrimRight(step.Thought, strutil.InvisibleTrimSet),
 				ReasoningContent: step.ReasoningContent,
 			}
 			if step.Action.ID != "" {
 				assistantMsg.ToolCalls = []llm.ToolCall{step.Action}
 			}
-			nudge := strings.TrimRight(step.UserNudge, invisibleChars)
+			nudge := strings.TrimRight(step.UserNudge, strutil.InvisibleTrimSet)
 			if assistantMsg.Content == "" && len(assistantMsg.ToolCalls) == 0 {
 				if nudge == "" {
 					assistantMsg.Content = "(proceeding)"
@@ -96,7 +96,7 @@ func stepsToMessages(steps []sdkagent.Step) []llm.Message {
 			}
 
 			if step.Action.ID != "" {
-				observation := strings.TrimRight(step.Observation, invisibleChars)
+				observation := strings.TrimRight(step.Observation, strutil.InvisibleTrimSet)
 				if observation == "" {
 					observation = "(no output)"
 				}
@@ -118,9 +118,8 @@ func stepsToMessages(steps []sdkagent.Step) []llm.Message {
 }
 
 // truncateToTokenBudget truncates text to fit within the token budget.
-// Uses a conservative character approximation (3 chars per token).
+// TruncateUTF8 appends "…" when truncated, followed by the summary marker.
 func truncateToTokenBudget(text string, maxTokens int) string {
-	// Conservative estimate: ~3 chars per token to leave room for encoding variance
 	maxChars := maxTokens * 3
 	if len(text) <= maxChars {
 		return text

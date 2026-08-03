@@ -126,45 +126,39 @@ The `strutil` package provides shared string helpers.
 ### TruncateUTF8
 
 ```go
-func TruncateUTF8(s string, maxBytes int) string
+func TruncateUTF8(s string, maxChars int) string
 ```
 
-`TruncateUTF8` returns `s` truncated to at most `maxBytes` bytes, respecting UTF-8 rune boundaries so the result is always valid UTF-8. If `s` is already shorter than `maxBytes` (or `maxBytes` is non-positive), `s` is returned unchanged.
+`TruncateUTF8` returns `s` truncated to at most `maxChars` runes, respecting UTF-8 boundaries so the result is always valid UTF-8. When truncation occurs, the result ends with `"…"` (U+2026) to indicate content was cut. If `s` is already `maxChars` runes or shorter, it is returned unchanged. If `maxChars` is non-positive, an empty string is returned.
 
 This is the recommended replacement for byte-slice truncation expressions like `s[:N]` when the input may contain multi-byte UTF-8 characters that the downstream consumer (LLM API, logger, frontend) expects to be valid. A naive `s[:N]` cut can split a multi-byte rune in half, producing invalid UTF-8 that causes encoding errors downstream.
 
 ```go
 // A 4-byte emoji followed by ASCII.
-s := "🎉 Hello, world!"
+s := "🎉 Hello, world!" // 13 runes
 
-// TruncateUTF8 respects rune boundaries — the result is always valid UTF-8.
+// TruncateUTF8 truncates by rune count and appends "…" when needed.
 truncated := strutil.TruncateUTF8(s, 6)
-// "🎉 H" — 4 bytes (emoji) + 1 byte (space) + 1 byte ('H') = 6 bytes.
+// "🎉 He…" — first 5 runes + "…" = 6 runes total.
 
-// When maxBytes falls inside a multi-byte rune, the cut backs up.
-// E.g. TruncateUTF8(s, 3) returns "" — a naive s[:3] would split the emoji.
-
-// No-op when the string is already short enough.
+// No-op when the string fits.
 strutil.TruncateUTF8("short", 100) // → "short"
 
-// No-op when maxBytes is non-positive.
-strutil.TruncateUTF8("anything", 0) // → "anything"
-```
-
-The implementation decrements `maxBytes` until `utf8.RuneStart(s[maxBytes])` is true, ensuring the cut never lands in the middle of a multi-byte rune.
+// Non-positive maxChars returns an empty string.
+strutil.TruncateUTF8("anything", 0) // → ""
 
 ### TruncateUTF8AtLineBoundary
 
 ```go
-func TruncateUTF8AtLineBoundary(s string, maxBytes int) string
+func TruncateUTF8AtLineBoundary(s string, maxChars int) string
 ```
 
-`TruncateUTF8AtLineBoundary` truncates `s` to at most `maxBytes` bytes using `TruncateUTF8`, then snaps the result back to the last newline so the returned string ends on a complete line. If the truncated string contains no newline, or the only newline is at index 0, the UTF-8-safe truncated value is returned unchanged.
+`TruncateUTF8AtLineBoundary` truncates `s` to at most `maxChars` runes, then rewinds to the last newline so the returned string ends on a complete line. Unlike `TruncateUTF8`, it does **not** append an ellipsis. If the truncated prefix contains no newline, or the only newline is at index 0, the raw truncation to `maxChars` runes is returned unchanged.
 
 Use this when downstream consumers expect line-oriented output (e.g. log lines, plan exploration summaries) and a cut mid-line would be confusing.
 
 ```go
-// Truncate to ~4000 bytes, ending on a line boundary.
+// Truncate to ~4000 runes, ending on a line boundary.
 summary := strutil.TruncateUTF8AtLineBoundary(longText, 4000)
 ```
 
@@ -260,7 +254,8 @@ func NewMulti(roots ...string) (*Multi, error)
 r, err := ignore.NewResolver("/home/user/project")
 
 // Multi-root resolver (workspace + a separate work directory).
-m, err := ignore.NewMulti(workspace, workDir)
+// Pass a logger for debug-level diagnostics; nil suppresses.
+m, err := ignore.NewMulti(logger, workspace, workDir)
 
 // Both are usable as a tools.IgnoreChecker:
 var checker tools.IgnoreChecker = m

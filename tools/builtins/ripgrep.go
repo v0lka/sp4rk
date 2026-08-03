@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -284,6 +285,18 @@ func (t *RipgrepTool) Execute(ctx context.Context, input json.RawMessage) (tools
 		}
 	}
 
+	// Capture a scan error (e.g. a single match line exceeded the 4 MiB
+	// buffer cap) so we can surface an incompleteness marker instead of
+	// silently dropping the rest of the results.
+	lineTruncated := errors.Is(scanner.Err(), bufio.ErrTooLong)
+
+	// Drain any remaining stdout. When the scanner aborts early (ErrTooLong),
+	// rg keeps producing output into a pipe nobody reads, blocks on a full
+	// pipe buffer, and never exits — causing cmd.Wait to hang until the search
+	// timeout. Draining to EOF lets rg finish and exit promptly. When the
+	// scanner already reached EOF this is a no-op.
+	_, _ = io.Copy(io.Discard, stdout)
+
 	waitErr := cmd.Wait()
 	if waitErr != nil {
 		var exitErr *exec.ExitError
@@ -310,12 +323,18 @@ func (t *RipgrepTool) Execute(ctx context.Context, input json.RawMessage) (tools
 		if timedOut {
 			content += "\n[search timed out — results may be incomplete]"
 		}
+		if lineTruncated {
+			content += "\n[some results omitted — a line exceeded the scan buffer]"
+		}
 		return tools.ToolResult{Content: content}, nil
 	}
 
 	fmt.Fprintf(&sb, "\nFound %d matches in %d files", matchCount, len(fileSet))
 	if timedOut {
 		sb.WriteString("\n[search timed out — results may be incomplete]")
+	}
+	if lineTruncated {
+		sb.WriteString("\n[some results omitted — a line exceeded the scan buffer]")
 	}
 
 	return tools.ToolResult{Content: sb.String()}, nil

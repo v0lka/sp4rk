@@ -118,13 +118,19 @@ func isValidResponsesReasoningEffort(effort string) bool {
 	}
 }
 
+// loggerOrDefault returns l if non-nil, otherwise slog.Default().
+func loggerOrDefault(l *slog.Logger) *slog.Logger {
+	if l != nil {
+		return l
+	}
+	return slog.Default()
+}
+
 // convertToResponsesInput converts internal messages to Responses API input items.
 // logger is used for debug-level diagnostics when unknown block types are
 // encountered (nil = slog.Default()).
 func convertToResponsesInput(messages []Message, logger *slog.Logger) responses.ResponseInputParam {
-	if logger == nil {
-		logger = slog.Default()
-	}
+	logger = loggerOrDefault(logger)
 	items := make(responses.ResponseInputParam, 0, len(messages))
 	for _, msg := range messages {
 		switch msg.Role {

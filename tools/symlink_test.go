@@ -640,7 +640,7 @@ func TestDetectSymlinks_PoshExecExtractsPath(t *testing.T) {
 	dir := t.TempDir()
 	input, _ := json.Marshal(map[string]string{"command": `Get-Content ` + filepath.ToSlash(filepath.Join(dir, "file.txt"))})
 	ctx := WithWorkspacePath(context.Background(), dir)
-	inside, outside, suspicious := DetectSymlinksInToolInput(ctx, "posh_exec", input, nil)
+	inside, outside, suspicious := DetectSymlinksInToolInput(ctx, "posh_exec", input, nil, nil)
 	if suspicious {
 		t.Fatal("expected not suspicious for literal posh_exec path")
 	}
@@ -653,7 +653,7 @@ func TestDetectSymlinks_PoshExecExtractsPath(t *testing.T) {
 func TestDetectSymlinks_PoshExecSuspicious(t *testing.T) {
 	input, _ := json.Marshal(map[string]string{"command": `Get-Content $HOME/secret`})
 	ctx := context.Background()
-	_, _, suspicious := DetectSymlinksInToolInput(ctx, "posh_exec", input, nil)
+	_, _, suspicious := DetectSymlinksInToolInput(ctx, "posh_exec", input, nil, nil)
 	if !suspicious {
 		t.Fatal("expected suspicious for posh_exec $HOME expansion")
 	}
@@ -670,7 +670,7 @@ func TestDetectSymlinks_PoshExecWithSymlink(t *testing.T) {
 	input, _ := json.Marshal(map[string]string{"command": command, "working_directory": dir})
 
 	ctx := WithWorkspacePath(context.Background(), dir)
-	inside, outside, suspicious := DetectSymlinksInToolInput(ctx, "posh_exec", input, nil)
+	inside, outside, suspicious := DetectSymlinksInToolInput(ctx, "posh_exec", input, nil, nil)
 	if suspicious {
 		t.Fatal("expected not suspicious")
 	}
@@ -684,7 +684,7 @@ func TestDetectSymlinks_PoshExecWithSymlink(t *testing.T) {
 func TestDetectSymlinks_BashExecStillDispatched(t *testing.T) {
 	input, _ := json.Marshal(map[string]string{"command": "cat $HOME/file"})
 	ctx := context.Background()
-	_, _, suspicious := DetectSymlinksInToolInput(ctx, "bash_exec", input, nil)
+	_, _, suspicious := DetectSymlinksInToolInput(ctx, "bash_exec", input, nil, nil)
 	if !suspicious {
 		t.Fatal("expected bash_exec dispatch still marks $HOME suspicious")
 	}
@@ -821,7 +821,7 @@ func TestDetectSymlinks_BashExecWithSymlink(t *testing.T) {
 	input, _ := json.Marshal(map[string]string{"command": command, "working_directory": dir})
 
 	ctx := WithWorkspacePath(context.Background(), dir)
-	inside, outside, suspicious := DetectSymlinksInToolInput(ctx, "bash_exec", input, nil)
+	inside, outside, suspicious := DetectSymlinksInToolInput(ctx, "bash_exec", input, nil, nil)
 
 	if suspicious {
 		t.Fatal("expected not suspicious")
@@ -837,7 +837,7 @@ func TestDetectSymlinks_BashExecClean(t *testing.T) {
 	input, _ := json.Marshal(map[string]string{"command": command})
 
 	ctx := WithWorkspacePath(context.Background(), dir)
-	inside, outside, suspicious := DetectSymlinksInToolInput(ctx, "bash_exec", input, nil)
+	inside, outside, suspicious := DetectSymlinksInToolInput(ctx, "bash_exec", input, nil, nil)
 
 	if suspicious {
 		t.Fatal("expected not suspicious")
@@ -851,7 +851,7 @@ func TestDetectSymlinks_BashExecSuspicious(t *testing.T) {
 	input, _ := json.Marshal(map[string]string{"command": "cat $HOME/file"})
 
 	ctx := context.Background()
-	inside, outside, suspicious := DetectSymlinksInToolInput(ctx, "bash_exec", input, nil)
+	inside, outside, suspicious := DetectSymlinksInToolInput(ctx, "bash_exec", input, nil, nil)
 
 	if !suspicious {
 		t.Fatal("expected suspicious for $var expansion")
@@ -873,7 +873,7 @@ func TestDetectSymlinks_StructuredWithSymlink(t *testing.T) {
 	schema := json.RawMessage(`{"type":"object","properties":{"file_path":{"type":"string"}}}`)
 
 	ctx := WithWorkspacePath(context.Background(), dir)
-	inside, outside, suspicious := DetectSymlinksInToolInput(ctx, "write_file", input, schema)
+	inside, outside, suspicious := DetectSymlinksInToolInput(ctx, "write_file", input, schema, nil)
 
 	if suspicious {
 		t.Fatal("expected not suspicious for structured tool")
@@ -892,7 +892,7 @@ func TestDetectSymlinks_StructuredClean(t *testing.T) {
 	input, _ := json.Marshal(map[string]string{"file_path": normalPath})
 	schema := json.RawMessage(`{"type":"object","properties":{"file_path":{"type":"string"}}}`)
 	ctx := WithWorkspacePath(context.Background(), dir)
-	inside, outside, suspicious := DetectSymlinksInToolInput(ctx, "read_file", input, schema)
+	inside, outside, suspicious := DetectSymlinksInToolInput(ctx, "read_file", input, schema, nil)
 
 	if suspicious {
 		t.Fatal("expected not suspicious")
@@ -1333,7 +1333,7 @@ func TestDetectSymlinks_AllowedRootClassifiedInside(t *testing.T) {
 	// With the allowed root in context, the traversal is 'inside'.
 	ctx := WithWorkspacePath(context.Background(), ws)
 	ctx = WithAllowedRoots(ctx, []string{auxRoot})
-	inside, outside, suspicious := DetectSymlinksInToolInput(ctx, "write_file", input, schema)
+	inside, outside, suspicious := DetectSymlinksInToolInput(ctx, "write_file", input, schema, nil)
 	if suspicious {
 		t.Fatal("expected not suspicious")
 	}
@@ -1464,7 +1464,7 @@ func TestDetectSymlinks_FieldAwareExcludesContent(t *testing.T) {
 			"old_string": "x",
 			"new_string": "y",
 		})
-		_, outsideTrav, _ := DetectSymlinksInToolInput(ctx, "edit_file", input, editSchema)
+		_, outsideTrav, _ := DetectSymlinksInToolInput(ctx, "edit_file", input, editSchema, nil)
 		if len(outsideTrav) == 0 {
 			t.Fatal("expected symlink escape detected via 'path' field")
 		}
@@ -1478,7 +1478,7 @@ func TestDetectSymlinks_FieldAwareExcludesContent(t *testing.T) {
 			"old_string": "// see " + pathThroughLink + " for details",
 			"new_string": "y",
 		})
-		insideTrav, outsideTrav, _ := DetectSymlinksInToolInput(ctx, "edit_file", input, editSchema)
+		insideTrav, outsideTrav, _ := DetectSymlinksInToolInput(ctx, "edit_file", input, editSchema, nil)
 		if len(insideTrav)+len(outsideTrav) != 0 {
 			t.Fatalf("expected content field (old_string) NOT scanned, got inside=%v outside=%v", insideTrav, outsideTrav)
 		}
@@ -1500,7 +1500,7 @@ func TestDetectSymlinks_NoPathFieldFallsBack(t *testing.T) {
 	input, _ := json.Marshal(map[string]string{"payload": filepath.Join(link, "f.txt")})
 	ctx := WithWorkspacePath(context.Background(), ws)
 
-	insideTrav, _, _ := DetectSymlinksInToolInput(ctx, "some_tool", input, schema)
+	insideTrav, _, _ := DetectSymlinksInToolInput(ctx, "some_tool", input, schema, nil)
 	if len(insideTrav) == 0 {
 		t.Fatal("expected fallback scan to detect the symlink inside the workspace")
 	}
@@ -1541,7 +1541,7 @@ func TestDetectSymlinks_MixedFieldsLogsOmission(t *testing.T) {
 	})
 	ctx := WithWorkspacePath(context.Background(), ws)
 
-	_, outsideTrav, _ := DetectSymlinksInToolInput(ctx, "some_tool", input, schema)
+	_, outsideTrav, _ := DetectSymlinksInToolInput(ctx, "some_tool", input, schema, nil)
 	// Only the recognized field is scanned, so exactly one traversal (the path
 	// through `linkInWS/a.txt`); the `target` value is dropped, not scanned.
 	if len(outsideTrav) != 1 {

@@ -117,16 +117,31 @@ var googleFinishReasonMap = map[string]string{
 // Gemma) served by an OpenAI-compatible gateway (e.g. Zen) that reuses the same
 // baseURL/apiKey/httpClient as the OpenAI provider.
 //
-// baseURL is the provider's configured base URL; the endpoint becomes
-// "{baseURL}/models/{model}:generateContent". apiKey is sent as the "?key="
+// cfg.BaseURL is the provider's configured base URL; the endpoint becomes
+// "{baseURL}/models/{model}:generateContent". cfg.APIKey is sent as the "?key="
 // query parameter rather than the x-goog-api-key header, because ?key= is the
-// most broadly supported auth form across Google-compatible gateways; see the
-// inline note at the request site for the logging redaction it implies.
-// providerName is used to attribute errors. httpClient may be nil
+// most broadly supported auth form across Google-compatible gateways.
+
+// googleCompletionConfig groups parameters for the internal googleCompletion
+// function to prevent accidental positional argument swaps (e.g. baseURL ↔ apiKey).
+type googleCompletionConfig struct {
+	HTTPClient   *http.Client
+	BaseURL      string
+	APIKey       string
+	ProviderName string
+}
+
+// googleCompletion calls the Google Generative Language API (Gemini) and
+// returns a unified ChatResponse.
+// cfg.ProviderName is used to attribute errors. cfg.HTTPClient may be nil
 // (→ http.DefaultClient).
-func googleCompletion(ctx context.Context, httpClient *http.Client, baseURL, apiKey, providerName string, req ChatRequest) (*ChatResponse, error) {
-	// Validate image blocks up front so a missing MediaType/ImageB64 yields a
-	// clear local error instead of an opaque API 400.
+func googleCompletion(ctx context.Context, cfg googleCompletionConfig, req ChatRequest) (*ChatResponse, error) {
+	httpClient := cfg.HTTPClient
+	if httpClient == nil {
+		httpClient = http.DefaultClient
+	}
+	providerName := cfg.ProviderName
+	baseURL := cfg.BaseURL
 	for _, msg := range req.Messages {
 		if err := ValidateContentBlocks(msg.ContentBlocks); err != nil {
 			return nil, fmt.Errorf("%s: %w", providerName, err)
@@ -147,7 +162,7 @@ func googleCompletion(ctx context.Context, httpClient *http.Client, baseURL, api
 		return nil, fmt.Errorf("%s: failed to build google request: %w", providerName, err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	if apiKey != "" {
+	if cfg.APIKey != "" {
 		// The API key is sent as the ?key= query parameter rather than the
 		// x-goog-api-key header. Both are documented Google auth forms, but
 		// ?key= is the most broadly supported across Google-compatible gateways
@@ -156,16 +171,11 @@ func googleCompletion(ctx context.Context, httpClient *http.Client, baseURL, api
 		// access logs — any URL logging in this layer or upstream MUST redact
 		// RawQuery and never log the full request URL verbatim.
 		q := httpReq.URL.Query()
-		q.Set("key", apiKey)
+		q.Set("key", cfg.APIKey)
 		httpReq.URL.RawQuery = q.Encode()
 	}
 
-	client := httpClient
-	if client == nil {
-		client = http.DefaultClient
-	}
-
-	resp, err := client.Do(httpReq)
+	resp, err := httpClient.Do(httpReq)
 	if err != nil {
 		return nil, WrapProviderError(providerName, 0, err)
 	}

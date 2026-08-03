@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/v0lka/sp4rk/strutil"
 )
 
 // Message — unit of communication with LLM (system/user/assistant/tool).
@@ -140,9 +142,9 @@ type TokenUsage struct {
 
 // normalizeResponse trims trailing whitespace from content and reasoning fields.
 func normalizeResponse(resp *ChatResponse) {
-	resp.Message.Content = strings.TrimRight(resp.Message.Content, " \t\n\r\f\v")
-	resp.Message.ReasoningContent = strings.TrimRight(resp.Message.ReasoningContent, " \t\n\r\f\v")
-	resp.Reasoning = strings.TrimRight(resp.Reasoning, " \t\n\r\f\v")
+	resp.Message.Content = strings.TrimRight(resp.Message.Content, strutil.InvisibleTrimSet)
+	resp.Message.ReasoningContent = strings.TrimRight(resp.Message.ReasoningContent, strutil.InvisibleTrimSet)
+	resp.Reasoning = strings.TrimRight(resp.Reasoning, strutil.InvisibleTrimSet)
 }
 
 // ToolDefinition — tool description for LLM (JSON Schema).

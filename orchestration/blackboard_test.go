@@ -71,11 +71,11 @@ func TestBlackboard_StepResult_SummaryTruncation500(t *testing.T) {
 	bb.SetStepResult("s1", longOutput, nil, nil)
 
 	r, _ := bb.GetStepResult("s1")
-	if len(r.Summary) != 503 { // 500 + "..."
-		t.Fatalf("expected summary length 503, got %d", len(r.Summary))
+	if len(r.Summary) != 502 { // 500 runes: 499 'x' + "…" (3 bytes) = 502 bytes
+		t.Fatalf("expected summary length 502, got %d", len(r.Summary))
 	}
-	if !strings.HasSuffix(r.Summary, "...") {
-		t.Fatalf("expected summary to end with '...', got %q", r.Summary[len(r.Summary)-5:])
+	if !strings.HasSuffix(r.Summary, "…") {
+		t.Fatalf("expected summary to end with '…', got %q", r.Summary[len(r.Summary)-5:])
 	}
 }
 

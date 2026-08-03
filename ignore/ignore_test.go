@@ -328,7 +328,7 @@ func TestMulti_RootForSelectsContainingRoot(t *testing.T) {
 	touchFile(t, alpha, "x.alpha")
 	touchFile(t, beta, "y.beta")
 
-	m, err := NewMulti(alpha, beta)
+	m, err := NewMulti(nil, alpha, beta)
 	if err != nil {
 		t.Fatalf("NewMulti: %v", err)
 	}
@@ -352,7 +352,7 @@ func TestMulti_RootForSelectsContainingRoot(t *testing.T) {
 func TestMulti_IgnoredFalseOutsideAllRoots(t *testing.T) {
 	alpha := t.TempDir()
 	writeFile(t, alpha, ".gitignore", "*.log\n")
-	m, err := NewMulti(alpha)
+	m, err := NewMulti(nil, alpha)
 	if err != nil {
 		t.Fatalf("NewMulti: %v", err)
 	}
@@ -373,7 +373,7 @@ func TestMulti_BothImplementIgnoreChecker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewResolver: %v", err)
 	}
-	m, err := NewMulti(root)
+	m, err := NewMulti(nil, root)
 	if err != nil {
 		t.Fatalf("NewMulti: %v", err)
 	}
@@ -388,7 +388,7 @@ func TestMulti_BothImplementIgnoreChecker(t *testing.T) {
 }
 
 func TestNewMulti_RequiresAtLeastOneRoot(t *testing.T) {
-	if _, err := NewMulti(); err == nil {
+	if _, err := NewMulti(nil); err == nil {
 		t.Fatal("NewMulti() should error without roots")
 	}
 }
@@ -627,7 +627,7 @@ func TestMulti_IgnoredByAIIgnore(t *testing.T) {
 	touchFile(t, beta, "priv.key")
 	touchFile(t, alpha, "app.log")
 
-	m, err := NewMulti(alpha, beta)
+	m, err := NewMulti(nil, alpha, beta)
 	if err != nil {
 		t.Fatalf("NewMulti: %v", err)
 	}
@@ -678,13 +678,13 @@ func TestNewMultiFromResolvers(t *testing.T) {
 	}
 
 	// Empty input → nil.
-	if m := NewMultiFromResolvers(); m != nil {
+	if m := NewMultiFromResolvers(nil); m != nil {
 		t.Fatalf("NewMultiFromResolvers() = %v, want nil", m)
 	}
 
-	m := NewMultiFromResolvers(ra)
+	m := NewMultiFromResolvers(nil, ra)
 	if m == nil {
-		t.Fatalf("NewMultiFromResolvers(ra) = nil, want non-nil")
+		t.Fatalf("NewMultiFromResolvers(nil, ra) = nil, want non-nil")
 	}
 	assertIgnored(t, m, joinRel(a, "x.secret"), false)
 }

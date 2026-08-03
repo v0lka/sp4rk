@@ -45,10 +45,11 @@ type SymlinkTraversal struct {
 // working_directory, dest; or suffixes _path, _dir, _file, _filepath, _root.
 // When a schema declares a recognized path field alongside other string-typed
 // fields whose names do NOT follow the convention, those non-path fields are
-// excluded from scanning and the omission is logged (slog.Default, Warn level)
-// so it is observable rather than silent. To ensure a path-carrying parameter
-// is scanned, name it with one of the recognized names or suffixes.
-func DetectSymlinksInToolInput(ctx context.Context, toolName string, input, schema json.RawMessage) (
+// excluded from scanning and the omission is logged via logger (Warn level)
+// so it is observable rather than silent. If logger is nil, slog.Default()
+// is used. To ensure a path-carrying parameter is scanned, name it with one
+// of the recognized names or suffixes.
+func DetectSymlinksInToolInput(ctx context.Context, toolName string, input, schema json.RawMessage, logger *slog.Logger) (
 	inside []SymlinkTraversal,
 	outside []SymlinkTraversal,
 	suspicious bool,
@@ -79,7 +80,11 @@ func DetectSymlinksInToolInput(ctx context.Context, toolName string, input, sche
 			// non-conventional name and will NOT be scanned. Log the omission
 			// so it is observable rather than silent; detection does not
 			// escalate on those fields.
-			slog.Warn("symlink detection narrowed by path-field allowlist; non-path string fields not scanned",
+			l := logger
+			if l == nil {
+				l = slog.Default()
+			}
+			l.Warn("symlink detection narrowed by path-field allowlist; non-path string fields not scanned",
 				"tool", toolName,
 				"scanned_path_fields", sortedFieldNames(pathFields),
 				"unscanned_string_fields", others)

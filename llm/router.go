@@ -318,10 +318,17 @@ func (r *Router) prepareRequest(ctx context.Context, req *ChatRequest, bareModel
 	// custom model), this also avoids repeated HuggingFace probes — previously
 	// each of protocol/family/context-window resolution issued its own Resolve.
 	var meta ModelMetadata
+	var ok bool
 	if r.registry != nil {
-		meta, _ = r.registry.Resolve(ctx, req.Model)
+		meta, ok = r.registry.Resolve(ctx, req.Model)
+		if !ok && r.logger != nil {
+			r.logger.Debug("router: model not found in registry", "model", req.Model)
+		}
 		if req.Protocol == "" {
 			req.Protocol = meta.Protocol
+		}
+		if req.ModelFamily == "" {
+			req.ModelFamily = meta.Family
 		}
 	}
 

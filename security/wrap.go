@@ -54,7 +54,7 @@ func WrapUntrustedContent(content, source string, metadata map[string]string) st
 	// with metadata value escaping below. Using %q alone produces Go-style
 	// \" escaping which is invalid in XML and can break attribute parsing.
 	escapedSource := strings.ReplaceAll(source, `"`, "&quot;")
-	fmt.Fprintf(&attrs, "source=%q", escapedSource)
+	fmt.Fprintf(&attrs, "source=\"%s\"", escapedSource)
 	// Sort metadata keys for deterministic attribute ordering.
 	keys := make([]string, 0, len(metadata))
 	for key := range metadata {
@@ -69,7 +69,7 @@ func WrapUntrustedContent(content, source string, metadata map[string]string) st
 			continue
 		}
 		escaped := strings.ReplaceAll(metadata[key], `"`, "&quot;")
-		fmt.Fprintf(&attrs, " %s=%q", key, escaped)
+		fmt.Fprintf(&attrs, " %s=\"%s\"", key, escaped)
 	}
 
 	return fmt.Sprintf("<%s %s>\n%s\n</%s>", UntrustedTag, attrs.String(), sanitized, UntrustedTag)

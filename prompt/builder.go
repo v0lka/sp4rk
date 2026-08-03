@@ -25,6 +25,9 @@ func SplitCacheBreak(systemPrompt string) []string {
 			result = append(result, p)
 		}
 	}
+	if len(result) == 0 {
+		return nil
+	}
 	return result
 }
 
@@ -235,12 +238,25 @@ func (s *SystemPromptBuilder) Replace(placeholder, value string) *SystemPromptBu
 	return s
 }
 
+// ReplaceAll registers multiple placeholder substitutions.
+func (s *SystemPromptBuilder) ReplaceAll(substitutions map[string]string) *SystemPromptBuilder {
+	s.b.ReplaceAll(substitutions)
+	return s
+}
+
 // ReplaceData registers a placeholder substitution for UNTRUSTED values.
 // Data substitutions are applied last in a single pass without re-scanning,
 // so placeholder names inside untrusted values are never expanded.
 // See Builder.ReplaceData.
 func (s *SystemPromptBuilder) ReplaceData(placeholder, value string) *SystemPromptBuilder {
 	s.b.ReplaceData(placeholder, value)
+	return s
+}
+
+// ReplaceDataAll registers multiple untrusted-value substitutions.
+// See Builder.ReplaceData.
+func (s *SystemPromptBuilder) ReplaceDataAll(substitutions map[string]string) *SystemPromptBuilder {
+	s.b.ReplaceDataAll(substitutions)
 	return s
 }
 

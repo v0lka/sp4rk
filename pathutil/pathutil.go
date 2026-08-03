@@ -14,6 +14,10 @@ import (
 // (ResolveExistingPrefix) to handle OS-level symlinks like macOS
 // /var → /private/var even when paths don't exist on disk.
 //
+// Both parent and child must be absolute paths. Passing a relative path
+// produces undefined results; callers must resolve paths to absolute form
+// before calling this function.
+//
 // The comparison is case-SENSITIVE. Use [IsWithinPathFold] for the
 // case-insensitive variant required by path-locality decisions on
 // case-insensitive filesystems (the default on macOS and Windows), where
@@ -32,6 +36,10 @@ func IsWithinPath(parent, child string) (bool, error) {
 // filesystems — the default on macOS (APFS) and Windows (NTFS) — where a path
 // written with different casing than the session root still resolves to the
 // same on-disk location.
+//
+// Both parent and child must be absolute paths. Passing a relative path
+// produces undefined results; callers must resolve paths to absolute form
+// before calling this function.
 //
 // This is the primitive consulted by tool-argument path-locality checks
 // (judge fast-path auto-approval, file-tool judges, symlink inside/outside
@@ -177,15 +185,14 @@ func probeCaseInsensitive(dir string) bool {
 	if err != nil {
 		return false
 	}
-	name := filepath.Base(f.Name())
+	defer func() { _ = os.Remove(f.Name()) }()
 	if err := f.Close(); err != nil {
-		_ = os.Remove(name)
 		return false
 	}
-	defer func() { _ = os.Remove(f.Name()) }()
 
 	// The "CaseSense-" prefix guarantees an upper-case letter, so the
 	// lower-cased name always differs and the test is meaningful.
+	name := filepath.Base(f.Name())
 	flipped := strings.ToLower(name)
 	if flipped == name {
 		flipped = strings.ToUpper(name)

@@ -698,46 +698,17 @@ func TestEmbedder_EmbedDocuments_CancelledContext_EmptyTexts(t *testing.T) {
 
 func TestTokenizer_EncodeBatch_MultipleTexts_MaxLenZero(t *testing.T) {
 	tok := &Tokenizer{inner: nil}
-	ids, mask, typeIDs := tok.EncodeBatch([]string{"hello", "world"}, 0)
-
-	// batchSize=2, maxLen=0, totalLen=0
-	if len(ids) != 0 {
-		t.Errorf("inputIDs length = %d, want 0", len(ids))
-	}
-	if len(mask) != 0 {
-		t.Errorf("attentionMask length = %d, want 0", len(mask))
-	}
-	if len(typeIDs) != 0 {
-		t.Errorf("tokenTypeIDs length = %d, want 0", len(typeIDs))
+	_, _, _, err := tok.EncodeBatch([]string{"hello", "world"}, 0)
+	if err == nil {
+		t.Error("expected error for EncodeBatch with maxLen=0 and non-empty texts")
 	}
 }
 
 func TestTokenizer_EncodeBatch_MultipleTexts_MaxLenOne(t *testing.T) {
 	tok := &Tokenizer{inner: nil}
-	ids, mask, typeIDs := tok.EncodeBatch([]string{"a", "b", "c"}, 1)
-
-	// batchSize=3, maxLen=1, totalLen=3 — but Encode returns nil for maxLen<2,
-	// so copy(nil, nil) is a no-op, leaving zero slices.
-	if len(ids) != 3 {
-		t.Errorf("inputIDs length = %d, want 3", len(ids))
-	}
-	if len(mask) != 3 {
-		t.Errorf("attentionMask length = %d, want 3", len(mask))
-	}
-	if len(typeIDs) != 3 {
-		t.Errorf("tokenTypeIDs length = %d, want 3", len(typeIDs))
-	}
-	// All values should be 0 (copy from nil slices)
-	for i := 0; i < 3; i++ {
-		if ids[i] != 0 {
-			t.Errorf("inputIDs[%d] = %d, want 0", i, ids[i])
-		}
-		if mask[i] != 0 {
-			t.Errorf("attentionMask[%d] = %d, want 0", i, mask[i])
-		}
-		if typeIDs[i] != 0 {
-			t.Errorf("tokenTypeIDs[%d] = %d, want 0", i, typeIDs[i])
-		}
+	_, _, _, err := tok.EncodeBatch([]string{"a", "b", "c"}, 1)
+	if err == nil {
+		t.Error("expected error for EncodeBatch with maxLen=1 and non-empty texts")
 	}
 }
 

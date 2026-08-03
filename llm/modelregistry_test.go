@@ -607,6 +607,33 @@ func TestModelRegistry_PartialOverrideInheritsBuiltinCapabilities(t *testing.T) 
 	}
 }
 
+// TestModelRegistry_PartialOverrideCatalogMissKeepsOptimisticCapabilities is the
+// regression test for the catalog-MISS counterpart of the capabilities footgun.
+// A protocol-only partial override for a model absent from every non-network
+// tier (not in the built-in catalog, not in the cache) must still inherit the
+// optimistic fallback Capabilities (Attachment=true), exactly as a no-override
+// Resolve of the same unknown model would (tier-5 fallback). Previously
+// resolveBuiltinOrCache's fallback returned a zero-value Capabilities, so the
+// override silently disabled image uploads for local models that c0wrk's
+// auto-remap targets (e.g. Gemma checkpoints served by LM Studio/vLLM).
+func TestModelRegistry_PartialOverrideCatalogMissKeepsOptimisticCapabilities(t *testing.T) {
+	registry := NewModelRegistry(map[string]ModelMetadata{
+		// Catalog-miss: no built-in entry, no seeded cache.
+		"totally-unknown-local-checkpoint": {Protocol: ProtocolChatCompletions},
+	})
+
+	meta, ok := registry.Resolve(context.Background(), "totally-unknown-local-checkpoint")
+	if !ok {
+		t.Fatal("expected ok=true for overridden model")
+	}
+	if !meta.Capabilities.Attachment {
+		t.Errorf("catalog-miss partial override disabled Attachment; got %+v (want optimistic Attachment=true like the no-override fallback)", meta.Capabilities)
+	}
+	if meta.Protocol != ProtocolChatCompletions {
+		t.Errorf("Protocol = %q, want %q (override authoritative)", meta.Protocol, ProtocolChatCompletions)
+	}
+}
+
 // TestModelRegistry_FullySpecifiedOverrideNotEnriched guards that a fully
 // specified override (all three scalar fields AND Capabilities set) is returned
 // verbatim and is never silently merged with lower-tier data — the prior

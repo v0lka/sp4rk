@@ -136,6 +136,8 @@ var languageMap = map[string]string{
 	".sql": "sql", ".sh": "shell", ".bash": "shell", ".dockerfile": "dockerfile",
 }
 
+// detectLanguage maps a file extension to a human-readable language name
+// for inclusion in chunk metadata.
 func detectLanguage(ext string) string {
 	if lang, ok := languageMap[ext]; ok {
 		return lang
@@ -143,6 +145,7 @@ func detectLanguage(ext string) string {
 	return "text"
 }
 
+// classifyFile categorizes a file by extension into code, markdown, config, or other.
 func classifyFile(ext string) fileType {
 	if ext == ".md" || ext == ".mdx" {
 		return fileTypeMarkdown
@@ -204,6 +207,8 @@ func splitBySingleBlanks(p piece, _ ChunkerConfig) []piece {
 	return parts
 }
 
+// splitOversized recursively splits any piece whose rune count exceeds MaxChunkSize,
+// using the provided splitter function.
 func splitOversized(parts []piece, cfg ChunkerConfig, splitter func(piece, ChunkerConfig) []piece) []piece {
 	var result []piece
 	for _, p := range parts {
@@ -341,8 +346,10 @@ func chunkConfig(text, ext string, cfg ChunkerConfig) []section {
 	return piecesToSections(pieces)
 }
 
-var jsonTopLevelKeyRe = regexp.MustCompile(`^ {2}"([^"]+)"\s*:`)
+var jsonTopLevelKeyRe = regexp.MustCompile(`^\s+"([^"]+)"\s*:`)
 
+// splitJSONTopLevel splits JSON text on top-level key boundaries.
+// It matches lines of the form `  "key":` and starts a new section at each match.
 func splitJSONTopLevel(text string) []string {
 	lines := strings.Split(text, "\n")
 	var parts []string
@@ -363,6 +370,7 @@ func splitJSONTopLevel(text string) []string {
 
 var yamlTopLevelKeyRe = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_\-]*\s*:`)
 
+// splitYAMLTopLevel splits YAML text on top-level key boundaries (unindented keys).
 func splitYAMLTopLevel(text string) []string {
 	lines := strings.Split(text, "\n")
 	var parts []string
@@ -381,6 +389,7 @@ func splitYAMLTopLevel(text string) []string {
 	return parts
 }
 
+// splitGenericConfig splits generic config text on top-level (unindented) key boundaries.
 func splitGenericConfig(text string) []string {
 	lines := strings.Split(text, "\n")
 	var parts []string
@@ -403,6 +412,7 @@ func splitGenericConfig(text string) []string {
 }
 
 // fixedSizeSplit splits text into fixed-size chunks with overlap.
+// Used as a fallback for unrecognized file types.
 func fixedSizeSplit(text string, cfg ChunkerConfig) []section {
 	parts := fixedSizePieces(piece{text: text, startLine: 1}, cfg)
 	return piecesToSections(parts)

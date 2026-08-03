@@ -824,10 +824,10 @@ defer bb.Shutdown()
 ### StepDumpTracker
 
 ```go
-func NewStepDumpTracker(dir string) *StepDumpTracker
+func NewStepDumpTracker(dir string, logger *slog.Logger) *StepDumpTracker
 ```
 
-A best-effort manager for **per-step LLM dump files**, used when the conductor records each plan step's LLM traffic to its own file for offline debugging. Pass a directory; `NewStepDumpTracker` creates it (logging a warning, not returning an error, on failure). Pass an empty `dir` to disable the tracker.
+A best-effort manager for **per-step LLM dump files**, used when the conductor records each plan step's LLM traffic to its own file for offline debugging. Pass a directory and a logger (must not be nil); `NewStepDumpTracker` creates the directory (logging a warning on failure, but not returning an error — dumps are best-effort debugging aids). Pass an empty `dir` to disable the tracker.
 
 ```go
 type StepDumpTracker struct{ /* unexported */ }

@@ -13,7 +13,7 @@ func FindReadySteps(plan *Plan, completed map[string]CompletedStep) []PlanStep {
 	if plan == nil {
 		return nil
 	}
-	ready := []PlanStep{}
+	var ready []PlanStep
 	for _, step := range plan.Steps {
 		// Skip if already completed
 		if _, done := completed[step.ID]; done {

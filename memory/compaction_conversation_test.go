@@ -3,6 +3,7 @@ package memory
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/v0lka/sp4rk/llm"
 )
@@ -240,10 +241,11 @@ func TestTruncateSummaryContent(t *testing.T) {
 	}
 
 	long := truncateSummaryContent("This is a very long text that should be truncated at some point", 30)
-	if len(long) > 30 {
-		t.Errorf("expected truncated text <= 30 chars, got %d: %q", len(long), long)
+	if utf8.RuneCountInString(long) > 30 {
+		t.Errorf("expected truncated text <= 30 runes, got %d runes, %d bytes: %q",
+			utf8.RuneCountInString(long), len(long), long)
 	}
-	if !strings.HasSuffix(long, "...") {
-		t.Errorf("expected truncated text to end with '...', got: %q", long)
+	if !strings.HasSuffix(long, "…") {
+		t.Errorf("expected truncated text to end with '…', got: %q", long)
 	}
 }

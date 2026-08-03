@@ -38,7 +38,6 @@ type Server struct {
 	name          string
 	client        *mcpclient.Client
 	tools         []ToolInfo
-	connected     bool
 	lastError     string
 	transportType string
 	logger        *slog.Logger
@@ -104,7 +103,6 @@ func (s *Server) Connect(ctx context.Context, cfg ServerConfig) error {
 
 	s.client = client
 	s.transportType = transportType
-	s.connected = true
 	s.lastError = ""
 	s.log().Debug("MCP server connected", "server", s.name, "transport", transportType)
 	return nil
@@ -322,7 +320,6 @@ func (s *Server) Close() error {
 	err := s.client.Close()
 	s.client = nil
 	s.tools = nil
-	s.connected = false
 	if err != nil {
 		s.lastError = err.Error()
 	}
@@ -350,7 +347,7 @@ func (s *Server) Status() ServerStatus {
 	return ServerStatus{
 		Name:      s.name,
 		Transport: s.transportType,
-		Connected: s.connected,
+		Connected: s.client != nil,
 		ToolCount: len(s.tools),
 		Tools:     toolNames,
 		Error:     s.lastError,

@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -340,12 +341,14 @@ func analyze(line string) (anchored, dirOnly bool, core string) {
 // answers ignore queries by delegating to whichever root contains the path.
 type Multi struct {
 	resolvers []*Resolver
+	logger    *slog.Logger
 }
 
 // NewMulti builds a Resolver for each root and returns a Multi over them.
 // Roots may be absolute or relative; each is resolved to an absolute path.
-// A failure building any resolver returns a wrapping error.
-func NewMulti(roots ...string) (*Multi, error) {
+// A failure building any resolver returns a wrapping error. logger is used
+// for debug-level diagnostics; pass nil to suppress.
+func NewMulti(logger *slog.Logger, roots ...string) (*Multi, error) {
 	if len(roots) == 0 {
 		return nil, errors.New("ignore: NewMulti requires at least one root")
 	}
@@ -357,7 +360,7 @@ func NewMulti(roots ...string) (*Multi, error) {
 		}
 		resolvers = append(resolvers, r)
 	}
-	return &Multi{resolvers: resolvers}, nil
+	return &Multi{resolvers: resolvers, logger: logger}, nil
 }
 
 // NewMultiFromResolvers wraps pre-built resolvers into a Multi without
@@ -365,18 +368,21 @@ func NewMulti(roots ...string) (*Multi, error) {
 // handling — building each Resolver individually and skipping (rather than
 // failing the whole workspace on) roots whose resolver could not be built
 // (e.g. a vanished or unreadable work directory) — instead of the
-// all-or-nothing failure of NewMulti. Returns nil when no resolvers are
-// supplied.
-//
-// The input slice is referenced (not copied): callers must not mutate it after
-// the call, and must not pass nil resolvers. The natural pattern of appending
-// only successfully-built resolvers satisfies both. For a defensive copy with
-// nil filtering, build the slice and pass it through NewMulti's per-root path.
-func NewMultiFromResolvers(resolvers ...*Resolver) *Multi {
-	if len(resolvers) == 0 {
+// all-or-nothing failure of NewMulti. Returns nil when no non-nil resolvers
+// are supplied (nil entries are silently filtered). logger is used for
+// debug-level diagnostics; pass nil to suppress.
+func NewMultiFromResolvers(logger *slog.Logger, resolvers ...*Resolver) *Multi {
+	// Filter nil entries so callers can append without nil-guarding.
+	filtered := make([]*Resolver, 0, len(resolvers))
+	for _, r := range resolvers {
+		if r != nil {
+			filtered = append(filtered, r)
+		}
+	}
+	if len(filtered) == 0 {
 		return nil
 	}
-	return &Multi{resolvers: resolvers}
+	return &Multi{resolvers: filtered, logger: logger}
 }
 
 // Resolvers returns the per-root resolvers. The returned slice is a copy; it
@@ -403,6 +409,10 @@ func (m *Multi) RootFor(absPath string) *Resolver {
 			ok, err = pathutil.IsWithinPath(r.root, absPath)
 		}
 		if err != nil {
+			if m.logger != nil {
+				m.logger.Debug("ignore: RootFor containment check failed, skipping resolver",
+					"root", r.root, "path", absPath, "error", err)
+			}
 			continue
 		}
 		if ok {

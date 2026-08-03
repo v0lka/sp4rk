@@ -135,7 +135,7 @@ func validateSkill(skill *Skill, dirPath string) error {
 
 	// Name format: lowercase alphanumeric + hyphens, no leading/trailing/consecutive hyphens
 	if !skillNamePattern.MatchString(skill.Metadata.Name) {
-		return fmt.Errorf("name %q must be lowercase alphanumeric with hyphens, no leading/trailing/consecutive hyphens", skill.Metadata.Name)
+		return fmt.Errorf("name %q must be lowercase alphanumeric with hyphens, no leading/trailing hyphens", skill.Metadata.Name)
 	}
 
 	// Name must match parent directory name

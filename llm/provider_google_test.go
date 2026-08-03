@@ -33,7 +33,7 @@ func TestGoogleCompletion_TextResponse(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	resp, err := googleCompletion(context.Background(), srv.Client(), srv.URL, "secret-key", "Zen", ChatRequest{
+	resp, err := googleCompletion(context.Background(), googleCompletionConfig{HTTPClient: srv.Client(), BaseURL: srv.URL, APIKey: "secret-key", ProviderName: "Zen"}, ChatRequest{
 		Model:     "gemini-1.5-pro",
 		MaxTokens: 100,
 		Messages:  []Message{{Role: "user", Content: "hi"}},
@@ -105,7 +105,7 @@ func TestGoogleCompletion_SystemInstruction(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	_, err := googleCompletion(context.Background(), srv.Client(), srv.URL, "k", "Zen", ChatRequest{
+	_, err := googleCompletion(context.Background(), googleCompletionConfig{HTTPClient: srv.Client(), BaseURL: srv.URL, APIKey: "k", ProviderName: "Zen"}, ChatRequest{
 		Model: "gemini-1.5-pro",
 		Messages: []Message{
 			{Role: "system", Content: "you are helpful"},
@@ -147,7 +147,7 @@ func TestGoogleCompletion_ToolCallResponse(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	resp, err := googleCompletion(context.Background(), srv.Client(), srv.URL, "k", "Zen", ChatRequest{
+	resp, err := googleCompletion(context.Background(), googleCompletionConfig{HTTPClient: srv.Client(), BaseURL: srv.URL, APIKey: "k", ProviderName: "Zen"}, ChatRequest{
 		Model:    "gemini-1.5-pro",
 		Messages: []Message{{Role: "user", Content: "weather in London?"}},
 	})
@@ -188,7 +188,7 @@ func TestGoogleCompletion_ToolResultUsesFunctionName(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	_, err := googleCompletion(context.Background(), srv.Client(), srv.URL, "k", "Zen", ChatRequest{
+	_, err := googleCompletion(context.Background(), googleCompletionConfig{HTTPClient: srv.Client(), BaseURL: srv.URL, APIKey: "k", ProviderName: "Zen"}, ChatRequest{
 		Model: "gemini-1.5-pro",
 		Messages: []Message{
 			{Role: "user", Content: "weather in London?"},
@@ -258,7 +258,7 @@ func TestGoogleCompletion_ToolsDeclared(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	_, err := googleCompletion(context.Background(), srv.Client(), srv.URL, "k", "Zen", ChatRequest{
+	_, err := googleCompletion(context.Background(), googleCompletionConfig{HTTPClient: srv.Client(), BaseURL: srv.URL, APIKey: "k", ProviderName: "Zen"}, ChatRequest{
 		Model:    "gemini-1.5-pro",
 		Messages: []Message{{Role: "user", Content: "hi"}},
 		Tools: []ToolDefinition{{
@@ -308,7 +308,7 @@ func TestGoogleCompletion_ErrorWrappedWithProviderName(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	_, err := googleCompletion(context.Background(), srv.Client(), srv.URL, "k", "Zen", ChatRequest{
+	_, err := googleCompletion(context.Background(), googleCompletionConfig{HTTPClient: srv.Client(), BaseURL: srv.URL, APIKey: "k", ProviderName: "Zen"}, ChatRequest{
 		Model:    "gemini-1.5-pro",
 		Messages: []Message{{Role: "user", Content: "hi"}},
 	})
@@ -338,7 +338,7 @@ func TestGoogleCompletion_EmptyCandidatesReturnsError(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	_, err := googleCompletion(context.Background(), srv.Client(), srv.URL, "k", "Zen", ChatRequest{
+	_, err := googleCompletion(context.Background(), googleCompletionConfig{HTTPClient: srv.Client(), BaseURL: srv.URL, APIKey: "k", ProviderName: "Zen"}, ChatRequest{
 		Model:    "gemini-1.5-pro",
 		Messages: []Message{{Role: "user", Content: "hi"}},
 	})
