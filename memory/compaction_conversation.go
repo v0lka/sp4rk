@@ -104,7 +104,11 @@ func compactConversationHistory(messages []llm.Message, budgetTokens int, tokenC
 		if half == 0 {
 			break // summary is too short to truncate further
 		}
-		summary = strutil.TruncateUTF8(summary, half)
+		truncated := strutil.TruncateUTF8(summary, half)
+		if truncated == summary {
+			break // no further progress possible (byte-halving converged on rune boundary)
+		}
+		summary = truncated
 		result[0].Content = summary
 		resultTokens = tokenCounter.CountMessages(result)
 	}
