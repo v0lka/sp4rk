@@ -238,7 +238,7 @@ func AssignKillOnCloseJob(cmd *exec.Cmd) (cleanup func(), err error)
 
 The model is **assign-after-Start**: call `cmd.Start()`, then `AssignKillOnCloseJob(cmd)` as the very next action, then `defer` the returned cleanup. `cmd.Process` must be non-nil. It is best-effort — on failure it leaks no handle, returns a no-op cleanup so the caller can defer it unconditionally, and returns the error so the caller can fall back to `cmd.Cancel`.
 
-This is the complement to `HideConsole`: together they hide the shell window AND guarantee no orphaned grandchildren or stray console windows persist after the host finishes, times out, or cancels. It requires `golang.org/x/sys/windows` (Windows 8+ for nested jobs) and lives behind a `//go:build windows` tag; it is not available on other platforms.
+This is the complement to `HideConsole`: together they hide the shell window AND guarantee no orphaned grandchildren or stray console windows persist after the host finishes, times out, or cancels. On Windows it requires `golang.org/x/sys/windows` (Windows 8+ for nested jobs) and lives behind a `//go:build windows` tag; on other platforms it is a no-op that returns a no-op cleanup and a nil error, so callers can defer it unconditionally without their own build tags — mirroring `HideConsole`.
 
 ## ignore
 

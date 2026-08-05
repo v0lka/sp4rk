@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"os/exec"
 	"regexp"
 	"syscall"
@@ -190,14 +189,15 @@ func (t *PoshExecTool) Execute(ctx context.Context, input json.RawMessage) (tool
 
 	// Attach the started process tree to a kill-on-close Job Object so that
 	// any grandchildren (browsers, helper windows, ...) are terminated when
-	// the job handle is closed below — on normal completion, timeout, or
-	// cancel alike. Best-effort: if assignment fails we log and fall back to
-	// the parent-only kill that cmd.Cancel performs above, never failing the
-	// command itself.
+	// the job handle is closed below. Closing the handle performs a hard
+	// kill (no graceful-shutdown window) on EVERY path — normal completion,
+	// timeout, and cancel alike — so any descendant still flushing when the
+	// command ends is terminated immediately; this is the intended
+	// "no orphans linger" behaviour for the browser/console-window use case.
+	// Best-effort: if assignment fails we surface it to the caller and fall
+	// back to the parent-only kill that cmd.Cancel performs above, never
+	// failing the command itself.
 	jobCleanup, jobErr := sysproc.AssignKillOnCloseJob(cmd)
-	if jobErr != nil {
-		log.Printf("posh_exec: job-object tree containment unavailable, falling back to parent-only kill: %v", jobErr)
-	}
 	// jobCleanup is always non-nil (a no-op on assignment failure); closing
 	// the job handle after Wait kills every surviving tree member.
 	defer jobCleanup()
@@ -216,8 +216,15 @@ func (t *PoshExecTool) Execute(ctx context.Context, input json.RawMessage) (tool
 		}, nil
 	}
 
-	return tools.ToolResult{
+	res := tools.ToolResult{
 		Content: string(output),
 		IsError: false,
-	}, nil
+	}
+	// Surface a degraded-containment note rather than logging via a global
+	// logger: the agent/user is the right audience, and a GUI host has no
+	// stderr to surface a log.Printf through.
+	if jobErr != nil {
+		res.Content += "\n[warning: job-object tree containment unavailable (" + jobErr.Error() + "), falling back to parent-only kill]"
+	}
+	return res, nil
 }
