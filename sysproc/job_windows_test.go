@@ -3,6 +3,7 @@
 package sysproc
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -19,7 +20,7 @@ import (
 // available on every supported Windows version.
 func startSleeping(t *testing.T) *exec.Cmd {
 	t.Helper()
-	cmd := exec.Command("ping", "-n", "60", "127.0.0.1")
+	cmd := exec.CommandContext(context.Background(), "ping", "-n", "60", "127.0.0.1")
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start ping: %v", err)
 	}
@@ -38,7 +39,7 @@ func TestCreateKillOnCloseJob_FlagSet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("createKillOnCloseJob: %v", err)
 	}
-	defer windows.CloseHandle(job)
+	defer func() { _ = windows.CloseHandle(job) }()
 
 	var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
 	if err := windows.QueryInformationJobObject(
@@ -96,7 +97,7 @@ func TestAssignKillOnCloseJob_HappyPath(t *testing.T) {
 // error otherwise"): a cmd with no running process returns ErrProcessNotStarted
 // and a non-nil (no-op) cleanup.
 func TestAssignKillOnCloseJob_RequiresStartedProcess(t *testing.T) {
-	cmd := exec.Command("ping", "-n", "60", "127.0.0.1") // intentionally not started
+	cmd := exec.CommandContext(context.Background(), "ping", "-n", "60", "127.0.0.1") // intentionally not started
 
 	cleanup, err := AssignKillOnCloseJob(cmd)
 	if !errors.Is(err, ErrProcessNotStarted) {
@@ -163,7 +164,7 @@ func findChildProcess(exe string, parentPID int) (pid int, ok bool) {
 	if err != nil {
 		return 0, false
 	}
-	defer windows.CloseHandle(snapshot)
+	defer func() { _ = windows.CloseHandle(snapshot) }()
 
 	var entry windows.ProcessEntry32
 	entry.Size = uint32(unsafe.Sizeof(entry))
@@ -200,7 +201,7 @@ func TestAssignKillOnCloseJob_TerminatesGrandchild(t *testing.T) {
 	// leading "ping -n 3" delay guarantees the grandchild is spawned only after
 	// AssignKillOnCloseJob has attached cmd.exe to the job, so it reliably
 	// inherits membership (no race escape).
-	cmd := exec.Command("cmd", "/c",
+	cmd := exec.CommandContext(context.Background(), "cmd", "/c",
 		"ping -n 3 127.0.0.1 >NUL & start /B ping -n 60 127.0.0.1 >NUL")
 	HideConsole(cmd)
 	if err := cmd.Start(); err != nil {
