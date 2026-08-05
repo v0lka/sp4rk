@@ -1189,7 +1189,11 @@ func (e *Executor) processBatchTool(
 // fragmentation nudge) and Stage 2 (token-budget truncation preserving
 // the Stage 1 nudge). Shared by processSingleToolCall and processBatchTool
 // to avoid duplicated pipeline logic. Returns the processed observation and
-// the ToolResultCache hash (empty if the tool is non-cacheable or cache is nil).
+// the ToolResultCache hash. The hash is empty only when there is no tool
+// cache, or when neither stage truncates a non-cacheable tool (small results
+// stay out of the cache). ANY truncation — for cacheable OR non-cacheable
+// tools — caches the full result and yields a non-empty hash so the LLM can
+// recover the dropped content via tool_result_read.
 func (e *Executor) processToolResult(
 	execCtx context.Context,
 	observation string,
@@ -1206,6 +1210,8 @@ func (e *Executor) processToolResult(
 
 	if e.toolCache != nil {
 		if _, isNonCacheable := e.nonCacheableTools[toolName]; !isNonCacheable {
+			// Cacheable tool: eagerly store the full result so the LLM can
+			// retrieve it via tool_result_read at any time.
 			meta := e.buildCacheMeta(execCtx, toolName, input)
 			cacheHash = e.toolCache.Store(toolName, fullResult, meta)
 
@@ -1224,6 +1230,28 @@ func (e *Executor) processToolResult(
 				// use case (LLM reads fragments on demand), not just truncation
 				// recovery.
 				observation += formatFileBackedNudge(cacheHash)
+			}
+		} else {
+			// Non-cacheable tool: skip EAGER caching, but if the result will be
+			// truncated at either stage, cache the full result on demand
+			// (cache-on-truncate) so the LLM can retrieve the dropped portion
+			// via tool_result_read. This decouples "eager caching" from
+			// "retrieval availability": nonCacheableTools no longer implies the
+			// result becomes permanently inaccessible when truncated. Small
+			// non-truncated results stay out of the cache (optimization kept).
+			stage2WillTruncate := e.willBudgetTruncate(observation, cw)
+			if wasTruncated || stage2WillTruncate {
+				meta := e.buildCacheMeta(execCtx, toolName, input)
+				cacheHash = e.toolCache.Store(toolName, fullResult, meta)
+				if wasTruncated {
+					maxSliceHint := 0
+					if e.perToolTruncation != nil {
+						if cfg, ok := e.perToolTruncation[toolName]; ok {
+							maxSliceHint = cfg.MaxLines
+						}
+					}
+					observation += formatFragmentationNudge(cacheHash, toolName, maxSliceHint)
+				}
 			}
 		}
 	}

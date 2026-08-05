@@ -10,7 +10,9 @@ import (
 	"github.com/v0lka/sp4rk/tools"
 )
 
-const toolResultReadDescription = `Read a previously cached tool result in fragments. Provide the short hash from a truncation nudge (e.g. "[This output was truncated ... hash: abc123 ...]") along with a 1-based start_line and the number of lines to read. Use this to retrieve more content from a truncated tool output without re-executing the original tool.`
+const toolResultReadDescription = `Read a previously cached tool result in fragments. Provide the short hash from a truncation nudge (e.g. "[This output was truncated ... hash: abc123 ...]") along with a 1-based start_line and the number of lines to read. Use this to retrieve more content from a truncated tool output without re-executing the original tool.
+
+Line escape-hatch: pass a 1-based ` + "`line`" + ` to return the FULL raw content of a single line, bypassing the per-line MaxLineBytes cap (default 1 MiB). This is the only way to recover a line shown with a "[...line N truncated...]" marker — the default read path (and this tool's own window reads) always apply MaxLineBytes, so the tail of such a line is otherwise inaccessible. For file-backed results (e.g. plain-text read_file) the full line is read directly from disk; for content-backed results (e.g. converted documents) the cached representation is returned. ` + "`line`" + ` takes precedence over start_line/num_lines.`
 
 const defaultResultReadLines = 500
 
@@ -38,6 +40,10 @@ func NewToolResultReadTool() *ToolResultReadTool {
 			"num_lines": {
 				"type": "integer",
 				"description": "Maximum number of lines to return. Defaults to 500."
+			},
+			"line": {
+				"type": "integer",
+				"description": "Escape-hatch: return the FULL raw content of a single line (1-based line number), bypassing the per-line MaxLineBytes cap. Use this to recover a line truncated with a '[...line N truncated...]' marker. Takes precedence over start_line/num_lines; only one line is returned."
 			}
 		},
 		"required": ["hash"]
@@ -51,6 +57,7 @@ type toolResultReadInput struct {
 	Hash      string `json:"hash"`
 	StartLine int    `json:"start_line"`
 	NumLines  int    `json:"num_lines"`
+	Line      int    `json:"line"`
 }
 
 // Execute retrieves the cached result fragment. For file-backed entries
@@ -108,6 +115,15 @@ func (t *ToolResultReadTool) Execute(ctx context.Context, input json.RawMessage)
 	}
 	if !capped && params.NumLines > defaultResultReadLines {
 		params.NumLines = defaultResultReadLines
+	}
+
+	// Escape-hatch: return the FULL raw content of a single line, bypassing the
+	// per-line MaxLineBytes DoS guard. The default read path (read_file and this
+	// tool's own window reads) always applies MaxLineBytes, so a line truncated
+	// by that guard is otherwise inaccessible. This is the only way to recover
+	// it — reachable solely via an explicit line=N request.
+	if params.Line > 0 {
+		return t.readSingleLine(entry, params)
 	}
 
 	// File-backed: stream fragments from disk.
@@ -188,4 +204,40 @@ func (t *ToolResultReadTool) readFromFileBacked(entry *agent.ToolResultCacheEntr
 	}
 
 	return tools.ToolResult{Content: sb.String()}, nil
+}
+
+// readSingleLine returns the full raw content of one line, bypassing the
+// per-line MaxLineBytes cap. For file-backed entries it reads the line directly
+// from disk via ReadSingleLine (true recovery of the raw line); for
+// content-backed entries it indexes into the cached string (the cached
+// representation, which for converted documents may already reflect an earlier
+// window/truncation). This is the escape-hatch for lines truncated by the
+// default read path and is only reachable via an explicit line=N request —
+// default window reads always apply MaxLineBytes.
+func (t *ToolResultReadTool) readSingleLine(entry *agent.ToolResultCacheEntry, params toolResultReadInput) (tools.ToolResult, error) {
+	// File-backed: stream the single full line straight from disk.
+	if entry.FileBacked {
+		line, totalLines, err := ReadSingleLine(entry.FilePath, params.Line)
+		if err != nil {
+			return tools.ToolResult{Content: fmt.Sprintf(
+				"[Line %d not available from cached %s result: %v | hash: %s]",
+				params.Line, entry.ToolName, err, params.Hash)}, nil
+		}
+		return tools.ToolResult{Content: fmt.Sprintf(
+			"[Full line %d of %d from cached %s result | hash: %s]\n%s",
+			params.Line, totalLines, entry.ToolName, params.Hash, line)}, nil
+	}
+
+	// Content-backed: index into the cached string (uncapped relative to the
+	// cache — the cached content is returned verbatim, no MaxLineBytes applied).
+	allLines := strings.Split(entry.Content, "\n")
+	totalLines := len(allLines)
+	if params.Line > totalLines {
+		return tools.ToolResult{Content: fmt.Sprintf(
+			"[Line %d is past end of cached %s result (%d lines) | hash: %s]",
+			params.Line, entry.ToolName, totalLines, params.Hash)}, nil
+	}
+	return tools.ToolResult{Content: fmt.Sprintf(
+		"[Line %d of %d from cached %s result | hash: %s]\n%s",
+		params.Line, totalLines, entry.ToolName, params.Hash, allLines[params.Line-1])}, nil
 }

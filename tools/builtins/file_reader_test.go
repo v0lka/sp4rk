@@ -210,7 +210,7 @@ func TestReadFileRange_MaxLineBytes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(result.Content, "[...line truncated at 100 bytes...]") {
+	if !strings.Contains(result.Content, "[...line 1 truncated at 100 bytes. Use tool_result_read(hash, line=1) to read the full line...]") {
 		t.Errorf("expected line truncation marker, got: %s", result.Content)
 	}
 }
@@ -228,7 +228,7 @@ func TestReadFileRange_MaxLineBytesPreservesNewline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(result.Content, "[...line truncated at 100 bytes...]") {
+	if !strings.Contains(result.Content, "[...line 1 truncated at 100 bytes. Use tool_result_read(hash, line=1) to read the full line...]") {
 		t.Errorf("expected truncation marker in content")
 	}
 	if !strings.Contains(result.Content, "\nshort\n") {
@@ -326,5 +326,48 @@ func TestReadFileRange_NonExistentFile(t *testing.T) {
 	})
 	if err == nil {
 		t.Error("expected error for non-existent file")
+	}
+}
+
+// ReadSingleLine is the escape-hatch behind tool_result_read's line parameter.
+// It must return the FULL raw line (bypassing MaxLineBytes), report the total
+// line count, and error when the requested line is past the end of the file.
+func TestReadSingleLine(t *testing.T) {
+	longLine := strings.Repeat("a", 5000) // well above a typical MaxLineBytes cap
+	content := "header\n" + longLine + "\nshort\n"
+	path := writeTempFile(t, "escape.txt", content)
+
+	// Line 2 is the pathological 5000-byte line.
+	line, totalLines, err := ReadSingleLine(path, 2)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if totalLines != 3 {
+		t.Errorf("totalLines = %d, want 3", totalLines)
+	}
+	if len(line) != 5000 {
+		t.Errorf("len(line) = %d, want full 5000 bytes (escape-hatch bypasses MaxLineBytes)", len(line))
+	}
+	if line != longLine {
+		t.Error("line content mismatch: expected the full long line")
+	}
+
+	// A normal line is returned verbatim (no trailing newline).
+	got, _, err := ReadSingleLine(path, 3)
+	if err != nil {
+		t.Fatalf("unexpected error reading line 3: %v", err)
+	}
+	if got != "short" {
+		t.Errorf("line 3 = %q, want %q", got, "short")
+	}
+
+	// Past end of file returns an error naming the bounds.
+	if _, _, err := ReadSingleLine(path, 99); err == nil {
+		t.Error("expected error for line past end of file")
+	}
+
+	// Invalid line number.
+	if _, _, err := ReadSingleLine(path, 0); err == nil {
+		t.Error("expected error for lineNum <= 0")
 	}
 }

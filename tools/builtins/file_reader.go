@@ -84,7 +84,7 @@ func ReadFileRange(params FileReadParams) (*FileReadResult, error) {
 			totalLines = lineNum
 
 			if !pastWindow && lineNum >= startLine && lineNum <= endLine {
-				writeLine(&builder, line, params.MaxLineBytes)
+				writeLine(&builder, line, lineNum, params.MaxLineBytes)
 			}
 
 			if lineNum > endLine {
@@ -121,8 +121,11 @@ func ReadFileRange(params FileReadParams) (*FileReadResult, error) {
 
 // writeLine appends a line to the builder, applying an optional per-line byte
 // cap. When the line exceeds MaxLineBytes, it is truncated and a marker is
-// appended. The trailing newline (if present) is preserved after the marker.
-func writeLine(builder *strings.Builder, line string, maxLineBytes int) {
+// appended. The marker names the line number and points at the recovery path:
+// tool_result_read(hash, line=lineNum) reads the full raw line via
+// ReadSingleLine, bypassing the cap. The trailing newline (if present) is
+// preserved after the marker.
+func writeLine(builder *strings.Builder, line string, lineNum, maxLineBytes int) {
 	if maxLineBytes <= 0 || len(line) <= maxLineBytes {
 		builder.WriteString(line)
 		return
@@ -132,10 +135,75 @@ func writeLine(builder *strings.Builder, line string, maxLineBytes int) {
 	truncated := line[:maxLineBytes]
 	truncated = strings.TrimSuffix(truncated, "\n")
 	builder.WriteString(truncated)
-	fmt.Fprintf(builder, "[...line truncated at %d bytes...]", maxLineBytes)
+	fmt.Fprintf(builder, "[...line %d truncated at %d bytes. Use tool_result_read(hash, line=%d) to read the full line...]",
+		lineNum, maxLineBytes, lineNum)
 	if hasNewline {
 		builder.WriteString("\n")
 	}
+}
+
+// maxRawLineBytes is the absolute ceiling for ReadSingleLine, the escape-hatch
+// behind tool_result_read's line parameter. It is far above the default
+// MaxLineBytes DoS guard (1 MiB) so that any realistic pathological-but-useful
+// single line (e.g. a multi-megabyte minified bundle) is fully recoverable,
+// while a truly adversarial multi-gigabyte line cannot exhaust memory. Default
+// reads never approach this ceiling; only an explicit tool_result_read(line=N)
+// request can reach it.
+const maxRawLineBytes = 64 << 20 // 64 MiB
+
+// ReadSingleLine reads exactly one line (1-based lineNum) from a file in full,
+// bypassing the per-line MaxLineBytes DoS guard. It is the escape-hatch backing
+// tool_result_read's line parameter: default reads (read_file and
+// tool_result_read window reads) always apply MaxLineBytes, so a line longer
+// than that cap is otherwise inaccessible. ReadSingleLine makes such a line
+// recoverable by an explicit, limited request — one line at a time.
+//
+// It scans to the requested line in O(1) memory (only lineNum is buffered),
+// then returns the line's full content — without the trailing newline — capped
+// only by maxRawLineBytes as a last-resort memory bound. totalLines is the
+// total line count of the file (computed in the same pass). An error is
+// returned when lineNum is past the end of the file.
+func ReadSingleLine(path string, lineNum int) (line string, totalLines int, err error) {
+	if lineNum <= 0 {
+		return "", 0, fmt.Errorf("lineNum must be >= 1, got %d", lineNum)
+	}
+
+	f, openErr := os.Open(path)
+	if openErr != nil {
+		return "", 0, openErr
+	}
+	defer func() { _ = f.Close() }()
+
+	reader := bufio.NewReaderSize(f, 64*1024)
+	current := 0
+
+	for {
+		raw, rerr := reader.ReadString('\n')
+		if raw != "" {
+			current++
+			if current == lineNum {
+				full := strings.TrimSuffix(raw, "\n")
+				if len(full) > maxRawLineBytes {
+					full = full[:maxRawLineBytes] +
+						fmt.Sprintf("[...raw line capped at %d bytes (absolute memory bound)...]", maxRawLineBytes)
+				}
+				// Continue scanning only to compute totalLines.
+				remaining, countErr := countRemainingNewlines(reader)
+				if countErr != nil {
+					return "", 0, countErr
+				}
+				return full, current + remaining, nil
+			}
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			return "", 0, rerr
+		}
+	}
+
+	return "", current, fmt.Errorf("line %d is past end of file (%d lines)", lineNum, current)
 }
 
 // countRemainingNewlines counts lines in the remaining data from reader without

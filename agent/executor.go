@@ -39,13 +39,19 @@ func DetectToolCallSyntaxInContent(content string) bool {
 }
 
 // defaultNonCacheableTools is the set of sp4rk-provided tool names whose results
-// are NOT cached. These are internal meta-tools or produce tiny outputs where
-// caching adds overhead.
+// are skipped for EAGER caching — internal meta-tools or tiny outputs where
+// caching the result up-front adds overhead with no benefit.
 //
-// NOTE: Tools listed here will not receive Stage‑2 hash hints either, because
-// the caching step (which produces the hash) is skipped. The exclusion from
-// both caching and hash hints is a deliberate dual-purpose: if a tool's results
-// are not worth caching, they are also not worth offering for fragment retrieval.
+// INVARIANT — truncation ALWAYS caches on demand and yields a hash. No tool,
+// cacheable or non-cacheable, is ever truncated without a retrieval path: the
+// dropped portion is recoverable via tool_result_read. "Non-cacheable" here
+// means "not cached UNLESS truncated", NEVER "permanently inaccessible on
+// truncation". When a non-cacheable result is truncated at Stage 1 (per-tool
+// line/byte limit) or Stage 2 (token budget), processToolResult performs
+// cache-on-truncate (ToolResultCache.Store) and embeds the resulting hash in the
+// truncation notice/fragmentation nudge so the LLM can re-read the full result.
+// Only small, NON-truncated non-cacheable results stay out of the cache
+// (optimization preserved).
 //
 // This set contains only tools that sp4rk itself provides. Consumers that
 // register additional non-cacheable tools (e.g. application-layer meta-tools
@@ -559,29 +565,60 @@ func copyNonCacheableTools(src map[string]struct{}) map[string]struct{} {
 	return dst
 }
 
+// computeBudgetCap derives the Stage 2 token cap from the configured budget and
+// the context manager's available tokens. It returns (capTokens, false) when the
+// budget is disabled (HardCapTokens <= 0), and (capTokens, true) otherwise. The
+// cap is min(HardCapTokens, AvailableTokens * MaxFillFraction) with a 256-token
+// floor. Shared by applyToolResultBudget (truncation) and willBudgetTruncate
+// (prediction) so the two decisions can never drift apart.
+func (e *Executor) computeBudgetCap(cw ContextManager) (capTokens int, applies bool) {
+	if e.toolResultBudget.HardCapTokens <= 0 {
+		return 0, false
+	}
+	available := cw.AvailableTokens()
+	adaptiveCap := int(float64(available) * e.toolResultBudget.MaxFillFraction)
+	capTokens = e.toolResultBudget.HardCapTokens
+	if adaptiveCap < capTokens {
+		capTokens = adaptiveCap
+	}
+	// Minimum floor to avoid useless truncation.
+	if capTokens < 256 {
+		capTokens = 256
+	}
+	return capTokens, true
+}
+
+// willBudgetTruncate reports whether applyToolResultBudget would truncate the
+// given observation. It mirrors applyToolResultBudget's decision (same cap via
+// computeBudgetCap, same len/4 token estimate, same charLimit check) without
+// performing the truncation or appending a notice. Used by processToolResult to
+// decide cache-on-truncate for non-cacheable tools before Stage 2 runs.
+func (e *Executor) willBudgetTruncate(observation string, cw ContextManager) bool {
+	capTokens, applies := e.computeBudgetCap(cw)
+	if !applies {
+		return false
+	}
+	// Estimate observation tokens (rough: len/4) — must match applyToolResultBudget.
+	observationTokens := len(observation) / 4
+	if observationTokens <= capTokens {
+		return false
+	}
+	charLimit := capTokens * 4
+	return charLimit < len(observation)
+}
+
 // applyToolResultBudget truncates a tool result if it exceeds the budget.
 // The budget is min(HardCapTokens, AvailableTokens * MaxFillFraction) with a 256-token floor.
 // When truncated, a notice is appended to inform the model. If cacheHash is non-empty,
 // the notice includes the hash and an instruction to use tool_result_read.
 func (e *Executor) applyToolResultBudget(observation string, cw ContextManager, toolName, cacheHash string) string {
-	if e.toolResultBudget.HardCapTokens <= 0 {
+	capTokens, applies := e.computeBudgetCap(cw)
+	if !applies {
 		return observation
 	}
 
 	// Estimate observation tokens (rough: len/4)
 	observationTokens := len(observation) / 4
-
-	// Calculate adaptive cap
-	available := cw.AvailableTokens()
-	adaptiveCap := int(float64(available) * e.toolResultBudget.MaxFillFraction)
-	capTokens := e.toolResultBudget.HardCapTokens
-	if adaptiveCap < capTokens {
-		capTokens = adaptiveCap
-	}
-	// Minimum floor to avoid useless truncation
-	if capTokens < 256 {
-		capTokens = 256
-	}
 
 	if observationTokens <= capTokens {
 		return observation

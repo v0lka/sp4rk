@@ -1280,3 +1280,252 @@ func TestBuildCacheMeta_ContentBacked_ReadFile(t *testing.T) {
 		t.Error("expected non-zero FileMtime for content-backed read_file")
 	}
 }
+
+// ============================================================================
+// cache-on-truncate for non-cacheable tools (Stage 1 + Stage 2)
+// ============================================================================
+//
+// Regression coverage for the irreversible-truncation bug: processToolResult
+// used to skip caching entirely for tools in nonCacheableTools, so a truncated
+// result got an "[OUTPUT TRUNCATED]" notice with NO hash — the dropped content
+// was permanently lost. Now ANY truncation caches the full result on demand and
+// yields a hash so the LLM can recover it via tool_result_read.
+
+func TestProcessToolResult_NonCacheable_Stage2Truncate_HashAndRetrievable(t *testing.T) {
+	// A non-cacheable tool whose output exceeds the token budget must be
+	// truncated at Stage 2 with a VALID non-empty hash, and tool_result_read
+	// (i.e. cache.Get) must return the full original content.
+	mockTools := newMockToolExecutor()
+	exec := newExecutorDefaultHITL(&mockLLMCaller{}, mockTools, &mockTokenCounter{}, 5, nil, false, ToolResultBudget{
+		HardCapTokens:   100,
+		MaxFillFraction: 0.5,
+	}, defaultCircuitBreakerConfig)
+	tc := NewToolResultCache(5 * time.Minute)
+	exec.SetToolCache(tc)
+
+	cm := newMockContextManager()
+	cm.availableTokens = 200 // adaptive cap = 100 → floor 256 dominates; make content clearly larger
+
+	// "search_facts" is in defaultNonCacheableTools. Use a large result that
+	// exceeds the 256-token floor cap (256 tokens ≈ 1024 chars).
+	fullContent := strings.Repeat("fact-", 400) // ~2000 chars → 500 tokens, well over cap
+	input, _ := json.Marshal(map[string]string{"query": "test"})
+
+	observation, cacheHash := exec.processToolResult(context.Background(), fullContent, fullContent, "search_facts", input, cm)
+
+	if cacheHash == "" {
+		t.Fatal("expected non-empty cache hash for truncated non-cacheable tool")
+	}
+	if !strings.Contains(observation, "OUTPUT TRUNCATED") {
+		t.Errorf("expected Stage 2 truncation notice, got: %s", observation)
+	}
+	// The Stage 2 notice must carry the hash + tool_result_read instruction.
+	if !strings.Contains(observation, "Hash: "+cacheHash) {
+		t.Errorf("expected truncation notice to reference hash %q, got: %s", cacheHash, observation)
+	}
+	if !strings.Contains(observation, "tool_result_read") {
+		t.Error("expected tool_result_read instruction in truncation notice")
+	}
+
+	// The full original content must be retrievable from the cache via the hash.
+	entry, ok := tc.Get(cacheHash)
+	if !ok {
+		t.Fatalf("cache.Get(%q) returned not-found; full result is irretrievable", cacheHash)
+	}
+	if entry.Content != fullContent {
+		t.Errorf("cached content does not match original full result (got %d bytes, want %d)", len(entry.Content), len(fullContent))
+	}
+	if entry.ToolName != "search_facts" {
+		t.Errorf("cached ToolName = %q, want %q", entry.ToolName, "search_facts")
+	}
+}
+
+func TestProcessToolResult_NonCacheable_Stage1Truncate_FragmentationNudge(t *testing.T) {
+	// A non-cacheable tool configured with per-tool truncation (Stage 1) must
+	// be truncated at Stage 1 and carry a fragmentation nudge with a valid hash.
+	mockTools := newMockToolExecutor()
+	exec := newExecutorDefaultHITL(&mockLLMCaller{}, mockTools, &mockTokenCounter{}, 5, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+	exec.SetPerToolTruncation(map[string]ToolTruncationConfig{
+		"search_facts": {MaxLines: 2},
+	})
+	tc := NewToolResultCache(5 * time.Minute)
+	exec.SetToolCache(tc)
+
+	cm := newMockContextManager()
+
+	fullContent := "line1\nline2\nline3\nline4\nline5"
+	input, _ := json.Marshal(map[string]string{"query": "test"})
+
+	observation, cacheHash := exec.processToolResult(context.Background(), fullContent, fullContent, "search_facts", input, cm)
+
+	if cacheHash == "" {
+		t.Fatal("expected non-empty cache hash for Stage 1 truncated non-cacheable tool")
+	}
+	// Stage 1 fragmentation nudge prefix (not the Stage 2 "[OUTPUT TRUNCATED" notice).
+	if !strings.Contains(observation, "This output was truncated to 2 lines for 'search_facts'") {
+		t.Errorf("expected Stage 1 fragmentation nudge, got: %s", observation)
+	}
+	if !strings.Contains(observation, "hash: "+cacheHash) {
+		t.Errorf("expected nudge to reference hash %q, got: %s", cacheHash, observation)
+	}
+	if !strings.Contains(observation, "tool_result_read") {
+		t.Error("expected tool_result_read instruction in fragmentation nudge")
+	}
+
+	// Full original content retrievable.
+	entry, ok := tc.Get(cacheHash)
+	if !ok {
+		t.Fatalf("cache.Get(%q) returned not-found after Stage 1 truncation", cacheHash)
+	}
+	if entry.Content != fullContent {
+		t.Errorf("cached content does not match original full result (got %q, want %q)", entry.Content, fullContent)
+	}
+}
+
+func TestProcessToolResult_NonCacheable_RoundTrip_FullContentViaToolResultRead(t *testing.T) {
+	// Round-trip reversibility for a non-cacheable tool. processToolResult caches
+	// the full result on truncate and yields a hash; re-reading the cache entry
+	// through the SAME windowed-line extraction that tool_result_read applies
+	// must reconstruct the COMPLETE original content, proving the dropped portion
+	// is fully recoverable and never permanently lost.
+	//
+	// This in-package test replicates tool_result_read's content-backed read
+	// algorithm (cache.Get + line-window slicing) because package agent cannot
+	// import the builtins package implementing ToolResultReadTool without an
+	// import cycle. The Stage 1/Stage 2 tests above prove processToolResult
+	// stores the entry with the full content; this test proves that entry is
+	// reassemblable into 100% of the original via the tool's own read path.
+	mockTools := newMockToolExecutor()
+	exec := newExecutorDefaultHITL(&mockLLMCaller{}, mockTools, &mockTokenCounter{}, 5, nil, false, ToolResultBudget{
+		HardCapTokens:   100,
+		MaxFillFraction: 0.5,
+	}, defaultCircuitBreakerConfig)
+	tc := NewToolResultCache(5 * time.Minute)
+	exec.SetToolCache(tc)
+
+	cm := newMockContextManager()
+	cm.availableTokens = 200 // adaptive cap = 100 → 256-token floor dominates
+
+	// "search_facts" is in defaultNonCacheableTools. Build a multi-line payload
+	// large enough to force Stage 2 truncation (256 tokens ≈ 1024 chars).
+	const numLines = 60
+	lines := make([]string, numLines)
+	for i := range lines {
+		lines[i] = fmt.Sprintf("fact line %02d: %s", i, strings.Repeat("x", 30))
+	}
+	fullContent := strings.Join(lines, "\n")
+	input, _ := json.Marshal(map[string]string{"query": "round-trip"})
+
+	observation, cacheHash := exec.processToolResult(context.Background(), fullContent, fullContent, "search_facts", input, cm)
+
+	// 1. The Stage 2 truncation notice must carry a usable hash the LLM can act on.
+	if cacheHash == "" {
+		t.Fatal("expected non-empty cache hash for truncated non-cacheable tool")
+	}
+	if !strings.Contains(observation, "OUTPUT TRUNCATED") {
+		t.Fatalf("expected Stage 2 truncation notice, got: %s", observation)
+	}
+	if !strings.Contains(observation, "Hash: "+cacheHash) {
+		t.Fatalf("truncation notice does not expose hash %q; observation: %s", cacheHash, observation)
+	}
+
+	// 2. Replicate tool_result_read's content-backed read: fetch the entry, then
+	//    reassemble the full content by reading consecutive line windows — exactly
+	//    how the LLM recovers the dropped portion fragment by fragment.
+	entry, ok := tc.Get(cacheHash)
+	if !ok {
+		t.Fatalf("cache.Get(%q) returned not-found; round-trip impossible", cacheHash)
+	}
+	allLines := strings.Split(entry.Content, "\n")
+	totalLines := len(allLines)
+	if totalLines != numLines {
+		t.Fatalf("line count drifted: cache has %d lines, original has %d", totalLines, numLines)
+	}
+
+	const windowSize = 10
+	var reassembled strings.Builder
+	startLine := 1
+	for startLine <= totalLines {
+		endLine := startLine + windowSize - 1
+		if endLine > totalLines {
+			endLine = totalLines
+		}
+		// tool_result_read slices allLines[startLine-1 : endLine] and joins on "\n".
+		reassembled.WriteString(strings.Join(allLines[startLine-1:endLine], "\n"))
+		if endLine < totalLines {
+			reassembled.WriteByte('\n')
+		}
+		startLine = endLine + 1
+	}
+
+	if reassembled.String() != fullContent {
+		t.Errorf("round-trip mismatch: reassembled content != original full result\nwant %d bytes\ngot  %d bytes",
+			len(fullContent), reassembled.Len())
+	}
+}
+
+func TestProcessToolResult_NonCacheable_SmallResult_NotCached(t *testing.T) {
+	// A small non-truncated result from a non-cacheable tool must NOT enter the
+	// cache (optimization preserved): cache.Len() unchanged after processing.
+	mockTools := newMockToolExecutor()
+	exec := newExecutorDefaultHITL(&mockLLMCaller{}, mockTools, &mockTokenCounter{}, 5, nil, false, ToolResultBudget{
+		HardCapTokens:   1000,
+		MaxFillFraction: 0.5,
+	}, defaultCircuitBreakerConfig)
+	tc := NewToolResultCache(5 * time.Minute)
+	exec.SetToolCache(tc)
+
+	cm := newMockContextManager()
+	cm.availableTokens = 100000
+
+	beforeLen := tc.Len()
+	input, _ := json.Marshal(map[string]string{"item": "checklist-ok"})
+
+	// "update_checklist" is in defaultNonCacheableTools and produces a tiny result.
+	observation, cacheHash := exec.processToolResult(context.Background(), "ok", "ok", "update_checklist", input, cm)
+
+	if cacheHash != "" {
+		t.Errorf("expected empty hash for small non-truncated non-cacheable result, got %q", cacheHash)
+	}
+	afterLen := tc.Len()
+	if afterLen != beforeLen {
+		t.Errorf("cache size changed for small non-cacheable result: before=%d after=%d", beforeLen, afterLen)
+	}
+	if observation != "ok" {
+		t.Errorf("expected unchanged observation, got %q", observation)
+	}
+}
+
+func TestWillBudgetTruncate(t *testing.T) {
+	// Direct coverage of the willBudgetTruncate predictor: it must agree with
+	// applyToolResultBudget's truncation decision across disabled/under/over
+	// cases, so processToolResult's cache-on-truncate prediction never drifts.
+	exec := newExecutorDefaultHITL(&mockLLMCaller{}, newMockToolExecutor(), &mockTokenCounter{}, 5, nil, false, ToolResultBudget{
+		HardCapTokens:   100,
+		MaxFillFraction: 0.5,
+	}, defaultCircuitBreakerConfig)
+	cm := newMockContextManager()
+	cm.availableTokens = 200 // adaptive cap = 100, floor dominates → 256
+
+	// Disabled budget → never truncates.
+	execDisabled := newExecutorDefaultHITL(&mockLLMCaller{}, newMockToolExecutor(), &mockTokenCounter{}, 5, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+	if execDisabled.willBudgetTruncate("any", cm) {
+		t.Error("expected willBudgetTruncate=false when budget disabled")
+	}
+
+	// Under budget (small content) → no truncation.
+	if exec.willBudgetTruncate("short", cm) {
+		t.Error("expected willBudgetTruncate=false for short content")
+	}
+
+	// Over budget (large content > 256 tokens ≈ 1024 chars) → truncation.
+	longContent := strings.Repeat("x", 2000) // 500 tokens
+	if !exec.willBudgetTruncate(longContent, cm) {
+		t.Error("expected willBudgetTruncate=true for over-budget content")
+	}
+	// Prediction must match the actual truncation decision.
+	actual := exec.applyToolResultBudget(longContent, cm, "some_tool", "")
+	if !strings.Contains(actual, "OUTPUT TRUNCATED") {
+		t.Error("applyToolResultBudget disagrees with willBudgetTruncate: expected truncation")
+	}
+}

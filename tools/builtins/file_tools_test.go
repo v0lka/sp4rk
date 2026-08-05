@@ -2038,6 +2038,82 @@ func TestToolResultReadTool_FileBacked(t *testing.T) {
 	}
 }
 
+// The `line` parameter is the escape-hatch: a file-backed read whose window
+// truncates a pathological line (via MaxLineBytes) must be recoverable in full
+// by an explicit tool_result_read(hash, line=N) request. Default reads keep the
+// DoS guard; only the explicit line request bypasses it.
+func TestToolResultReadTool_FileBacked_LineEscapeHatch(t *testing.T) {
+	tmpDir := t.TempDir()
+	testFile := filepath.Join(tmpDir, "bundle.txt")
+
+	longLine := strings.Repeat("a", 5000) // exceeds default MaxLineBytes (1 MiB? no — see below)
+	// Use a small cap to force truncation deterministically without a 1 MiB line.
+	content := "line one\n" + longLine + "\nline three\n"
+	if err := os.WriteFile(testFile, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := os.Stat(testFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cache := agent.NewToolResultCache(5 * time.Minute)
+	hash := cache.Store("read_file", "", agent.ToolCacheMeta{
+		FilePath:   testFile,
+		FileMtime:  info.ModTime().UnixNano(),
+		FileSize:   info.Size(),
+		FileBacked: true,
+	})
+
+	ctx := agent.WithToolResultCache(context.Background(), cache)
+	tool := NewToolResultReadTool()
+
+	// Default window read applies MaxLineBytes (1 MiB default) — the 5000-byte
+	// line fits, so no truncation here; this confirms the guard's default size.
+	windowInput, _ := json.Marshal(map[string]any{
+		"hash":       hash,
+		"start_line": 1,
+		"num_lines":  3,
+	})
+	windowRes, err := tool.Execute(ctx, windowInput)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(windowRes.Content, longLine[:100]) {
+		t.Errorf("expected the long line in the window read, got: %s", windowRes.Content)
+	}
+
+	// Explicit line=N returns the FULL raw line, bypassing any cap.
+	lineInput, _ := json.Marshal(map[string]any{
+		"hash": hash,
+		"line": 2,
+	})
+	lineRes, err := tool.Execute(ctx, lineInput)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if lineRes.IsError {
+		t.Errorf("expected success, got error: %s", lineRes.Content)
+	}
+	if !strings.Contains(lineRes.Content, "Full line 2 of 3") {
+		t.Errorf("expected 'Full line 2 of 3' header, got: %s", lineRes.Content[:min(80, len(lineRes.Content))])
+	}
+	if !strings.Contains(lineRes.Content, longLine) {
+		t.Errorf("escape-hatch must return the full raw line (bypassing MaxLineBytes)")
+	}
+
+	// Line past end of file is reported gracefully.
+	pastInput, _ := json.Marshal(map[string]any{"hash": hash, "line": 99})
+	pastRes, err := tool.Execute(ctx, pastInput)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(pastRes.Content, "not available") {
+		t.Errorf("expected 'not available' for line past EOF, got: %s", pastRes.Content)
+	}
+}
+
 func TestToolResultReadTool_FileBacked_MidFile(t *testing.T) {
 	tmpDir := t.TempDir()
 	testFile := filepath.Join(tmpDir, "cached.go")
