@@ -102,7 +102,7 @@ agents
   (stdlib + yaml.v3 + log/slog only; no engine packages)
 
 sysproc
-  (stdlib only; no engine packages)
+  (stdlib on non-Windows; Windows process-tree containment uses golang.org/x/sys/windows behind a //go:build windows tag; no engine packages)
 
 ignore
   └──→ pathutil   (external doublestar only otherwise)

@@ -197,9 +197,9 @@ func main() {
 import "github.com/v0lka/sp4rk/sysproc"
 ```
 
-The `sysproc` package configures process-creation attributes for child processes spawned by host applications and the SDK's own helper processes. It exists because a Windows host built as a GUI-subsystem binary has no attached console, so any child started via `os/exec` allocates a fresh console window by default — a terminal that flashes or stays open on screen. `HideConsole` suppresses that window.
+The `sysproc` package configures process-creation attributes for child processes spawned by host applications and the SDK's own helper processes. It exists because a Windows host built as a GUI-subsystem binary has no attached console, so any child started via `os/exec` allocates a fresh console window by default — a terminal that flashes or stays open on screen. `HideConsole` suppresses that window, and `AssignKillOnCloseJob` guarantees the whole descendant tree is cleaned up.
 
-The package is stdlib-only and has no engine imports; it is a near-leaf consumed by `tools`, `tools/builtins`, and `tools/mcp`. Callers apply it without their own platform build tags.
+The package has no engine imports; it is a near-leaf consumed by `tools`, `tools/builtins`, and `tools/mcp`. Callers apply it without their own platform build tags. `HideConsole` is stdlib-only; the Windows process-tree-containment helper (`AssignKillOnCloseJob`) requires `golang.org/x/sys/windows`, confined to a `//go:build windows` file, so the package is no longer strictly stdlib-only on Windows.
 
 ### HideConsole
 
@@ -227,6 +227,18 @@ Do **not** call it for an interactive PTY/ConPTY session, which routes the child
 ### Why CREATE_NO_WINDOW, not HideWindow
 
 Go's `syscall.SysProcAttr.HideWindow` field hides a window that has already been created via `ShowWindow(SW_HIDE)` and still allows a brief flash. `CREATE_NO_WINDOW` suppresses console allocation entirely, so no window ever appears — including no flash.
+
+### AssignKillOnCloseJob
+
+```go
+func AssignKillOnCloseJob(cmd *exec.Cmd) (cleanup func(), err error)
+```
+
+`AssignKillOnCloseJob` places an already-started process — and, by inheritance, its entire descendant tree — into a Windows Job Object configured with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. The returned cleanup closure closes the job handle (typically via `defer`, after `cmd.Wait`), terminating every process still in the job: the command on timeout/cancellation, plus any surviving children and grandchildren on normal completion. It solves the orphan problem where a command's long-lived children (e.g. a browser and its console window launched by `posh_exec`'s PowerShell) outlive the command's own kill scope.
+
+The model is **assign-after-Start**: call `cmd.Start()`, then `AssignKillOnCloseJob(cmd)` as the very next action, then `defer` the returned cleanup. `cmd.Process` must be non-nil. It is best-effort — on failure it leaks no handle, returns a no-op cleanup so the caller can defer it unconditionally, and returns the error so the caller can fall back to `cmd.Cancel`.
+
+This is the complement to `HideConsole`: together they hide the shell window AND guarantee no orphaned grandchildren or stray console windows persist after the host finishes, times out, or cancels. It requires `golang.org/x/sys/windows` (Windows 8+ for nested jobs) and lives behind a `//go:build windows` tag; it is not available on other platforms.
 
 ## ignore
 

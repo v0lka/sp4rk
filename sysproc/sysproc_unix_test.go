@@ -20,3 +20,20 @@ func TestHideConsole(t *testing.T) {
 		t.Error("HideConsole must not modify SysProcAttr on non-Windows platforms")
 	}
 }
+
+func TestAssignKillOnCloseJobNoOp(t *testing.T) {
+	cmd := exec.CommandContext(context.Background(), "echo", "test")
+
+	// AssignKillOnCloseJob must be a no-op on non-Windows platforms: a nil
+	// error and a safe-to-call cleanup, callable even before Start.
+	cleanup, err := AssignKillOnCloseJob(cmd)
+	if err != nil {
+		t.Fatalf("AssignKillOnCloseJob returned error on non-Windows: %v", err)
+	}
+	if cleanup == nil {
+		t.Fatal("AssignKillOnCloseJob returned nil cleanup on non-Windows")
+	}
+	// cleanup must be safely callable and idempotent.
+	cleanup()
+	cleanup()
+}

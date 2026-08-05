@@ -42,7 +42,7 @@ Formal design specifications live in [`specs/`](specs/) (architecture, domains, 
 | `…/pathutil` | Reusable filesystem-path algorithms: `IsWithinPath`, `SplitPathComponents`, `ResolveExistingPrefix` |
 | `…/strutil` | String helpers: `TruncateUTF8` and related utilities |
 | `…/ignore` | Multi-root `.gitignore`/`.aiignore` resolver: `Resolver`, `Multi`, `IgnoreChecker` (satisfied structurally by `tools.IgnoreChecker`) |
-| `…/sysproc` | Child-process console-window suppression (`HideConsole`): OR-edits `CREATE_NO_WINDOW` on Windows, no-op elsewhere; stdlib-only |
+| `…/sysproc` | Child-process console-window suppression (`HideConsole`) + process-tree containment (`AssignKillOnCloseJob`): OR-edits `CREATE_NO_WINDOW` on Windows and assigns started processes to a kill-on-close Job Object; no-op elsewhere. `HideConsole` is stdlib-only; the Windows Job-Object helper depends on `golang.org/x/sys/windows` (behind a `//go:build windows` tag) |
 
 ### Entry points
 

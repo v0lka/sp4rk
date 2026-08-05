@@ -14,6 +14,7 @@ require (
 	github.com/sugarme/tokenizer v0.3.0
 	github.com/yalue/onnxruntime_go v1.27.0
 	golang.org/x/net v0.53.0
+	golang.org/x/sys v0.46.0
 	gopkg.in/yaml.v3 v3.0.1
 	mvdan.cc/sh/v3 v3.7.0
 )

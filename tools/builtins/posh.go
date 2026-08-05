@@ -3,10 +3,12 @@
 package builtins
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os/exec"
 	"regexp"
 	"syscall"
@@ -125,19 +127,26 @@ func (t *PoshExecTool) Execute(ctx context.Context, input json.RawMessage) (tool
 	// Create command: Windows PowerShell, no profile, non-interactive.
 	cmd := exec.CommandContext(timeoutCtx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command)
 
-	// Place the command in a new process group. On Windows, killing the
-	// entire process tree on timeout requires a Job Object
-	// (golang.org/x/sys/windows), which sp4rk avoids to stay stdlib-only.
-	// We therefore kill just the parent powershell.exe process and rely on
-	// WaitDelay to drain any pipe readers. PowerShell -NonInteractive
-	// -Command typically does not spawn long-lived children that outlive it.
+	// Place the command in a new process group so cmd.Cancel can target
+	// powershell.exe in isolation (CREATE_NEW_PROCESS_GROUP). The full process
+	// tree — powershell.exe plus any grandchildren it spawns, e.g. a browser
+	// and the console-subsystem helper window a Playwright-driven
+	// chrome-headless-shell leaves behind — is additionally contained in a
+	// kill-on-close Job Object attached after Start (see below). On normal
+	// completion, timeout, or cancel the whole tree is terminated, so no
+	// orphaned windows linger after the command ends. CREATE_NO_WINDOW
+	// (HideConsole, below) and the Job Object are complementary: the former
+	// hides the shell's own window and default-flag children that share its
+	// console buffer; the latter guarantees cleanup of anything that escapes
+	// by allocating its own window.
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNewProcessGroup}
 	// Suppress the console window that a GUI-subsystem host would otherwise
 	// allocate for the child process (CREATE_NO_WINDOW). This is OR-ed with
 	// createNewProcessGroup so both flags remain in effect.
 	sysproc.HideConsole(cmd)
 
-	// Cancel kills the parent process instead of just the parent.
+	// Cancel kills the powershell.exe parent on timeout/cancel; the Job
+	// Object attached after Start then reaps any surviving grandchildren.
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
 			return nil
@@ -164,8 +173,37 @@ func (t *PoshExecTool) Execute(ctx context.Context, input json.RawMessage) (tool
 		cmd.Dir = workDir
 	}
 
-	// Execute and capture combined output
-	output, err := cmd.CombinedOutput()
+	// Capture combined stdout+stderr ourselves rather than using
+	// CombinedOutput: CombinedOutput runs Start+Wait as one atomic step,
+	// leaving no window to attach the process tree to its Job Object between
+	// them. Both streams share one buffer so ordering is preserved.
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+
+	if err := cmd.Start(); err != nil {
+		return tools.ToolResult{
+			Content: fmt.Sprintf("failed to start command: %v", err),
+			IsError: true,
+		}, nil
+	}
+
+	// Attach the started process tree to a kill-on-close Job Object so that
+	// any grandchildren (browsers, helper windows, ...) are terminated when
+	// the job handle is closed below — on normal completion, timeout, or
+	// cancel alike. Best-effort: if assignment fails we log and fall back to
+	// the parent-only kill that cmd.Cancel performs above, never failing the
+	// command itself.
+	jobCleanup, jobErr := sysproc.AssignKillOnCloseJob(cmd)
+	if jobErr != nil {
+		log.Printf("posh_exec: job-object tree containment unavailable, falling back to parent-only kill: %v", jobErr)
+	}
+	// jobCleanup is always non-nil (a no-op on assignment failure); closing
+	// the job handle after Wait kills every surviving tree member.
+	defer jobCleanup()
+
+	err = cmd.Wait()
+	output := buf.Bytes()
 
 	if err != nil {
 		result := string(output) + "\n" + err.Error()
