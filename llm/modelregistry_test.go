@@ -105,7 +105,7 @@ func TestModelRegistry_FallbackForUnknownModel(t *testing.T) {
 
 	expected := ModelMetadata{
 		ContextWindow: 128000,
-		OutputLimit:   4096,
+		OutputLimit:   32768,
 		TokenizerType: "approximate",
 		// Unknown models default to optimistic attachment support: better to
 		// surface a runtime provider error than to deny image uploads.
@@ -356,11 +356,12 @@ func TestModelRegistry_FuzzyMatch_DoesNotCollideVersions(t *testing.T) {
 	if !ok36 || !ok37 {
 		t.Fatalf("both should resolve; got ok36=%v ok37=%v", ok36, ok37)
 	}
-	// Built-in qwen3.6-35b-a3b-fp8 has OutputLimit 8192; qwen3.7-max has 65536.
-	// They must not have been swapped or merged.
-	if m36.OutputLimit == m37.OutputLimit {
-		t.Errorf("distinct versions resolved to identical OutputLimit %d — possible collision",
-			m36.OutputLimit)
+	// They must not have been swapped or merged. qwen3.6-35b-a3b-fp8 (262144)
+	// and qwen3.7-max (1000000) have distinct context windows, so compare those
+	// — both legitimately share OutputLimit 65536 now.
+	if m36.ContextWindow == m37.ContextWindow {
+		t.Errorf("distinct versions resolved to identical ContextWindow %d — possible collision",
+			m36.ContextWindow)
 	}
 }
 
@@ -1007,12 +1008,12 @@ func TestModelRegistry_SourceFallback(t *testing.T) {
 		t.Fatal("expected ok=false when source returns false")
 	}
 
-	// Fallback defaults: ContextWindow: 128000, OutputLimit: 4096, TokenizerType: "approximate"
+	// Fallback defaults: ContextWindow: 128000, OutputLimit: 32768, TokenizerType: "approximate"
 	if meta.ContextWindow != 128000 {
 		t.Errorf("expected fallback ContextWindow 128000, got %d", meta.ContextWindow)
 	}
-	if meta.OutputLimit != 4096 {
-		t.Errorf("expected fallback OutputLimit 4096, got %d", meta.OutputLimit)
+	if meta.OutputLimit != 32768 {
+		t.Errorf("expected fallback OutputLimit 32768, got %d", meta.OutputLimit)
 	}
 	if meta.TokenizerType != "approximate" {
 		t.Errorf("expected fallback TokenizerType %q, got %q", "approximate", meta.TokenizerType)
@@ -1085,8 +1086,8 @@ func TestModelRegistry_FetchFromHuggingFace(t *testing.T) {
 		if meta.ContextWindow != 8192 {
 			t.Errorf("expected ContextWindow 8192, got %d", meta.ContextWindow)
 		}
-		if meta.OutputLimit != 4096 {
-			t.Errorf("expected OutputLimit 4096, got %d", meta.OutputLimit)
+		if meta.OutputLimit != 32768 {
+			t.Errorf("expected OutputLimit 32768, got %d", meta.OutputLimit)
 		}
 		if meta.TokenizerType != "approximate" {
 			t.Errorf("expected TokenizerType 'approximate', got %q", meta.TokenizerType)
@@ -1533,8 +1534,8 @@ func TestResolveBuiltInModel_UnknownModel(t *testing.T) {
 	if meta.ContextWindow != 128000 {
 		t.Errorf("expected fallback ContextWindow 128000, got %d", meta.ContextWindow)
 	}
-	if meta.OutputLimit != 4096 {
-		t.Errorf("expected fallback OutputLimit 4096, got %d", meta.OutputLimit)
+	if meta.OutputLimit != 32768 {
+		t.Errorf("expected fallback OutputLimit 32768, got %d", meta.OutputLimit)
 	}
 	if meta.TokenizerType != "approximate" {
 		t.Errorf("expected fallback TokenizerType approximate, got %s", meta.TokenizerType)
