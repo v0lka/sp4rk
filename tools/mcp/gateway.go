@@ -437,10 +437,16 @@ func (e *ReconfigureError) Error() string {
 }
 
 // ServerStatus represents the current status of an MCP server connection.
+//
+// Starting is a transient state distinct from Connected/Error: it marks an entry
+// that is still being initialized (e.g. the gateway placeholder while startup is
+// in flight). It is non-omitempty (always serializes, like Connected) so the
+// frontend can treat it as a first-class state without falsy-coalescing.
 type ServerStatus struct {
 	Name      string   `json:"name"`
 	Transport string   `json:"transport"`
 	Connected bool     `json:"connected"`
+	Starting  bool     `json:"starting"`
 	ToolCount int      `json:"tool_count"`
 	Tools     []string `json:"tools"`
 	Error     string   `json:"error,omitempty"`
