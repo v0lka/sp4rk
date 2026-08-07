@@ -347,8 +347,20 @@ func normalizeSeparators(s string) string {
 // resolve as relative on a Windows host. POSIX-rooted values are therefore
 // joined and cleaned with the path package; Windows-style (drive/UNC) and host
 // paths use filepath as usual.
+//
+// Every part is normalized to forward slashes before joining. Joining with
+// [filepath.Separator] ('\' on Windows) would mix a backslash into a
+// POSIX-rooted value — and [path.Clean] (used for POSIX roots) treats '\' as a
+// literal character, not a separator, so "/opt/x" + '\' + "/y/.." would clean
+// to "/opt/x\y" rather than "/opt/y". Normalizing first keeps a single,
+// consistent separator so the POSIX branch's path.Clean behaves correctly on
+// every host.
 func cleanJoined(parts ...string) string {
-	joined := strings.Join(parts, string(filepath.Separator))
+	normalized := make([]string, len(parts))
+	for i, p := range parts {
+		normalized[i] = normalizeSeparators(p)
+	}
+	joined := strings.Join(normalized, "/")
 	if strings.HasPrefix(joined, "/") {
 		return path.Clean(joined)
 	}
