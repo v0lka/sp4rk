@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 
 	mcpclient "github.com/mark3labs/mcp-go/client"
@@ -110,8 +111,15 @@ func (s *Server) Connect(ctx context.Context, cfg ServerConfig) error {
 
 // connectStdio creates a stdio MCP client.
 func (s *Server) connectStdio(ctx context.Context, cfg ServerConfig) (*mcpclient.Client, error) {
-	// Build environment variables slice
-	env := os.Environ()
+	// Build environment variables slice using an allowlist rather than
+	// os.Environ(). MCP servers run arbitrary, potentially third-party
+	// commands from config (ASI04 — agentic supply chain); forwarding the
+	// full parent environment would leak host secrets (LLM API keys, proxy
+	// credentials, etc.) to every stdio MCP child process. Only a minimal
+	// safe set required for a process to find its own executables and
+	// locale is inherited; anything else the server needs must be declared
+	// explicitly in its cfg.Env.
+	env := safeStdioEnv(os.Environ())
 	for key, value := range cfg.Env {
 		env = append(env, fmt.Sprintf("%s=%s", key, value))
 	}
@@ -152,6 +160,61 @@ func (s *Server) connectStdio(ctx context.Context, cfg ServerConfig) (*mcpclient
 	}
 
 	return client, nil
+}
+
+// stdioEnvAllowlist is the set of environment variables that are inherited
+// from the host by stdio MCP server processes. These are the minimal vars a
+// process needs to locate its own executables (PATH, HOME), identify the user
+// (USER, SHELL), select a locale (LANG, LC_*), and place temp files (TMPDIR,
+// TEMP/TMP). Everything else must be declared explicitly in the server's
+// cfg.Env. Secrets — LLM API keys, proxy credentials, etc. — must never be
+// forwarded implicitly (ASI04).
+//
+// HOME is intentionally included: many Node/Python MCP servers read
+// ~/.config, ~/.npmrc or ~/.cache at startup and misbehave or crash without
+// it. HOME is not itself a secret. An operator who wants strict isolation
+// (e.g. to block ~/.aws/credentials reads) can strip HOME via cfg.Env —
+// explicit cfg.Env entries are applied after this filter and win.
+var stdioEnvAllowlist = map[string]struct{}{
+	"PATH":   {},
+	"HOME":   {},
+	"USER":   {},
+	"SHELL":  {},
+	"LANG":   {},
+	"TERM":   {},
+	"TMPDIR": {},
+	"TEMP":   {},
+	"TMP":    {},
+	// Locale variables share the LC_ prefix.
+}
+
+// isAllowedStdioEnvVar reports whether the given env var (NAME=value form)
+// is on the allowlist (exact match on NAME, or an LC_* locale variable).
+func isAllowedStdioEnvVar(entry string) bool {
+	key, _, ok := strings.Cut(entry, "=")
+	if !ok {
+		return false
+	}
+	if _, allowed := stdioEnvAllowlist[key]; allowed {
+		return true
+	}
+	return strings.HasPrefix(key, "LC_")
+}
+
+// safeStdioEnv filters a raw os.Environ()-style slice down to the allowlisted
+// variables only. Explicit server cfg.Env values are applied on top by the
+// caller, so they always win and are not subject to this filter.
+func safeStdioEnv(raw []string) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(stdioEnvAllowlist)+4)
+	for _, e := range raw {
+		if isAllowedStdioEnvVar(e) {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 // connectHTTP creates an HTTP MCP client with fallback from Streamable HTTP to SSE.

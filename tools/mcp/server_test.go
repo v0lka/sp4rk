@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -308,4 +309,72 @@ func toLower(c byte) byte {
 		return c + ('a' - 'A')
 	}
 	return c
+}
+
+// ---------------------------------------------------------------------------
+// stdio environment allowlist (ASI04)
+// ---------------------------------------------------------------------------
+
+func TestIsAllowedStdioEnvVar_Allowlist(t *testing.T) {
+	allowed := []string{
+		"PATH=/usr/bin:/bin",
+		"HOME=/home/user",
+		"USER=user",
+		"SHELL=/bin/bash",
+		"LANG=en_US.UTF-8",
+		"TERM=xterm-256color",
+		"TMPDIR=/tmp",
+		"TEMP=/tmp",
+		"TMP=/tmp",
+		"LC_ALL=en_US.UTF-8",
+		"LC_CTYPE=C",
+	}
+	for _, e := range allowed {
+		if !isAllowedStdioEnvVar(e) {
+			t.Errorf("expected %q to be allowed", e)
+		}
+	}
+}
+
+func TestIsAllowedStdioEnvVar_RejectsSecrets(t *testing.T) {
+	rejected := []string{
+		"ANTHROPIC_API_KEY=sk-ant-xxx",
+		"OPENAI_API_KEY=sk-xxx",
+		"HTTP_PROXY=http://user:pass@proxy:8080",
+		"AWS_SECRET_ACCESS_KEY=abcdef",
+		"GITHUB_TOKEN=ghp_xxx",
+		"DATABASE_URL=postgres://user:pass@host/db",
+	}
+	for _, e := range rejected {
+		if isAllowedStdioEnvVar(e) {
+			t.Errorf("expected %q to be REJECTED (not on allowlist)", e)
+		}
+	}
+}
+
+func TestSafeStdioEnv_FiltersToAllowlist(t *testing.T) {
+	raw := []string{
+		"PATH=/usr/bin",
+		"HOME=/home/user",
+		"TMPDIR=/tmp",
+		"ANTHROPIC_API_KEY=sk-ant-secret",
+		"OPENAI_API_KEY=sk-secret",
+		"LC_ALL=en_US.UTF-8",
+		"SOME_RANDOM_VAR=value",
+	}
+	got := safeStdioEnv(raw)
+	if len(got) != 4 { // PATH, HOME, TMPDIR, LC_ALL
+		t.Fatalf("expected 4 allowlisted vars, got %d: %v", len(got), got)
+	}
+	for _, e := range got {
+		if strings.Contains(e, "secret") {
+			t.Errorf("secret leaked through filter: %q", e)
+		}
+	}
+}
+
+func TestSafeStdioEnv_EmptyReturnsNil(t *testing.T) {
+	if got := safeStdioEnv(nil); got != nil {
+		t.Errorf("expected nil for empty input, got %v", got)
+	}
 }

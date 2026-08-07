@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os/exec"
 	"regexp"
+	"strings"
 	"syscall"
 	"time"
 
@@ -87,7 +88,15 @@ func (t *PoshExecTool) Judge(ctx context.Context, input json.RawMessage) (allowe
 		}
 	}
 
-	return false, "" // No match, defer to LLM Judge
+	// Containment check: reject commands that reference filesystem paths
+	// outside the configured session roots (workspace + auxiliary roots).
+	// Mirrors BashExecTool.Judge exactly, differing only in ShellKind
+	// (ShellPosh) so PowerShell env syntax like "$env:VAR" is recognized.
+	if outside := tools.PathsOutsideRoots(ctx, params.Command, tools.ShellPosh, params.WorkingDirectory); len(outside) > 0 {
+		return false, "command references path(s) outside session roots: " + strings.Join(outside, ", ")
+	}
+
+	return false, "" // No concern to report; workspace auto-approval semantics apply.
 }
 
 // Execute runs the PowerShell command and returns the result.

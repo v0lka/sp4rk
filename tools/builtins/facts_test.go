@@ -191,3 +191,111 @@ func TestSearchFactsTool_InvalidJSON(t *testing.T) {
 		t.Fatal("expected error result for invalid JSON")
 	}
 }
+
+// TestStoreFactTool_RefusesSecrets verifies the ASI06 secret-scanner refuses
+// to persist credentials to long-term memory.
+func TestStoreFactTool_RefusesSecrets(t *testing.T) {
+	tool := NewStoreFactTool()
+
+	secrets := []string{
+		`ANTHROPIC_API_KEY=sk-ant-api03-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`,
+		`token=dGhpcyBpcyBhIHZlcnkgbG9uZyBzZWNyZXQgdG9rZW4gdmFsdWU=`,
+		`Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.longtoken`,
+		`password=hunter2supersecretvalue123`,
+		`AKIAIOSFODNN7EXAMPLE`,
+		`OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz0123456789`,
+	}
+	for _, s := range secrets {
+		fs := &mockFactStore{} // fresh store per case
+		ctx := ctxWithFactStore(fs)
+		input, _ := json.Marshal(StoreFactInput{
+			Keywords: []string{"a", "b", "c"},
+			Content:  s,
+		})
+		result, err := tool.Execute(ctx, input)
+		if err != nil {
+			t.Fatalf("unexpected error for %q: %v", s, err)
+		}
+		if !result.IsError {
+			t.Errorf("expected refusal for secret %q, got: %s", s, result.Content)
+		}
+		if len(fs.facts) != 0 {
+			t.Errorf("expected no facts stored for secret %q, got %d", s, len(fs.facts))
+		}
+	}
+}
+
+// TestStoreFactTool_AcceptsNonSecret verifies normal facts are stored.
+func TestStoreFactTool_AcceptsNonSecret(t *testing.T) {
+	tool := NewStoreFactTool()
+	fs := &mockFactStore{}
+	ctx := ctxWithFactStore(fs)
+
+	input, _ := json.Marshal(StoreFactInput{
+		Keywords: []string{"auth", "middleware", "jwt"},
+		Content:  "Authentication uses JWT with EdDSA signing. Tokens expire in 1 hour.",
+	})
+	result, err := tool.Execute(ctx, input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("expected success for benign fact, got: %s", result.Content)
+	}
+	if len(fs.facts) != 1 {
+		t.Errorf("expected 1 fact stored, got %d", len(fs.facts))
+	}
+}
+
+// TestStoreFactTool_RefusesSecretInKeyword verifies the scanner also checks
+// the keywords field, closing the gap where a credential could be stashed in
+// a keyword tag while the content stays benign (ASI06).
+func TestStoreFactTool_RefusesSecretInKeyword(t *testing.T) {
+	tool := NewStoreFactTool()
+	fs := &mockFactStore{}
+	ctx := ctxWithFactStore(fs)
+
+	input, _ := json.Marshal(StoreFactInput{
+		Keywords: []string{"deploy", "sk-ant-api03-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "ci"},
+		Content:  "Deployment uses the staging environment.",
+	})
+	result, err := tool.Execute(ctx, input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.IsError {
+		t.Fatal("expected refusal when a keyword contains a secret, got success")
+	}
+	if len(fs.facts) != 0 {
+		t.Errorf("expected no facts stored, got %d", len(fs.facts))
+	}
+}
+
+// TestStoreFactTool_AcceptsProseWithCredentialWords verifies that the anchored
+// assignment patterns do not refuse legitimate documentation prose containing
+// words like "token", "auth", or "secret" in sentence context — the false
+// positives flagged in the review.
+func TestStoreFactTool_AcceptsProseWithCredentialWords(t *testing.T) {
+	tool := NewStoreFactTool()
+
+	prose := []string{
+		"the token: a1b2c3d4e5f6g7h8 expires hourly",
+		"see auth: ed25519signature1234 for details",
+		"OAuth2 is used for authentication",
+	}
+	for _, p := range prose {
+		fs := &mockFactStore{}
+		ctx := ctxWithFactStore(fs)
+		input, _ := json.Marshal(StoreFactInput{
+			Keywords: []string{"a", "b", "c"},
+			Content:  p,
+		})
+		result, err := tool.Execute(ctx, input)
+		if err != nil {
+			t.Fatalf("unexpected error for %q: %v", p, err)
+		}
+		if result.IsError {
+			t.Errorf("expected prose %q to be accepted, got refusal: %s", p, result.Content)
+		}
+	}
+}

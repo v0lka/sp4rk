@@ -36,7 +36,10 @@ func NewReadAttachmentTool() *ReadAttachmentTool {
 		},
 		"required": ["attachment_id"]
 	}`),
-		Policy: tools.PolicyAlwaysAllow,
+		// ASI01: converted markdown (PDFs, docs, spreadsheets) is external
+		// content that may carry prompt-injection payloads. Treat as untrusted.
+		Untrusted: true,
+		Policy:    tools.PolicyAlwaysAllow,
 	}}
 }
 

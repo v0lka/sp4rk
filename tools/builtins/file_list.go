@@ -33,7 +33,9 @@ func NewListDirectoryTool() *ListDirectoryTool {
 				},
 				"required": ["path"]
 			}`),
-			Policy: tools.PolicyAlwaysAllow,
+			// ASI01: filenames may carry prompt-injection payloads.
+			Untrusted: true,
+			Policy:    tools.PolicyAlwaysAllow,
 		},
 	}
 }

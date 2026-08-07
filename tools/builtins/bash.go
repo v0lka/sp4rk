@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os/exec"
 	"regexp"
+	"strings"
 	"syscall"
 	"time"
 
@@ -62,7 +63,11 @@ type bashInput struct {
 }
 
 // Judge evaluates whether a bash command is safe to execute.
-// It checks the command against compiled blacklist patterns.
+// It checks the command against compiled blacklist patterns first (the more
+// specific reason), then performs path-containment analysis: any shell token
+// resolving to an absolute path outside the session roots escalates the call to
+// user confirmation, mirroring how read_file/list_directory Judges behave. With
+// no session roots configured containment is a no-op (no crash, no reason).
 func (t *BashExecTool) Judge(ctx context.Context, input json.RawMessage) (allowed bool, reason string) {
 	var params bashInput
 	if err := json.Unmarshal(input, &params); err != nil {
@@ -75,7 +80,14 @@ func (t *BashExecTool) Judge(ctx context.Context, input json.RawMessage) (allowe
 		}
 	}
 
-	return false, "" // No match, defer to LLM Judge
+	// Path-containment analysis: out-of-root paths escalate to confirmation
+	// even under always_allow, closing the documented-invariant gap. The Judge
+	// runs before auto-approval, so a non-empty reason here forces a prompt.
+	if outside := tools.PathsOutsideRoots(ctx, params.Command, tools.ShellBash, params.WorkingDirectory); len(outside) > 0 {
+		return false, "command references path(s) outside session roots: " + strings.Join(outside, ", ")
+	}
+
+	return false, "" // No concern to report; workspace auto-approval semantics apply.
 }
 
 // Execute runs the bash command and returns the result.

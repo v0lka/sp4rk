@@ -180,6 +180,31 @@ func TestPoshExecTool_Judge_InvalidJSON(t *testing.T) {
 	}
 }
 
+// TestPoshExecTool_Judge_OutOfRootPath verifies the containment check added
+// to Judge: a command referencing a path outside the configured session
+// roots is rejected with allow=false and a "session roots" reason. Mirrors
+// the bash Judge test (BashExecTool.Judge) for symmetry between the two
+// shells; the only difference is the ShellKind passed to PathsOutsideRoots.
+func TestPoshExecTool_Judge_OutOfRootPath(t *testing.T) {
+	tool := mustNewPoshExecTool(t, nil) // empty blacklist: only containment triggers
+
+	// Workspace root isolated from the system; an absolute system path is
+	// provably outside it, so containment must reject the command.
+	ws := t.TempDir()
+	ctx := tools.WithWorkspacePath(context.Background(), ws)
+	input, _ := json.Marshal(map[string]string{
+		"command": `Get-Content C:\Windows\System32\drivers\etc\hosts`,
+	})
+
+	allow, reasoning := tool.Judge(ctx, input)
+	if allow {
+		t.Error("expected Judge to return allow=false for out-of-root path")
+	}
+	if !strings.Contains(reasoning, "session roots") {
+		t.Errorf("expected reasoning to mention session roots, got: %s", reasoning)
+	}
+}
+
 func TestPoshExecTool_WorkingDirectory(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "posh_test")
 	if err != nil {

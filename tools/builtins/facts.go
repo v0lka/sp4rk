@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/v0lka/sp4rk/agent"
@@ -70,6 +71,20 @@ func (t *StoreFactTool) Execute(ctx context.Context, input json.RawMessage) (too
 	}
 	if strings.TrimSpace(params.Content) == "" {
 		return tools.ToolResult{Content: "validation error: content is required", IsError: true}, nil
+	}
+
+	// ASI06-R8/R10: refuse to persist content that looks like a secret/credential.
+	// The fact store persists across sessions; a leaked API key there is a
+	// durable secret-disclosure. This is a heuristic lint, not a guarantee —
+	// it catches the common "ANTHROPIC_API_KEY=sk-..." / "token=..." shapes.
+	// Both content and keywords are scanned: a careless agent could stash a
+	// credential in a keyword tag, bypassing a content-only check.
+	if hit := firstSecretHit(params.Content, params.Keywords); hit != "" {
+		return tools.ToolResult{
+			Content: "refused: input appears to contain a secret (" + hit + "). " +
+				"Secrets must not be stored in agent memory. Store only the non-secret fact.",
+			IsError: true,
+		}, nil
 	}
 
 	fs := agent.FactStoreFromContext(ctx)
@@ -146,4 +161,60 @@ func (t *SearchFactsTool) Execute(ctx context.Context, input json.RawMessage) (t
 	}
 
 	return tools.ToolResult{Content: b.String()}, nil
+}
+
+// secretPatterns are heuristics that catch common credential shapes a careless
+// agent might try to persist to long-term memory. They are intentionally broad
+// (favor recall) since refusing a borderline fact is a recoverable false
+// positive, while persisting a real secret is a durable disclosure (ASI06).
+//
+// The assignment patterns deliberately avoid the bare "keyword: value" prose
+// form: a colon-separated lowercase keyword in a sentence ("the token:
+// abcd1234", "see auth: ed25519...") is not a secret. Real assignments use
+// either "=" (env/shell) or a quoted value (JSON/YAML config); the quoted-value
+// requirement is the discriminator that separates structured secrets from
+// prose without sacrificing recall for "OPENAI_API_KEY=sk-..." prefixes.
+var secretPatterns = []*regexp.Regexp{
+	// "=" assignments: KEY=value (env, shell, .env files). Matches prefixed
+	// identifiers like OPENAI_API_KEY or ANTHROPIC_API_KEY.
+	regexp.MustCompile(`(?i)(?:api[_-]?key|password|passwd|secret|token|access[_-]?key|auth)\s*=\s*\S{8,}`),
+	// ":" assignments with a quoted value (JSON/YAML/TOML config). The value
+	// must be quoted so prose like "the token: abcd1234" never matches.
+	regexp.MustCompile(`(?i)["']?(?:api[_-]?key|password|passwd|secret|token|access[_-]?key|auth)["']?\s*:\s*["']\S{8,}["']`),
+	// OpenAI-style keys.
+	regexp.MustCompile(`sk-[A-Za-z0-9]{20,}`),
+	// Anthropic-style keys.
+	regexp.MustCompile(`sk-ant-[A-Za-z0-9_-]{20,}`),
+	// Generic long hex/base64 "bearer" tokens.
+	regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._-]{20,}`),
+	// AWS access keys.
+	regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+	// GitHub PATs.
+	regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{36,}`),
+}
+
+// matchesSecretPattern returns a human-readable label of the first secret
+// pattern matched by content, or "" if none match.
+func matchesSecretPattern(content string) string {
+	for _, re := range secretPatterns {
+		if re.MatchString(content) {
+			return re.String()
+		}
+	}
+	return ""
+}
+
+// firstSecretHit returns the label of the first secret pattern matched across
+// the content and each keyword entry, or "" if none match. Scanning keywords
+// closes the gap where a credential could be stashed in a keyword tag.
+func firstSecretHit(content string, keywords []string) string {
+	if hit := matchesSecretPattern(content); hit != "" {
+		return hit
+	}
+	for _, kw := range keywords {
+		if hit := matchesSecretPattern(kw); hit != "" {
+			return hit
+		}
+	}
+	return ""
 }

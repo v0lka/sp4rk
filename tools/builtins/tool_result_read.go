@@ -48,7 +48,10 @@ func NewToolResultReadTool() *ToolResultReadTool {
 		},
 		"required": ["hash"]
 	}`),
-		Policy: tools.PolicyAlwaysAllow,
+		// ASI01: re-surfaces previously cached tool output, which may be
+		// untrusted data from an earlier external read. Preserve the wrap.
+		Untrusted: true,
+		Policy:    tools.PolicyAlwaysAllow,
 	}}
 }
 

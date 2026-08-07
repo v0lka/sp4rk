@@ -102,6 +102,9 @@ func NewVectorSearchTool(searchFunc VectorSearchFunc, waitFunc VectorSearchWaitF
 		"required": ["query"]
 	}`),
 			Policy: tools.PolicyAlwaysAllow,
+			// ASI01: content previews are real source from the workspace,
+			// which may carry prompt-injection payloads. Treat as untrusted.
+			Untrusted: true,
 		},
 		searchFunc: searchFunc,
 		waitFunc:   waitFunc,
