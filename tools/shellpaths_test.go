@@ -4,6 +4,7 @@ package tools
 
 import (
 	"context"
+	"path"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -230,7 +231,7 @@ func TestResolveShellPathTokens_DedupeAndClean(t *testing.T) {
 		"cp /var/log/syslog /var/log/syslog $SHLP_HOME/x/.. ", ShellBash, "")
 
 	wantSyslog := "/var/log/syslog"
-	wantExpanded := filepath.Clean("/opt/expanded/x/..") // == /opt/expanded
+	wantExpanded := path.Clean("/opt/expanded/x/..") // == /opt/expanded
 	if !sliceContains(got, wantSyslog) {
 		t.Fatalf("expected %q in resolved tokens, got %v", wantSyslog, got)
 	}

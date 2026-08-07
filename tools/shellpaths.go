@@ -22,6 +22,7 @@ package tools
 import (
 	"context"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -105,7 +106,7 @@ func ResolveShellPathTokens(command string, shell ShellKind, workDir string) []s
 	var out []string
 	for _, tok := range re.FindAllString(command, -1) {
 		resolved, ok := resolveShellToken(tok, shell, workDir)
-		if !ok || resolved == "" || !filepath.IsAbs(resolved) {
+		if !ok || resolved == "" || !isAbsResolved(resolved) {
 			continue
 		}
 		if _, dup := seen[resolved]; dup {
@@ -182,7 +183,15 @@ func resolveShellToken(token string, shell ShellKind, workDir string) (string, b
 		return resolveRelativeToken(token, workDir)
 	default:
 		// Anything else matched by the combined regex is an absolute path
-		// (POSIX root or Windows drive) coming from [pathRegex].
+		// coming from [pathRegex]: a POSIX root ("/...") or a Windows drive
+		// ("C:\..."). A POSIX-rooted path is absolute by definition on every
+		// host, but filepath.IsAbs returns false for it on Windows and
+		// filepath.Clean rewrites its separators to backslashes — so clean it
+		// with the path package to keep it forward-slashed and POSIX-absolute
+		// regardless of host OS. Windows drive paths use filepath as usual.
+		if strings.HasPrefix(token, "/") {
+			return path.Clean(token), true
+		}
 		return filepath.Clean(token), true
 	}
 }
@@ -198,6 +207,20 @@ var urlSchemeFragmentRe = regexp.MustCompile(`^[A-Za-z]://`)
 // scheme (e.g. "s://github.com/..." extracted from "https://github.com/...").
 func isURLSchemeFragment(token string) bool {
 	return urlSchemeFragmentRe.MatchString(token)
+}
+
+// isAbsResolved reports whether resolved is an absolute path on any host. It
+// treats a POSIX root ("/...") — which a shell command can carry regardless of
+// the host OS — as absolute on every platform, in addition to what the host's
+// [filepath.IsAbs] considers absolute (a Windows drive "C:\..." on Windows).
+//
+// On Windows, filepath.IsAbs("/etc/passwd") returns false and the resolved
+// POSIX path would be dropped from the output; this helper keeps it, so a
+// command like "cat /etc/passwd" is still flagged as referencing an out-of-root
+// path on a Windows CI host. Windows drive paths remain absolute everywhere
+// because they are detected by prefix, not by filepath.IsAbs.
+func isAbsResolved(resolved string) bool {
+	return strings.HasPrefix(resolved, "/") || filepath.IsAbs(resolved)
 }
 
 // resolveTildeToken expands "~" (and "~<sep>...") to the home directory.
@@ -254,9 +277,9 @@ func resolveEnvToken(token string, shell ShellKind) (string, bool) {
 	}
 	rest = normalizeSeparators(rest)
 	if rest != "" {
-		return filepath.Clean(filepath.Join(val, rest)), true
+		return cleanJoined(val, rest), true
 	}
-	return filepath.Clean(val), true
+	return cleanJoined(val), true
 }
 
 // splitBrace extracts the variable name inside "${...}" / "${env:...}" and the
@@ -316,15 +339,37 @@ func normalizeSeparators(s string) string {
 	return strings.ReplaceAll(s, "\\", "/")
 }
 
-// userHomeDir returns the current user's home directory, preferring
-// [os.UserHomeDir] and falling back to $HOME then $USERPROFILE for
-// environments where the OS call fails.
-func userHomeDir() string {
-	if h, err := os.UserHomeDir(); err == nil && h != "" {
-		return h
+// cleanJoined cleans the join of a resolved env-var value with an optional path
+// remainder, preserving POSIX separators when the value is a POSIX-rooted
+// absolute path. [filepath.Clean]/[filepath.Join] on Windows rewrite the
+// leading "/" of a POSIX path to "\" (collapsing "/var/log/syslog" to a
+// relative "var\log\syslog"), which would make a POSIX-absolute env path
+// resolve as relative on a Windows host. POSIX-rooted values are therefore
+// joined and cleaned with the path package; Windows-style (drive/UNC) and host
+// paths use filepath as usual.
+func cleanJoined(parts ...string) string {
+	joined := strings.Join(parts, string(filepath.Separator))
+	if strings.HasPrefix(joined, "/") {
+		return path.Clean(joined)
 	}
+	return filepath.Clean(joined)
+}
+
+// userHomeDir returns the current user's home directory, preferring $HOME
+// (the override the bash/posh "tilde expansion tests rely on via t.Setenv and
+// the variable os.UserHomeDir consults last on Windows), then $USERPROFILE,
+// then [os.UserHomeDir]. On Windows os.UserHomeDir resolves via USERPROFILE
+// and does not consult $HOME, so a test that t.Setenv("HOME", fakeHome) to
+// pin tilde expansion would be silently bypassed without this precedence.
+func userHomeDir() string {
 	if h := os.Getenv("HOME"); h != "" {
 		return h
 	}
-	return os.Getenv("USERPROFILE")
+	if h := os.Getenv("USERPROFILE"); h != "" {
+		return h
+	}
+	if h, err := os.UserHomeDir(); err == nil && h != "" {
+		return h
+	}
+	return ""
 }
