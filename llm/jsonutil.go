@@ -54,23 +54,18 @@ func ExtractJSON(content string) string {
 			ch := content[i]
 
 			if inString {
-				if ch == '\\' {
-					// Count consecutive backslashes to the left to determine
-					// if the next quote we encounter is escaped.
-					escapeCount := 1
+				if ch == '"' {
+					// Exiting a string. Count preceding backslashes (to the
+					// left, which we have not yet scanned) to determine if
+					// this quote is escaped. An odd count means the quote is
+					// escaped and we stay in the string.
+					escapeCount := 0
 					for j := i - 1; j >= 0 && content[j] == '\\'; j-- {
 						escapeCount++
 					}
-					// If escapeCount is odd, the quote to the left is escaped
-					// and we stay in the string; skip over all backslashes.
 					if escapeCount%2 == 1 {
-						i -= escapeCount - 1
 						continue
 					}
-					// Even count: the quote we passed was NOT escaped.
-					// Fall through to normal processing.
-				}
-				if ch == '"' {
 					inString = false
 				}
 				continue

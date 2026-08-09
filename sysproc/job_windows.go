@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sync"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -75,15 +76,16 @@ func AssignKillOnCloseJob(cmd *exec.Cmd) (cleanup func(), err error) {
 		return noopCleanup, err
 	}
 
-	var closed bool
+	var closeOnce sync.Once
 	return func() {
-		if closed {
-			return
-		}
-		closed = true
 		// Closing the last handle to the job object terminates all members
-		// because JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE is set.
-		_ = windows.CloseHandle(job)
+		// because JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE is set. sync.Once makes
+		// the closure safe to call concurrently and guarantees the handle is
+		// closed exactly once (never double-closed), honoring the idempotency
+		// contract documented above.
+		closeOnce.Do(func() {
+			_ = windows.CloseHandle(job)
+		})
 	}, nil
 }
 

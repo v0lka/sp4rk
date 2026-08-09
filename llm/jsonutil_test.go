@@ -68,6 +68,20 @@ func TestExtractJSON_MultipleBlocks(t *testing.T) {
 			wantJSON: `{"key": "escaped \" quote"}`,
 		},
 		{
+			name:    "escaped quote with braces inside string value",
+			content: `Result: {"a":"{\"b\":1}"}`,
+			wantOK:  true,
+			// The value of "a" is the string {"b":1} (escaped quotes + braces).
+			wantJSON: `{"a":"{\"b\":1}"}`,
+		},
+		{
+			name:    "escaped backslash before closing quote in string with braces",
+			content: `Text {"path":"C:\\dir\\"} end`,
+			wantOK:  true,
+			// \\ is an escaped backslash, the following " terminates the string.
+			wantJSON: `{"path":"C:\\dir\\"}`,
+		},
+		{
 			name:    "no braces returns original",
 			content: `just plain text`,
 			wantOK:  false,

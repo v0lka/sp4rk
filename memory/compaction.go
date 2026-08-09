@@ -45,9 +45,25 @@ func NewCompactionStrategy(name string, cfg CompactionConfig, deps CompactionDep
 		maxTokens = 16000
 	}
 
+	// Sliding-window defaults. A zero-valued config must NOT silently erase the
+	// entire step history: keepFirst=0 && keepLast=0 would drop every step on
+	// the first compaction (the early-return guard is only hit when
+	// len(steps) <= 0). Defaulting here mirrors the behaviour already applied
+	// for summarization and hierarchical, and matches the Framework's own
+	// production default. The Conductor falls back to "sliding_window" when no
+	// strategy is specified, so these defaults are the common path.
+	keepFirst := cfg.SlidingWindow.KeepFirst
+	if keepFirst <= 0 {
+		keepFirst = 3
+	}
+	keepLast := cfg.SlidingWindow.KeepLast
+	if keepLast <= 0 {
+		keepLast = 10
+	}
+
 	switch name {
 	case "sliding_window":
-		return NewSlidingWindowStrategy(cfg.SlidingWindow.KeepFirst, cfg.SlidingWindow.KeepLast)
+		return NewSlidingWindowStrategy(keepFirst, keepLast)
 	case "summarization":
 		blockSize := cfg.Summarization.BlockSize
 		if blockSize <= 0 {
@@ -81,6 +97,6 @@ func NewCompactionStrategy(name string, cfg CompactionConfig, deps CompactionDep
 		}
 		return NewHierarchicalStrategy(distant, middle, recent, obsTruncateHier, deps.Summarize, deps.TokenCounter, maxTokens)
 	default:
-		return NewSlidingWindowStrategy(cfg.SlidingWindow.KeepFirst, cfg.SlidingWindow.KeepLast)
+		return NewSlidingWindowStrategy(keepFirst, keepLast)
 	}
 }

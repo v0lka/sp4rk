@@ -24,8 +24,19 @@ type BraveProvider struct {
 // NewBraveProviderWithClient creates a new BraveProvider with the given API key, timeout,
 // and optional HTTP client. If client is nil, a default client with the specified timeout is used.
 func NewBraveProviderWithClient(apiKey string, timeout time.Duration, client *http.Client) *BraveProvider {
+	// The API key travels in the X-Subscription-Token header. Refuse to follow
+	// redirects so the header (and key) is never re-sent to another host — Go
+	// only strips a fixed set of sensitive headers (Authorization, Cookie) on
+	// cross-host redirects, not custom ones like this. This protection must
+	// apply to a caller-supplied client too: we make a shallow copy (never
+	// mutating the caller's) and set CheckRedirect unconditionally.
+	noRedirect := func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	if client == nil {
-		client = &http.Client{Timeout: timeout}
+		client = &http.Client{Timeout: timeout, CheckRedirect: noRedirect}
+	} else {
+		c := *client
+		c.CheckRedirect = noRedirect
+		client = &c
 	}
 	return &BraveProvider{
 		apiKey:  apiKey,

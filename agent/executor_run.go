@@ -587,11 +587,16 @@ func (e *Executor) handleTruncationStopReason(ctx context.Context, resp *llm.Cha
 		ReasoningContent: resp.Message.ReasoningContent,
 		Action:           truncAction,
 		Observation:      truncObs,
-		TokensUsed:       resp.Usage.InputTokens + resp.Usage.OutputTokens,
+		// IsError marks this as a non-result: the tool call was NOT executed
+		// (it was truncated by the max output token limit). This prevents the
+		// mutation gate from counting an unexecuted write_file/edit_file as a
+		// successful mutation (silent false success). Mirrors the HITL-reject path.
+		IsError:    true,
+		TokensUsed: resp.Usage.InputTokens + resp.Usage.OutputTokens,
 	}
 	state.allSteps = append(state.allSteps, step)
 	cw.AddStep(step)
-	e.emitter.ToolResult(state.stepNum, 0, len(truncObs), truncObs, false)
+	e.emitter.ToolResult(state.stepNum, 0, len(truncObs), truncObs, true)
 	e.emitter.StepComplete(state.stepNum, time.Since(state.stepStartTime))
 	return nil, actionContinue
 }
@@ -1364,7 +1369,7 @@ func (e *Executor) checkRepeatIdenticalTool(
 			nudgeMsg = repeatErrorNudgeMessage
 		}
 		e.emitter.ExecutorDiagnostic(state.stepNum, "repeated_tool_call_nudge", map[string]any{"tool": action.Name, "repeat_count": e.consecutiveRepeatCount})
-		e.emitter.ToolResult(state.stepNum, callIdx, len(nudgeMsg), nudgeMsg, false)
+		e.emitter.ToolResult(state.stepNum, callIdx, len(nudgeMsg), nudgeMsg, true)
 		stepThought := ""
 		stepReasoning := ""
 		if callIdx == 0 {
@@ -1376,8 +1381,13 @@ func (e *Executor) checkRepeatIdenticalTool(
 			ReasoningContent: stepReasoning,
 			Action:           action,
 			Observation:      nudgeMsg,
-			TokensUsed:       resp.Usage.InputTokens + resp.Usage.OutputTokens,
-			ResponseGroup:    responseGroup,
+			// IsError marks this as a non-result: the tool call was NOT executed
+			// (it was intercepted by the repeat-identical circuit breaker). This
+			// prevents the mutation gate from counting an unexecuted mutating tool
+			// as a successful mutation. Mirrors the HITL-reject path.
+			IsError:       true,
+			TokensUsed:    resp.Usage.InputTokens + resp.Usage.OutputTokens,
+			ResponseGroup: responseGroup,
 		}
 		state.allSteps = append(state.allSteps, step)
 		cw.AddStep(step)

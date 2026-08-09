@@ -133,7 +133,8 @@ func validateSkill(skill *Skill, dirPath string) error {
 		return fmt.Errorf("name must be at most 64 characters, got %d", len(skill.Metadata.Name))
 	}
 
-	// Name format: lowercase alphanumeric + hyphens, no leading/trailing/consecutive hyphens
+	// Name format: lowercase alphanumeric + hyphens, no leading/trailing hyphens
+	// (consecutive hyphens are permitted, e.g. "a--b").
 	if !skillNamePattern.MatchString(skill.Metadata.Name) {
 		return fmt.Errorf("name %q must be lowercase alphanumeric with hyphens, no leading/trailing hyphens", skill.Metadata.Name)
 	}

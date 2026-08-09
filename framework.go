@@ -474,21 +474,32 @@ func (fw *Framework) Execute(ctx context.Context, systemPrompt orchestration.Sys
 	}
 	defer conductor.Cleanup()
 
-	var bb orchestration.Blackboard
+	bb, shutdown := fw.newBlackboard("execute")
+	defer shutdown()
+	bb.SetOriginalRequest(userMessage)
+	availableTools := fw.tools.List()
+	return conductor.Run(ctx, userMessage, bb, availableTools, events, "")
+}
+
+// newBlackboard constructs the orchestration blackboard according to the
+// Framework's persistence/notification configuration, keeping the classic
+// Framework.Execute and the fluent TaskBuilder.Execute paths in lockstep.
+//
+// When a Checkpointer is configured it returns a CheckpointedBlackboard
+// (persisted through the checkpointer, keyed by a unique per-execution ID built
+// from idPrefix) and wires OnBlackboardChanged; the returned shutdown function
+// MUST be deferred by the caller to flush queued checkpoints. Without a
+// Checkpointer it returns an in-memory MapBlackboard and a no-op shutdown.
+func (fw *Framework) newBlackboard(idPrefix string) (bb orchestration.Blackboard, shutdown func()) {
 	if fw.cfg.Checkpointer != nil {
-		id := fmt.Sprintf("execute-%d", time.Now().UnixNano())
+		id := fmt.Sprintf("%s-%d", idPrefix, time.Now().UnixNano())
 		cb := orchestration.NewCheckpointedBlackboard(id, fw.cfg.Checkpointer, fw.logger, 0)
 		if fw.cfg.OnBlackboardChanged != nil {
 			cb.SetOnChanged(fw.cfg.OnBlackboardChanged)
 		}
-		defer cb.Shutdown()
-		bb = cb
-	} else {
-		bb = orchestration.NewMapBlackboard()
+		return cb, cb.Shutdown
 	}
-	bb.SetOriginalRequest(userMessage)
-	availableTools := fw.tools.List()
-	return conductor.Run(ctx, userMessage, bb, availableTools, events, "")
+	return orchestration.NewMapBlackboard(), func() {}
 }
 
 // Shutdown releases all resources held by the Framework (MCP connections, etc.).

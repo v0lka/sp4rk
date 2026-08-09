@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -177,7 +179,13 @@ func googleCompletion(ctx context.Context, cfg googleCompletionConfig, req ChatR
 
 	resp, err := httpClient.Do(httpReq)
 	if err != nil {
-		return nil, WrapProviderError(providerName, 0, err)
+		// On a transport-level failure, httpClient.Do returns a *url.Error whose
+		// Error() renders the full request URL — including the ?key= query
+		// parameter carrying the API key. Propagating it raw would leak the secret
+		// into error strings, logs, and UIs. Redact the query first; the underlying
+		// net error is preserved via the cloned *url.Error's Unwrap chain, so retry
+		// classification (errors.Is/As on net errors) still works.
+		return nil, WrapProviderError(providerName, 0, redactKeyFromURLError(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -428,4 +436,26 @@ func mapGoogleFinishReason(reason string, hasToolCalls bool) string {
 		return mapped
 	}
 	return reason
+}
+
+// redactKeyFromURLError strips the API key from a transport error's URL.
+// googleCompletion sends the key as a ?key= query parameter; on a network
+// failure http.Client.Do returns a *url.Error whose Error() string includes
+// the full request URL (key and all). This clones such an error with the query
+// removed so the secret never reaches logs or error displays. The underlying net
+// error is preserved (the clone keeps the original Err, and *url.Error
+// implements Unwrap), so retry classification via errors.Is/As still works.
+func redactKeyFromURLError(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		redacted, perr := url.Parse(ue.URL)
+		if perr == nil {
+			redacted.RawQuery = ""
+			return &url.Error{Op: ue.Op, URL: redacted.String(), Err: ue.Err}
+		}
+		// Unparseable URL: emit a fixed marker rather than risk echoing the
+		// original (key-bearing) string.
+		return &url.Error{Op: ue.Op, URL: "[redacted]", Err: ue.Err}
+	}
+	return err
 }

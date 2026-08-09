@@ -233,7 +233,8 @@ func (b *TaskBuilder) Execute() (*orchestration.ExecutionResult, error) {
 	}
 	defer conductor.Cleanup()
 
-	bb := orchestration.NewMapBlackboard()
+	bb, shutdown := b.fw.newBlackboard("taskf")
+	defer shutdown()
 	bb.SetOriginalRequest(b.task)
 	availableTools := b.fw.ToolRegistry().List()
 

@@ -187,3 +187,66 @@ func TestExaProvider_RealSearch(t *testing.T) {
 		t.Error("Expected results for 'golang programming language'")
 	}
 }
+
+// TestExaProvider_RedirectNotFollowed verifies the default client refuses to
+// follow redirects. The API key travels in the x-api-key header; Go only strips
+// a fixed set of sensitive headers (Authorization, Cookie) on cross-host
+// redirects, so following one would re-send the key to the redirect target. The
+// client must surface the redirect instead.
+func TestExaProvider_RedirectNotFollowed(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		t.Error("redirect target was hit; the client must not follow redirects")
+	}))
+	defer target.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	defer srv.Close()
+
+	p := NewExaProviderWithClient("secret-key", 30*time.Second, nil)
+	p.SetBaseURL(srv.URL)
+
+	_, err := p.Search(context.Background(), "test", 5)
+	if err == nil {
+		t.Fatal("expected an error for a redirect response, got nil")
+	}
+	if !strings.Contains(err.Error(), "HTTP 302") {
+		t.Errorf("error = %q, want it to contain %q (redirect surfaced, not followed)", err.Error(), "HTTP 302")
+	}
+}
+
+// TestExaProvider_CallerClientRedirectEnforced verifies that a caller-supplied
+// client ALSO gets the redirect protection (the API key would otherwise leak to
+// a cross-host redirect target). Before the fix, CheckRedirect was only set on
+// the default (nil) client path, silently disabling protection for callers that
+// passed their own client. It also verifies the caller's client is not mutated.
+func TestExaProvider_CallerClientRedirectEnforced(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		t.Error("redirect target was hit; caller client must not follow redirects")
+	}))
+	defer target.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	defer srv.Close()
+
+	// A caller client with no CheckRedirect (would follow redirects by default).
+	callerClient := &http.Client{Timeout: 30 * time.Second}
+	p := NewExaProviderWithClient("secret-key", 30*time.Second, callerClient)
+	p.SetBaseURL(srv.URL)
+
+	_, err := p.Search(context.Background(), "test", 5)
+	if err == nil {
+		t.Fatal("expected an error for a redirect response, got nil")
+	}
+	if !strings.Contains(err.Error(), "HTTP 302") {
+		t.Errorf("error = %q, want it to contain %q (redirect surfaced, not followed)", err.Error(), "HTTP 302")
+	}
+
+	// The caller's original client must not have been mutated.
+	if callerClient.CheckRedirect != nil {
+		t.Error("caller client was mutated; CheckRedirect must remain nil on the original")
+	}
+}

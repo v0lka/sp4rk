@@ -32,6 +32,7 @@ const (
 	ConfirmDenyAndStop
 )
 
-// ConfirmFunc is called before executing a mutating tool.
-// If nil, all tools execute without confirmation (CLI mode).
+// ConfirmFunc is called before executing a tool whose effective policy is
+// PolicyUserConfirm. If nil, such calls are DENIED (fail-closed) — set one
+// via ToolRegistry.SetConfirmFunc or use explicit PolicyAlwaysAllow overrides.
 type ConfirmFunc func(ctx context.Context, req ConfirmationRequest) (ConfirmationResponse, error)

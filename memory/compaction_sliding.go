@@ -15,7 +15,18 @@ type SlidingWindowStrategy struct {
 }
 
 // NewSlidingWindowStrategy creates a new SlidingWindowStrategy.
+// Negative keepFirst/keepLast values are clamped to 0 to prevent slice-bounds
+// panics in Compact. Note that keepFirst=0 and keepLast=0 together is a
+// degenerate configuration that drops the entire history on compaction;
+// prefer the higher-level NewCompactionStrategy factory, which applies sane
+// defaults for zero values.
 func NewSlidingWindowStrategy(keepFirst, keepLast int) *SlidingWindowStrategy {
+	if keepFirst < 0 {
+		keepFirst = 0
+	}
+	if keepLast < 0 {
+		keepLast = 0
+	}
 	return &SlidingWindowStrategy{
 		keepFirst: keepFirst,
 		keepLast:  keepLast,

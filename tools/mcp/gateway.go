@@ -187,6 +187,15 @@ func (g *Gateway) Reconfigure(ctx context.Context, newConfig GatewayConfig,
 		g.log().Debug("MCP server removed", "server", name)
 	}
 
+	// Apply the new default work directory before the add/change loop so that
+	// servers relying on an empty WorkDir (which inherits the default) are
+	// compared and reconnected against the NEW default. Updating it after the
+	// loop would cause such servers to keep running with the stale directory
+	// until the next Reconfigure call (one cycle late).
+	if newConfig.DefaultWorkDir != "" {
+		g.defaultWorkDir = newConfig.DefaultWorkDir
+	}
+
 	// Process added and changed servers
 	for name, entry := range newConfig.Servers {
 		// Build ServerConfig from ServerEntry
@@ -281,9 +290,6 @@ func (g *Gateway) Reconfigure(ctx context.Context, newConfig GatewayConfig,
 
 	// Update stored config
 	g.config = newConfig
-	if newConfig.DefaultWorkDir != "" {
-		g.defaultWorkDir = newConfig.DefaultWorkDir
-	}
 
 	if len(errs) > 0 {
 		return &ReconfigureError{Errors: errs}

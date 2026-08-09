@@ -121,7 +121,7 @@ func (r *Resolver) match(relPath string, isDir bool, origin string) bool {
 	relPath = filepath.ToSlash(filepath.Clean(relPath))
 	// The root itself, an empty path, or a path escaping the root cannot be
 	// ignored by a rule.
-	if relPath == "" || relPath == "." || strings.HasPrefix(relPath, "..") {
+	if relPath == "" || relPath == "." || relPath == ".." || strings.HasPrefix(relPath, "../") {
 		return false
 	}
 	segments := strings.Split(relPath, "/")

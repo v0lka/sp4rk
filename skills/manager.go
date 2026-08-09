@@ -27,7 +27,9 @@ type SkillManager struct {
 func NewSkillManager(dirs []string, logger *slog.Logger) *SkillManager {
 	return &SkillManager{
 		skills: make(map[string]*Skill),
-		dirs:   dirs,
+		// Defensive copy so a caller mutating the slice after construction
+		// cannot change the discovery set (consistent with agents.NewAgentManager).
+		dirs:   append([]string(nil), dirs...),
 		logger: logger,
 	}
 }

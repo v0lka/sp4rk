@@ -88,6 +88,19 @@ func NewAnthropicProvider(cfg AnthropicProviderConfig) (*AnthropicProvider, erro
 	if cfg.HTTPClient != nil {
 		*httpClient = *cfg.HTTPClient
 	}
+	// The go-anthropic SDK sends the API key in the x-api-key header, which
+	// Go does NOT strip on cross-host redirects (only Authorization, Cookie,
+	// and Www-Authenticate are). Refuse to follow redirects so the key is
+	// never forwarded to a redirect target — a redirect from a /messages
+	// endpoint is a misconfiguration or attack, not normal operation. This
+	// guard applies unconditionally, including to a caller-supplied client
+	// (whose fields are cloned above, never mutated): the credential-leak
+	// threat is identical regardless of who supplied the client, and a custom
+	// proxy/gateway pointing at an Anthropic-compatible endpoint is precisely
+	// where an unexpected redirect is most dangerous.
+	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
 	httpClient.Transport = &capturingTransport{base: httpClient.Transport}
 	opts = append(opts, anthropic.WithHTTPClient(httpClient))
 

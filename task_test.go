@@ -3,6 +3,8 @@ package sp4rk
 import (
 	"context"
 	"errors"
+	"log/slog"
+	"sync"
 	"testing"
 
 	"github.com/v0lka/sp4rk/orchestration"
@@ -236,5 +238,72 @@ func TestCompletedInOrder_NilPlan(t *testing.T) {
 	got := completedInOrder(completed, nil)
 	if len(got) != 2 {
 		t.Fatalf("len = %d, want 2", len(got))
+	}
+}
+
+// recordingCheckpointer is a minimal orchestration.Checkpointer that counts
+// SaveCheckpoint calls (LoadCheckpoint/DeleteCheckpoint are no-op stubs).
+type recordingCheckpointer struct {
+	mu    sync.Mutex
+	saves int
+}
+
+func (r *recordingCheckpointer) SaveCheckpoint(context.Context, string, orchestration.Blackboard) error {
+	r.mu.Lock()
+	r.saves++
+	r.mu.Unlock()
+	return nil
+}
+func (r *recordingCheckpointer) LoadCheckpoint(context.Context, string) (orchestration.Blackboard, error) {
+	return nil, nil
+}
+func (r *recordingCheckpointer) DeleteCheckpoint(context.Context, string) error { return nil }
+
+// TestFramework_NewBlackboard_WiresCheckpointerAndNotification verifies the
+// shared blackboard factory honours Config.Checkpointer and
+// Config.OnBlackboardChanged. This is the wiring the fluent
+// TaskBuilder.Execute path previously dropped (it always built an in-memory
+// MapBlackboard), so a crash-resume/notifications config set on the Framework
+// was silently ignored via TaskF. Both Execute paths now route through
+// newBlackboard.
+func TestFramework_NewBlackboard_WiresCheckpointerAndNotification(t *testing.T) {
+	cp := &recordingCheckpointer{}
+	var changed []string
+	fw := &Framework{
+		cfg: Config{
+			Checkpointer:        cp,
+			OnBlackboardChanged: func(ct string) { changed = append(changed, ct) },
+		},
+		logger: slog.Default(),
+	}
+
+	bb, shutdown := fw.newBlackboard("test")
+	defer shutdown()
+	if _, ok := bb.(*orchestration.CheckpointedBlackboard); !ok {
+		t.Fatalf("newBlackboard with Checkpointer = %T, want *CheckpointedBlackboard", bb)
+	}
+
+	// A mutation must fire OnBlackboardChanged synchronously and enqueue a
+	// checkpoint; flushing via shutdown persists it.
+	bb.SetOriginalRequest("hello-task")
+	shutdown()
+
+	if len(changed) == 0 {
+		t.Error("OnBlackboardChanged never fired; the TaskF path was wiring neither Checkpointer nor OnBlackboardChanged")
+	}
+	if cp.saves == 0 {
+		t.Error("Checkpointer.SaveCheckpoint never called; persistence is not wired through newBlackboard")
+	}
+}
+
+// TestFramework_NewBlackboard_NoCheckpointer verifies the in-memory fallback:
+// without a Checkpointer, newBlackboard returns a plain MapBlackboard and a
+// no-op shutdown.
+func TestFramework_NewBlackboard_NoCheckpointer(t *testing.T) {
+	fw := &Framework{cfg: Config{}, logger: slog.Default()}
+	bb, shutdown := fw.newBlackboard("test")
+	shutdown() // must be a safe no-op
+	if _, ok := bb.(*orchestration.MapBlackboard); !ok {
+		t.Fatalf("newBlackboard without Checkpointer = %T, want *MapBlackboard", bb)
 	}
 }

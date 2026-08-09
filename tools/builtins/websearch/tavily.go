@@ -23,16 +23,17 @@ type TavilyProvider struct {
 // NewTavilyProviderWithClient creates a new TavilyProvider with the given API key, timeout,
 // and optional HTTP client. If client is nil, a default client with the specified timeout is used.
 func NewTavilyProviderWithClient(apiKey string, timeout time.Duration, client *http.Client) *TavilyProvider {
+	// The Tavily API key travels in the POST body. Refuse to follow redirects
+	// so the body (and key) is never re-sent to another host. This protection
+	// must apply to a caller-supplied client too: we make a shallow copy (never
+	// mutating the caller's) and set CheckRedirect unconditionally.
+	noRedirect := func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	if client == nil {
-		// The Tavily API key travels in the POST body. Refuse to follow
-		// redirects so the body (and key) is never re-sent to another host.
-		// A caller-provided client is used as-is (never mutated).
-		client = &http.Client{
-			Timeout: timeout,
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		}
+		client = &http.Client{Timeout: timeout, CheckRedirect: noRedirect}
+	} else {
+		c := *client
+		c.CheckRedirect = noRedirect
+		client = &c
 	}
 	return &TavilyProvider{
 		apiKey:  apiKey,

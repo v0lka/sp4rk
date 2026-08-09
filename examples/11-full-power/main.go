@@ -30,6 +30,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/v0lka/sp4rk"
@@ -174,6 +175,11 @@ func run() error {
 			WarningPercent:    92,
 			EmergencyPercent:  98,
 		},
+		// OnBlackboardChanged fires only when a Checkpointer is configured (the
+		// notification hook lives on CheckpointedBlackboard). This in-memory
+		// checkpointer makes the callback fire for real; a production deployment
+		// would use a durable backend (file, DB, ...).
+		Checkpointer: newMemoryCheckpointer(),
 		OnBlackboardChanged: func(changeType string) {
 			fmt.Printf("  📝 blackboard: %s\n", changeType)
 		},
@@ -302,4 +308,36 @@ func trunc(s string, n int) string {
 		return s
 	}
 	return strutil.TruncateUTF8(s, n)
+}
+
+// memoryCheckpointer is a minimal in-memory orchestration.Checkpointer used
+// only to demonstrate the OnBlackboardChanged callback in this example. A real
+// deployment would back it with durable storage (file, DB, ...).
+type memoryCheckpointer struct {
+	mu   sync.Mutex
+	data map[string]orchestration.Blackboard
+}
+
+func newMemoryCheckpointer() *memoryCheckpointer {
+	return &memoryCheckpointer{data: make(map[string]orchestration.Blackboard)}
+}
+
+func (m *memoryCheckpointer) SaveCheckpoint(_ context.Context, id string, bb orchestration.Blackboard) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.data[id] = bb
+	return nil
+}
+
+func (m *memoryCheckpointer) LoadCheckpoint(_ context.Context, id string) (orchestration.Blackboard, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.data[id], nil
+}
+
+func (m *memoryCheckpointer) DeleteCheckpoint(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.data, id)
+	return nil
 }

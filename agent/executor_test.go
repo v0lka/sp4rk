@@ -1095,6 +1095,18 @@ func TestExecutor_Run_TruncatedToolCall_SkipsExecution(t *testing.T) {
 	if !foundTruncMsg {
 		t.Error("expected truncation system message in step observation")
 	}
+
+	// Regression: the truncation-intercept step must carry IsError=true so the
+	// mutation gate does not count an unexecuted write_file as a successful
+	// mutation (which would produce a silent false-success — a coder step
+	// accepted with Finished=true but no real file change).
+	for _, s := range result.Steps {
+		if s.Action.Name == "write_file" && strings.Contains(s.Observation, "was NOT executed") {
+			if !s.IsError {
+				t.Error("truncation-intercept step must have IsError=true so the mutation gate excludes it")
+			}
+		}
+	}
 }
 
 func TestExecutor_Run_ConsecutiveTruncation_Aborts(t *testing.T) {

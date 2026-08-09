@@ -452,3 +452,43 @@ func TestOpenAIProvider_GoogleDelegate_ErrorWrappedWithProviderName(t *testing.T
 		t.Errorf("expected error to be wrapped with provider name \"Zen\", got: %v", err)
 	}
 }
+
+// TestGoogleCompletion_TransportErrorRedactsAPIKey verifies that when the HTTP
+// call fails at the transport layer (connection refused etc.), the propagated
+// error does NOT leak the API key, which is sent as a ?key= query parameter.
+// Go's *url.Error renders the full request URL (query included) in its Error()
+// string, so without redaction the key would flow into logs and error displays.
+// Retry classification must be preserved (the underlying net error is kept).
+func TestGoogleCompletion_TransportErrorRedactsAPIKey(t *testing.T) {
+	// Port 1 reliably refuses connections at the transport layer (no LLM round
+	// trip), producing the *url.Error path exercised by this regression test.
+	_, err := googleCompletion(context.Background(), googleCompletionConfig{
+		HTTPClient:   &http.Client{},
+		BaseURL:      "http://127.0.0.1:1",
+		APIKey:       "SECRET-API-KEY-12345",
+		ProviderName: "Zen",
+	}, ChatRequest{
+		Model:    "gemini-1.5-pro",
+		Messages: []Message{{Role: "user", Content: "hi"}},
+	})
+	if err == nil {
+		t.Fatal("expected a transport error, got nil")
+	}
+	if strings.Contains(err.Error(), "SECRET-API-KEY-12345") {
+		t.Errorf("API key leaked into error string: %v", err)
+	}
+	// The error must still be a classified *llm.Error mentioning the provider.
+	var llmErr *Error
+	if !errors.As(err, &llmErr) {
+		t.Fatalf("expected a classified *llm.Error, got %T: %v", err, err)
+	}
+	if !strings.Contains(err.Error(), "Zen") {
+		t.Errorf("expected error wrapped with provider name \"Zen\", got: %v", err)
+	}
+	// Retry classification must survive redaction: connection-refused is a
+	// transient net error, so the cloned *url.Error's Unwrap chain must still
+	// resolve to syscall.ECONNREFUSED.
+	if !llmErr.Retryable {
+		t.Errorf("expected connection-refused classified retryable, got retryable=false: %v", err)
+	}
+}

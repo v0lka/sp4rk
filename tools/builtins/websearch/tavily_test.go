@@ -299,3 +299,58 @@ func TestTavilyProvider_MissingAPIKey(t *testing.T) {
 		t.Errorf("Expected error message about missing API key, got: %s", result.Content)
 	}
 }
+
+// TestTavilyProvider_RedirectNotFollowed verifies the default client refuses to
+// follow redirects. The API key travels in the POST body; following a redirect
+// would re-send it to another host.
+func TestTavilyProvider_RedirectNotFollowed(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		t.Error("redirect target was hit; the client must not follow redirects")
+	}))
+	defer target.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	defer srv.Close()
+
+	p := NewTavilyProviderWithClient("secret-key", 30*time.Second, nil)
+	p.SetBaseURL(srv.URL)
+
+	_, err := p.Search(context.Background(), "test", 5)
+	if err == nil {
+		t.Fatal("expected an error for a redirect response, got nil")
+	}
+	if !strings.Contains(err.Error(), "HTTP 302") {
+		t.Errorf("error = %q, want it to contain %q (redirect surfaced, not followed)", err.Error(), "HTTP 302")
+	}
+}
+
+// TestTavilyProvider_CallerClientRedirectEnforced verifies that a caller-supplied
+// client ALSO gets the redirect protection and is not mutated.
+func TestTavilyProvider_CallerClientRedirectEnforced(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		t.Error("redirect target was hit; caller client must not follow redirects")
+	}))
+	defer target.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	defer srv.Close()
+
+	callerClient := &http.Client{Timeout: 30 * time.Second}
+	p := NewTavilyProviderWithClient("secret-key", 30*time.Second, callerClient)
+	p.SetBaseURL(srv.URL)
+
+	_, err := p.Search(context.Background(), "test", 5)
+	if err == nil {
+		t.Fatal("expected an error for a redirect response, got nil")
+	}
+	if !strings.Contains(err.Error(), "HTTP 302") {
+		t.Errorf("error = %q, want it to contain %q (redirect surfaced, not followed)", err.Error(), "HTTP 302")
+	}
+	if callerClient.CheckRedirect != nil {
+		t.Error("caller client was mutated; CheckRedirect must remain nil on the original")
+	}
+}

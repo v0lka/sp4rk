@@ -14,6 +14,7 @@ import (
 	"github.com/v0lka/sp4rk/llm"
 	"github.com/v0lka/sp4rk/orchestration"
 	"github.com/v0lka/sp4rk/prompt"
+	"github.com/v0lka/sp4rk/security"
 	"github.com/v0lka/sp4rk/tools"
 )
 
@@ -131,7 +132,17 @@ func (r *Reflector) buildUserMessage(
 				}
 			}
 			if step.Observation != "" {
-				fmt.Fprintf(&sb, "**Observation:** %s\n", step.Observation)
+				// Honor the untrusted-content boundary: observations from
+				// untrusted sources (web, MCP, filesystem) must be wrapped
+				// before they reach the reflection LLM, exactly as the
+				// ContextWindow does for the agent loop. Omitting this would
+				// let an attacker inject instructions into the reflection
+				// prompt via a malicious tool observation.
+				obs := step.Observation
+				if step.IsUntrusted {
+					obs = security.WrapUntrustedContent(obs, step.Action.Name, nil)
+				}
+				fmt.Fprintf(&sb, "**Observation:** %s\n", obs)
 			}
 			sb.WriteString("\n")
 		}

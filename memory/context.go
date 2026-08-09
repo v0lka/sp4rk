@@ -178,6 +178,20 @@ func NewContextWindow(cfg ContextWindowConfig) *ContextWindow {
 		injectionDefenseEnabled: cfg.InjectionDefenseEnabled,
 		pruning:                 cfg.Pruning,
 	}
+	// Threshold fields default individually to sensible values when left
+	// zero-valued, honoring the zero-value-falls-back contract documented on
+	// ContextWindowConfig. Without this, a zero EmergencyPercent would make
+	// CheckFill report "emergency" even at low fill (percent >= 0).
+	def := DefaultCompactionThresholds()
+	if cw.thresholds.PredictivePercent == 0 {
+		cw.thresholds.PredictivePercent = def.PredictivePercent
+	}
+	if cw.thresholds.WarningPercent == 0 {
+		cw.thresholds.WarningPercent = def.WarningPercent
+	}
+	if cw.thresholds.EmergencyPercent == 0 {
+		cw.thresholds.EmergencyPercent = def.EmergencyPercent
+	}
 	safetyMarginPercent := cfg.SafetyMarginPercent
 	if safetyMarginPercent <= 0 {
 		safetyMarginPercent = defaultSafetyMargin
@@ -237,10 +251,16 @@ func (cw *ContextWindow) AvailableTokens() int {
 func (cw *ContextWindow) CheckFill() sdkagent.FillCheck {
 	used := cw.tracker.EstimateTotal()
 	effectiveMax := cw.EffectiveMax()
-	percent := float64(0)
-	if effectiveMax > 0 {
-		percent = float64(used) / float64(effectiveMax) * 100
+
+	// When the effective budget is non-positive (output limit + safety margin
+	// consume the entire window), the window is overcommitted. Report it as
+	// full/reject so compaction and pruning agree with FillPercent (which
+	// returns 100% in the same case).
+	if effectiveMax <= 0 {
+		return sdkagent.FillCheck{Percent: 100, Status: "reject", Used: used, Max: effectiveMax}
 	}
+
+	percent := float64(used) / float64(effectiveMax) * 100
 
 	status := "ok"
 	switch {
@@ -849,6 +869,14 @@ func (cw *ContextWindow) Compact(ctx context.Context) *CompactionResult {
 	cw.compactedMessages = cw.strategy.Compact(ctx, cw.steps, budgetTokens)
 	cw.compactedThroughIndex = len(cw.steps)
 
+	// Re-apply the prompt-injection boundary to untrusted tool messages in
+	// the frozen prefix. The strategies build verbatim tool messages via
+	// stepsToMessages, which (unlike buildToolMsg) does NOT apply the
+	// injection-defense wrap — so without this, previously-fenced untrusted
+	// tool output (web/MCP/filesystem) would re-enter LLM context raw after
+	// compaction, bypassing the security model's untrusted-content boundary.
+	cw.wrapUntrustedInFrozenPrefix()
+
 	// Estimate after-compaction fill
 	effectiveMax := cw.EffectiveMax()
 	afterPercent := float64(0)
@@ -884,5 +912,55 @@ func (cw *ContextWindow) Compact(ctx context.Context) *CompactionResult {
 	return &CompactionResult{
 		BeforePercent: beforeFill.Percent,
 		AfterPercent:  afterPercent,
+	}
+}
+
+// wrapUntrustedInFrozenPrefix re-applies the prompt-injection boundary to tool
+// messages in cw.compactedMessages whose source step was flagged IsUntrusted.
+//
+// The compaction strategies (SlidingWindow/Summarization/Hierarchical) build
+// verbatim tool messages via the standalone stepsToMessages helper, which reads
+// step.Observation raw and — unlike buildToolMsg — does NOT apply the
+// injection-defense wrap. Once compaction fires, compactedMessages becomes the
+// frozen prefix prepended verbatim by buildStepMessages, so without this
+// post-processing previously-fenced untrusted content (web/MCP/filesystem tool
+// output) would re-enter LLM context without the <untrusted-content> boundary
+// the security model guarantees. Summary/system messages produced by the
+// strategies are LLM-distilled (not raw tool output) and are left untouched.
+func (cw *ContextWindow) wrapUntrustedInFrozenPrefix() {
+	if !cw.injectionDefenseEnabled || len(cw.compactedMessages) == 0 {
+		return
+	}
+	// Map the tool-call IDs of untrusted steps to their source tool name, so
+	// verbatim tool messages can be matched back to their originating step.
+	type untrustedMeta struct{ source string }
+	untrusted := make(map[string]untrustedMeta)
+	for _, s := range cw.steps {
+		if s.IsUntrusted && s.Action.ID != "" {
+			untrusted[s.Action.ID] = untrustedMeta{source: s.Action.Name}
+		}
+	}
+	if len(untrusted) == 0 {
+		return
+	}
+	for i, msg := range cw.compactedMessages {
+		if msg.Role != "tool" || msg.ToolCallID == "" {
+			continue
+		}
+		meta, ok := untrusted[msg.ToolCallID]
+		if !ok {
+			continue
+		}
+		// Wrap unconditionally. step.Observation is stored raw (stepsToMessages
+		// reads it verbatim), so it is never already wrapped here. Crucially, a
+		// content-based "already wrapped?" heuristic must NOT be used: if an
+		// untrusted observation happens to contain the literal boundary-tag text
+		// (e.g. a web page or file that discusses prompt-injection defenses), such
+		// a guard would skip the wrap and let that observation re-enter LLM context
+		// WITHOUT the security boundary — a prompt-injection bypass. WrapUntrustedContent
+		// is self-sanitizing (it calls the idempotent StripUntrustedTags, which
+		// escapes any literal <untrusted-content sequences to &lt;), so wrapping
+		// unconditionally is always safe even for already-wrapped content.
+		cw.compactedMessages[i].Content = security.WrapUntrustedContent(msg.Content, meta.source, nil)
 	}
 }

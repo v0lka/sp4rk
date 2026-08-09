@@ -157,7 +157,10 @@ func (t *Tool) ServerName() string {
 }
 
 // Judge implements sdktools.ToolJudger for MCP tools.
-// MCP tools are remote and opaque, so we always defer to the LLM Judge.
+// MCP tools have no tool-specific safety heuristic; returning (false, "")
+// means "no tool-specific concern" — the registry executes directly under an
+// AlwaysAllow override. MCP tools default to PolicyUserConfirm, so this is
+// only reached via an explicit override.
 func (t *Tool) Judge(_ context.Context, _ json.RawMessage) (allowed bool, reason string) {
-	return false, "" // defer to LLM Judge
+	return false, "" // no tool-specific concern
 }

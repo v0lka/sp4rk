@@ -316,6 +316,30 @@ func TestResolver_MatchRootRelativeAPI(t *testing.T) {
 	}
 }
 
+// TestResolver_MatchRootEscapeGuard verifies the root-escape guard matches only
+// paths whose first segment is ".." (i.e. they escape the root), and not in-root
+// files whose name merely begins with two dots. Previously the guard used
+// strings.HasPrefix(relPath, ".."), which also matched an in-root "..foo" and
+// wrongly reported it as not-ignored regardless of any matching rule.
+func TestResolver_MatchRootEscapeGuard(t *testing.T) {
+	root := t.TempDir()
+	// A rule that explicitly matches a file whose name begins with two dots.
+	writeFile(t, root, ".gitignore", "..foo\n")
+	r, err := NewResolver(root)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+
+	// "..foo" is an in-root file matched by the rule -> ignored.
+	if got := r.Match("..foo", false); got != true {
+		t.Errorf(`Match("..foo") = %v, want true (in-root file matched by rule)`, got)
+	}
+	// A genuine root-escape path is still rejected (never ignored).
+	if got := r.Match("../sibling", false); got != false {
+		t.Errorf(`Match("../sibling") = %v, want false (escapes root)`, got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Multi: root selection, containment, IgnoreChecker
 // ---------------------------------------------------------------------------

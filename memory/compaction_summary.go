@@ -8,6 +8,7 @@ import (
 
 	sdkagent "github.com/v0lka/sp4rk/agent"
 	"github.com/v0lka/sp4rk/llm"
+	"github.com/v0lka/sp4rk/security"
 	"github.com/v0lka/sp4rk/strutil"
 )
 
@@ -144,6 +145,12 @@ func (s *SummarizationStrategy) buildBlockText(steps []sdkagent.Step) string {
 			obs := step.Observation
 			if len(obs) > s.observationTruncate {
 				obs = strutil.TruncateUTF8(obs, s.observationTruncate)
+			}
+			// Honor the untrusted-content boundary: the summarizer is an LLM
+			// context, so untrusted observations must be wrapped before they
+			// enter it (mirrors the reflector + ContextWindow defense).
+			if step.IsUntrusted {
+				obs = security.WrapUntrustedContent(obs, step.Action.Name, nil)
 			}
 			stepText += fmt.Sprintf("  Observation: %s\n", obs)
 		}
