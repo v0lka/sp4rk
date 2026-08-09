@@ -756,6 +756,18 @@ func checkPathsForSymlinks(ctx context.Context, paths, roots []string) (inside, 
 		workspace = roots[0]
 	}
 	for _, p := range paths {
+		// This gate deliberately does NOT consult IsHarmlessDevicePath: it
+		// resolves every path component via Lstat instead of trusting the path
+		// string, which is essential for security. Harmless-looking names can be
+		// symlinks: on macOS /dev/stdin, /dev/stdout and /dev/stderr are symlinks
+		// into /dev/fd/* (bound to host-defined file descriptors) and MUST be
+		// walked so their targets are classified as inside/outside the workspace.
+		// Character devices such as /dev/null and /dev/full are never symlinks,
+		// so walkSymlinkComponents returns nil for them — no shortcut is needed.
+		// On Linux the std streams are character devices and likewise produce no
+		// traversal; on Windows there is no /dev. This keeps the gate correct on
+		// all three target OSes (linux, darwin, windows) without ever trusting a
+		// device name.
 		for _, t := range walkSymlinkComponents(ctx, p, workspace) {
 			if t.Unresolvable {
 				// Cannot determine where the component resolves — fail closed

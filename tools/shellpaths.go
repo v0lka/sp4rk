@@ -232,6 +232,11 @@ func relativePathWordStart(command string, start int) int {
 // When [SessionRoots] returns an empty list the function returns nil: with no
 // roots configured containment cannot be enforced, mirroring
 // tools/builtins/workdir.go's no-roots contract.
+//
+// Harmless special-device paths (/dev/null, /dev/full; NUL on Windows) are
+// excluded via [IsHarmlessDevicePath] so shell idioms like `cmd > /dev/null`
+// do not escalate to user confirmation when all other referenced paths are
+// in-root.
 func PathsOutsideRoots(ctx context.Context, command string, shell ShellKind, workDir string) []string {
 	roots := SessionRoots(ctx)
 	if len(roots) == 0 {
@@ -244,6 +249,9 @@ func PathsOutsideRoots(ctx context.Context, command string, shell ShellKind, wor
 
 	var outside []string
 	for _, p := range ResolveShellPathTokens(command, shell, workDir) {
+		if IsHarmlessDevicePath(p) {
+			continue
+		}
 		inside := false
 		for _, root := range roots {
 			if IsWithinRoot(ctx, root, p) {

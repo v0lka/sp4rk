@@ -385,3 +385,39 @@ func sliceContains(ss []string, s string) bool {
 	}
 	return false
 }
+
+// TestPathsOutsideRoots_HarmlessDeviceNotReported verifies that harmless
+// special-device paths (e.g. /dev/null, /dev/full) are NOT reported as
+// outside the session roots, even though they are not contained in any root.
+func TestPathsOutsideRoots_HarmlessDeviceNotReported(t *testing.T) {
+	ws := t.TempDir()
+	ctx := WithWorkspacePath(context.Background(), ws)
+	for _, cmd := range []string{
+		"cat foo > /dev/null",
+		"echo hi > /dev/null",
+		"cat /dev/null",
+		"echo x > /dev/full",
+	} {
+		got := PathsOutsideRoots(ctx, cmd, ShellBash, ws)
+		if len(got) != 0 {
+			t.Errorf("harmless-device cmd %q must not be flagged as out-of-root, got %v", cmd, got)
+		}
+	}
+}
+
+// TestPathsOutsideRoots_HarmlessDeviceAlongsideOutsided verifies that a
+// harmless device does not mask genuinely out-of-root paths: the real escape
+// (/etc/passwd) is still reported when it appears alongside /dev/null.
+func TestPathsOutsideRoots_HarmlessDeviceAlongsideOutside(t *testing.T) {
+	ws := t.TempDir()
+	ctx := WithWorkspacePath(context.Background(), ws)
+	got := PathsOutsideRoots(ctx, "cat /etc/passwd > /dev/null", ShellBash, ws)
+	if !sliceContains(got, "/etc/passwd") {
+		t.Fatalf("expected /etc/passwd reported alongside /dev/null, got %v", got)
+	}
+	for _, p := range got {
+		if p == "/dev/null" {
+			t.Fatalf("/dev/null must not be reported as out-of-root, got %v", got)
+		}
+	}
+}

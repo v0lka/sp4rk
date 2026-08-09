@@ -113,7 +113,14 @@ func validateResolvedPath(resolved string) error {
 // vice versa. Symlinks are resolved through the longest existing prefix so
 // that OS-level symlinks (e.g., macOS /tmp → /private/tmp) do not cause false
 // negatives.
+//
+// Harmless special-device paths (/dev/null, /dev/full; NUL on Windows) are
+// treated as local via [tools.IsHarmlessDevicePath] so file operations
+// targeting them do not force a user-confirmation prompt.
 func isPathInSessionRoots(ctx context.Context, absPath string) bool {
+	if tools.IsHarmlessDevicePath(absPath) {
+		return true
+	}
 	for _, root := range tools.SessionRoots(ctx) {
 		if isPathInRootStr(ctx, absPath, root) {
 			return true

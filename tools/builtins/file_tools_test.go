@@ -2473,6 +2473,30 @@ func TestIsPathInSessionRoots_NoRoots(t *testing.T) {
 	}
 }
 
+// TestIsPathInSessionRoots_HarmlessDevice verifies harmless special-device
+// paths (/dev/null, /dev/full) are treated as local by the file-tool judges,
+// so read_file/write_file targeting them do not force a confirmation.
+func TestIsPathInSessionRoots_HarmlessDevice(t *testing.T) {
+	ws := t.TempDir()
+	ctx := tools.WithWorkspacePath(context.Background(), ws)
+	for _, p := range []string{"/dev/null", "/dev/full"} {
+		if !isPathInSessionRoots(ctx, p) {
+			t.Errorf("expected harmless device %q to be treated as local", p)
+		}
+	}
+	// Process streams are NOT harmless — their targets are host-defined file
+	// descriptors — so they must be treated as out-of-root and gated.
+	for _, p := range []string{"/dev/stdin", "/dev/stdout", "/dev/stderr"} {
+		if isPathInSessionRoots(ctx, p) {
+			t.Errorf("expected process stream %q to NOT be treated as local", p)
+		}
+	}
+	// A genuinely out-of-root path must still be rejected.
+	if isPathInSessionRoots(ctx, "/etc/passwd") {
+		t.Error("expected /etc/passwd to NOT be in session roots")
+	}
+}
+
 // TestIsPathInSessionRoots_AllowedRoot proves a path inside an additional
 // allowed root (auxiliary working directory) is treated identically to the
 // workspace and temp directory.

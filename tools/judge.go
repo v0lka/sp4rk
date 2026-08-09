@@ -331,6 +331,9 @@ func AllPathsInDir(ctx context.Context, input json.RawMessage, dir string) bool 
 
 	for _, p := range allPaths {
 		cleaned := filepath.Clean(p)
+		if IsHarmlessDevicePath(cleaned) {
+			continue
+		}
 		if !isPathInWorkspace(ctx, cleaned, dir) {
 			return false
 		}
@@ -364,6 +367,10 @@ func pathInAnyRoot(ctx context.Context, absPath string, roots []string) bool {
 // absolute path and every such path is within at least one of the session
 // roots (workspace, temp directory, and any additional allowed roots). This
 // is the canonical path-containment check consulted by the judge fast-path.
+//
+// Harmless special-device paths (/dev/null, /dev/full; NUL on Windows) are
+// excluded from the check via [IsHarmlessDevicePath] so they do not force a
+// confirmation when they appear alongside in-root paths.
 func AllPathsInSessionRoots(ctx context.Context, input json.RawMessage) bool {
 	roots := SessionRoots(ctx)
 	if len(roots) == 0 {
@@ -387,6 +394,9 @@ func AllPathsInSessionRoots(ctx context.Context, input json.RawMessage) bool {
 
 	for _, p := range allPaths {
 		cleaned := filepath.Clean(p)
+		if IsHarmlessDevicePath(cleaned) {
+			continue
+		}
 		if !pathInAnyRoot(ctx, cleaned, roots) {
 			return false
 		}

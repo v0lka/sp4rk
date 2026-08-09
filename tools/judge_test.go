@@ -956,6 +956,28 @@ func TestAllPathsInSessionRoots(t *testing.T) {
 	}
 }
 
+// TestAllPathsInSessionRoots_HarmlessDevice verifies that harmless
+// special-device paths (e.g. /dev/null) do not force the fast-path to fail
+// even though they fall outside the session roots, and do not mask a genuine
+// out-of-root path when one appears alongside them.
+func TestAllPathsInSessionRoots_HarmlessDevice(t *testing.T) {
+	ws := t.TempDir()
+	ctx := WithWorkspacePath(context.Background(), ws)
+
+	// /dev/null alone is harmless — auto-allow.
+	if got := AllPathsInSessionRoots(ctx, json.RawMessage(`{"path":"/dev/null"}`)); !got {
+		t.Fatal("expected /dev/null to be treated as local")
+	}
+	// /dev/null alongside an in-workspace path — still local.
+	if got := AllPathsInSessionRoots(ctx, json.RawMessage(`{"path":"/dev/null","dest":"`+ws+`/out"}`)); !got {
+		t.Fatal("expected /dev/null + in-root path to be treated as local")
+	}
+	// /dev/null alongside a genuine out-of-root path — must fail (not masked).
+	if got := AllPathsInSessionRoots(ctx, json.RawMessage(`{"path":"/dev/null","dest":"/etc/evil"}`)); got {
+		t.Fatal("expected out-of-root path to fail fast-path even with /dev/null present")
+	}
+}
+
 // TestJudge_AllowedRootsPreCheck_AllowsInternalPaths proves that a path inside
 // an auxiliary allowed root auto-allows via the unified fast-path, mirroring
 // the existing workspace/temp-dir pre-check tests.
