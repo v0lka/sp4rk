@@ -82,7 +82,16 @@ var shellTokenRe = map[ShellKind]*regexp.Regexp{
 // ResolveShellPathTokens extracts path-like tokens from a shell command string
 // and resolves shell idioms to absolute paths:
 //
-//   - Absolute paths (matched by [pathRegex]) are passed through as-is.
+//   - Absolute paths (matched by [pathRegex]) are passed through as-is, but
+//     only when their leading separator ("/", or a drive letter's separator)
+//     STARTS a token. A "/" that follows a path-component character is a
+//     separator inside a relative path (e.g. the "/src" in
+//     "frontend/src/main.tsx"): rather than treat the fragment as an absolute
+//     path, the ENTIRE enclosing relative-path word is resolved against
+//     workDir. This avoids both the false positive of flagging an in-workspace
+//     relative path and the false negative of silently dropping a genuine
+//     parent-ref escape hidden behind a relative prefix (e.g.
+//     "./../etc/passwd", "a/../../etc/passwd", "subdir/../..").
 //   - "~" and "~user" (bash) and bare "~" (posh) expand to the current user's
 //     home directory via [os.UserHomeDir] (falling back to $HOME then
 //     $USERPROFILE). "~user" is best-effort and skipped when unresolvable.
@@ -104,7 +113,55 @@ func ResolveShellPathTokens(command string, shell ShellKind, workDir string) []s
 
 	seen := make(map[string]struct{})
 	var out []string
-	for _, tok := range re.FindAllString(command, -1) {
+	for _, m := range re.FindAllStringIndex(command, -1) {
+		start, end := m[0], m[1]
+		tok := command[start:end]
+		// Boundary checks for tokens whose leading character could continue a
+		// preceding relative-path word (".." parent-refs and POSIX "/abs"
+		// paths). Env ("$VAR") and tilde ("~") tokens start with non-path
+		// characters and are inherently bounded, so they are exempt.
+		switch tok[0] {
+		case '.':
+			// A ".." glued to a preceding path-component char — e.g. the ".." in
+			// the filename "x.." inside "x../../etc/passwd" — is part of a
+			// filename component, never a standalone parent-directory reference,
+			// so it cannot on its own be the start of an out-of-root escape.
+			if start > 0 && isPathComponentChar(command[start-1]) {
+				continue
+			}
+			// Trailing boundary: a run of 3+ dots ("...", "....") is an ellipsis
+			// (e.g. the go-test recursive pattern "go test ..."), not a
+			// parent-directory reference. Only treat ".." as a parent ref when it
+			// is not immediately followed by another dot.
+			if after := start + 2; after < len(command) && command[after] == '.' {
+				continue
+			}
+		case '/':
+			// A "/" that follows a path-component char is the separator INSIDE a
+			// relative path (e.g. the "/src" in "frontend/src/main.tsx"), not the
+			// start of an absolute path. Resolving just the "/..." fragment
+			// against the filesystem root would misclassify in-workspace relative
+			// paths — but a plain skip would also swallow a genuine parent-ref
+			// escape hidden behind a relative prefix, such as "./../etc/passwd"
+			// or "a/../../etc/passwd". Resolve the WHOLE relative-path word
+			// against workDir instead: in-root words resolve inside workDir (and
+			// are dropped by PathsOutsideRoots), while escaping words surface as
+			// a real out-of-root path. Windows drive-letter alternatives start
+			// with a letter, never "/", so they never reach this branch.
+			if start > 0 && isPathComponentChar(command[start-1]) {
+				wordStart := relativePathWordStart(command, start)
+				resolved, ok := resolveRelativeToken(command[wordStart:end], workDir)
+				if !ok || resolved == "" || !isAbsResolved(resolved) {
+					continue
+				}
+				if _, dup := seen[resolved]; dup {
+					continue
+				}
+				seen[resolved] = struct{}{}
+				out = append(out, resolved)
+				continue
+			}
+		}
 		resolved, ok := resolveShellToken(tok, shell, workDir)
 		if !ok || resolved == "" || !isAbsResolved(resolved) {
 			continue
@@ -116,6 +173,46 @@ func ResolveShellPathTokens(command string, shell ShellKind, workDir string) []s
 		out = append(out, resolved)
 	}
 	return out
+}
+
+// pathComponentChars lists the characters that may occur inside a filesystem
+// path component (filename). pathRegex's absolute-path alternative can match a
+// "/" that follows such a character — the separator inside a relative path —
+// so a preceding path-component character marks a "/" as part of a relative
+// path rather than the start of an absolute one.
+const pathComponentChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-~"
+
+// isPathComponentChar reports whether b may occur inside a filesystem path
+// component (filename), i.e. it is one of [pathComponentChars].
+func isPathComponentChar(b byte) bool {
+	return strings.IndexByte(pathComponentChars, b) >= 0
+}
+
+// relativePathWordStart finds the byte offset at which the relative-path word
+// containing position start begins. It scans backwards over characters that may
+// form a relative path component (letters, digits and the separator/idiom
+// characters '.', '_', '-', '~', '/', '\') until it reaches a character that
+// cannot be part of a path word (whitespace, a shell operator, a quote, etc.).
+// The result is then trimmed back to the first non-separator character so the
+// returned offset points at the start of the word (e.g. for "a/../b" with
+// start at the "/b", the result is the offset of "a").
+//
+// This is used to resolve a "/"-leading fragment that pathRegex matches inside
+// a relative path (e.g. the "/../etc/passwd" in "./../etc/passwd") by resolving
+// the entire relative word against workDir rather than treating the fragment as
+// an absolute path.
+func relativePathWordStart(command string, start int) int {
+	const relativeWordChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-~/\\"
+	i := start
+	for i > 0 && strings.IndexByte(relativeWordChars, command[i-1]) >= 0 {
+		i--
+	}
+	// Trim a leading separator run ("../", "./", "/" or "\") back to the first
+	// component character so the word starts at an actual name/idiom character.
+	for i < start && (command[i] == '/' || command[i] == '\\') {
+		i++
+	}
+	return i
 }
 
 // PathsOutsideRoots resolves the shell tokens in command and reports those

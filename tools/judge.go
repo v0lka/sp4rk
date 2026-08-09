@@ -288,8 +288,21 @@ func ExtractJSONStrings(data any) []string {
 }
 
 // ExtractPaths extracts absolute path-like substrings from a string value.
+// A "/" that follows a path-component character is treated as a separator
+// inside a relative path (e.g. the "/src" in "frontend/src/main.tsx"), not the
+// start of an absolute one — mirroring ResolveShellPathTokens so the shell and
+// JSON-input extractors agree on what counts as a path. Windows drive-letter
+// alternatives ("C:\...") start with a letter and are unaffected.
 func ExtractPaths(s string) []string {
-	return pathRegex.FindAllString(s, -1)
+	var out []string
+	for _, m := range pathRegex.FindAllStringIndex(s, -1) {
+		start := m[0]
+		if s[start] == '/' && start > 0 && isPathComponentChar(s[start-1]) {
+			continue
+		}
+		out = append(out, s[start:m[1]])
+	}
+	return out
 }
 
 // AllPathsInDir returns true if the JSON input contains at least one absolute

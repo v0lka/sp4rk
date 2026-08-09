@@ -250,6 +250,129 @@ func TestResolveShellPathTokens_DedupeAndClean(t *testing.T) {
 	}
 }
 
+// TestPathsOutsideRoots_RelativePathNotExtracted is the regression test for the
+// false-positive where pathRegex (via FindAllString) matched a "/" ANYWHERE in
+// the command, not only at a token boundary. A relative path such as
+// "frontend/src/main.tsx" or "go test ./core/..." had its embedded "/src/..." or
+// "/core/..." extracted as a spurious POSIX absolute path and flagged as
+// out-of-root, triggering constant confirmation prompts. After the fix the "/"
+// following a path-component character is treated as a separator inside the
+// relative path and ignored.
+func TestPathsOutsideRoots_RelativePathNotExtracted(t *testing.T) {
+	ws := t.TempDir()
+	ctx := WithWorkspacePath(context.Background(), ws)
+
+	for _, cmd := range []string{
+		"go test ./core/...",
+		"git diff --stat frontend/src/main.tsx",
+		"cat backend/config/config.go",
+		"ls core/tools",
+		"npm run build -- --config frontend/vite.config.ts",
+	} {
+		got := PathsOutsideRoots(ctx, cmd, ShellBash, ws)
+		if len(got) != 0 {
+			t.Errorf("relative cmd %q must not be flagged as out-of-root, got %v", cmd, got)
+		}
+	}
+}
+
+// TestPathsOutsideRoots_DotDotEllipsisNotParentRef is the regression test for
+// the false-positive where relDotDotRe matched the ".." inside a run of 3+
+// dots (an ellipsis, e.g. the go-test recursive pattern "go test ..."). The
+// extracted ".." resolved against the workspace to its PARENT directory and was
+// flagged as out-of-root. This affected bash ("go test ...") and especially
+// posh ("go test .\core\..."), whose backslash separators are not consumed by
+// pathRegex the way bash's "/" is. After the fix a ".." immediately followed
+// by another dot is recognized as an ellipsis, not a parent-directory ref.
+func TestPathsOutsideRoots_DotDotEllipsisNotParentRef(t *testing.T) {
+	ws := t.TempDir()
+	ctx := WithWorkspacePath(context.Background(), ws)
+
+	commands := map[ShellKind][]string{
+		ShellBash: {
+			"go test ./...",
+			"go test ...",
+			"go test ./core/...",
+			"go test ./core/... ./backend/...",
+		},
+		ShellPosh: {
+			"go test ...",
+			"go test .\\core\\...",
+			"go test .\\... .\\backend\\...",
+		},
+	}
+	for shell, cmds := range commands {
+		for _, cmd := range cmds {
+			got := PathsOutsideRoots(ctx, cmd, shell, ws)
+			if len(got) != 0 {
+				t.Errorf("[%s] ellipsis cmd %q must not be flagged as out-of-root, got %v", shell, cmd, got)
+			}
+		}
+	}
+}
+
+// TestPathsOutsideRoots_GenuineEscapeStillFlagged verifies the boundary fix
+// does not weaken genuine parent-directory escapes: a real "../.." (bash) or
+// "..\.." (posh) that resolves outside the workspace is still reported.
+func TestPathsOutsideRoots_GenuineEscapeStillFlagged(t *testing.T) {
+	ws := t.TempDir()
+	ctx := WithWorkspacePath(context.Background(), ws)
+
+	got := PathsOutsideRoots(ctx, "cat ../../etc/passwd", ShellBash, ws)
+	// The exact resolved path depends on how deeply nested ws is; what matters
+	// is that the genuine "../.." escape resolves OUTSIDE the workspace and is
+	// reported (it must end in "etc/passwd" two levels above ws).
+	if len(got) == 0 || !strings.HasSuffix(got[0], "etc/passwd") {
+		t.Fatalf("expected ../../etc/passwd -> <ws parent-parent>/etc/passwd flagged as out-of-root, got %v", got)
+	}
+}
+
+// TestPathsOutsideRoots_PrefixedEscapeStillFlagged is the regression test for
+// the security hole introduced by the original leading-boundary fix: a genuine
+// parent-directory escape written with a relative prefix (the canonical shell
+// ways to express an escape) was silently dropped because the "/"-leading
+// pathRegex token that pathRegex matched INSIDE the escape was suppressed
+// without resolving the enclosing word. After the fix the whole relative-path
+// word is resolved against workDir, so these escapes surface as real
+// out-of-root paths and the always-allow escalation is re-armed.
+func TestPathsOutsideRoots_PrefixedEscapeStillFlagged(t *testing.T) {
+	ws := t.TempDir()
+	ctx := WithWorkspacePath(context.Background(), ws)
+
+	for _, cmd := range []string{
+		"cat ./../etc/passwd",
+		"cat ./../../etc/passwd",
+		"cat a/../../etc/passwd",
+		"cd subdir/../..",
+	} {
+		got := PathsOutsideRoots(ctx, cmd, ShellBash, ws)
+		if len(got) == 0 {
+			t.Errorf("prefixed escape cmd %q must be flagged as out-of-root, got %v", cmd, got)
+		}
+	}
+}
+
+// TestPathsOutsideRoots_RelativeWordInRootNotFlagged pins Issue #2: a relative
+// path that resolves INSIDE the workspace (even with ".." components) must not
+// be flagged. "a/../b" resolves to ws/b (in-root); "x../../etc/passwd" has its
+// ".." glued to a filename char, so the whole token resolves to a path still
+// rooted under ws and is correctly not flagged.
+func TestPathsOutsideRoots_RelativeWordInRootNotFlagged(t *testing.T) {
+	ws := t.TempDir()
+	ctx := WithWorkspacePath(context.Background(), ws)
+
+	for _, cmd := range []string{
+		"cat a/../b",
+		"cat x../../etc/passwd",
+		"cat ./subdir/../file.txt",
+	} {
+		got := PathsOutsideRoots(ctx, cmd, ShellBash, ws)
+		if len(got) != 0 {
+			t.Errorf("in-root relative cmd %q must not be flagged, got %v", cmd, got)
+		}
+	}
+}
+
 // sliceContains reports whether ss contains s.
 func sliceContains(ss []string, s string) bool {
 	for _, v := range ss {

@@ -600,6 +600,65 @@ func TestJudge_WorkspacePreCheck_RelativePaths(t *testing.T) {
 	}
 }
 
+// TestExtractPaths_RelativePathNotExtracted is the regression test for the
+// false positive where pathRegex (via FindAllString) matched a "/" ANYWHERE in a
+// JSON string value, not only at a token boundary. A relative path such as
+// "frontend/src/main.tsx" had its embedded "/src/main.tsx" extracted as a
+// spurious POSIX absolute path. After the fix a "/" that follows a
+// path-component character is treated as a separator inside a relative path and
+// is not extracted — mirroring ResolveShellPathTokens so the two extractors
+// agree on what counts as a path.
+func TestExtractPaths_RelativePathNotExtracted(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want []string
+	}{
+		{
+			name: "relative path embedded slash not extracted",
+			in:   "frontend/src/main.tsx",
+			want: nil,
+		},
+		{
+			name: "nested relative path not extracted",
+			in:   "git diff --stat backend/config/config.go",
+			want: nil,
+		},
+		{
+			name: "absolute path at token boundary still extracted",
+			in:   "cat /etc/passwd",
+			want: []string{"/etc/passwd"},
+		},
+		{
+			name: "absolute path following space still extracted",
+			in:   "rm -rf /tmp/session-temp/cache",
+			want: []string{"/tmp/session-temp/cache"},
+		},
+		{
+			name: "leading absolute path extracted",
+			in:   "/tmp/session-temp/data.json",
+			want: []string{"/tmp/session-temp/data.json"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ExtractPaths(tt.in)
+			if len(got) == 0 && len(tt.want) == 0 {
+				return
+			}
+			if len(got) != len(tt.want) {
+				t.Errorf("ExtractPaths(%q) = %v, want %v", tt.in, got, tt.want)
+				return
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("ExtractPaths(%q)[%d] = %q, want %q", tt.in, i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
 func TestAllPathsInDir(t *testing.T) {
 	tests := []struct {
 		name  string
