@@ -83,8 +83,15 @@ func classifyNetError(err error) bool {
 		return true
 	}
 
-	// Check for syscall errors (ECONNREFUSED, ECONNRESET, EHOSTUNREACH)
-	if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EHOSTUNREACH) {
+	// Check for transient connection failures (ECONNREFUSED, ECONNRESET,
+	// EHOSTUNREACH). Match the raw syscall.Errno from the error chain via a
+	// platform-specific helper: on Unix the POSIX errno sentinels are the real
+	// OS values, while on Windows they are invented and we must match the raw
+	// Winsock codes instead (see errno_windows.go). errors.As is used rather
+	// than errors.Is so the comparison is uniform across platforms and does not
+	// depend on the fragile invented-errno situation on Windows.
+	var errno syscall.Errno
+	if errors.As(err, &errno) && isTransientConnErrno(errno) {
 		return true
 	}
 
