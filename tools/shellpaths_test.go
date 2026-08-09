@@ -321,8 +321,11 @@ func TestPathsOutsideRoots_GenuineEscapeStillFlagged(t *testing.T) {
 	got := PathsOutsideRoots(ctx, "cat ../../etc/passwd", ShellBash, ws)
 	// The exact resolved path depends on how deeply nested ws is; what matters
 	// is that the genuine "../.." escape resolves OUTSIDE the workspace and is
-	// reported (it must end in "etc/passwd" two levels above ws).
-	if len(got) == 0 || !strings.HasSuffix(got[0], "etc/passwd") {
+	// reported (it must end in "etc/passwd" two levels above ws). Normalize the
+	// resolved path's separators to "/" before the suffix check: on Windows
+	// resolveRelativeToken returns a filepath.Clean-ed path with backslash
+	// separators, so a literal "etc/passwd" suffix would never match there.
+	if len(got) == 0 || !strings.HasSuffix(filepath.ToSlash(got[0]), "etc/passwd") {
 		t.Fatalf("expected ../../etc/passwd -> <ws parent-parent>/etc/passwd flagged as out-of-root, got %v", got)
 	}
 }
