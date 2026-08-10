@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"testing"
 
 	"github.com/v0lka/sp4rk/llm"
@@ -968,8 +969,13 @@ func TestAllPathsInSessionRoots_HarmlessDevice(t *testing.T) {
 	if got := AllPathsInSessionRoots(ctx, json.RawMessage(`{"path":"/dev/null"}`)); !got {
 		t.Fatal("expected /dev/null to be treated as local")
 	}
-	// /dev/null alongside an in-workspace path — still local.
-	if got := AllPathsInSessionRoots(ctx, json.RawMessage(`{"path":"/dev/null","dest":"`+ws+`/out"}`)); !got {
+	// /dev/null alongside an in-workspace path — still local. Build the dest
+	// with forward slashes so the embedded JSON is valid on every host (a raw
+	// Windows temp dir contains backslashes that would otherwise produce
+	// illegal JSON escapes such as "\U" or "\T"). The containment check
+	// filepath.Cleans both sides, so separators do not affect the result.
+	dest := filepath.ToSlash(filepath.Join(ws, "out"))
+	if got := AllPathsInSessionRoots(ctx, json.RawMessage(`{"path":"/dev/null","dest":"`+dest+`"}`)); !got {
 		t.Fatal("expected /dev/null + in-root path to be treated as local")
 	}
 	// /dev/null alongside a genuine out-of-root path — must fail (not masked).

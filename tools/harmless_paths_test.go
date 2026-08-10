@@ -1,6 +1,9 @@
 package tools
 
-import "testing"
+import (
+	"runtime"
+	"testing"
+)
 
 func TestIsHarmlessDevicePath(t *testing.T) {
 	tests := []struct {
@@ -25,7 +28,11 @@ func TestIsHarmlessDevicePath(t *testing.T) {
 		{"disk", "/dev/sda1", false},
 		{"normal file", "/tmp/foo.txt", false},
 		{"normal relative", "dev/null", false}, // not absolute → not a device
-		{"ordinary nul lowercase on posix", "nul", false},
+		// A bare "nul" is an ordinary file on a POSIX host (not a device), so
+		// it is NOT harmless there. On Windows it is the reserved NUL device —
+		// the /dev/null equivalent — and therefore harmless. The expectation
+		// is thus host-dependent, matching IsHarmlessDevicePath's OS-gating.
+		{"bare nul", "nul", runtime.GOOS == "windows"},
 		{"ordinary file named devnull", "/home/me/devnull", false},
 		// Variations that should still match after normalization.
 		{"trailing slash cleaned", "/dev/null/", true},
