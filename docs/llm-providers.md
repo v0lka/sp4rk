@@ -250,7 +250,7 @@ Resolution order (first match wins; every map lookup uses the lowercased key):
 2b. **Fuzzy match** — a vendor-prefix- and separator-insensitive lookup across overrides then built-ins. `normalizeModelID` strips the org/vendor prefix up to the first `/`, lowercases the result, and removes `.`/`-`/`_` punctuation (alphanumerics are never altered, so distinct versions stay distinct — unlike edit-distance it cannot collapse versions); on a multi-match the lexicographically smallest key wins; the hit is cached under the query key. Lookups are O(1) reads against normalized-ID indexes built once at registry construction. Bridges naming drift between hosts and the registry, e.g. `"gpt4o"` matches `"gpt-4o"`, a bare `"glm-5.2-fp8"` matches the prefixed `"zai-org/glm-5.2-fp8"`.
 3. **Cache** — results from previous external lookups.
 4. **External sources** — HuggingFace API lookup (lazy, cached), then any sources registered via `RegisterSource` (e.g. an LM Studio provider).
-5. **Fallback defaults** — `ContextWindow: 128000`, `OutputLimit: 4096`, `TokenizerType: "approximate"`; `ok` is false. Unknown and HuggingFace-resolved models default to attachment-capable (`defaultUnknownCapabilities` sets `Attachment: true`) — a runtime provider error is preferred over silently denying image uploads for a model the registry does not know.
+5. **Fallback defaults** — `ContextWindow: 128000`, `OutputLimit: 32768`, `TokenizerType: "approximate"`; `ok` is false. Unknown and HuggingFace-resolved models default to attachment-capable (`defaultUnknownCapabilities` sets `Attachment: true`) — a runtime provider error is preferred over silently denying image uploads for a model the registry does not know.
 
 Additional methods:
 

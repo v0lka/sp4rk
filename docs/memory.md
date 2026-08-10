@@ -221,7 +221,7 @@ type CompactionConfig struct {
 }
 ```
 
-`NewCompactionStrategy` applies defaults when fields are zero: `BlockSize` → `10`, `KeepLast` → `5`, `ObservationTruncate` → `500`, ratios → `0.4/0.3/0.3`.
+`NewCompactionStrategy` applies defaults when fields are zero: `BlockSize` → `10`, `KeepLast` → `5`, `ObservationTruncate` → `500`, ratios → `0.4/0.3/0.3`. For the `sliding_window` strategy, `KeepFirst` → `3` and `KeepLast` → `10` apply when zero, so a zero-valued config does not erase the entire step history.
 
 ### CompactionDeps
 
@@ -322,6 +322,8 @@ cw.SetHistoryMutation(memory.HistoryMutation{
 ## Prompt Injection Defense Integration
 
 When `InjectionDefenseEnabled` is `true`, tool outputs from tools that return external data (marked via the step's `IsUntrusted` flag) are wrapped in `<untrusted-content>` tags before being added to the prompt. This defends against indirect prompt injection. See [Security](security.md) for details on the wrapping and stripping functions.
+
+The boundary **survives compaction**: the compaction strategies build verbatim tool messages without the defense wrap, so the `ContextWindow` re-wraps any tool message in the frozen compacted prefix whose source step was flagged `IsUntrusted` after compaction. Untrusted output never re-enters LLM context without the boundary.
 
 ## Complete Example
 

@@ -127,7 +127,8 @@ The `batch` tool lets the model dispatch multiple tool calls in one turn. It is 
 - When `mutationRequired` is set, finish without a prior successful mutating tool is rejected (nudge then `Finished: false`).
 - Both checklist sub-gates are soft: after one nudge attempt, finish is accepted regardless.
 - Tool results from untrusted sources are wrapped in `<untrusted-content>` tags before becoming an LLM message (when injection defense is enabled on the `ContextManager`).
-- Every `Step` carries `IsUntrusted` (set after tool execution via `tool.IsUntrusted()` or MCP source check) and `CacheHash` (empty for non-cacheable tools).
+- Every `Step` carries `IsUntrusted` (set after tool execution via `tool.IsUntrusted()` or MCP source check) and `CacheHash` (empty for a non-cacheable tool that was not truncated).
+- No tool — cacheable or non-cacheable — is ever truncated without a retrieval path. When a non-cacheable tool's result is truncated at Stage 1 (line/byte) or Stage 2 (token budget), the executor caches it on demand (`ToolResultCache.Store`) and embeds the resulting hash in the truncation notice so the model can re-read the full result via `tool_result_read`. Only small non-truncated non-cacheable results stay out of the cache.
 - `batch` is intercepted before the registry; its sub-calls are cached individually.
 
 ## Related Specs

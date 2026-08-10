@@ -276,7 +276,7 @@ type SymlinkTraversal struct {
 ### DetectSymlinksInToolInput
 
 ```go
-func DetectSymlinksInToolInput(ctx context.Context, toolName string, input, schema json.RawMessage) (
+func DetectSymlinksInToolInput(ctx context.Context, toolName string, input, schema json.RawMessage, logger *slog.Logger) (
     inside []SymlinkTraversal,
     outside []SymlinkTraversal,
     suspicious bool,
@@ -287,7 +287,7 @@ Extracts path-like tokens from the tool input (via the [path extraction helpers]
 
 `schema` is the tool's JSON input schema and drives **field-aware** extraction. When the schema declares recognizable path fields, only those fields are scanned, so content payloads (`edit_file` `old_string`/`new_string`, `write_file` `content`) are never mistaken for paths. When no schema is supplied (`nil`) or no path field is recognized, detection falls back to scanning **every** string value, preserving coverage for unconventional tools (pass the tool's real schema to gain the false-positive reduction). Obtain the schema from the `ToolDescriptor.InputSchema` / MCP tool metadata.
 
-**Path-field naming convention.** A property is treated as a path field when it is string-typed (or untyped) and its name matches an exact name (`path`, `file`, `dir`, `directory`, `filepath`, `filename`, `cwd`, `root`, `working_directory`, `workdir`, `dest`, `destination`) or ends with a suffix (`_path`, `_dir`, `_directory`, `_file`, `_filepath`, `_root`). When a schema declares a recognized path field alongside *other* string-typed fields whose names do not follow the convention, those non-path fields are excluded from scanning and the omission is logged (`slog.Default`, Warn level) so it is observable rather than silent. To ensure a path-carrying parameter is scanned, name it with one of the recognized names/suffixes.
+**Path-field naming convention.** A property is treated as a path field when it is string-typed (or untyped) and its name matches an exact name (`path`, `file`, `dir`, `directory`, `filepath`, `filename`, `cwd`, `root`, `working_directory`, `workdir`, `dest`, `destination`) or ends with a suffix (`_path`, `_dir`, `_directory`, `_file`, `_filepath`, `_root`). When a schema declares a recognized path field alongside *other* string-typed fields whose names do not follow the convention, those non-path fields are excluded from scanning and the omission is logged via `logger` (Warn level); if `logger` is `nil`, `slog.Default()` is used, so the omission is observable rather than silent. To ensure a path-carrying parameter is scanned, name it with one of the recognized names/suffixes.
 
 `suspicious` is set for `bash_exec` commands containing unresolved shell expansions (`$var`, `$(cmd)`, `` `cmd` ``, process substitution) that may hide additional paths; for other tools it is always `false`.
 
@@ -326,11 +326,11 @@ func AllPathsInWorkspace(ctx context.Context, input json.RawMessage) bool
 func AllPathsInSessionRoots(ctx context.Context, input json.RawMessage) bool
 ```
 
-- `ExtractPaths` — finds absolute POSIX-style and Windows drive-letter paths (`/usr/bin`, `C:\foo\bar`) in a string via a regex.
+- `ExtractPaths` — finds absolute POSIX-style and Windows drive-letter paths (`/usr/bin`, `C:\foo\bar`) in a string via a regex. A `/` that follows a path-component character is treated as a **separator inside a relative path** (e.g. the `/src` in `frontend/src/main.tsx`), not the start of an absolute one — so embedded relative paths are not misread as absolute escapes. Windows drive-letter alternatives (`C:\…`) start with a letter and are unaffected.
 - `ExtractJSONStrings` — recursively collects every string value from a `json.Unmarshal` result (maps, slices, strings).
-- `AllPathsInDir` — returns `true` only if the input contains **at least one** absolute path **and every** such path is within `dir` (via `pathutil.IsWithinPath`). Empty/`""` when there are no paths.
+- `AllPathsInDir` — returns `true` only if the input contains **at least one** absolute path **and every** such path is within `dir` (via `pathutil.IsWithinPath`). Empty/`""` when there are no paths. Harmless special-device paths (`/dev/null`, `/dev/full`; `NUL` on Windows) are exempted via `IsHarmlessDevicePath` so they do not force a confirmation when they appear alongside in-root paths.
 - `AllPathsInWorkspace` — `AllPathsInDir` bound to the workspace path from context.
-- `AllPathsInSessionRoots` — the canonical containment check consulted by the judge fast-path: returns `true` only if the input contains at least one absolute path and every such path is within at least one session root (`SessionRoots(ctx)`, the union of workspace + temp directory + `WithAllowedRoots` roots).
+- `AllPathsInSessionRoots` — the canonical containment check consulted by the judge fast-path: returns `true` only if the input contains at least one absolute path and every such path is within at least one session root (`SessionRoots(ctx)`, the union of workspace + temp directory + `WithAllowedRoots` roots). Harmless special-device paths are exempted via `IsHarmlessDevicePath`, so `/dev/null`/`/dev/full`/`NUL` do not force a confirmation.
 
 These are the primitives behind the judge's "all paths inside a session root → auto-approve" fast-path.
 

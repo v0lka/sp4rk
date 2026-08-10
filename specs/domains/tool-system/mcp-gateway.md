@@ -44,7 +44,11 @@ StartGateway(ctx, cfg, registry, expandEnv, logger)
 
 For HTTP, the client first tries the **Streamable HTTP** transport and falls back to **SSE** (Server-Sent Events) if initialization fails — compatible with both modern and legacy MCP HTTP servers.
 
-For stdio, the subprocess is always built through a custom command factory that merges `os.Environ()` with the configured `Env` (matching the transport's default merge), applies `WorkDir`/`DefaultWorkDir` when set, and calls `sysproc.HideConsole(cmd)` so a GUI-subsystem host application does not allocate a console window for the long-lived server process (`CREATE_NO_WINDOW` on Windows; no-op elsewhere). The factory is installed unconditionally — even when no `WorkDir` is set — so window suppression applies to every stdio server.
+For stdio, the subprocess is always built through a custom command factory that merges the allowlisted host environment (see [Stdio environment allowlist](#stdio-environment-allowlist-supply-chain-defense) below) with the configured `Env` (matching the transport's default merge), applies `WorkDir`/`DefaultWorkDir` when set, and calls `sysproc.HideConsole(cmd)` so a GUI-subsystem host application does not allocate a console window for the long-lived server process (`CREATE_NO_WINDOW` on Windows; no-op elsewhere). The factory is installed unconditionally — even when no `WorkDir` is set — so window suppression applies to every stdio server.
+
+### Stdio environment allowlist (supply-chain defense)
+
+A stdio MCP server runs an arbitrary third-party command declared in config, so it is treated as untrusted by default. The subprocess inherits only an allowlisted subset of the host environment: `PATH`, `HOME`, `USER`, `SHELL`, `LANG`, `TERM`, `TMPDIR`, `TEMP`, `TMP`, and `LC_*` locale variables (`safeStdioEnv`). Host secrets — LLM API keys, proxy credentials — are never forwarded implicitly. Explicit `cfg.Env` entries are applied on top of the allowlist and always win, so a host that wants to pass a secret to a server declares it explicitly, and one that wants stricter isolation (e.g. to block `~/.aws/credentials` reads via `HOME`) can override `HOME` through `cfg.Env`.
 
 ### Environment variable expansion
 
@@ -69,7 +73,7 @@ After connecting, each server is queried with `tools/list`. Returned tools becom
 
 ### Status & introspection
 
-`Status()` returns per-server `ServerStatus` (name, transport, connected, tool count, tools, error), sorted by name for deterministic output. `ServerNames()`, `ToolCount()`, and `GetServer(name)` provide further introspection.
+`Status()` returns per-server `ServerStatus` (name, transport, connected, starting, tool count, tools, error), sorted by name for deterministic output. `starting` is a transient state distinct from `Connected`/`Error`, marking an entry still being initialized; it is non-omitempty (always serialized) so a frontend can treat it as a first-class state. `ServerNames()`, `ToolCount()`, and `GetServer(name)` provide further introspection.
 
 ## Error Handling
 

@@ -135,12 +135,19 @@ The `MemoryTools()` bundle registers `store_fact` and `search_facts`. Facts are 
 #### Blackboard change callback
 
 ```go
-OnBlackboardChanged: func(changeType string) {
-    fmt.Printf("blackboard: %s\n", changeType)
+// OnBlackboardChanged fires ONLY when a Checkpointer is configured — the
+// notification hook lives on CheckpointedBlackboard. The example wires an
+// in-memory checkpointer precisely so the callback fires for this demo.
+base := sp4rk.Config{
+    // …execution tuning, compaction…
+    Checkpointer: newMemoryCheckpointer(), // required for the callback below
+    OnBlackboardChanged: func(changeType string) {
+        fmt.Printf("blackboard: %s\n", changeType)
+    },
 }
 ```
 
-Fires after every successful blackboard write (`plan`, `step_result`, `fact`, `attachment`, `reflection`). Useful for UI integration or audit logging.
+Fires after every successful blackboard write (`plan`, `step_result`, `fact`, `attachment`, `reflection`). The notification hook lives on `CheckpointedBlackboard`, so it only runs when a `Checkpointer` is present — a plain blackboard never invokes it. The example's `newMemoryCheckpointer()` (an in-memory `orchestration.Checkpointer` at the bottom of `main.go`) exists solely to satisfy that requirement; a production deployment would back it with durable storage (file, DB, …). Useful for UI integration or audit logging.
 
 #### Compaction configuration
 

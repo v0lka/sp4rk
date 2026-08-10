@@ -153,7 +153,7 @@ type Step struct {
 | `UserNudge` | An optional user message injected after the step's normal messages (e.g. step-limit nudges, circuit-breaker warnings). |
 | `ResponseGroup` | Links steps that came from a single LLM response containing multiple tool calls. Steps sharing a non-zero value are rendered as one assistant message with multiple tool calls. Zero means a standalone step. |
 | `IsUntrusted` | `true` when the observation came from an untrusted external source (web, MCP, filesystem). Such observations are wrapped in `<untrusted-content>` tags before entering the LLM context as a prompt-injection defense. |
-| `CacheHash` | SHA-256 hash of the full (pre-truncation) tool result, stored in the `ToolResultCache`. Empty for non-cacheable tools or when caching is disabled. Used to replace old tool results with a cache reference, reducing replay cost. |
+| `CacheHash` | SHA-256 hash of the full (pre-truncation) tool result, stored in the `ToolResultCache`. Empty for non-cacheable tools whose result is **not** truncated, or when caching is disabled. A non-cacheable tool that *is* truncated is cached on demand (cache-on-truncate) and gets a hash, so the full result stays recoverable via `tool_result_read`. Used to replace old tool results with a cache reference, reducing replay cost. |
 
 ## ExecutorResult
 
@@ -473,7 +473,7 @@ These setters configure optional behavior. Call them **before** `Run`.
 | `SetLogger(l *slog.Logger)` | Sets the structured logger. Defaults to a discard handler. |
 | `SetReasoningEffort(effort string)` | Sets the reasoning effort passed to LLM calls (empty = no reasoning control). |
 | `SetToolCache(cache *ToolResultCache)` | Sets the shared tool-result cache. All tool results are stored before truncation. |
-| `SetPerToolTruncation(cfg map[string]ToolTruncationConfig)` | Sets per-tool Stage 1 truncation defaults. |
+| `SetPerToolTruncation(cfg map[string]ToolTruncationConfig)` | Sets per-tool Stage 1 truncation defaults. The provided map is deep-copied, so the caller may mutate it after the call. |
 | `SetPreWarningPercent(percent int)` | Sets the context-fill percentage that triggers the pre-compaction `store_fact` warning nudge (0 = disabled). |
 | `SetFinishGuard(fn func(ctx) error)` | Sets a callback invoked before finish is accepted. A non-nil error rejects finish with a nudge. Used to prevent abandoning pending async work. |
 | `AddNonCacheableTools(names ...string)` | Adds tool names to the non-cacheable set (extends SDK defaults). |

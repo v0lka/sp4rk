@@ -120,10 +120,10 @@ When `Transport` is `"stdio"` (the default), the gateway launches a local subpro
 
 - **`Command`** is the executable to run (e.g. `"npx"`, `"node"`, `"python"`).
 - **`Args`** are the command-line arguments passed to it.
-- **`Env`** is merged onto the current process environment (`os.Environ()`).
+- **`Env`** is applied on top of an **allowlisted** subset of the host environment, not the full process environment. stdio servers run arbitrary third-party commands, so they inherit only `PATH`, `HOME`, `USER`, `SHELL`, `LANG`, `TERM`, `TMPDIR`, `TEMP`, `TMP`, and any `LC_*` locale variables — host secrets (LLM API keys, proxy credentials, etc.) are **not** forwarded implicitly. Explicit `Env` entries are applied on top and always win, so anything else a server needs must be declared there.
 - **`WorkDir`** sets the subprocess's working directory (falls back to `DefaultWorkDir`).
 
-The subprocess is spawned with `exec.CommandContext`, inheriting the merged environment and the configured working directory. Communication happens over the process's stdin/stdout pipes via the MCP client library.
+The subprocess is spawned with `exec.CommandContext`, inheriting the allowlisted environment (plus explicit `Env` entries) and the configured working directory. Communication happens over the process's stdin/stdout pipes via the MCP client library.
 
 ```go
 "filesystem": {
@@ -259,7 +259,7 @@ Config comparison uses the *expanded* config (see [Environment variable expansio
 ### Status and introspection
 
 ```go
-g.Status()      // []ServerStatus — per-server name, transport, connected, tool count, tools, error
+g.Status()      // []ServerStatus — per-server name, transport, connected, starting, tool count, tools, error
 g.ServerNames() // []string — all connected server names
 g.ToolCount()   // int — total tools across all servers
 g.GetServer(n)  // *Server — a specific server by name, or nil

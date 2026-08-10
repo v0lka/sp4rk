@@ -34,6 +34,8 @@ The flag defaults to **case-sensitive** (fail-safe): when detection is impossibl
 
 The flag is attached automatically by `tools.WithWorkspacePath` (which probes the workspace root) and may be overridden by `tools.WithCaseInsensitivePaths`. Hosts that construct their context without `WithWorkspacePath` (e.g. `WithWorkspacePathNoProbe`) inherit the fail-safe case-sensitive default unless they attach the flag explicitly.
 
+Harmless special-device paths are exempted from path-locality determination via [`tools.IsHarmlessDevicePath`](#path-locality-primitive). A path that is a bit-bucket or error-sink pseudo-device — `/dev/null` and `/dev/full` on POSIX, `NUL` on Windows (matched case-insensitively as the final path component) — cannot leak data outside the workspace nor persist unwanted changes, so `AllPathsInSessionRoots` and `AllPathsInDir` skip it. This is why `cat file > /dev/null`, `read_file /dev/null`, or `write_file NUL` are not forced to confirm as out-of-workspace operations. The symlink gate deliberately does **not** consult it: it resolves every path component via `Lstat` rather than trusting the path string, so harmless-looking names that are actually symlinks (e.g. macOS `/dev/stdin`, which points into `/dev/fd/*`) are still walked and resolved.
+
 ## Tool Policies
 
 Every tool carries a `ToolPolicy` (`github.com/v0lka/sp4rk/tools`). It is an integer enum whose string mapping is stable:
@@ -131,6 +133,10 @@ The host wires `ConfirmFunc` via `sp4rk.Config.ConfirmFunc` (framework) or `regi
 
 MCP servers are untrusted; a malicious or compromised server could advertise a tool named `read_file` or `bash_exec` to intercept calls intended for built-in tools. The registry stores each tool's source category explicitly at registration (`RegisterWithSourceCategory`) and **rejects any MCP-categorized registration that would overwrite an existing non-MCP tool**. Built-in tools can always replace MCP tools, and an MCP server may re-register its own tools on reconnect.
 
+## MCP stdio Environment Allowlist (Supply-Chain Defense)
+
+A stdio MCP server runs an arbitrary third-party command declared in config, so its subprocess inherits only an allowlisted subset of the host environment: `PATH`, `HOME`, `USER`, `SHELL`, `LANG`, `TERM`, `TMPDIR`, `TEMP`, `TMP`, and `LC_*` locale variables. Host secrets — LLM API keys, proxy credentials — are never forwarded implicitly. Explicit `cfg.Env` entries are applied on top of the allowlist and always win, so a host that wants to pass a secret to a server declares it explicitly, and one that wants stricter isolation can override inherited vars (e.g. `HOME`) through `cfg.Env`.
+
 ## Indirect Prompt Injection Defense
 
 sp4rk protects the LLM context from untrusted tool output that could contain hidden instructions (prompt injection). The defense lives in `github.com/v0lka/sp4rk/security` and is applied by the memory layer's `ContextWindow`.
@@ -155,6 +161,8 @@ func StripUntrustedTags(content string) string
 `WrapUntrustedContent` wraps content in `<untrusted-content>` tags with a `source` attribute (the producing tool's name) and optional metadata attributes. The content is **first sanitized** via `StripUntrustedTags` to prevent tag-breakout attacks.
 
 The wrapping is applied by `memory.ContextWindow.BuildPrompt` (when constructed with `InjectionDefenseEnabled: true`) — the last point before content reaches the LLM API. It runs **after** history mutation and pruning, so the defense always wraps the final content the model sees.
+
+The boundary survives compaction. When a compaction strategy freezes verbatim tool messages into a compacted prefix, `ContextWindow.wrapUntrustedInFrozenPrefix` re-wraps any tool message whose source step was flagged `IsUntrusted` via `WrapUntrustedContent` (the summarization strategy likewise wraps untrusted observations). The strategies build their verbatim tool messages through a path that bypasses the live `BuildPrompt` wrap, so without this re-application previously-fenced untrusted content would re-enter context raw after compaction; the boundary guarantees it never does.
 
 ### Trust Classification
 
@@ -215,6 +223,7 @@ File-based defaults, session roots, and blacklist regexes are host-application c
 - `PolicyAlwaysDeny` is never bypassed — not by a judge, not by a confirmation, not by an override that does not change the policy.
 - A `ToolJudger` escalation requires `allow=false` **with non-empty reasoning**; `allow=false` with empty reasoning proceeds.
 - Untrusted tool output is wrapped in `<untrusted-content>` before it reaches the model, unconditionally for any tool whose `IsUntrusted()` is true (or that is MCP-sourced).
+- The untrusted-content boundary survives compaction: `ContextWindow` re-wraps untrusted tool messages retained in the frozen compacted prefix, so untrusted content never re-enters LLM context raw after compaction.
 - `WrapUntrustedContent` always sanitizes its content with `StripUntrustedTags` first.
 - An MCP tool registration can never overwrite an existing non-MCP tool.
 - The LLM-powered `ToolJudge` verdict parser fails **safe** to `VerdictConfirm` on any unrecognized or ambiguous verdict: verdict tokens are matched whole-token (case-insensitive), so negations of allow-words (e.g. `DISALLOW`, `DISAPPROVE`) are never misclassified as `VerdictAllow`. An LLM error likewise yields `VerdictConfirm`. See [../contracts/tools.md](../contracts/tools.md) for the verdict vocabulary.

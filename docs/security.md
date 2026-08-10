@@ -94,6 +94,8 @@ cw := memory.NewContextWindow(memory.ContextWindowConfig{
 
 When `BuildPrompt` assembles the step history, each tool message whose `IsUntrusted` flag is set is passed through `security.WrapUntrustedContent` with the tool name as the `source`. The wrapping is applied **after** history mutation and pruning, so the defense always wraps the final content the model sees.
 
+This guarantee holds across compaction. The compaction strategies build verbatim tool messages that bypass the `BuildPrompt` wrap, so the `ContextWindow` re-wraps any tool message in the frozen compacted prefix whose source step was flagged `IsUntrusted`. Untrusted output never re-enters context without the boundary.
+
 ## Tool IsUntrusted Flag
 
 The `IsUntrusted` field on a step marks tools whose output originates from external, potentially adversarial sources. Typical untrusted tools include:
@@ -117,6 +119,14 @@ Configure the confirmation channel via `sp4rk.Config.ConfirmFunc` (Framework) or
 ## MCP Tool Shadowing Protection
 
 MCP servers are untrusted; a malicious or compromised server could advertise a tool named `read_file` or `bash_exec` to intercept calls intended for built-in tools. The registry stores each tool's source category explicitly at registration time (`RegisterWithSourceCategory`) and **rejects any MCP-categorized registration that would overwrite an existing non-MCP tool**. Built-in tools can always replace MCP tools, and an MCP server may re-register its own tools on reconnect.
+
+## MCP stdio environment isolation
+
+MCP servers run arbitrary third-party commands. To avoid leaking host secrets (LLM API keys, proxy credentials) into every stdio child process, stdio servers inherit only an **allowlisted** subset of the parent environment — `PATH`, `HOME`, `USER`, `SHELL`, `LANG`, `TERM`, `TMPDIR`, `TEMP`, `TMP`, and `LC_*` locale variables — rather than the full `os.Environ()`. Anything else a server needs must be declared explicitly in its `ServerEntry.Env`; explicit entries are applied on top and always win. See [MCP integration](mcp-integration.md#stdio-transport) for configuration details.
+
+## Harmless device-path exemption
+
+Path-locality confirmation checks (`tools.AllPathsInDir` / `AllPathsInSessionRoots`) exempt harmless special-device paths — `/dev/null`, `/dev/full` (POSIX) and `NUL` (Windows) — via `tools.IsHarmlessDevicePath`, so referencing `/dev/null` does not force a confirmation when it appears alongside in-root paths. The symlink gate does not consult this exemption: it resolves every path via `Lstat`, so device paths are still classified by their traversal behaviour. See [Tool Safety](tool-safety.md#path-extraction-helpers) for the extraction primitives.
 
 ## Complete Example
 
