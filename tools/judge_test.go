@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/v0lka/sp4rk/llm"
@@ -12,24 +13,44 @@ import (
 )
 
 // mockLLMProvider is a mock implementation of llm.Provider for testing.
+// It supports both a fixed response/err and a per-call handler; the mu mutex
+// guards the captured requests so the mock is safe for concurrent test use.
 type mockLLMProvider struct {
-	response    *llm.ChatResponse
-	err         error
+	mu       sync.Mutex
+	response *llm.ChatResponse
+	err      error
+	handler  func(context.Context, llm.ChatRequest) (*llm.ChatResponse, error)
+	requests []llm.ChatRequest
+	// callCount/lastRequest are read by legacy single-call tests; they are
+	// updated under mu to remain correct under the concurrent paths too.
 	callCount   int
 	lastRequest *llm.ChatRequest
 }
 
 func (m *mockLLMProvider) ChatCompletion(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
+	m.mu.Lock()
+	m.requests = append(m.requests, req)
 	m.callCount++
 	m.lastRequest = &req
-	if m.err != nil {
-		return nil, m.err
+	handler := m.handler
+	response := m.response
+	err := m.err
+	m.mu.Unlock()
+	if handler != nil {
+		return handler(ctx, req)
 	}
-	return m.response, nil
+	return response, err
 }
 
 func (m *mockLLMProvider) Name() string {
 	return "mock"
+}
+
+// snapshot returns a copy of all captured requests. Safe for concurrent use.
+func (m *mockLLMProvider) snapshot() []llm.ChatRequest {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]llm.ChatRequest(nil), m.requests...)
 }
 
 func TestJudgeCacheKey(t *testing.T) {

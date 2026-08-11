@@ -25,7 +25,10 @@ var pathRegex = regexp.MustCompile(`(?:/[a-zA-Z0-9/_.\-~]+|[A-Za-z]:[\\/][A-Za-z
 // judgeUnparsedReason is the fail-safe reasoning returned when the LLM
 // response cannot be parsed at all. Kept as a constant so callers (and tests)
 // can detect a total parse failure.
-const judgeUnparsedReason = "Unable to parse judge response; requiring manual confirmation for safety"
+const (
+	judgeUnparsedReason      = "Unable to parse judge response; requiring manual confirmation for safety"
+	strictJudgeFailureReason = "Strict judge evaluation failed; requiring manual confirmation for safety"
+)
 
 // The following regexes make parseJudgeResponse tolerant of the formatting
 // variations LLMs commonly produce despite the requested two-line format.
@@ -55,6 +58,27 @@ const (
 	VerdictConfirm
 )
 
+// StrictJudgeRequest contains all decision-relevant context for strict
+// automatic evaluation of a user-confirmation gate. ToolSource identifies the
+// registration origin (for example "core" or an MCP server name). Environment
+// context is obtained from EnvInfo attached to ctx.
+type StrictJudgeRequest struct {
+	ToolName    string
+	Input       json.RawMessage
+	TaskContext string
+	ToolSource  string
+}
+
+// strictJudgeEnvelope is serialized as JSON to keep untrusted data fields
+// structurally separated in the LLM request.
+type strictJudgeEnvelope struct {
+	TaskContext string `json:"task_context"`
+	ToolName    string `json:"tool_name"`
+	ToolSource  string `json:"tool_source"`
+	Input       string `json:"input"`
+	Environment string `json:"environment,omitempty"`
+}
+
 // judgeResult holds both verdict and reasoning for caching.
 type judgeResult struct {
 	verdict   JudgeVerdict
@@ -63,6 +87,11 @@ type judgeResult struct {
 
 // ToolJudge evaluates whether a mutating tool call is safe to auto-approve.
 // It maintains an LRU-style cache keyed by tool+input to avoid redundant LLM calls.
+//
+// The provider and model fields are write-once: they are set in NewToolJudge
+// and never mutated afterward, so they may be read without holding mu. The
+// remaining mutable fields (systemPrompt, isInternalFn, cache) are guarded by
+// mu and must be accessed under the lock.
 type ToolJudge struct {
 	provider     llm.Provider
 	model        string
@@ -176,6 +205,16 @@ func (j *ToolJudge) Judge(ctx context.Context, toolName string, input json.RawMe
 	}
 	j.mu.RUnlock()
 
+	// provider is immutable after construction (write-once in NewToolJudge),
+	// so it is read without the lock. A nil provider means the judge was
+	// configured without an LLM backend; fail safe to CONFIRM.
+	if j.provider == nil {
+		if log != nil {
+			log.Warn("judge: provider unavailable, fail-safe to CONFIRM", "tool", toolName)
+		}
+		return VerdictConfirm, "Judge provider unavailable; requiring manual confirmation for safety", nil
+	}
+
 	// Build LLM request
 	inputStr := string(input)
 
@@ -248,6 +287,105 @@ func (j *ToolJudge) Judge(ctx context.Context, toolName string, input json.RawMe
 	j.mu.Unlock()
 
 	return verdict, reasoning, nil
+}
+
+// JudgeStrict performs a conservative LLM evaluation for automatic resolution
+// of a user-confirmation gate. Unlike Judge, it never applies internal-tool or
+// session-root fast paths and deliberately does not cache results: every gate
+// is evaluated against its current task, source, input, and environment
+// context. Any request construction failure, provider error, timeout, or
+// unparseable response fails safe to VerdictConfirm.
+func (j *ToolJudge) JudgeStrict(ctx context.Context, request StrictJudgeRequest) (JudgeVerdict, string, error) {
+	log := j.logger
+	if log != nil {
+		log.Debug("strict judge: evaluating tool", "tool", request.ToolName)
+	}
+
+	envelope := strictJudgeEnvelope{
+		TaskContext: request.TaskContext,
+		ToolName:    request.ToolName,
+		ToolSource:  request.ToolSource,
+		Input:       string(request.Input),
+		Environment: FormatCompactEnvBlock(EnvInfoFrom(ctx)),
+	}
+	prompt, err := json.Marshal(envelope)
+	if err != nil {
+		// Defensive: strictJudgeEnvelope contains only string fields, so
+		// json.Marshal cannot fail in practice. Keep the fail-safe anyway for
+		// forward compatibility if the struct ever gains an unmarshalable field.
+		if log != nil {
+			log.Warn("strict judge: invalid evaluation context, fail-safe to CONFIRM", "tool", request.ToolName)
+		}
+		return VerdictConfirm, strictJudgeFailureReason, nil
+	}
+
+	// provider and model are write-once after construction (see ToolJudge
+	// doc comment), so they are read without holding mu.
+	if j.provider == nil {
+		if log != nil {
+			log.Warn("strict judge: provider unavailable, fail-safe to CONFIRM", "tool", request.ToolName)
+		}
+		return VerdictConfirm, strictJudgeFailureReason, nil
+	}
+
+	req := llm.ChatRequest{
+		Model: j.model,
+		Messages: []llm.Message{
+			{Role: "system", Content: judge_prompts.JudgeStrictSystem},
+			{Role: "user", Content: string(prompt)},
+		},
+		MaxTokens: 100,
+	}
+
+	judgeCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+
+	var resp *llm.ChatResponse
+	resp, err = j.provider.ChatCompletion(judgeCtx, req)
+	if err != nil || resp == nil {
+		if log != nil {
+			// Do not log the provider error: provider diagnostics can echo the
+			// request and therefore sensitive tool arguments.
+			log.Warn("strict judge: LLM call failed, fail-safe to CONFIRM", "tool", request.ToolName)
+		}
+		return VerdictConfirm, strictJudgeFailureReason, nil
+	}
+
+	verdict, reasoning := parseStrictJudgeResponse(strings.TrimSpace(resp.Message.Content))
+	if log != nil {
+		log.Debug("strict judge: LLM verdict", "tool", request.ToolName, "verdict", verdictString(verdict))
+	}
+	return verdict, reasoning, nil
+}
+
+// parseStrictJudgeResponse accepts only the strict prompt's two canonical
+// verdict tokens. The advisory parser intentionally remains more tolerant for
+// the on-demand Ask Agent flow.
+func parseStrictJudgeResponse(content string) (verdict JudgeVerdict, reasoning string) {
+	lines := strings.Split(strings.TrimSpace(content), "\n")
+	if len(lines) != 2 {
+		return VerdictConfirm, judgeUnparsedReason
+	}
+
+	verdictLine := strings.TrimSpace(lines[0])
+	reasonLine := strings.TrimSpace(lines[1])
+	if !strings.HasPrefix(verdictLine, "VERDICT: ") || !strings.HasPrefix(reasonLine, "REASON: ") {
+		return VerdictConfirm, judgeUnparsedReason
+	}
+
+	verdictText := strings.TrimSpace(strings.TrimPrefix(verdictLine, "VERDICT: "))
+	reasoning = strings.TrimSpace(strings.TrimPrefix(reasonLine, "REASON: "))
+	if reasoning == "" {
+		return VerdictConfirm, judgeUnparsedReason
+	}
+	switch verdictText {
+	case "ALLOW":
+		return VerdictAllow, reasoning
+	case "CONFIRM":
+		return VerdictConfirm, reasoning
+	default:
+		return VerdictConfirm, judgeUnparsedReason
+	}
 }
 
 // isShellTool reports whether the tool executes arbitrary shell commands.

@@ -18,6 +18,10 @@ type ConfirmationRequest struct {
 	ToolName       string          `json:"tool_name"`
 	Input          json.RawMessage `json:"input"`
 	JudgeReasoning string          `json:"judge_reasoning,omitempty"`
+	// DisableJudge prevents a confirmation surfaced by the strict automatic
+	// judge from being sent through the advisory on-demand judge a second time.
+	// The zero value preserves the existing Ask Agent flow for ordinary gates.
+	DisableJudge bool `json:"disable_judge,omitempty"`
 }
 
 // ConfirmationResponse represents the user's confirmation decision.
