@@ -75,6 +75,16 @@ func TestModelRegistry_BuiltInResolution(t *testing.T) {
 		{"glm-5.2", 1000000, 128000, "approximate"},
 		{"glm-5.1", 200000, 128000, "approximate"},
 		{"glm-5", 200000, 128000, "approximate"},
+
+		// Kimi models (Moonshot AI) — verified from platform.kimi.ai/docs and
+		// kimi.com/code/docs (the Kimi Code endpoint serves short, non-prefixed
+		// IDs that contain no "kimi" substring).
+		{"kimi-k3", 1000000, 131072, "approximate"},
+		{"k3", 1000000, 131072, "approximate"},
+		{"k3-256k", 262144, 65536, "approximate"},
+		{"kimi-k2.7-code", 262144, 65536, "approximate"},
+		{"kimi-for-coding", 262144, 65536, "approximate"},
+		{"kimi-for-coding-highspeed", 262144, 65536, "approximate"},
 	}
 
 	for _, tt := range tests {
@@ -751,6 +761,15 @@ func TestResolveFamily_BuiltinModels(t *testing.T) {
 		// DeepSeek V4 models
 		{"deepseek-v4-pro", "deepseek"},
 		{"deepseek-v4-flash", "deepseek"},
+
+		// Kimi models — the Kimi Code endpoint's short IDs ("k3", "k3-256k")
+		// contain no "kimi" substring, so these pin the explicit built-in
+		// Family rather than DetectFamily substring matching.
+		{"kimi-k3", "kimi"},
+		{"k3", "kimi"},
+		{"k3-256k", "kimi"},
+		{"kimi-k2.7-code", "kimi"},
+		{"kimi-for-coding", "kimi"},
 
 		// Grok models → default family
 		{"grok-4.20", "default"},

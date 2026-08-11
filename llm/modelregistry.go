@@ -883,16 +883,68 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 		// ── Kimi models (Moonshot AI) ───────────────────────────────────
 		// Source: https://platform.kimi.ai/docs/models.md
 		// Current (Aug 2026): kimi-k3 (1M context, native vision, deep
-		// reasoning) and the kimi-k2.5/k2.6 series (256K context, multimodal,
-		// thinking + non-thinking modes). All support Agent/tool tasks.
+		// reasoning), the kimi-k2.7-code series (256K, coding-dedicated,
+		// thinking always on) and the kimi-k2.5/k2.6 series (256K context,
+		// multimodal, thinking + non-thinking modes). All support Agent/tool
+		// tasks.
+		// The Kimi Code subscription endpoint (api.kimi.com/coding) serves the
+		// same models under SHORT, non-prefixed IDs — "k3" (up to 1M, tier
+		// dependent), "k3-256k" (fixed 256K), "kimi-for-coding" and
+		// "kimi-for-coding-highspeed" (K2.7 Code, 256K). Source:
+		// https://www.kimi.com/code/docs/en/kimi-code/models
+		// These short IDs contain no "kimi" substring, so DetectFamily would
+		// miss them — the explicit Family here is load-bearing.
 		// Note: OutputLimit is a context-window reserve (subtracted from the
 		// window), so we store a practical reserve, not the absolute ceiling.
 		// kimi-k3: 131K default (configurable up to 1M).
-		// kimi-k2.6 / kimi-k2.5: 256K max output; reserve 65K (the 256K
-		// ceiling would zero the input budget under EffectiveMax).
+		// kimi-k2.7-code / kimi-k2.6 / kimi-k2.5: 256K max output; reserve 65K
+		// (the 256K ceiling would zero the input budget under EffectiveMax).
 		"kimi-k3": {
 			ContextWindow: 1000000,
 			OutputLimit:   131072,
+			TokenizerType: "approximate",
+			Family:        "kimi",
+			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		// Kimi Code endpoint aliases (see the section comment above).
+		"k3": {
+			ContextWindow: 1000000,
+			OutputLimit:   131072,
+			TokenizerType: "approximate",
+			Family:        "kimi",
+			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"k3-256k": {
+			ContextWindow: 262144,
+			OutputLimit:   65536,
+			TokenizerType: "approximate",
+			Family:        "kimi",
+			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"kimi-k2.7-code": {
+			ContextWindow: 262144,
+			OutputLimit:   65536,
+			TokenizerType: "approximate",
+			Family:        "kimi",
+			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"kimi-k2.7-code-highspeed": {
+			ContextWindow: 262144,
+			OutputLimit:   65536,
+			TokenizerType: "approximate",
+			Family:        "kimi",
+			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"kimi-for-coding": {
+			ContextWindow: 262144,
+			OutputLimit:   65536,
+			TokenizerType: "approximate",
+			Family:        "kimi",
+			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"kimi-for-coding-highspeed": {
+			ContextWindow: 262144,
+			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "kimi",
 			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
