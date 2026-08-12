@@ -22,6 +22,7 @@ import (
 // .gitignore natively; the checker additionally applies .aiignore rules rg
 // cannot see.
 func TestRipgrepTool_HonorsRootAiignoreWithChecker(t *testing.T) {
+	requireRipgrep(t)
 	base := t.TempDir()
 	ignoreWriteFile(t, filepath.Join(base, ".aiignore"), "secret.go\n")
 	ignoreWriteFile(t, filepath.Join(base, "main.go"), "package main\n\n// needle here\n")
@@ -51,6 +52,7 @@ func TestRipgrepTool_HonorsRootAiignoreWithChecker(t *testing.T) {
 // with NO checker in context, ripgrep must behave exactly as today. Since rg
 // does not natively honour .aiignore, the aiignored file must still be found.
 func TestRipgrepTool_NoCheckerSearchesAiignoredFile(t *testing.T) {
+	requireRipgrep(t)
 	base := t.TempDir()
 	ignoreWriteFile(t, filepath.Join(base, ".aiignore"), "secret.go\n")
 	ignoreWriteFile(t, filepath.Join(base, "secret.go"), "package secret\n\n// needle here\n")
@@ -79,6 +81,7 @@ func TestRipgrepTool_NoCheckerSearchesAiignoredFile(t *testing.T) {
 // the IgnoreChecker snapshots ignore files at construction — so the .aiignore
 // must be written BEFORE the checker is built.
 func TestRipgrepTool_HonorsRootAiignoreUnderWorkDir(t *testing.T) {
+	requireRipgrep(t)
 	workspace := t.TempDir()
 	workDir := t.TempDir()
 
@@ -128,6 +131,7 @@ func TestRipgrepTool_HonorsRootAiignoreUnderWorkDir(t *testing.T) {
 // filtering through the checker, nested ignore files are honoured exactly as
 // glob honours them — both tools share one source of truth.
 func TestRipgrepTool_PostFiltersNestedAiignore(t *testing.T) {
+	requireRipgrep(t)
 	base := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(base, "pkg"), 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
@@ -162,6 +166,7 @@ func TestRipgrepTool_PostFiltersNestedAiignore(t *testing.T) {
 // also honours natively) is still excluded, and the count reflects only the
 // kept matches.
 func TestRipgrepTool_PostFiltersGitignoredFile(t *testing.T) {
+	requireRipgrep(t)
 	base := t.TempDir()
 	ignoreWriteFile(t, filepath.Join(base, ".gitignore"), "*.log\n")
 	ignoreWriteFile(t, filepath.Join(base, "keep.go"), "package main\n\n// token here\n")

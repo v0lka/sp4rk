@@ -4,12 +4,28 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/v0lka/sp4rk/tools"
 )
+
+// requireRipgrep skips the test when the `rg` (ripgrep) binary is not found in
+// PATH. rg is a managed runtime dependency: the tool-manager PATH-prepends it
+// at desktop startup (see specs/decisions/010-tool-manager.md), but that
+// prepending does not run in the test environment, so rg must already be on
+// the system PATH. When it is absent — e.g. a CI/dev host without ripgrep —
+// the test is skipped rather than failing. This mirrors how the rest of the
+// suite treats external dependencies (webfetch without network, mcp without a
+// server, embedder without ONNX).
+func requireRipgrep(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("rg"); err != nil {
+		t.Skipf("ripgrep (rg) not found in PATH: %v", err)
+	}
+}
 
 // setupRipgrepTestDir creates a temp directory with test files containing known content.
 func setupRipgrepTestDir(t *testing.T) string {
@@ -54,6 +70,7 @@ func TestRipgrepTool_DefaultPolicy(t *testing.T) {
 }
 
 func TestRipgrepTool_BasicSearch(t *testing.T) {
+	requireRipgrep(t)
 	base := setupRipgrepTestDir(t)
 	tool := NewRipgrepTool()
 
@@ -79,6 +96,7 @@ func TestRipgrepTool_BasicSearch(t *testing.T) {
 }
 
 func TestRipgrepTool_IgnoreCase(t *testing.T) {
+	requireRipgrep(t)
 	base := setupRipgrepTestDir(t)
 	tool := NewRipgrepTool()
 
@@ -103,6 +121,7 @@ func TestRipgrepTool_IgnoreCase(t *testing.T) {
 }
 
 func TestRipgrepTool_FilePattern(t *testing.T) {
+	requireRipgrep(t)
 	base := setupRipgrepTestDir(t)
 	tool := NewRipgrepTool()
 
@@ -127,6 +146,7 @@ func TestRipgrepTool_FilePattern(t *testing.T) {
 }
 
 func TestRipgrepTool_MaxResults(t *testing.T) {
+	requireRipgrep(t)
 	base := setupRipgrepTestDir(t)
 	tool := NewRipgrepTool()
 
@@ -170,6 +190,7 @@ func TestRipgrepTool_NonExistentPath(t *testing.T) {
 }
 
 func TestRipgrepTool_NoMatches(t *testing.T) {
+	requireRipgrep(t)
 	base := setupRipgrepTestDir(t)
 	tool := NewRipgrepTool()
 
@@ -203,6 +224,7 @@ func TestRipgrepTool_InvalidJSON(t *testing.T) {
 }
 
 func TestRipgrepTool_LongLineTruncation(t *testing.T) {
+	requireRipgrep(t)
 	base := t.TempDir()
 	tool := NewRipgrepTool()
 
@@ -239,6 +261,7 @@ func TestRipgrepTool_LongLineTruncation(t *testing.T) {
 }
 
 func TestRipgrepTool_WorkspaceFallback(t *testing.T) {
+	requireRipgrep(t)
 	workspace := t.TempDir()
 	if err := os.WriteFile(filepath.Join(workspace, "code.go"), []byte("func main() {}"), 0o644); err != nil {
 		t.Fatal(err)
@@ -280,6 +303,7 @@ func TestRipgrepTool_NoPathNoWorkspace(t *testing.T) {
 // false with ErrTooLong, silently truncating results with no indication.
 // After the fix, an explicit incompleteness marker is appended.
 func TestRipgrepTool_LineExceedsScanBuffer(t *testing.T) {
+	requireRipgrep(t)
 	base := t.TempDir()
 	tool := NewRipgrepTool()
 
