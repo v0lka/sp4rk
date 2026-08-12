@@ -205,6 +205,52 @@ func TestPoshExecTool_Judge_OutOfRootPath(t *testing.T) {
 	}
 }
 
+// TestPoshExecTool_Judge_WhollyNonExistentPathSkipped mirrors the bash case: a
+// path whose entire subtree does not exist (a fabricated token with no real
+// on-disk anchor below the volume root) is dropped and does not force a
+// confirmation.
+func TestPoshExecTool_Judge_WhollyNonExistentPathSkipped(t *testing.T) {
+	ws := t.TempDir()
+	ctx := tools.WithWorkspacePath(context.Background(), ws)
+
+	tool := mustNewPoshExecTool(t, nil)
+	// No existing ancestor below the C:\ volume root → not anchored.
+	input, _ := json.Marshal(map[string]string{
+		"command": `Get-Content C:\zzz-qqq-nonexistent\rrr`,
+	})
+
+	allow, reasoning := tool.Judge(ctx, input)
+	if allow {
+		t.Error("expected allow=false (Judge never returns true), got true")
+	}
+	if reasoning != "" {
+		t.Errorf("expected empty reasoning for a wholly non-existent path, got: %s", reasoning)
+	}
+}
+
+// TestPoshExecTool_Judge_NonExistentUnderExistingOutsideFlagged mirrors the
+// bash case and verifies the core security fix: a write/create target whose
+// leaf does not yet exist but whose parent directory DOES exist and is outside
+// the session roots is escalated to confirmation. C:\Windows\System32\drivers
+// exists and is outside the temp workspace.
+func TestPoshExecTool_Judge_NonExistentUnderExistingOutsideFlagged(t *testing.T) {
+	ws := t.TempDir()
+	ctx := tools.WithWorkspacePath(context.Background(), ws)
+
+	tool := mustNewPoshExecTool(t, nil)
+	input, _ := json.Marshal(map[string]string{
+		"command": `Set-Content -Path C:\Windows\System32\drivers\sp4rk-nonexistent-leaf -Value x`,
+	})
+
+	allow, reasoning := tool.Judge(ctx, input)
+	if allow {
+		t.Error("expected allow=false for a write into an existing out-of-root dir")
+	}
+	if !strings.Contains(reasoning, "session roots") {
+		t.Errorf("expected reasoning to mention session roots for an anchored out-of-root target, got: %s", reasoning)
+	}
+}
+
 func TestPoshExecTool_WorkingDirectory(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "posh_test")
 	if err != nil {

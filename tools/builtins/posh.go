@@ -92,8 +92,15 @@ func (t *PoshExecTool) Judge(ctx context.Context, input json.RawMessage) (allowe
 	// outside the configured session roots (workspace + auxiliary roots).
 	// Mirrors BashExecTool.Judge exactly, differing only in ShellKind
 	// (ShellPosh) so PowerShell env syntax like "$env:VAR" is recognized.
-	if outside := tools.PathsOutsideRoots(ctx, params.Command, tools.ShellPosh, params.WorkingDirectory); len(outside) > 0 {
-		return false, "command references path(s) outside session roots: " + strings.Join(outside, ", ")
+	// A path is escalated when it, or its nearest existing ancestor directory,
+	// exists and is outside the roots — retaining write/create targets whose
+	// leaf does not yet exist but whose parent directory does, so a write
+	// into an existing out-of-root directory still triggers a prompt under
+	// auto-approval. A wholly non-existent subtree (a fabricated token with
+	// no real anchor) is dropped.
+	outside := tools.PathsOutsideRoots(ctx, params.Command, tools.ShellPosh, params.WorkingDirectory)
+	if outside = tools.ExistingOrAnchoredPaths(outside); len(outside) > 0 {
+		return false, "command references existing path(s) outside session roots: " + strings.Join(outside, ", ")
 	}
 
 	return false, "" // No concern to report; workspace auto-approval semantics apply.

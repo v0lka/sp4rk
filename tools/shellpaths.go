@@ -266,6 +266,113 @@ func PathsOutsideRoots(ctx context.Context, command string, shell ShellKind, wor
 	return outside
 }
 
+// ExistingPaths returns the subset of paths that exist on the host filesystem.
+//
+// This is the pure on-disk existence primitive. The shell-exec Judges
+// (bash_exec, posh_exec) use the anchored variant [ExistingOrAnchoredPaths]
+// instead, which also retains write/create targets whose nearest existing
+// ancestor directory exists — so that creating a new file in an existing
+// out-of-root directory still escalates to confirmation. ExistingPaths is kept
+// for callers that need strict on-disk existence only.
+//
+// Fail-safe: a path whose existence cannot be determined for a reason other
+// than "does not exist" (e.g. a permission error on a parent directory) is
+// kept — the entry may exist, so it remains subject to the check rather than
+// being silently let through.
+func ExistingPaths(paths []string) []string {
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		_, err := os.Stat(p)
+		if err == nil || !os.IsNotExist(err) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// ExistingOrAnchoredPaths returns the subset of paths that are anchored to a
+// real on-disk location: the path itself exists, or it is a write/create
+// target whose nearest existing ancestor directory exists (below the volume
+// root). The shell-exec Judges (bash_exec, posh_exec) use it to decide whether
+// a command referencing an out-of-root path should escalate to user
+// confirmation.
+//
+// Unlike [ExistingPaths], which only keeps paths that already exist, this also
+// keeps paths that live under an existing out-of-root directory — the
+// security-sensitive case of a write that CREATES a new file in a real system
+// directory (e.g. "/etc/cron.d/newjob", "~/.ssh/newkey"). Dropping such
+// targets would let a prompt-injection-driven write bypass the confirmation
+// gate under auto-approval, so they are retained. This is consistent with the
+// file-tool Judges, which consult [AllPathsInSessionRoots] for pure
+// containment with no existence filter: bash must not become a weaker route
+// to an out-of-root write than write_file.
+//
+// A wholly non-existent subtree — a path whose only existing ancestor is the
+// filesystem/volume root itself (e.g. a fabricated token "/zzz/qqq" where
+// "/zzz" does not exist) — is dropped: no real directory anchors it, so a
+// write there cannot succeed without a prior mkdir (which the Judge assesses
+// as a separate command). This keeps the false-positive reduction for
+// path-like tokens that do not correspond to any real location.
+//
+// Fail-safe: a path whose existence, or whose ancestor's existence, cannot be
+// determined for a reason other than "does not exist" (e.g. a permission error
+// on a parent directory) is kept — it may be real, so it remains subject to
+// the check rather than being silently let through.
+func ExistingOrAnchoredPaths(paths []string) []string {
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if pathHasExistingAnchor(p) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// pathHasExistingAnchor reports whether p is anchored to a real on-disk
+// location: p itself exists, or its nearest existing ancestor directory exists
+// below the volume root. See [ExistingOrAnchoredPaths] for the policy rationale.
+func pathHasExistingAnchor(p string) bool {
+	_, err := os.Stat(p)
+	if err == nil {
+		return true // p exists on disk.
+	}
+	if !os.IsNotExist(err) {
+		return true // fail-safe: undetermined existence → keep.
+	}
+	// p does not exist; keep it as a write target when its nearest existing
+	// ancestor directory exists (a real directory would receive the write).
+	_, ok := nearestExistingAncestorDir(p)
+	return ok
+}
+
+// nearestExistingAncestorDir returns the nearest existing ancestor directory of
+// p, walking up from filepath.Dir(p). It does NOT accept the filesystem/volume
+// root as an anchor: a path whose only existing ancestor is the root points
+// into a wholly non-existent subtree and returns ok=false. The walk is
+// fail-safe — an ancestor whose existence cannot be determined (an error other
+// than "does not exist") is treated as existing.
+func nearestExistingAncestorDir(p string) (string, bool) {
+	dir := filepath.Dir(filepath.Clean(p))
+	for {
+		// The volume/filesystem root is not a meaningful anchor: filepath.Dir
+		// of a root returns the root itself, so this identifies it on every
+		// platform ("/" on POSIX, "C:\" on Windows).
+		if filepath.Dir(dir) == dir {
+			return "", false
+		}
+		if _, err := os.Stat(dir); err == nil {
+			return dir, true
+		} else if !os.IsNotExist(err) {
+			return dir, true // fail-safe: undetermined → assume existing.
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", false
+		}
+		dir = parent
+	}
+}
+
 // resolveShellToken dispatches a single matched token to the appropriate
 // resolver based on its leading character(s). It returns (resolved, ok); ok is
 // false when the token cannot be resolved (the caller drops it).

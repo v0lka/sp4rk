@@ -361,3 +361,77 @@ func TestBashExecTool_Judge_BlacklistPrecedence(t *testing.T) {
 		t.Errorf("expected blacklist reason (not containment reason), got: %s", reason)
 	}
 }
+
+// TestBashExecTool_Judge_WhollyNonExistentPathSkipped verifies that a path
+// whose entire subtree does not exist (a fabricated token with no real
+// on-disk anchor below the filesystem root) is dropped and does not force a
+// confirmation. Such tokens merely resemble paths and have no location to
+// write into, so they are not escalated.
+func TestBashExecTool_Judge_WhollyNonExistentPathSkipped(t *testing.T) {
+	ws := t.TempDir()
+	ctx := tools.WithWorkspacePath(context.Background(), ws)
+
+	tool := mustNewBashExecTool(t, nil)
+	// "/zzz/qqq/rrr" has no existing ancestor below "/" → not anchored.
+	input, _ := json.Marshal(map[string]string{"command": "cat /zzz/qqq/rrr"})
+
+	allow, reason := tool.Judge(ctx, input)
+	if allow {
+		t.Error("expected allow=false (Judge never returns true), got true")
+	}
+	if reason != "" {
+		t.Errorf("expected empty reason for a wholly non-existent path, got: %s", reason)
+	}
+}
+
+// TestBashExecTool_Judge_NonExistentUnderExistingOutsideFlagged verifies the
+// core security fix: a write/create target whose leaf does not yet exist but
+// whose parent directory DOES exist and is outside the session roots is
+// escalated to confirmation. This is the prompt-injection-relevant case
+// (e.g. "echo ... > /etc/cron.d/newjob"), and must not bypass the gate under
+// auto-approval.
+func TestBashExecTool_Judge_NonExistentUnderExistingOutsideFlagged(t *testing.T) {
+	ws := t.TempDir()
+	ctx := tools.WithWorkspacePath(context.Background(), ws)
+
+	// /etc exists on macOS/Linux and is outside the temp workspace; the leaf
+	// "cron.d/sp4rk-nonexistent-leaf" does not exist, but /etc/cron.d anchors it.
+	tool := mustNewBashExecTool(t, nil)
+	input, _ := json.Marshal(map[string]string{
+		"command": "echo x > /etc/cron.d/sp4rk-nonexistent-leaf",
+	})
+
+	allow, reason := tool.Judge(ctx, input)
+	if allow {
+		t.Error("expected allow=false for a write into an existing out-of-root dir")
+	}
+	if !strings.Contains(reason, "session roots") {
+		t.Errorf("expected reason to mention session roots for an anchored out-of-root target, got: %s", reason)
+	}
+}
+
+// TestBashExecTool_Judge_ExistingOutsideStillFlagged verifies that an existing
+// out-of-root path is still escalated, and that when both an existing and a
+// wholly non-existent out-of-root path appear, only the anchored one surfaces
+// in the reason.
+func TestBashExecTool_Judge_ExistingOutsideStillFlagged(t *testing.T) {
+	ws := t.TempDir()
+	ctx := tools.WithWorkspacePath(context.Background(), ws)
+
+	// A wholly non-existent token (no existing anchor below root).
+	ghost := "/zzz/qqq/ghost"
+	// /etc/passwd exists on macOS/Linux and is outside the temp workspace.
+	tool := mustNewBashExecTool(t, nil)
+	input, _ := json.Marshal(map[string]string{"command": "cat /etc/passwd " + ghost})
+
+	allow, reason := tool.Judge(ctx, input)
+	if allow {
+		t.Error("expected allow=false for a command referencing an existing out-of-root path")
+	}
+	if !strings.Contains(reason, "/etc/passwd") {
+		t.Errorf("expected reason to mention the existing offending path '/etc/passwd', got: %s", reason)
+	}
+	if strings.Contains(reason, ghost) {
+		t.Errorf("wholly non-existent path %q must be dropped from the reason, got: %s", ghost, reason)
+	}
+}

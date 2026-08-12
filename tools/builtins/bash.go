@@ -83,8 +83,17 @@ func (t *BashExecTool) Judge(ctx context.Context, input json.RawMessage) (allowe
 	// Path-containment analysis: out-of-root paths escalate to confirmation
 	// even under always_allow, closing the documented-invariant gap. The Judge
 	// runs before auto-approval, so a non-empty reason here forces a prompt.
-	if outside := tools.PathsOutsideRoots(ctx, params.Command, tools.ShellBash, params.WorkingDirectory); len(outside) > 0 {
-		return false, "command references path(s) outside session roots: " + strings.Join(outside, ", ")
+	//
+	// A path is escalated when it, or its nearest existing ancestor directory,
+	// exists and is outside the session roots. This retains write/create
+	// targets whose leaf does not yet exist but whose parent directory does
+	// (e.g. "echo ... > /etc/cron.d/newjob"), so a prompt-injection-driven
+	// write into an existing out-of-root directory still triggers a prompt
+	// under auto-approval. A wholly non-existent subtree (a fabricated token
+	// with no real anchor) is dropped, keeping the false-positive rate low.
+	outside := tools.PathsOutsideRoots(ctx, params.Command, tools.ShellBash, params.WorkingDirectory)
+	if outside = tools.ExistingOrAnchoredPaths(outside); len(outside) > 0 {
+		return false, "command references existing path(s) outside session roots: " + strings.Join(outside, ", ")
 	}
 
 	return false, "" // No concern to report; workspace auto-approval semantics apply.

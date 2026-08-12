@@ -4,6 +4,7 @@ package tools
 
 import (
 	"context"
+	"os"
 	"path"
 	"path/filepath"
 	"strings"
@@ -419,5 +420,85 @@ func TestPathsOutsideRoots_HarmlessDeviceAlongsideOutside(t *testing.T) {
 		if p == "/dev/null" {
 			t.Fatalf("/dev/null must not be reported as out-of-root, got %v", got)
 		}
+	}
+}
+
+// TestExistingPaths filters a slice of paths down to those that exist on the
+// host filesystem. This is the strict on-disk existence primitive; the
+// shell-exec Judges use the anchored variant (TestExistingOrAnchoredPaths).
+func TestExistingPaths(t *testing.T) {
+	existing1 := t.TempDir()
+	existing2 := filepath.Join(t.TempDir(), "file.txt")
+	if err := os.WriteFile(existing2, []byte("x"), 0o644); err != nil {
+		t.Fatalf("setup file: %v", err)
+	}
+	missingDir := filepath.Join(t.TempDir(), "does", "not", "exist")
+	missingFile := filepath.Join(t.TempDir(), "missing.txt")
+
+	in := []string{existing1, existing2, missingDir, missingFile, ""}
+	got := ExistingPaths(in)
+
+	if len(got) != 2 {
+		t.Fatalf("expected 2 existing paths, got %d: %v", len(got), got)
+	}
+	if !sliceContains(got, existing1) || !sliceContains(got, existing2) {
+		t.Fatalf("expected %q and %q to remain, got %v", existing1, existing2, got)
+	}
+	for _, p := range got {
+		if p == missingDir || p == missingFile || p == "" {
+			t.Fatalf("non-existent/empty path must be dropped, got %v", got)
+		}
+	}
+}
+
+// TestExistingOrAnchoredPaths verifies the ancestor-anchored filter used by the
+// shell-exec Judges: a path is retained when it exists, OR when its nearest
+// existing ancestor directory exists (a write target in a real directory). A
+// wholly non-existent subtree (no existing ancestor below the volume root) is
+// dropped.
+func TestExistingOrAnchoredPaths(t *testing.T) {
+	existingFile := filepath.Join(t.TempDir(), "file.txt")
+	if err := os.WriteFile(existingFile, []byte("x"), 0o644); err != nil {
+		t.Fatalf("setup file: %v", err)
+	}
+	existingDir := t.TempDir()
+
+	// A write target whose leaf does not exist but whose parent directory does.
+	anchoredTarget := filepath.Join(existingDir, "newchild", "newleaf")
+
+	// A wholly non-existent subtree: no ancestor below the volume root exists.
+	// Use an unlikely name so it does not collide with a real directory.
+	whollyMissing := string(filepath.Separator) + "zzz-qqq-rrr-nono-" + "leaf"
+
+	in := []string{existingFile, anchoredTarget, whollyMissing, ""}
+	got := ExistingOrAnchoredPaths(in)
+
+	if !sliceContains(got, existingFile) {
+		t.Errorf("existing file %q must be retained, got %v", existingFile, got)
+	}
+	if !sliceContains(got, anchoredTarget) {
+		t.Errorf("anchored write target %q (parent %q exists) must be retained, got %v", anchoredTarget, existingDir, got)
+	}
+	for _, p := range got {
+		if p == whollyMissing {
+			t.Errorf("wholly non-existent path %q must be dropped, got %v", whollyMissing, got)
+		}
+		if p == "" {
+			t.Errorf("empty path must be dropped, got %v", got)
+		}
+	}
+}
+
+// TestExistingOrAnchoredPaths_SystemDirWriteTarget verifies the
+// prompt-injection-relevant case: a write into an existing system directory
+// whose leaf does not yet exist is retained, so it would escalate a shell
+// command under auto-approval. /etc exists on macOS/Linux.
+func TestExistingOrAnchoredPaths_SystemDirWriteTarget(t *testing.T) {
+	got := ExistingOrAnchoredPaths([]string{"/etc/cron.d/sp4rk-unrelated-leaf-marker"})
+	if len(got) != 1 {
+		t.Fatalf("expected the anchored system-dir write target to be retained, got %v", got)
+	}
+	if got[0] != "/etc/cron.d/sp4rk-unrelated-leaf-marker" {
+		t.Errorf("expected the target path verbatim, got %q", got[0])
 	}
 }
