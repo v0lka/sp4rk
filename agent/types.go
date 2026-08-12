@@ -155,6 +155,24 @@ type ContextManager interface {
 	VulnerableOutputs() []VulnerableOutput
 }
 
+// InterjectionConsumer is an optional capability interface for
+// ContextManager implementations that hold a one-shot pending user message
+// (set via the orchestration.InterjectionAware capability by the Conductor).
+// The executor calls ConsumePendingUserInterjection after a successful LLM
+// response so the nudge — which BuildPrompt appends on every call until
+// consumed — is retired after exactly one successful LLM call.
+//
+// Decoupling the nudge's lifetime from BuildPrompt lets it survive a
+// reactive-compaction retry: callLLMWithReactiveCompaction calls BuildPrompt a
+// second time after the first LLM call fails with context-exceeded, and
+// without an explicit consume-on-success the nudge would be silently dropped
+// on the failed first attempt. A ContextManager that does not implement this
+// interface simply keeps re-appending a pending nudge until the host clears it
+// (graceful degradation). sp4rk's memory.ContextWindow implements it.
+type InterjectionConsumer interface {
+	ConsumePendingUserInterjection()
+}
+
 // StepLimitResponse represents the user's decision when the agent's step limit is reached.
 type StepLimitResponse string
 

@@ -99,6 +99,17 @@ type StepSeedable interface {
 	SeedSteps(steps []agent.Step)
 }
 
+// InterjectionAware is an optional capability interface for ContextManager
+// implementations that accept a one-shot pending user message. The Conductor
+// type-asserts the ContextManager against this interface and calls
+// SetPendingUserInterjection when PendingUserInterjection is configured (the
+// resume-with-nudge path), so the user's nudge lands as the final message
+// after the seeded step history in the very next LLM call. sp4rk's
+// memory.ContextWindow implements it.
+type InterjectionAware interface {
+	SetPendingUserInterjection(msg string)
+}
+
 // ContextManagerFactory creates a ContextManager for a new task step.
 // pruningOverrides, when provided, override the global pruning configuration
 // with step-specific KeepLastN and ProtectedTools values.

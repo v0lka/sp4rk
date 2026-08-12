@@ -105,6 +105,19 @@ type ContextWindow struct {
 	// already represented by compactedMessages. Only steps[compactedThroughIndex:]
 	// need to be converted on subsequent BuildPrompt calls, until the next Compact().
 	compactedThroughIndex int
+
+	// pendingUserInterjection is a one-shot user message appended as the FINAL
+	// message after the seeded step history. It is used for resume-with-nudge:
+	// when an execution is resumed from a checkpoint, the caller may attach a
+	// user nudge (e.g. "try variant B instead") that must land next to the
+	// pending tool result in the very next LLM call.
+	//
+	// BuildPrompt consumes it on read: the FIRST BuildPrompt that includes it
+	// appends the message and clears the field, so the nudge appears in exactly
+	// one LLM call and never duplicates across subsequent steps. (BuildPrompt is
+	// only called at the LLM-call site in the executor loop, so consume-on-read
+	// is equivalent to "resets after the first LLM call".)
+	pendingUserInterjection string
 }
 
 // noopCounter is a zero-cost TokenCounter used when no tracker is provided.
@@ -324,6 +337,31 @@ func (cw *ContextWindow) SetPriorConversation(msgs []llm.Message) {
 	cw.priorConversation = msgs
 }
 
+// SetPendingUserInterjection sets a one-shot user message that BuildPrompt
+// appends as the FINAL message after the seeded step history. It is meant for
+// resume-with-nudge: when resuming an execution from a checkpoint, the caller
+// can attach a user nudge that lands next to the pending tool result in the
+// very next LLM call.
+//
+// The nudge is appended on every BuildPrompt until the executor retires it via
+// ConsumePendingUserInterjection (called only after a successful LLM
+// response), so it survives a reactive-compaction retry rather than being
+// dropped on a failed first attempt. Pass "" to clear manually.
+func (cw *ContextWindow) SetPendingUserInterjection(msg string) {
+	cw.pendingUserInterjection = msg
+}
+
+// ConsumePendingUserInterjection retires the one-shot pending user message so
+// it no longer appears in subsequent BuildPrompt calls. The executor calls
+// this after a successful LLM response (the nudge was delivered to the model),
+// which decouples the nudge's lifetime from BuildPrompt: it persists across a
+// reactive-compaction retry (a second BuildPrompt after the first LLM call
+// fails with context-exceeded) instead of being silently dropped. A no-op when
+// no nudge is pending.
+func (cw *ContextWindow) ConsumePendingUserInterjection() {
+	cw.pendingUserInterjection = ""
+}
+
 // AddStep appends a step to the history and updates the token tracker.
 // The token estimate is approximate — it concatenates content strings without
 // accounting for LLM message framing overhead (~4 tokens/message). The
@@ -439,6 +477,20 @@ func (cw *ContextWindow) BuildPrompt() []llm.Message {
 	// 5. Step history
 	stepMessages := cw.buildStepMessages()
 	messages = append(messages, stepMessages...)
+
+	// 6. Pending user interjection (one-shot). Appended as the FINAL user
+	// message after the seeded step history so a resume-with-nudge lands next
+	// to the pending tool result in the very next LLM call. NOT cleared here:
+	// the nudge is appended on every BuildPrompt until the executor retires it
+	// via ConsumePendingUserInterjection (called only after a successful LLM
+	// response). This decouples the nudge's lifetime from BuildPrompt so it
+	// survives a reactive-compaction retry — which calls BuildPrompt a second
+	// time after the first LLM call fails with context-exceeded — rather than
+	// being silently dropped on the failed attempt. Empty → nothing appended
+	// (BuildPrompt identical to the no-interjection path).
+	if msg, ok := cw.buildNudgeMsg(cw.pendingUserInterjection); ok {
+		messages = append(messages, msg)
+	}
 
 	return messages
 }

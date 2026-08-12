@@ -94,6 +94,12 @@ const (
 	ExecutionStatusAborted ExecutionStatus = "aborted"
 	// ExecutionStatusCancelled — the context was cancelled mid-execution.
 	ExecutionStatusCancelled ExecutionStatus = "cancelled"
+	// ExecutionStatusPaused — the executor stopped at a step boundary because a
+	// cooperative pause signal tripped (agent.ErrPaused). The trajectory so far
+	// is preserved in the result's Steps; execution may be resumed. Distinct
+	// from cancelled (user/interrupt) and partial (budget exhausted): a pause is
+	// an explicit, recoverable checkpoint requested mid-run.
+	ExecutionStatusPaused ExecutionStatus = "paused"
 )
 
 // ExecutionResult is the output of Orchestrator.Execute.

@@ -74,6 +74,27 @@ type ConductorConfig struct {
 	// the blocks precedence over the plain Content string. nil or an empty
 	// slice preserves the legacy text-only SetTask path (backward compatible).
 	ContentBlocks []llm.ContentBlock
+
+	// PendingUserInterjection is a one-shot user message attached to a resume
+	// (resume-with-nudge). When non-empty, the Conductor calls
+	// SetPendingUserInterjection (via the InterjectionAware capability) so the
+	// ContextManager appends it as the FINAL user message after the seeded
+	// step history — landing next to the pending tool result in the very next
+	// LLM call. The ContextManager consumes it on the first BuildPrompt, so it
+	// appears in exactly one LLM call and never duplicates. Empty is the
+	// default no-nudge behavior (backward compatible).
+	PendingUserInterjection string
+
+	// PauseChecker, when non-nil, is installed on the Executor via
+	// SetPauseChecker. It is invoked at every step boundary (immediately after
+	// the context-cancellation check); a true return causes Run to stop
+	// cooperatively, returning the trajectory so far together with ErrPaused
+	// (which the Conductor maps to ExecutionStatusPaused). A nil checker means
+	// the loop never pauses on its own (the default, backward-compatible
+	// behavior). The host application threads a universal pause signal here so
+	// ANY conductor run — normal or specialized — can be paused at a step
+	// boundary.
+	PauseChecker func(context.Context) bool
 }
 
 // Conductor runs a single Executor.Run that owns a task end-to-end.
@@ -197,6 +218,20 @@ func (c *Conductor) Run(
 		sscm.SeedSteps(resume)
 	}
 
+	// Resume-with-nudge: when a pending user interjection is configured, inject
+	// it into the ContextManager so BuildPrompt appends it as the final user
+	// message after the seeded step history — landing next to the pending tool
+	// result in the very next LLM call. The ContextManager consumes it on the
+	// first BuildPrompt, so it never duplicates. The InterjectionAware
+	// capability is optional; a ContextManager that does not implement it
+	// simply ignores the nudge (no fail-fast — unlike ResumeSteps, a dropped
+	// nudge degrades gracefully rather than producing an incoherent resume).
+	if c.cfg.PendingUserInterjection != "" {
+		if icm, ok := cm.(InterjectionAware); ok {
+			icm.SetPendingUserInterjection(c.cfg.PendingUserInterjection)
+		}
+	}
+
 	// Build the executor caller: wire context tracker correction if the
 	// context manager exposes one (TrackerProvider) and the caller supports
 	// tracker injection.
@@ -255,6 +290,14 @@ func (c *Conductor) Run(
 		executor.AddNonCacheableTools(c.cfg.NonCacheableTools...)
 	}
 
+	// Cooperative pause signal: install the checker on the executor so Run
+	// polls it at every step boundary. A true return stops the loop with
+	// ErrPaused (mapped to ExecutionStatusPaused below). Nil (default) leaves
+	// the loop non-pausing and is fully backward-compatible.
+	if c.cfg.PauseChecker != nil {
+		executor.SetPauseChecker(c.cfg.PauseChecker)
+	}
+
 	// Finish-join guard: reject finish when pending async delegations exist,
 	// preventing the Conductor from abandoning background work silently.
 	executor.SetFinishGuard(func(ctx context.Context) error {
@@ -279,13 +322,14 @@ func (c *Conductor) Run(
 
 	result, err := executor.Run(ctx, availableTools, cm)
 	status := ExecutionStatusSuccess
-	if err != nil {
-		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
-			status = ExecutionStatusCancelled
-		} else {
-			status = ExecutionStatusFailed
-		}
-	} else if result == nil || !result.Finished {
+	switch {
+	case err != nil && errors.Is(err, agent.ErrPaused):
+		status = ExecutionStatusPaused
+	case err != nil && (errors.Is(err, context.Canceled) || ctx.Err() != nil):
+		status = ExecutionStatusCancelled
+	case err != nil:
+		status = ExecutionStatusFailed
+	case result == nil || !result.Finished:
 		status = ExecutionStatusPartial
 	}
 
@@ -293,7 +337,13 @@ func (c *Conductor) Run(
 	if result != nil {
 		output = result.Output
 	}
-	if err != nil && output == "" {
+	// A paused run is a recoverable checkpoint, not a failure: leave Output
+	// empty rather than surfacing the raw ErrPaused sentinel string
+	// ("executor paused at step boundary"), which reads as an error. The
+	// resumable trajectory is preserved on the blackboard (via the injected
+	// TrajectoryStore, as for any conductor run). Callers detect pause via
+	// Status == ExecutionStatusPaused / errors.Is(err, agent.ErrPaused).
+	if err != nil && output == "" && status != ExecutionStatusPaused {
 		output = err.Error()
 	}
 

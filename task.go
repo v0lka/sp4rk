@@ -292,6 +292,7 @@ func (b *TaskBuilder) runPlanned(
 	completed := make(map[string]orchestration.CompletedStep)
 	var reflections []orchestration.Reflection
 	aborted := false
+	paused := false
 
 	// Honour context cancellation between waves: without this check a
 	// cancelled context causes the loop to grind through every remaining
@@ -305,12 +306,12 @@ func (b *TaskBuilder) runPlanned(
 		var replanPlan *orchestration.Plan
 		for _, step := range ready {
 			b.events.OnStepStarted(step.ID, step.Description, step.Summary)
-			b.runStep(ctx, conductor, bb, availableTools, pl, step, completed, rf, &reflections, &aborted, &replanPlan)
-			if aborted || replanPlan != nil {
+			b.runStep(ctx, conductor, bb, availableTools, pl, step, completed, rf, &reflections, &aborted, &paused, &replanPlan)
+			if aborted || paused || replanPlan != nil {
 				break
 			}
 		}
-		if aborted {
+		if aborted || paused {
 			break
 		}
 		if replanPlan != nil {
@@ -331,9 +332,9 @@ func (b *TaskBuilder) runPlanned(
 	}
 
 	// Derive terminal status from the completed set. See planCompletionStatus
-	// for the precedence rules (aborted > failed > partial > success) and the
-	// partial/cycle detection.
-	status, failed, execErr := planCompletionStatus(completed, plan, aborted)
+	// for the precedence rules (aborted > paused > failed > partial > success)
+	// and the partial/cycle detection.
+	status, failed, execErr := planCompletionStatus(completed, plan, aborted, paused)
 
 	return &orchestration.ExecutionResult{
 		Output:      orchestration.AggregateOutput(completed, plan, nil),
@@ -351,17 +352,19 @@ func (b *TaskBuilder) runPlanned(
 // ExecutionResult.FailedSteps field.
 //
 // Ordering matters: aborted takes precedence (the user/reflector halted
-// execution), then failed (at least one step was attempted and exhausted its
-// retry budget — cascaded dependents are a consequence of the failure), then
-// partial. The partial case fires only when no step failed and nothing was
-// aborted, yet some steps never ran — which, because FindReadySteps blocks a
-// step solely on a failed or missing dependency, can only mean a cyclic or
-// dangling DependsOn graph. Without this check such a plan would be falsely
-// reported as success.
+// execution), then paused (a cooperative pause signal tripped mid-run — a
+// recoverable checkpoint, not a failure), then failed (at least one step was
+// attempted and exhausted its retry budget — cascaded dependents are a
+// consequence of the failure), then partial. The partial case fires only when
+// no step failed and nothing was aborted or paused, yet some steps never ran —
+// which, because FindReadySteps blocks a step solely on a failed or missing
+// dependency, can only mean a cyclic or dangling DependsOn graph. Without this
+// check such a plan would be falsely reported as success.
 func planCompletionStatus(
 	completed map[string]orchestration.CompletedStep,
 	plan *orchestration.Plan,
 	aborted bool,
+	paused bool,
 ) (status orchestration.ExecutionStatus, failed int, execErr error) {
 	for _, c := range completed {
 		if c.Error != nil {
@@ -371,6 +374,8 @@ func planCompletionStatus(
 	switch {
 	case aborted:
 		status = orchestration.ExecutionStatusAborted
+	case paused:
+		status = orchestration.ExecutionStatusPaused
 	case failed > 0:
 		status = orchestration.ExecutionStatusFailed
 	case len(completed) < len(plan.Steps):
@@ -424,7 +429,11 @@ func completedInOrder(completed map[string]orchestration.CompletedStep, plan *or
 // error message. When reflection is enabled, a failing attempt may instead
 // abort (sets *aborted) or replan (produces a new plan via *replanPlan); in
 // both cases the step is intentionally left out of completed so it — and
-// anything depending on it — is re-evaluated under the new plan.
+// anything depending on it — is re-evaluated under the new plan. A
+// cooperative pause (agent.ErrPaused → ExecutionStatusPaused) sets *paused
+// and returns immediately: it is a recoverable checkpoint, not a failure, so
+// the step is neither retried, reflected on, nor recorded as failed — its
+// partial trajectory is preserved on the blackboard for a later resume.
 func (b *TaskBuilder) runStep(
 	ctx context.Context,
 	conductor *orchestration.Conductor,
@@ -436,6 +445,7 @@ func (b *TaskBuilder) runStep(
 	rf *reflector.Reflector,
 	reflections *[]orchestration.Reflection,
 	aborted *bool,
+	paused *bool,
 	replanPlan **orchestration.Plan,
 ) {
 	maxAttempts := b.maxRetries + 1
@@ -452,6 +462,20 @@ func (b *TaskBuilder) runStep(
 			completed[step.ID] = orchestration.CompletedStep{StepID: step.ID, Output: result.Output, Steps: trajectory}
 			bb.SetStepResult(step.ID, result.Output, nil, trajectory)
 			b.events.OnStepCompleted(step.ID, true, 0, "")
+			return
+		}
+
+		// Cooperative pause: a step-level pause is a recoverable checkpoint,
+		// not a failure. Suspend immediately — do not record the step as
+		// failed, and do not reflect or retry (a pause is not cancellation, so
+		// the retry loop would otherwise burn its whole budget re-tripping the
+		// pause). The partial trajectory is preserved on the blackboard so a
+		// later resume can recover it; *paused propagates the suspension up to
+		// runPlanned, which stops the DAG and reports ExecutionStatusPaused.
+		if result != nil && result.Status == orchestration.ExecutionStatusPaused {
+			bb.SetStepResult(step.ID, "", nil, trajectory)
+			b.events.OnStepCompleted(step.ID, false, 0, "paused")
+			*paused = true
 			return
 		}
 

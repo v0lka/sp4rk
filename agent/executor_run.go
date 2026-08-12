@@ -136,6 +136,18 @@ func (e *Executor) callLLMWithReactiveCompaction(ctx context.Context, state *run
 		return nil, actionNone, fmt.Errorf("llm returned empty response at step %d", state.stepNum)
 	}
 
+	// The pending user interjection (resume-with-nudge) was delivered to the
+	// model on this successful LLM call. Retire it now so it no longer appears
+	// in subsequent BuildPrompt calls. Consuming here — rather than in
+	// BuildPrompt itself — preserves the nudge across a reactive-compaction
+	// retry: the first BuildPrompt/Call fails with context-exceeded (nudge
+	// survives), Compact runs, and the second BuildPrompt/Call still carries
+	// the nudge until it succeeds here. A ContextManager without the
+	// InterjectionConsumer capability is left untouched (graceful degradation).
+	if ic, ok := cw.(InterjectionConsumer); ok {
+		ic.ConsumePendingUserInterjection()
+	}
+
 	return resp, actionNone, nil
 }
 

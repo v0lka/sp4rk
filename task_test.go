@@ -121,7 +121,7 @@ func TestPlanCompletionStatus_Success(t *testing.T) {
 		"a": {StepID: "a", Output: "done a"},
 		"b": {StepID: "b", Output: "done b"},
 	}
-	status, failed, err := planCompletionStatus(completed, plan, false)
+	status, failed, err := planCompletionStatus(completed, plan, false, false)
 	if status != orchestration.ExecutionStatusSuccess {
 		t.Errorf("status = %q, want success", status)
 	}
@@ -145,7 +145,7 @@ func TestPlanCompletionStatus_FailedPrecedenceOverPartial(t *testing.T) {
 	completed := map[string]orchestration.CompletedStep{
 		"a": {StepID: "a", Error: errors.New("boom")},
 	}
-	status, failed, err := planCompletionStatus(completed, plan, false)
+	status, failed, err := planCompletionStatus(completed, plan, false, false)
 	if status != orchestration.ExecutionStatusFailed {
 		t.Errorf("status = %q, want failed (not partial)", status)
 	}
@@ -167,7 +167,7 @@ func TestPlanCompletionStatus_AbortedPrecedence(t *testing.T) {
 	completed := map[string]orchestration.CompletedStep{
 		"a": {StepID: "a", Error: errors.New("failed then aborted")},
 	}
-	status, failed, err := planCompletionStatus(completed, plan, true)
+	status, failed, err := planCompletionStatus(completed, plan, true, false)
 	if status != orchestration.ExecutionStatusAborted {
 		t.Errorf("status = %q, want aborted", status)
 	}
@@ -189,7 +189,7 @@ func TestPlanCompletionStatus_PartialOnUnattemptedSteps(t *testing.T) {
 		{ID: "a", DependsOn: []string{"b"}},
 		{ID: "b", DependsOn: []string{"a"}},
 	}}
-	status, failed, err := planCompletionStatus(map[string]orchestration.CompletedStep{}, plan, false)
+	status, failed, err := planCompletionStatus(map[string]orchestration.CompletedStep{}, plan, false, false)
 	if status != orchestration.ExecutionStatusPartial {
 		t.Errorf("status = %q, want partial", status)
 	}
@@ -198,6 +198,32 @@ func TestPlanCompletionStatus_PartialOnUnattemptedSteps(t *testing.T) {
 	}
 	if !errors.Is(err, orchestration.ErrExecutionIncomplete) {
 		t.Errorf("err = %v, want a value wrapping ErrExecutionIncomplete", err)
+	}
+}
+
+// TestPlanCompletionStatus_PausedPrecedence — a cooperative pause tripping
+// mid-run is a recoverable checkpoint, not a failure. It must surface as
+// paused (over partial, since some steps remain unattempted) and report no
+// failed steps and no ErrExecutionIncomplete (a pause is intentional, not an
+// incomplete plan).
+func TestPlanCompletionStatus_PausedPrecedence(t *testing.T) {
+	plan := &orchestration.Plan{Steps: []orchestration.PlanStep{
+		{ID: "a"},
+		{ID: "b", DependsOn: []string{"a"}},
+	}}
+	completed := map[string]orchestration.CompletedStep{
+		"a": {StepID: "a", Output: "done a"},
+		// "b" never attempted because the run paused after "a".
+	}
+	status, failed, err := planCompletionStatus(completed, plan, false, true)
+	if status != orchestration.ExecutionStatusPaused {
+		t.Errorf("status = %q, want paused", status)
+	}
+	if failed != 0 {
+		t.Errorf("failed = %d, want 0 (a pause is not a failure)", failed)
+	}
+	if err != nil {
+		t.Errorf("err = %v, want nil for paused (intentional checkpoint, not incomplete)", err)
 	}
 }
 

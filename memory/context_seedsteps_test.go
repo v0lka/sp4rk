@@ -183,3 +183,127 @@ func TestSeedSteps_NilClearsHistory(t *testing.T) {
 		}
 	}
 }
+
+// TestSeedSteps_PendingUserInterjection verifies the resume-with-nudge path:
+// after SeedSteps + SetPendingUserInterjection, the first BuildPrompt shows
+// BOTH the last seeded tool result AND the nudge as the final user message
+// (so the nudge lands next to the pending tool result in the next LLM call).
+// It also verifies the decoupled lifetime contract: the nudge is NOT consumed
+// by BuildPrompt (so it survives a reactive-compaction retry that calls
+// BuildPrompt a second time); only an explicit ConsumePendingUserInterjection
+// — which the executor calls after a successful LLM response — retires it.
+func TestSeedSteps_PendingUserInterjection(t *testing.T) {
+	cw := NewContextWindow(ContextWindowConfig{
+		SystemPrompt: "You are helpful.",
+		ModelMeta:    testModelMeta(128000),
+		Tracker:      llm.NewContextTokenTracker(llm.NewSimpleTokenCounter()),
+		Thresholds:   testThresholds(),
+		Strategy:     NewSlidingWindowStrategy(5, 5),
+	})
+	cw.SetTask("Do something")
+
+	lastObservation := "config contents"
+	steps := []sdkagent.Step{
+		seededStep("I should read the file", "file contents here", "read_file", 1),
+		seededStep("Now I will check the config", lastObservation, "read_file", 2),
+	}
+	cw.SeedSteps(steps)
+
+	nudge := "please continue with variant B"
+	cw.SetPendingUserInterjection(nudge)
+
+	// First BuildPrompt: the nudge must be present as the FINAL message.
+	messages := cw.BuildPrompt()
+	if len(messages) == 0 {
+		t.Fatal("BuildPrompt returned no messages")
+	}
+
+	// The last tool result (final seeded step's observation) must be present.
+	foundLastToolResult := false
+	for _, m := range messages {
+		if m.Role == "tool" && m.Content == lastObservation {
+			foundLastToolResult = true
+		}
+	}
+	if !foundLastToolResult {
+		t.Errorf("expected last tool result %q in prompt, not found in messages: %+v", lastObservation, messages)
+	}
+
+	// The nudge must be the FINAL message and a user message.
+	last := messages[len(messages)-1]
+	if last.Role != "user" {
+		t.Errorf("final message role = %q, want %q (the nudge)", last.Role, "user")
+	}
+	if last.Content != nudge {
+		t.Errorf("final message content = %q, want nudge %q", last.Content, nudge)
+	}
+
+	// Second BuildPrompt: the nudge must STILL be present. BuildPrompt does not
+	// consume the nudge — this is the fix for the reactive-compaction retry
+	// case, where the first LLM call fails with context-exceeded and the
+	// executor loops back to BuildPrompt. The nudge survives so it is delivered
+	// on the (successful) retry instead of being silently dropped.
+	second := cw.BuildPrompt()
+	if len(second) == 0 {
+		t.Fatal("second BuildPrompt returned no messages")
+	}
+	secondLast := second[len(second)-1]
+	if secondLast.Role != "user" || secondLast.Content != nudge {
+		t.Errorf("second BuildPrompt final message = %q (%q), want nudge %q — nudge must persist across BuildPrompt calls until explicitly consumed",
+			secondLast.Role, secondLast.Content, nudge)
+	}
+
+	// The executor retires the nudge via ConsumePendingUserInterjection after a
+	// successful LLM response. After that, subsequent BuildPrompts have no nudge.
+	cw.ConsumePendingUserInterjection()
+	third := cw.BuildPrompt()
+	for _, m := range third {
+		if m.Role == "user" && m.Content == nudge {
+			t.Errorf("nudge %q present after ConsumePendingUserInterjection — should be retired", nudge)
+		}
+	}
+	// The last tool result must still be present in the third build.
+	foundLastToolResultThird := false
+	for _, m := range third {
+		if m.Role == "tool" && m.Content == lastObservation {
+			foundLastToolResultThird = true
+		}
+	}
+	if !foundLastToolResultThird {
+		t.Errorf("expected last tool result %q in third BuildPrompt, not found", lastObservation)
+	}
+}
+
+// TestSeedSteps_NoPendingInterjection_IdenticalPrompt verifies that without a
+// pending interjection, BuildPrompt is identical to the current behavior —
+// i.e. the interjection path appends nothing.
+func TestSeedSteps_NoPendingInterjection_IdenticalPrompt(t *testing.T) {
+	cfg := ContextWindowConfig{
+		SystemPrompt: "You are helpful.",
+		ModelMeta:    testModelMeta(128000),
+		Tracker:      llm.NewContextTokenTracker(llm.NewSimpleTokenCounter()),
+		Thresholds:   testThresholds(),
+		Strategy:     NewSlidingWindowStrategy(5, 5),
+	}
+	cwWith := NewContextWindow(cfg)
+	cwWithout := NewContextWindow(cfg)
+
+	cwWith.SetTask("task")
+	cwWithout.SetTask("task")
+
+	steps := []sdkagent.Step{
+		seededStep("think one", "obs one", "read_file", 1),
+	}
+	cwWith.SeedSteps(steps)
+	cwWithout.SeedSteps(steps)
+
+	// Set an empty interjection on cwWith — must be a no-op.
+	cwWith.SetPendingUserInterjection("")
+
+	withMsgs := cwWith.BuildPrompt()
+	withoutMsgs := cwWithout.BuildPrompt()
+
+	if len(withMsgs) != len(withoutMsgs) {
+		t.Fatalf("len(with interjection) = %d, len(without) = %d — empty interjection must not change prompt", len(withMsgs), len(withoutMsgs))
+	}
+}

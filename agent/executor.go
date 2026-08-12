@@ -314,6 +314,13 @@ type Executor struct {
 	// Zero-value (nil/empty) restores the default fresh-start behavior.
 	resumeSteps []Step
 
+	// pauseChecker, when non-nil, is invoked at every step boundary in Run
+	// (after the context-cancellation check). A true return causes Run to stop
+	// cooperatively, returning the trajectory so far and the ErrPaused
+	// sentinel. Set via WithPauseChecker or SetPauseChecker. Nil disables
+	// pausing (default, backward-compatible behavior).
+	pauseChecker func(context.Context) bool
+
 	logger *slog.Logger
 }
 
@@ -329,6 +336,7 @@ type executorOptions struct {
 	circuitBreaker          CircuitBreakerConfig
 	hitl                    HITLHandler
 	resumeSteps             []Step
+	pauseChecker            func(context.Context) bool
 }
 
 // Option configures an Executor created by NewExecutor. Only types from this
@@ -346,6 +354,7 @@ var (
 	_ Option = circuitBreakerOption{}
 	_ Option = hitlOption{}
 	_ Option = resumeStepsOption{}
+	_ Option = pauseCheckerOption{}
 )
 
 type tokenCounterOption struct{ Counter llm.TokenCounter }
@@ -429,6 +438,22 @@ func WithResumeSteps(steps []Step) Option {
 	return resumeStepsOption{Steps: steps}
 }
 
+type pauseCheckerOption struct{ Checker func(context.Context) bool }
+
+func (o pauseCheckerOption) apply(opts *executorOptions) { opts.pauseChecker = o.Checker }
+
+// WithPauseChecker installs a cooperative pause signal checked at every step
+// boundary in Run, immediately after the context-cancellation check. When the
+// checker returns true at the top of an iteration, Run returns the trajectory
+// collected so far — including the last completed tool result — together with
+// the sentinel ErrPaused and Finished: false. A nil/omitted checker means the
+// loop never pauses on its own (the default, fully backward-compatible
+// behavior). The checker must be safe to call from the Run goroutine and
+// should be cheap; it is invoked once per step.
+func WithPauseChecker(checker func(context.Context) bool) Option {
+	return pauseCheckerOption{Checker: checker}
+}
+
 // NewExecutor creates a new Executor.
 //
 // llmRouter, toolRegistry, and maxSteps are required. Optional configuration
@@ -463,6 +488,7 @@ func NewExecutor(llmRouter LLMCaller, toolRegistry ToolExecutor, maxSteps int, o
 		checklistGateEnabled:    true,
 		nonCacheableTools:       copyNonCacheableTools(defaultNonCacheableTools),
 		resumeSteps:             o.resumeSteps,
+		pauseChecker:            o.pauseChecker,
 	}
 }
 
@@ -496,6 +522,13 @@ func (e *Executor) SetPreWarningPercent(percent int) { e.preWarningPercent = per
 // containing the error message. Used by the sp4rk Conductor to prevent
 // abandoning pending async delegations.
 func (e *Executor) SetFinishGuard(fn func(ctx context.Context) error) { e.finishGuard = fn }
+
+// SetPauseChecker installs a cooperative pause signal checked at every step
+// boundary in Run (immediately after the context-cancellation check). When the
+// checker returns true, Run returns the trajectory so far together with the
+// ErrPaused sentinel. Pass nil to clear a previously installed checker and
+// restore the default non-pausing behavior. Must be called before Run.
+func (e *Executor) SetPauseChecker(fn func(context.Context) bool) { e.pauseChecker = fn }
 
 // log returns the executor's logger or a discard logger if none was set.
 func (e *Executor) log() *slog.Logger {
@@ -814,6 +847,14 @@ func isPathWithinWorkspace(ctx context.Context, path, workspaceRoot string) bool
 	return tools.IsWithinRoot(ctx, workspaceRoot, path)
 }
 
+// ErrPaused is returned by Executor.Run when a cooperative pause signal trips
+// at a step boundary. It accompanies a non-nil *ExecutorResult whose Steps hold
+// the trajectory collected so far (including the last completed tool result);
+// Finished is false. Callers should errors.Is-check for ErrPaused to distinguish
+// a recoverable checkpoint from cancellation (context.Canceled) or a genuine
+// failure, and may resume the run via WithResumeSteps using the returned Steps.
+var ErrPaused = errors.New("executor paused at step boundary")
+
 // Run executes the ReAct loop for the given task tools and context manager.
 // The caller is responsible for setting the task context (via tools.WithTaskContext)
 // before calling Run.
@@ -866,6 +907,16 @@ func (e *Executor) Run(ctx context.Context, taskTools []tools.ToolDescriptor, cw
 		// Check context cancellation
 		if err := ctx.Err(); err != nil {
 			return nil, err
+		}
+
+		// Cooperative pause check (step boundary). Trips after the context
+		// check so an already-cancelled run reports cancellation, not pause.
+		// state.allSteps holds every completed step — including the most
+		// recent tool result — so the returned trajectory is a resumable
+		// checkpoint. With no checker installed this is a no-op and the loop
+		// behaves exactly as before.
+		if e.pauseChecker != nil && e.pauseChecker(ctx) {
+			return &ExecutorResult{Steps: state.allSteps, Finished: false}, ErrPaused
 		}
 
 		// Call LLM with reactive compaction on context-exceeded

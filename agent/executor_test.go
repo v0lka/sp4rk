@@ -249,6 +249,107 @@ func TestExecutor_Run_ContextCancelled(t *testing.T) {
 	}
 }
 
+func TestExecutor_Run_PauseCheckerTripsAfterNSteps(t *testing.T) {
+	// The agent performs a tool call each step. The pause checker trips on the
+	// 3rd boundary check — i.e. after two completed tool steps — so the
+	// returned trajectory must hold those two steps, including the last tool
+	// result in the final step's Observation.
+	toolInput := json.RawMessage(`{"path": "/tmp/test"}`)
+	mockLLM := &mockLLMCaller{
+		responses: []*llm.ChatResponse{
+			llmResponseWithToolCall("step 1", "read_file", toolInput),
+			llmResponseWithToolCall("step 2", "read_file", toolInput),
+			llmResponseWithToolCall("step 3 (should not run)", "read_file", toolInput),
+		},
+	}
+	mockTools := newMockToolExecutor()
+	mockTools.results["read_file"] = tools.ToolResult{Content: "hello world"}
+
+	cm := newMockContextManager()
+	checks := 0
+	exec := newExecutorDefaultHITL(mockLLM, mockTools, &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+	exec.SetPauseChecker(func(context.Context) bool {
+		checks++
+		return checks > 2 // trip on the 3rd boundary check
+	})
+
+	result, err := exec.Run(context.Background(), []tools.ToolDescriptor{
+		{Name: "read_file", Description: "read a file", Source: "core"},
+	}, cm)
+
+	if !errors.Is(err, ErrPaused) {
+		t.Fatalf("expected ErrPaused, got %v", err)
+	}
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+	if result.Finished {
+		t.Error("expected Finished=false for a paused run")
+	}
+	if len(result.Steps) != 2 {
+		t.Fatalf("len(Steps) = %d, want 2 (two completed tool calls before pause)", len(result.Steps))
+	}
+	// The paused trajectory must include the last tool result.
+	last := result.Steps[len(result.Steps)-1]
+	if last.Observation != "hello world" {
+		t.Errorf("last step Observation = %q, want %q", last.Observation, "hello world")
+	}
+	// The checker is consulted once per step boundary: twice (continuing) then
+	// once more (tripping) = 3 invocations.
+	if checks != 3 {
+		t.Errorf("pause checker invoked %d times, want 3", checks)
+	}
+}
+
+func TestExecutor_Run_PauseCheckerNeverTrips(t *testing.T) {
+	// A checker that always returns false must leave Run identical to the
+	// default (no-checker) behavior: the loop runs to completion.
+	mockLLM := &mockLLMCaller{
+		responses: []*llm.ChatResponse{
+			llmResponseFinish("done", "final answer"),
+		},
+	}
+	cm := newMockContextManager()
+	exec := newExecutorDefaultHITL(mockLLM, newMockToolExecutor(), &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+	exec.SetPauseChecker(func(context.Context) bool { return false })
+
+	result, err := exec.Run(context.Background(), nil, cm)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.Finished {
+		t.Error("expected Finished=true when pause checker never trips")
+	}
+	if result.Output != "final answer" {
+		t.Errorf("Output = %q, want %q", result.Output, "final answer")
+	}
+}
+
+func TestExecutor_Run_PauseCheckerViaOption(t *testing.T) {
+	// WithPauseChecker must install the checker at construction time so it is
+	// honored on the very first step boundary.
+	mockLLM := &mockLLMCaller{
+		responses: []*llm.ChatResponse{
+			llmResponseFinish("done", "should not reach"),
+		},
+	}
+	cm := newMockContextManager()
+	exec := NewExecutor(mockLLM, newMockToolExecutor(), 10,
+		WithPauseChecker(func(context.Context) bool { return true }), // trip immediately
+	)
+
+	result, err := exec.Run(context.Background(), nil, cm)
+	if !errors.Is(err, ErrPaused) {
+		t.Fatalf("expected ErrPaused when option-installed checker trips on first boundary, got %v", err)
+	}
+	if result == nil || result.Finished {
+		t.Fatal("expected non-nil, unfinished result on first-boundary pause")
+	}
+	if len(result.Steps) != 0 {
+		t.Errorf("len(Steps) = %d, want 0 (paused before any tool call)", len(result.Steps))
+	}
+}
+
 func TestExecutor_Run_ToolExecutionError(t *testing.T) {
 	toolInput := json.RawMessage(`{}`)
 	mockLLM := &mockLLMCaller{
