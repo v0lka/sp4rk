@@ -7,6 +7,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -492,13 +493,37 @@ func TestExistingOrAnchoredPaths(t *testing.T) {
 // TestExistingOrAnchoredPaths_SystemDirWriteTarget verifies the
 // prompt-injection-relevant case: a write into an existing system directory
 // whose leaf does not yet exist is retained, so it would escalate a shell
-// command under auto-approval. /etc exists on macOS/Linux.
+// command under auto-approval. The anchor directory is the nearest existing
+// system directory for the running OS — /etc on macOS/Linux, %SystemRoot%
+// (e.g. C:\Windows) on Windows — so the retention is exercised on every
+// platform rather than only where /etc happens to exist.
 func TestExistingOrAnchoredPaths_SystemDirWriteTarget(t *testing.T) {
-	got := ExistingOrAnchoredPaths([]string{"/etc/cron.d/sp4rk-unrelated-leaf-marker"})
+	anchorDir := systemWriteAnchorDir(t)
+	target := filepath.Join(anchorDir, "cron.d", "sp4rk-unrelated-leaf-marker")
+
+	got := ExistingOrAnchoredPaths([]string{target})
 	if len(got) != 1 {
 		t.Fatalf("expected the anchored system-dir write target to be retained, got %v", got)
 	}
-	if got[0] != "/etc/cron.d/sp4rk-unrelated-leaf-marker" {
+	if got[0] != target {
 		t.Errorf("expected the target path verbatim, got %q", got[0])
 	}
+}
+
+// systemWriteAnchorDir returns a real, existing OS system directory that can
+// anchor a write target whose own leaf does not exist: /etc on POSIX, and
+// %SystemRoot% (e.g. C:\Windows, always set on supported Windows releases) on
+// Windows. It lets the cross-platform SystemDirWriteTarget test exercise the
+// prompt-injection-relevant retention on every OS. It skips (rather than fails)
+// in the unlikely event the anchor cannot be resolved.
+func systemWriteAnchorDir(t *testing.T) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		sysRoot := os.Getenv("SystemRoot") // e.g. C:\Windows; set on every Windows host.
+		if sysRoot == "" {
+			t.Skip("%SystemRoot% is unset; cannot resolve a Windows system-dir anchor")
+		}
+		return sysRoot
+	}
+	return "/etc"
 }
