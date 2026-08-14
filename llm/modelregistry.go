@@ -1591,6 +1591,50 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			Family:        "qwen",
 			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
+		// Qwen3.8: dense multimodal (text+image/video), thinking on by default
+		// (disabling per request, depth via reasoning_effort), 256K context,
+		// extensible to 1M on Qwen Cloud.
+		//   config: max_position_embeddings=262144 (Qwen3_5ForConditionalGeneration)
+		"qwen/qwen3.8-27b": {
+			ContextWindow: 262144,
+			OutputLimit:   65536,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		// Qwen3.8-2.4T-A95B: the open flagship — first Qwen-Max-class open
+		// release. TEXT-ONLY MoE (no vision tower), unlike the smaller dense
+		// 3.8 members. Thinking is mandatory (cannot be disabled); depth via
+		// reasoning_effort (xhigh default), history retained via
+		// preserve_thinking. 256K native context, extensible to ~1M.
+		//   config: max_position_embeddings=262144 (Qwen3_5MoeForCausalLM)
+		"qwen/qwen3.8-2.4t-a95b": {
+			ContextWindow: 262144,
+			OutputLimit:   65536,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		// Qwen3.8 FP8 (HuggingFace): official FP8 checkpoints of the 3.8
+		// lineup — same architectures, thinking, tool support, and 256K
+		// context as their base models.
+		//   config: max_position_embeddings=262144
+		//     2.4T — Qwen3_5MoeForCausalLM (text-only MoE)
+		//     27B  — Qwen3_5ForConditionalGeneration (multimodal)
+		"qwen/qwen3.8-2.4t-a95b-fp8": {
+			ContextWindow: 262144,
+			OutputLimit:   65536,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		"qwen/qwen3.8-27b-fp8": {
+			ContextWindow: 262144,
+			OutputLimit:   65536,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
 		// Qwen3-Coder: non-thinking coding MoE, 256K context.
 		"qwen/qwen3-coder-30b": {
 			ContextWindow: 262144,
