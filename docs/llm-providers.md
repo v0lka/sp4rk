@@ -17,7 +17,7 @@ Key types:
 | `ProviderEntry` | Declarative description of a single provider and its models |
 | `Router` / `RouterConfig` | Routes calls to the active provider; holds retry config |
 | `Provider` | Unified interface implemented by every provider backend |
-| `ModelRegistry` / `ModelMetadata` | 6-tier metadata resolution for any model |
+| `ModelRegistry` / `ModelMetadata` | 7-tier metadata resolution for any model |
 | `APIProtocol` / `DetectProtocol` | Wire-protocol detection; routes a request to the right endpoint |
 | `TokenCounter` / `ContextTokenTracker` | Token estimation and API-corrected tracking |
 | `UsageTracker` / `TrackingCaller` | Per-session and per-step token accounting |
@@ -227,7 +227,7 @@ func main() {
 
 ## ModelRegistry
 
-`ModelRegistry` provides a 6-tier resolution system for model metadata. It is thread-safe and lazily fetches from external sources. All lookups are keyed case-insensitively (`strings.ToLower`) so model IDs that differ only in casing from their canonical registry keys resolve correctly.
+`ModelRegistry` provides a 7-tier resolution system for model metadata. It is thread-safe and lazily fetches from external sources. All lookups are keyed case-insensitively (`strings.ToLower`) so model IDs that differ only in casing from their canonical registry keys resolve correctly.
 
 ```go
 registry := llm.NewModelRegistry(nil) // nil = no user overrides
@@ -235,7 +235,7 @@ registry := llm.NewModelRegistry(nil) // nil = no user overrides
 
 `NewModelRegistry` accepts an optional `overrides` map that is defensively copied at construction time, so callers (e.g. config reloads) can mutate their own map without racing the registry's concurrent readers.
 
-### 6-tier resolution
+### 7-tier resolution
 
 `Resolve(ctx, model)` returns `ModelMetadata` and a boolean indicating whether the model was found in a known source. When `ok` is false, the returned metadata contains usable fallback defaults.
 
@@ -246,8 +246,9 @@ func (r *ModelRegistry) Resolve(ctx context.Context, model string) (ModelMetadat
 Resolution order (first match wins; every map lookup uses the lowercased key):
 
 1. **User overrides** — from the `overrides` map passed to `NewModelRegistry`.
+1.5. **Observed runtime entries** — written by `SetRuntimeMetadata`: how the model is *actually* being served. A self-hosted server's runtime context window outranks the built-in catalog spec — the catalog describes the checkpoint's maximum capability, the runtime entry describes the context length the server is actually enforcing. An explicit user override always wins over a probe.
 2. **Built-in registry** — a hardcoded table of well-known models (OpenAI, Anthropic, Google, DeepSeek, Qwen, GLM, Kimi, xAI Grok, …).
-2b. **Fuzzy match** — a vendor-prefix- and separator-insensitive lookup across overrides then built-ins. `normalizeModelID` strips the org/vendor prefix up to the first `/`, lowercases the result, and removes `.`/`-`/`_` punctuation (alphanumerics are never altered, so distinct versions stay distinct — unlike edit-distance it cannot collapse versions); on a multi-match the lexicographically smallest key wins; the hit is cached under the query key. Lookups are O(1) reads against normalized-ID indexes built once at registry construction. Bridges naming drift between hosts and the registry, e.g. `"gpt4o"` matches `"gpt-4o"`, a bare `"glm-5.2-fp8"` matches the prefixed `"zai-org/glm-5.2-fp8"`.
+2b. **Fuzzy match** — a vendor-prefix- and separator-insensitive lookup across overrides, then observed runtime entries, then built-ins. `normalizeModelID` strips the org/vendor prefix up to the first `/`, lowercases the result, and removes `.`/`-`/`_` punctuation (alphanumerics are never altered, so distinct versions stay distinct — unlike edit-distance it cannot collapse versions); on a multi-match the lexicographically smallest key wins; the hit is cached under the query key. Lookups are O(1) reads against normalized-ID indexes (`overridesIndex`/`builtInIndex` built once at construction, `runtimeIndex` rebuilt under the registry lock on every runtime write). Bridges naming drift between hosts and the registry, e.g. `"gpt4o"` matches `"gpt-4o"`, a bare `"glm-5.2-fp8"` matches the prefixed `"zai-org/glm-5.2-fp8"` — so a probe that observed a server's real window under one spelling is still found under a drifted spelling.
 3. **Cache** — results from previous external lookups.
 4. **External sources** — HuggingFace API lookup (lazy, cached), then any sources registered via `RegisterSource` (e.g. an LM Studio provider). A failed HuggingFace probe is negatively cached for 10 minutes (`negativeCacheTTL`): repeat `Resolve` calls inside the window skip the probe entirely and fall through to registered sources, so an unknown model costs at most one HTTP round-trip per window. A successful re-probe or `Invalidate` clears the record, and an expired record is evicted at read time. Cancellation of the caller's context (`context.Canceled`) is never recorded — it describes the caller, not HuggingFace — while a deadline miss is (the registry's own HTTP timeout surfaces the same sentinel).
 5. **Fallback defaults** — `ContextWindow: 128000`, `OutputLimit: 32768`, `TokenizerType: "approximate"`; `ok` is false. Unknown and HuggingFace-resolved models default to attachment-capable (`defaultUnknownCapabilities` sets `Attachment: true`) — a runtime provider error is preferred over silently denying image uploads for a model the registry does not know.
@@ -255,15 +256,17 @@ Resolution order (first match wins; every map lookup uses the lowercased key):
 Additional methods:
 
 - `RegisterSource(src ModelMetadataSource)` — add a custom metadata source. Sources are called in order after the HuggingFace lookup fails (a fresh negative-cache entry also skips straight here).
-- `Invalidate(model)` — remove a cached entry (e.g. on a mid-session model change) and its negative-cache record, forcing an immediate HuggingFace re-probe instead of waiting out the TTL window.
-- `ResolveLocal(model)` — resolve using only the I/O-free tiers (overrides, built-ins, fuzzy, cache read) with a hard never-touches-the-network guarantee; on a miss it returns immediately with the fallback defaults and `ok=false`. `Resolve` delegates its local tiers to it, so the two entry points agree. Use it on synchronous UI paths (model pickers, context-usage meters) and in code paths that hold no `context.Context`.
-- `SetCachedMetadata(model, meta)` — store a late-learned entry at tier 3 (the cache). Lets a caller that discovers a model's real context window after construction (e.g. a lazy probe of a local server) populate it. Takes effect only when no tier-1 override or tier-2 built-in exists, so overrides and well-known specs are never silently clobbered. A partial override that leaves its `ContextWindow` at zero inherits the cache-tier value once it arrives, so a lazy local-model probe is not shadowed by a non-zero fallback window baked into the override.
+- `Invalidate(model)` — remove a cached entry (e.g. on a mid-session model change), its negative-cache record, and any observed runtime entry (with its fuzzy-index mirror), forcing an immediate HuggingFace re-probe instead of waiting out the TTL window.
+- `ResolveLocal(model)` — resolve using only the I/O-free tiers (overrides, observed runtime, built-ins, fuzzy, cache read) with a hard never-touches-the-network guarantee; on a miss it returns immediately with the fallback defaults and `ok=false`. `Resolve` delegates its local tiers to it, so the two entry points agree. Use it on synchronous UI paths (model pickers, context-usage meters) and in code paths that hold no `context.Context`.
+- `SetCachedMetadata(model, meta)` — store a late-learned entry at tier 3 (the cache). Lets a caller that discovers a model's real context window after construction (e.g. a lazy probe of a local server) populate it. Takes effect only when no tier-1 override, tier-1.5 runtime entry, or tier-2 built-in exists, so overrides, probe results, and well-known specs are never silently clobbered. A partial override that leaves its `ContextWindow` at zero inherits the cache-tier value once it arrives, so a lazy local-model probe is not shadowed by a non-zero fallback window baked into the override.
+- `SetRuntimeMetadata(model, meta)` — store an OBSERVED runtime entry at tier 1.5 (above the built-in catalog, below user overrides) describing how a model is *actually* served: LM Studio loads models at a user-chosen context length, Ollama defaults `num_ctx` to 8K, vLLM takes `--max-model-len` — budgeting against the catalog window in those cases leaves the effective budget inflated until the API starts rejecting requests. Partial entries are NOT enriched on write; zero fields inherit from the tiers below runtime (built-in → cache → fallback) at `Resolve`/`ResolveLocal` time, so a probe should set the fields it actually observed and leave the rest zero. Performs no I/O; the entry is keyed by the exact lowercased model id the caller resolved and mirrored into the fuzzy index.
+- `RuntimeMetadata(model)` — read an observed runtime entry back **as stored**, without enrichment (e.g. to validate a probe cache without re-probing); returns `ok=false` when no runtime entry exists. Use `ResolveLocal` for the effective, enriched values.
 - `SetHTTPClient(client)` — replace the HTTP client used for HuggingFace lookups.
 - `ResolveBuiltInModel(model)` — a package-level function that resolves using **only** the built-in catalog (exact case-insensitive, then fuzzy), with no network access and no overrides/cache/HF/sources; returns the fallback defaults with `ok=false` when absent. Safe for startup paths, e.g. to compare a config override against the built-in values or to merge a partial override onto built-in metadata at construction time.
 
 #### Partial overrides
 
-A tier-1 override that pins only some fields — a **partial** override — inherits its unset scalar fields from the lower non-network tiers (built-in → cache → fallback). The inheritable fields are `ContextWindow`, `OutputLimit`, `TokenizerType`, and `Capabilities`. This closes two footguns:
+A tier-1 override that pins only some fields — a **partial** override — inherits its unset scalar fields from the lower non-network tiers (observed runtime → built-in → cache → fallback). The inheritable fields are `ContextWindow`, `OutputLimit`, `TokenizerType`, and `Capabilities`. This closes two footguns:
 
 - A protocol-only override (e.g. `{Protocol: ChatCompletions}` for a Google-named checkpoint served locally) previously left `ContextWindow`/`OutputLimit` at zero, collapsing the context window and rejecting requests, and left `Capabilities` all-false, silently disabling tool-calling, reasoning, and image uploads. A zero-valued `ModelCapabilities` is now treated as "unset" and inherited, exactly like a zero `ContextWindow`.
 - A protocol-only override that also carried a fallback `ContextWindow: 128000` shadowed a lazy local-model probe writing the model's real window to the cache tier via `SetCachedMetadata`. Keeping the override's window at zero lets the cache-tier probe result take effect once it arrives.

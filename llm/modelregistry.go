@@ -70,6 +70,8 @@ type ModelRegistry struct {
 	builtInIndex   map[string]ModelMetadata // normalized-ID -> metadata index for fuzzy built-in lookup
 	overrides      map[string]ModelMetadata
 	overridesIndex map[string]ModelMetadata // normalized-ID -> metadata index for fuzzy override lookup
+	runtime        map[string]ModelMetadata // observed runtime limits (tier 1.5): above built-ins, below user overrides
+	runtimeIndex   map[string]ModelMetadata // normalized-ID -> metadata index for fuzzy runtime lookup; rebuilt under mu on every runtime write
 	cache          map[string]ModelMetadata
 	negativeCache  map[string]time.Time  // lowercased key → time of the last failed HuggingFace probe
 	sources        []ModelMetadataSource // external metadata sources (e.g., LM Studio)
@@ -94,6 +96,8 @@ func NewModelRegistry(overrides map[string]ModelMetadata) *ModelRegistry {
 		builtInIndex:   getBuiltInIndex(),
 		overrides:      copied,
 		overridesIndex: buildNormalizedIndex(copied),
+		runtime:        make(map[string]ModelMetadata),
+		runtimeIndex:   make(map[string]ModelMetadata),
 		cache:          make(map[string]ModelMetadata),
 		negativeCache:  make(map[string]time.Time),
 		httpClient:     &http.Client{Timeout: 10 * time.Second},
@@ -111,12 +115,15 @@ func (r *ModelRegistry) SetHTTPClient(client *http.Client) {
 
 // Resolve returns model metadata using a tiered lookup:
 //   - 1. User overrides (from config)
+//   - 1.5. Observed runtime entries (SetRuntimeMetadata) — how the model is
+//     actually being served; supersedes the built-in spec (tier 2)
 //   - 2. Built-in registry (hardcoded table)
-//   - 2b. Fuzzy match across overrides + built-ins, with the vendor prefix
-//     stripped and separator punctuation (".", "-", "_") removed — so
-//     "qwen3.6" matches "qwen36", "gpt-4" matches "gpt4", and a bare
-//     "glm-5.2-fp8" matches the prefixed "zai-org/glm-5.2-fp8". Consulted only
-//     on an exact-lookup miss; the result is cached under the query key.
+//   - 2b. Fuzzy match across overrides, observed runtime entries, and
+//     built-ins, with the vendor prefix stripped and separator punctuation
+//     (".", "-", "_") removed — so "qwen3.6" matches "qwen36", "gpt-4"
+//     matches "gpt4", and a bare "glm-5.2-fp8" matches the prefixed
+//     "zai-org/glm-5.2-fp8". Consulted only on an exact-lookup miss; the
+//     result is cached under the query key.
 //   - 3. Lazy cache (HuggingFace results, source results, SetCachedMetadata)
 //   - 4. External sources, in order: HuggingFace API lookup (lazy, cached)
 //     and sources registered via RegisterSource (e.g. an LM Studio provider).
@@ -212,8 +219,10 @@ func (r *ModelRegistry) Resolve(ctx context.Context, model string) (ModelMetadat
 // tiered lookup — the same tier sequence as Resolve with every tier that can
 // perform I/O removed:
 //   - 1. User overrides (from config)
+//   - 1.5. Observed runtime entries (SetRuntimeMetadata)
 //   - 2. Built-in registry (hardcoded table)
-//   - 2b. Fuzzy match across overrides + built-ins, cached under the query key
+//   - 2b. Fuzzy match across overrides, observed runtime entries, and
+//     built-ins, cached under the query key
 //   - 3. Lazy cache — READ-ONLY: entries previously written by Resolve's
 //     HuggingFace/source tiers, by SetCachedMetadata, or by a fuzzy hit
 //   - 5. Fallback defaults (ok=false)
@@ -251,6 +260,21 @@ func (r *ModelRegistry) ResolveLocal(model string) (ModelMetadata, bool) {
 		return meta, true
 	}
 
+	// Priority 1.5: Observed runtime entry (SetRuntimeMetadata). A self-hosted
+	// server's runtime window outranks the built-in catalog spec — the catalog
+	// describes the checkpoint's maximum capability, while the runtime entry
+	// describes the context length the server is actually enforcing. See
+	// SetRuntimeMetadata for the precedence rationale. Partial runtime entries
+	// enrich against the tiers strictly below runtime (resolveSpecOrCache).
+	if meta, ok := r.runtimeLookup(key); ok {
+		meta = r.enrichPartialWith(meta, func() ModelMetadata {
+			return r.resolveSpecOrCache(model, key)
+		})
+		meta.Family = resolveFamily(model, meta)
+		meta.Protocol = resolveProtocol(model, meta)
+		return meta, true
+	}
+
 	// Priority 2: Check built-in registry (no lock needed for read-only map)
 	if meta, ok := r.builtIn[key]; ok {
 		meta.Family = resolveFamily(model, meta)
@@ -258,8 +282,9 @@ func (r *ModelRegistry) ResolveLocal(model string) (ModelMetadata, bool) {
 		return meta, true
 	}
 
-	// Priority 2b: Fuzzy match — separator-insensitive lookup across overrides
-	// and built-ins. Bridges cosmetic naming drift (a host serving
+	// Priority 2b: Fuzzy match — separator-insensitive lookup across
+	// overrides, observed runtime entries, and built-ins (in that precedence).
+	// Bridges cosmetic naming drift (a host serving
 	// "Qwen/Qwen36-35B-A3B-FP8" for the registry key "qwen/qwen3.6-35b-a3b-fp8")
 	// without the false-positive risk of edit-distance matching. Cache the hit
 	// under the query key so repeat resolves take the fast path.
@@ -330,12 +355,16 @@ func fallbackMetadata() ModelMetadata {
 // Invalidate removes an entry from the cache map (for model change mid-session).
 // It clears both the positive cache entry and any negative-cache record, so the
 // next Resolve re-probes HuggingFace from scratch instead of waiting out the
-// negativeCacheTTL window.
+// negativeCacheTTL window. The observed runtime entry (tier 1.5) is cleared
+// too, along with its fuzzy-index mirror: it describes the PREVIOUS serving
+// arrangement, which a model switch has just invalidated.
 func (r *ModelRegistry) Invalidate(model string) {
 	r.mu.Lock()
 	key := strings.ToLower(model)
 	delete(r.cache, key)
 	delete(r.negativeCache, key)
+	delete(r.runtime, key)
+	r.rebuildRuntimeIndex()
 	r.mu.Unlock()
 }
 
@@ -346,9 +375,10 @@ func (r *ModelRegistry) Invalidate(model string) {
 // re-querying the network.
 //
 // Tier-3 priority means the entry takes effect only when no user override
-// (tier 1) or built-in entry (tier 2) already exists for the model, so a
-// config.yaml override or a well-known model's spec is never silently clobbered.
-// Calling this for a model that already resolved from tier 1/2 will simply be
+// (tier 1), observed runtime entry (tier 1.5), or built-in entry (tier 2)
+// already exists for the model, so a config.yaml override, a server probe
+// result, or a well-known model's spec is never silently clobbered.
+// Calling this for a model that already resolved from tier 1/1.5/2 will simply be
 // shadowed at Resolve time.
 func (r *ModelRegistry) SetCachedMetadata(model string, meta ModelMetadata) {
 	meta.Family = resolveFamily(model, meta)
@@ -356,6 +386,75 @@ func (r *ModelRegistry) SetCachedMetadata(model string, meta ModelMetadata) {
 	r.mu.Lock()
 	r.cache[strings.ToLower(model)] = meta
 	r.mu.Unlock()
+}
+
+// SetRuntimeMetadata stores an OBSERVED runtime metadata entry (Resolution
+// tier 1.5 — above the built-in catalog, below user overrides). It exists for
+// late-learned facts about how a model is ACTUALLY being served, as opposed to
+// its published spec: a self-hosted OpenAI-compatible server (LM Studio,
+// vLLM, Ollama) frequently serves a well-known checkpoint with a runtime
+// context window far below the catalog maximum (LM Studio loads models at a
+// user-chosen context length; Ollama defaults num_ctx to 8K; vLLM is started
+// with --max-model-len). Budgeting compaction against the catalog window in
+// that case leaves the effective budget inflated until the API starts
+// rejecting requests, and the status bar displays a maximum the server will
+// never honor.
+//
+// Precedence semantics:
+//   - An explicit user override (tier 1) always wins: the user's config.yaml
+//     choice is authoritative and is never clobbered by a probe.
+//   - The runtime entry supersedes the built-in spec (tier 2) for every field
+//     it carries, because the serving runtime — not the vendor datasheet — is
+//     the ground truth for what the endpoint will accept.
+//   - It also supersedes the lazy cache (tier 3), so a HuggingFace
+//     config.json lookup for the checkpoint name cannot pin the spec window
+//     over the observed one.
+//
+// Partial entries are NOT enriched here; zero fields inherit from the tiers
+// below runtime (built-in → cache → fallback) via enrichPartialWith against
+// resolveSpecOrCache — exactly like a partial user override. Callers that
+// probe a server should set the fields they actually observed and leave the
+// rest zero.
+//
+// Unlike the network tiers, this method performs no I/O. The entry is keyed
+// by the exact (lowercased) model id the caller resolved, so it is consulted
+// by both Resolve and the network-free ResolveLocal; it is also mirrored into
+// the normalized-ID fuzzy index, so a later lookup under a cosmetically
+// drifted spelling of the same id (e.g. a dropped dot) still finds the
+// observed limits.
+func (r *ModelRegistry) SetRuntimeMetadata(model string, meta ModelMetadata) {
+	meta.Family = resolveFamily(model, meta)
+	meta.Protocol = resolveProtocol(model, meta)
+	r.mu.Lock()
+	r.runtime[strings.ToLower(model)] = meta
+	r.rebuildRuntimeIndex()
+	r.mu.Unlock()
+}
+
+// rebuildRuntimeIndex re-derives the normalized-ID fuzzy index over the
+// observed runtime entries. The caller must hold r.mu (exclusive): writes are
+// rare (one per probe) and the entry set is small, so a full deterministic
+// rebuild is simpler and safer than incremental index maintenance, preserving
+// the same lexicographic tie-break as buildNormalizedIndex.
+func (r *ModelRegistry) rebuildRuntimeIndex() {
+	r.runtimeIndex = buildNormalizedIndex(r.runtime)
+}
+
+// RuntimeMetadata returns the observed runtime entry (tier 1.5) for a model,
+// when present. It is the read-side companion of SetRuntimeMetadata, exposed
+// so callers (e.g. a probe cache validator) can check what a previous probe
+// learned without re-probing. The second return is false when no runtime
+// entry exists for the model.
+//
+// The entry is returned AS STORED, without tier enrichment: a partial entry
+// (e.g. one carrying only the observed ContextWindow) reports zero for the
+// fields the probe did not observe. Use ResolveLocal for the effective,
+// enriched values.
+func (r *ModelRegistry) RuntimeMetadata(model string) (ModelMetadata, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	meta, ok := r.runtime[strings.ToLower(model)]
+	return meta, ok
 }
 
 // resolveFamily determines the family for a model.
@@ -380,9 +479,10 @@ func resolveProtocol(modelID string, meta ModelMetadata) APIProtocol {
 // override — one that pins only some dimensions, e.g. a protocol-only
 // auto-remap that injects {Protocol: ChatCompletions} for a local
 // Google-named checkpoint served by LM Studio/vLLM — by inheriting them from
-// the lower-priority NON-network tiers (built-in exact → built-in fuzzy →
-// cache → fallback defaults). Network tiers (HuggingFace, registered sources)
-// are deliberately skipped so an override lookup never performs I/O.
+// the lower-priority NON-network tiers (observed runtime → built-in exact →
+// built-in fuzzy → cache → fallback defaults). Network tiers (HuggingFace,
+// registered sources) are deliberately skipped so an override lookup never
+// performs I/O.
 //
 // A field already set in the override is authoritative and left untouched, so
 // a fully-specified override (the common case: config.yaml entries whose
@@ -409,11 +509,22 @@ func resolveProtocol(modelID string, meta ModelMetadata) APIProtocol {
 // inheriting it here lets the cache-tier probe result take effect once it
 // arrives.
 func (r *ModelRegistry) enrichPartialOverride(model, key string, override ModelMetadata) ModelMetadata {
+	return r.enrichPartialWith(override, func() ModelMetadata {
+		return r.resolveBuiltinOrCache(model, key)
+	})
+}
+
+// enrichPartialWith is the engine behind enrichPartialOverride: it fills the
+// zero/empty scalar fields of `override` from the (memoized-on-call) baseline.
+// The baseline is a function so the runtime tier can enrich against the tiers
+// strictly below it (see resolveSpecOrCache) without special-casing field
+// logic in two places.
+func (r *ModelRegistry) enrichPartialWith(override ModelMetadata, baseline func() ModelMetadata) ModelMetadata {
 	if override.ContextWindow != 0 && override.OutputLimit != 0 &&
 		override.TokenizerType != "" && override.Capabilities != (ModelCapabilities{}) {
 		return override
 	}
-	lower := r.resolveBuiltinOrCache(model, key)
+	lower := baseline()
 	if override.ContextWindow == 0 {
 		override.ContextWindow = lower.ContextWindow
 	}
@@ -429,13 +540,42 @@ func (r *ModelRegistry) enrichPartialOverride(model, key string, override ModelM
 	return override
 }
 
+// runtimeLookup reads the observed runtime tier (1.5) under RLock. It returns
+// the raw stored entry — enrichment of partial entries is the caller's job,
+// mirroring the override tier.
+func (r *ModelRegistry) runtimeLookup(key string) (ModelMetadata, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	meta, ok := r.runtime[key]
+	return meta, ok
+}
+
 // resolveBuiltinOrCache resolves a model using only the non-network,
-// already-resolved tiers plus the fallback defaults — built-in exact → built-in
-// fuzzy → cache → fallback — with no I/O. It is the "lower-tier" baseline used
-// by enrichPartialOverride to fill the unset scalar fields of a partial
-// override. r.builtIn/r.builtInIndex are immutable after construction (no lock
-// needed); r.cache is guarded by r.mu.
+// already-resolved tiers plus the fallback defaults — runtime observed →
+// built-in exact → built-in fuzzy → cache → fallback — with no I/O. It is the
+// "lower-tier" baseline used by enrichPartialOverride to fill the unset
+// scalar fields of a partial override. r.builtIn/r.builtInIndex are immutable
+// after construction (no lock needed); r.cache is guarded by r.mu.
+//
+// The observed runtime tier leads the chain: when a partial override leaves
+// the context window unset and a server probe has observed the real window,
+// the observed value — not the catalog spec — must be inherited. This is what
+// lets a user override that pins only the output limit still surface the
+// self-hosted server's runtime window.
 func (r *ModelRegistry) resolveBuiltinOrCache(model, key string) ModelMetadata {
+	if meta, ok := r.runtimeLookup(key); ok {
+		return meta
+	}
+	return r.resolveSpecOrCache(model, key)
+}
+
+// resolveSpecOrCache is resolveBuiltinOrCache minus the runtime tier:
+// built-in exact → built-in fuzzy → cache → fallback. It is the baseline used
+// when enriching a PARTIAL RUNTIME entry — exact or fuzzy hit — whose unset
+// fields must inherit from the tiers below it: consulting the runtime tier
+// again would return the very entry being enriched and leave its zero fields
+// zero.
+func (r *ModelRegistry) resolveSpecOrCache(model, key string) ModelMetadata {
 	if meta, ok := r.builtIn[key]; ok {
 		return meta
 	}
@@ -484,18 +624,28 @@ func normalizeModelID(id string) string {
 }
 
 // fuzzyLookup performs a vendor-prefix- and separator-insensitive search across
-// user overrides and the built-in registry, used when the exact
+// user overrides, observed runtime entries, and the built-in registry — in
+// that precedence, mirroring the exact-lookup tiers — used when the exact
 // (case-insensitive) lookup misses. It bridges the cosmetic naming differences
 // real-world model hosts introduce — e.g. a registry key "qwen/qwen3.6-35b-a3b-fp8"
 // served by a host as "Qwen/Qwen36-35B-A3B-FP8" (dot dropped) collapses to the
 // same normalized form, and a prefixed key "zai-org/glm-5.2-fp8" matches a bare
-// query "GLM-5.2-FP8" (vendor prefix discarded). Overrides take priority over
-// built-ins, mirroring the exact-lookup tiers. Returns false when nothing
+// query "GLM-5.2-FP8" (vendor prefix discarded). Without the runtime leg, a
+// probe that observed a self-hosted server's real window under one spelling
+// would be invisible to a later resolve under a drifted spelling of the same
+// id, and the catalog maximum would silently win. Returns false when nothing
 // matches, so callers can fall through to network sources and the final default.
 //
 // Lookups are O(1) map reads against the normalized-ID indexes
-// (r.overridesIndex, r.builtInIndex) built once at registry construction — no
-// per-call normalization or full-table scan.
+// (r.overridesIndex, r.builtInIndex, r.runtimeIndex). The first two are
+// immutable after construction (no lock); r.runtimeIndex is rebuilt under the
+// write lock on every runtime write and read under RLock — the RLock is
+// released before any enrichment baseline runs, so no recursive locking.
+//
+// A partial runtime entry found here enriches against the tiers strictly
+// below runtime (resolveSpecOrCache), exactly like the exact tier-1.5 path,
+// so a probe that observed only the context window still surfaces the
+// catalog output limit under a drifted spelling.
 func (r *ModelRegistry) fuzzyLookup(model string) (ModelMetadata, bool) {
 	want := normalizeModelID(model)
 	if want == "" {
@@ -504,7 +654,25 @@ func (r *ModelRegistry) fuzzyLookup(model string) (ModelMetadata, bool) {
 	if meta, ok := r.overridesIndex[want]; ok {
 		return meta, true
 	}
+	if meta, ok := r.runtimeFuzzyLookup(want); ok {
+		key := strings.ToLower(model)
+		meta = r.enrichPartialWith(meta, func() ModelMetadata {
+			return r.resolveSpecOrCache(model, key)
+		})
+		return meta, true
+	}
 	meta, ok := r.builtInIndex[want]
+	return meta, ok
+}
+
+// runtimeFuzzyLookup reads one normalized-ID entry from the observed runtime
+// index under RLock. The lock is held only for the map read; enrichment of a
+// partial hit happens in the caller, after release, so its baseline
+// (resolveSpecOrCache) can take the same RWMutex without recursive locking.
+func (r *ModelRegistry) runtimeFuzzyLookup(want string) (ModelMetadata, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	meta, ok := r.runtimeIndex[want]
 	return meta, ok
 }
 

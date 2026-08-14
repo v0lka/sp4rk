@@ -1765,6 +1765,289 @@ func TestModelRegistry_SetCachedMetadata_DoesNotOverrideUserOverride(t *testing.
 	}
 }
 
+// TestModelRegistry_SetRuntimeMetadata_BeatsBuiltIn verifies the tier-1.5
+// semantics: an OBSERVED runtime entry supersedes the built-in catalog spec.
+// This is the self-hosted scenario the tier exists for — LM Studio/Ollama/
+// vLLM serve a well-known checkpoint at a runtime context length far below
+// the catalog maximum ("qwen/qwen3.6-35b-a3b" catalogs at 262144 but the
+// server may enforce e.g. 32768).
+func TestModelRegistry_SetRuntimeMetadata_BeatsBuiltIn(t *testing.T) {
+	registry := NewModelRegistry(nil)
+
+	// Built-in entry exists with ContextWindow 262144.
+	registry.SetRuntimeMetadata("qwen/qwen3.6-35b-a3b", ModelMetadata{
+		ContextWindow: 32768,
+		OutputLimit:   8192,
+		TokenizerType: "approximate",
+	})
+
+	meta, ok := registry.ResolveLocal("qwen/qwen3.6-35b-a3b")
+	if !ok {
+		t.Fatal("expected runtime entry to resolve")
+	}
+	if meta.ContextWindow != 32768 {
+		t.Errorf("runtime entry did not supersede built-in: got %d, want 32768", meta.ContextWindow)
+	}
+	if meta.OutputLimit != 8192 {
+		t.Errorf("runtime OutputLimit not honored: got %d, want 8192", meta.OutputLimit)
+	}
+}
+
+// TestModelRegistry_SetRuntimeMetadata_UserOverrideStillWins verifies tier 1
+// beats tier 1.5: an explicit config.yaml override is never clobbered by an
+// observed runtime entry.
+func TestModelRegistry_SetRuntimeMetadata_UserOverrideStillWins(t *testing.T) {
+	registry := NewModelRegistry(map[string]ModelMetadata{
+		"qwen/qwen3.6-35b-a3b": {
+			ContextWindow: 131072,
+			OutputLimit:   32768,
+			TokenizerType: "approximate",
+		},
+	})
+
+	registry.SetRuntimeMetadata("qwen/qwen3.6-35b-a3b", ModelMetadata{
+		ContextWindow: 32768,
+		OutputLimit:   8192,
+		TokenizerType: "approximate",
+	})
+
+	meta, _ := registry.ResolveLocal("qwen/qwen3.6-35b-a3b")
+	if meta.ContextWindow != 131072 {
+		t.Errorf("user override clobbered by runtime: got %d, want 131072", meta.ContextWindow)
+	}
+}
+
+// TestModelRegistry_SetRuntimeMetadata_BeatsCache verifies the runtime tier
+// also shadows the lazy cache (tier 3): a HuggingFace config.json lookup
+// cached under the checkpoint name cannot pin the spec window over the
+// observed runtime window.
+func TestModelRegistry_SetRuntimeMetadata_BeatsCache(t *testing.T) {
+	registry := NewModelRegistry(nil)
+
+	// Simulate an earlier HuggingFace fetch having cached the checkpoint spec.
+	registry.SetCachedMetadata("qwen/qwen3.6-35b-a3b", ModelMetadata{
+		ContextWindow: 262144,
+		OutputLimit:   65536,
+		TokenizerType: "approximate",
+	})
+	// The local-server probe then observes the runtime window.
+	registry.SetRuntimeMetadata("qwen/qwen3.6-35b-a3b", ModelMetadata{
+		ContextWindow: 32768,
+		OutputLimit:   8192,
+		TokenizerType: "approximate",
+	})
+
+	meta, _ := registry.ResolveLocal("qwen/qwen3.6-35b-a3b")
+	if meta.ContextWindow != 32768 {
+		t.Errorf("cache shadowed runtime: got %d, want 32768", meta.ContextWindow)
+	}
+}
+
+// TestModelRegistry_SetRuntimeMetadata_PartialUserOverrideInheritsWindow is
+// the motivating regression for the c0wrk self-hosted bug: the user pins ONLY
+// the output limit in config.yaml (context window left unset = inherit), and
+// the self-hosted server's runtime window must surface through the partial
+// override via enrichPartialOverride — not the built-in catalog spec.
+func TestModelRegistry_SetRuntimeMetadata_PartialUserOverrideInheritsWindow(t *testing.T) {
+	// Partial override: only OutputLimit pinned (ContextWindow 0 = inherit).
+	registry := NewModelRegistry(map[string]ModelMetadata{
+		"qwen/qwen3.6-35b-a3b": {OutputLimit: 65536},
+	})
+
+	registry.SetRuntimeMetadata("qwen/qwen3.6-35b-a3b", ModelMetadata{
+		ContextWindow: 32768,
+		OutputLimit:   8192,
+		TokenizerType: "approximate",
+	})
+
+	meta, _ := registry.ResolveLocal("qwen/qwen3.6-35b-a3b")
+	if meta.ContextWindow != 32768 {
+		t.Errorf("partial override did not inherit runtime window: got %d, want 32768", meta.ContextWindow)
+	}
+	if meta.OutputLimit != 65536 {
+		t.Errorf("user-pinned OutputLimit not authoritative: got %d, want 65536", meta.OutputLimit)
+	}
+}
+
+// TestModelRegistry_SetRuntimeMetadata_PartialRuntimeEntryEnriches verifies a
+// PARTIAL runtime entry inherits its unset scalars from the tiers BELOW it
+// (built-in → cache → fallback) — not from itself.
+func TestModelRegistry_SetRuntimeMetadata_PartialRuntimeEntryEnriches(t *testing.T) {
+	registry := NewModelRegistry(nil)
+
+	// Runtime entry observes only the window; output limit/tokenizer inherit
+	// from the built-in catalog entry (qwen/qwen3.6-35b-a3b: 65536 output).
+	registry.SetRuntimeMetadata("qwen/qwen3.6-35b-a3b", ModelMetadata{ContextWindow: 32768})
+
+	meta, _ := registry.ResolveLocal("qwen/qwen3.6-35b-a3b")
+	if meta.ContextWindow != 32768 {
+		t.Errorf("runtime window lost during enrichment: got %d, want 32768", meta.ContextWindow)
+	}
+	if meta.OutputLimit != 65536 {
+		t.Errorf("unset runtime OutputLimit did not inherit built-in 65536: got %d", meta.OutputLimit)
+	}
+	if meta.TokenizerType == "" {
+		t.Error("unset runtime TokenizerType did not inherit from lower tiers")
+	}
+}
+
+// TestModelRegistry_Invalidate_ClearsRuntime verifies Invalidate drops the
+// observed runtime entry along with the cache, so a model switch re-probes
+// instead of pinning the previous serving arrangement's window.
+func TestModelRegistry_Invalidate_ClearsRuntime(t *testing.T) {
+	registry := NewModelRegistry(nil)
+
+	registry.SetRuntimeMetadata("qwen/qwen3.6-35b-a3b", ModelMetadata{
+		ContextWindow: 32768,
+		OutputLimit:   8192,
+		TokenizerType: "approximate",
+	})
+	registry.Invalidate("qwen/qwen3.6-35b-a3b")
+
+	if _, ok := registry.RuntimeMetadata("qwen/qwen3.6-35b-a3b"); ok {
+		t.Error("Invalidate did not clear the runtime entry")
+	}
+	// Post-invalidate resolution falls back to the built-in spec.
+	meta, _ := registry.ResolveLocal("qwen/qwen3.6-35b-a3b")
+	if meta.ContextWindow != 262144 {
+		t.Errorf("post-invalidate window = %d, want built-in 262144", meta.ContextWindow)
+	}
+}
+
+// TestModelRegistry_SetRuntimeMetadata_FuzzyLookupFindsRuntimeEntry is the
+// drifted-spelling scenario the runtime fuzzy mirror exists for: a probe
+// stored the observed window under the canonical id
+// "qwen/qwen3.6-35b-a3b", and a later resolve arrives under a host spelling
+// with the dot dropped ("Qwen/Qwen36-35B-A3B" — the exact case the fuzzy tier
+// exists to bridge). Without the runtime leg in the fuzzy tier, the lookup
+// falls through to the built-in catalog maximum (262144) and silently ignores
+// the server's observed 32768.
+func TestModelRegistry_SetRuntimeMetadata_FuzzyLookupFindsRuntimeEntry(t *testing.T) {
+	registry := NewModelRegistry(nil)
+
+	registry.SetRuntimeMetadata("qwen/qwen3.6-35b-a3b", ModelMetadata{
+		ContextWindow: 32768,
+		OutputLimit:   8192,
+		TokenizerType: "approximate",
+	})
+
+	meta, ok := registry.ResolveLocal("Qwen/Qwen36-35B-A3B")
+	if !ok {
+		t.Fatal("expected fuzzy lookup to find the runtime entry")
+	}
+	if meta.ContextWindow != 32768 {
+		t.Errorf("fuzzy lookup lost the observed runtime window: got %d, want 32768", meta.ContextWindow)
+	}
+}
+
+// TestModelRegistry_SetRuntimeMetadata_FuzzyPartialRuntimeEnriches verifies a
+// PARTIAL runtime entry found via the fuzzy tier enriches its unset scalars
+// from the tiers below runtime, mirroring the exact tier-1.5 path: the probe
+// observed only the window, and the catalog output limit (65536 for
+// qwen/qwen3.6-35b-a3b) must still surface under the drifted spelling.
+func TestModelRegistry_SetRuntimeMetadata_FuzzyPartialRuntimeEnriches(t *testing.T) {
+	registry := NewModelRegistry(nil)
+
+	registry.SetRuntimeMetadata("qwen/qwen3.6-35b-a3b", ModelMetadata{ContextWindow: 32768})
+
+	meta, ok := registry.ResolveLocal("Qwen/Qwen36-35B-A3B")
+	if !ok {
+		t.Fatal("expected fuzzy lookup to find the runtime entry")
+	}
+	if meta.ContextWindow != 32768 {
+		t.Errorf("fuzzy runtime window lost during enrichment: got %d, want 32768", meta.ContextWindow)
+	}
+	if meta.OutputLimit != 65536 {
+		t.Errorf("unset fuzzy runtime OutputLimit did not inherit built-in 65536: got %d", meta.OutputLimit)
+	}
+}
+
+// TestModelRegistry_SetRuntimeMetadata_FuzzyOverrideBeatsRuntime verifies the
+// fuzzy tier mirrors the exact-tier precedence override > runtime > built-in:
+// when a user override and a runtime entry normalize to the same form, the
+// override wins even under a drifted query spelling.
+func TestModelRegistry_SetRuntimeMetadata_FuzzyOverrideBeatsRuntime(t *testing.T) {
+	registry := NewModelRegistry(map[string]ModelMetadata{
+		"qwen/qwen3.6-35b-a3b": {
+			ContextWindow: 131072,
+			OutputLimit:   32768,
+			TokenizerType: "approximate",
+		},
+	})
+
+	registry.SetRuntimeMetadata("qwen/qwen3.6-35b-a3b", ModelMetadata{
+		ContextWindow: 32768,
+		OutputLimit:   8192,
+		TokenizerType: "approximate",
+	})
+
+	meta, ok := registry.ResolveLocal("Qwen/Qwen36-35B-A3B")
+	if !ok {
+		t.Fatal("expected fuzzy lookup to resolve")
+	}
+	if meta.ContextWindow != 131072 {
+		t.Errorf("fuzzy lookup clobbered user override with runtime entry: got %d, want 131072", meta.ContextWindow)
+	}
+}
+
+// TestModelRegistry_Invalidate_ClearsRuntimeFuzzyIndex verifies Invalidate
+// drops the normalized-ID mirror along with the runtime entry, so a resolve
+// under a drifted spelling falls back to the built-in spec instead of the
+// previous serving arrangement's window.
+func TestModelRegistry_Invalidate_ClearsRuntimeFuzzyIndex(t *testing.T) {
+	registry := NewModelRegistry(nil)
+
+	registry.SetRuntimeMetadata("qwen/qwen3.6-35b-a3b", ModelMetadata{
+		ContextWindow: 32768,
+		OutputLimit:   8192,
+		TokenizerType: "approximate",
+	})
+	registry.Invalidate("qwen/qwen3.6-35b-a3b")
+
+	meta, ok := registry.ResolveLocal("Qwen/Qwen36-35B-A3B")
+	if !ok {
+		t.Fatal("expected fuzzy lookup to find the built-in entry")
+	}
+	if meta.ContextWindow != 262144 {
+		t.Errorf("post-invalidate fuzzy window = %d, want built-in 262144", meta.ContextWindow)
+	}
+}
+
+// TestModelRegistry_SetRuntimeMetadata_ConcurrentFuzzyReads hammers the
+// runtime fuzzy index from concurrent readers and writers (run under -race):
+// the index is rebuilt under the write lock on every store, so readers must
+// always observe a consistent map and the observed window.
+func TestModelRegistry_SetRuntimeMetadata_ConcurrentFuzzyReads(t *testing.T) {
+	registry := NewModelRegistry(nil)
+	registry.SetRuntimeMetadata("qwen/qwen3.6-35b-a3b", ModelMetadata{ContextWindow: 32768})
+
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				registry.SetRuntimeMetadata("qwen/qwen3.6-35b-a3b", ModelMetadata{
+					ContextWindow: 32768,
+					OutputLimit:   8192,
+					TokenizerType: "approximate",
+				})
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				meta, ok := registry.ResolveLocal("Qwen/Qwen36-35B-A3B")
+				if !ok || meta.ContextWindow != 32768 {
+					t.Errorf("ResolveLocal(Qwen/Qwen36-35B-A3B) = (window %d, ok %t), want (32768, true)", meta.ContextWindow, ok)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
 // TestResolveProtocol_BuiltinAndPattern verifies that ModelMetadata.Protocol is
 // populated by Resolve across the four protocols, for both built-in models and
 // DetectProtocol-based pattern matching.
