@@ -18,6 +18,16 @@ import (
 // user/config-controlled and could return an oversized body.
 const maxHuggingFaceConfigBytes = 1 << 20 // 1 MiB
 
+// negativeCacheTTL is how long a failed HuggingFace probe suppresses further
+// probes of the same model key. Without it, a model unknown to every tier
+// would cost one HTTP round-trip per Resolve call, and Resolve sits on hot UI
+// paths (model pickers, context-usage estimation) where the same unknown ID is
+// resolved over and over. The window bounds a mistyped or genuinely missing
+// model to at most one wasted request per TTL while still letting a model
+// published in the meantime become visible without an app restart or an
+// explicit Invalidate.
+const negativeCacheTTL = 10 * time.Minute
+
 // ModelCapabilities describes what a model supports.
 //
 // The struct carries json+yaml struct tags so a single canonical type can be
@@ -61,6 +71,7 @@ type ModelRegistry struct {
 	overrides      map[string]ModelMetadata
 	overridesIndex map[string]ModelMetadata // normalized-ID -> metadata index for fuzzy override lookup
 	cache          map[string]ModelMetadata
+	negativeCache  map[string]time.Time  // lowercased key → time of the last failed HuggingFace probe
 	sources        []ModelMetadataSource // external metadata sources (e.g., LM Studio)
 	mu             sync.RWMutex
 	httpClient     *http.Client
@@ -84,6 +95,7 @@ func NewModelRegistry(overrides map[string]ModelMetadata) *ModelRegistry {
 		overrides:      copied,
 		overridesIndex: buildNormalizedIndex(copied),
 		cache:          make(map[string]ModelMetadata),
+		negativeCache:  make(map[string]time.Time),
 		httpClient:     &http.Client{Timeout: 10 * time.Second},
 	}
 }
@@ -105,18 +117,126 @@ func (r *ModelRegistry) SetHTTPClient(client *http.Client) {
 //     "qwen3.6" matches "qwen36", "gpt-4" matches "gpt4", and a bare
 //     "glm-5.2-fp8" matches the prefixed "zai-org/glm-5.2-fp8". Consulted only
 //     on an exact-lookup miss; the result is cached under the query key.
-//   - 3. HuggingFace API lookup (lazy, cached)
-//   - 4. Registered sources (e.g., LM Studio provider)
+//   - 3. Lazy cache (HuggingFace results, source results, SetCachedMetadata)
+//   - 4. External sources, in order: HuggingFace API lookup (lazy, cached)
+//     and sources registered via RegisterSource (e.g. an LM Studio provider).
+//     A FAILED HuggingFace probe is remembered in a negative cache for
+//     negativeCacheTTL: repeat Resolve calls inside that window skip the
+//     network entirely and fall straight through to registered sources. A
+//     subsequent success clears the negative record; cancellation of the
+//     caller's context is never recorded (see the write site below).
 //   - 5. Fallback defaults (ok=false)
+//
+// The local, in-memory portion of the lookup (tiers 1, 2, 2b, and the cache
+// read of tier 3) is shared with ResolveLocal, which Resolve consults first —
+// the two methods cannot drift apart on those tiers.
 //
 // The second return value indicates whether the model was found in a known source.
 // When ok is false, the returned metadata contains usable fallback defaults.
 func (r *ModelRegistry) Resolve(ctx context.Context, model string) (ModelMetadata, bool) {
+	// Local tiers first: overrides → built-in → fuzzy → lazy cache (see
+	// ResolveLocal). A hit needs no I/O, so the network tiers below run only
+	// on a miss.
+	if meta, ok := r.ResolveLocal(model); ok {
+		return meta, true
+	}
+
+	// Case-insensitive key for the cache maps; the original casing is
+	// preserved for the HuggingFace URL path (same convention as ResolveLocal).
+	key := strings.ToLower(model)
+
+	// Priority 4 (first half): Fetch from HuggingFace — unless a recent probe
+	// already failed. The negative cache turns "unknown model" from one HTTP
+	// round-trip per Resolve into at most one per negativeCacheTTL window.
+	if !r.negativeCacheFresh(key) {
+		meta, err := r.fetchFromHuggingFace(ctx, model)
+		if err == nil {
+			meta.Family = resolveFamily(model, meta)
+			meta.Protocol = resolveProtocol(model, meta)
+			r.mu.Lock()
+			r.cache[key] = meta
+			delete(r.negativeCache, key)
+			r.mu.Unlock()
+			return meta, true
+		}
+		// Every failure shape counts — 404, timeout, transport error,
+		// malformed or empty config — because each means "HuggingFace cannot
+		// resolve this model right now". Record it so the next Resolve within
+		// the TTL skips the round-trip. Cancellation of the CALLER's context
+		// is the one exception: it describes the caller's state (a step
+		// deadline hit, a shutdown), not HuggingFace's, so the next Resolve
+		// with a live context re-probes immediately instead of riding out the
+		// window on fallback metadata. context.DeadlineExceeded is
+		// deliberately NOT excepted: the registry's own HTTP client timeout
+		// surfaces the same sentinel, and that failure legitimately describes
+		// HuggingFace.
+		if !errors.Is(err, context.Canceled) {
+			r.mu.Lock()
+			r.negativeCache[key] = time.Now()
+			r.mu.Unlock()
+		}
+	}
+
+	// Priority 4 (second half): Try registered sources
+	// Copy sources slice under read lock, then call sources without lock
+	// (sources may do HTTP calls, so we don't want to hold the lock)
+	r.mu.RLock()
+	sources := make([]ModelMetadataSource, len(r.sources))
+	copy(sources, r.sources)
+	r.mu.RUnlock()
+
+	for _, src := range sources {
+		m, ok := src(model)
+		if !ok {
+			continue
+		}
+		m.Family = resolveFamily(model, m)
+		m.Protocol = resolveProtocol(model, m)
+		r.mu.Lock()
+		r.cache[key] = m
+		r.mu.Unlock()
+		return m, true
+	}
+
+	// Priority 5: Fallback to defaults.
+	// Assume attachment support optimistically: an unknown model may well be
+	// multimodal, and it is better to surface a runtime provider error than to
+	// silently deny image uploads for a model the registry does not know.
+	meta := fallbackMetadata()
+	meta.Family = resolveFamily(model, meta)
+	meta.Protocol = resolveProtocol(model, meta)
+	return meta, false
+}
+
+// ResolveLocal returns model metadata using a strictly local, network-free
+// tiered lookup — the same tier sequence as Resolve with every tier that can
+// perform I/O removed:
+//   - 1. User overrides (from config)
+//   - 2. Built-in registry (hardcoded table)
+//   - 2b. Fuzzy match across overrides + built-ins, cached under the query key
+//   - 3. Lazy cache — READ-ONLY: entries previously written by Resolve's
+//     HuggingFace/source tiers, by SetCachedMetadata, or by a fuzzy hit
+//   - 5. Fallback defaults (ok=false)
+//
+// GUARANTEE: ResolveLocal never touches the network. It issues no HTTP
+// requests, consults no registered metadata sources, and never blocks on I/O —
+// for a model no tier knows it returns immediately with the fallback defaults
+// and ok=false rather than probing. It is the resolver of choice for UI paths
+// (model pickers, context-usage meters, settings screens) where a synchronous
+// network lookup would stall rendering or fire on every keystroke, and for
+// code paths that hold no context.Context.
+//
+// Resolve delegates its local tiers to this method, so tiers 1/2/2b and the
+// cache read behave identically under both entry points and cannot drift.
+//
+// The second return value indicates whether the model was found in a known
+// local source; when it is false the returned metadata contains the same
+// usable fallback defaults Resolve returns.
+func (r *ModelRegistry) ResolveLocal(model string) (ModelMetadata, bool) {
 	// Case-insensitive lookup: model IDs arriving from OpenAI-compatible hosts
 	// (e.g. vLLM) frequently differ only in casing from their canonical
 	// registry keys. Normalize once and use this key for every map lookup;
-	// family/protocol detection lowercases independently and HuggingFace
-	// fetching preserves the original casing for the URL path.
+	// family/protocol detection lowercases independently.
 	key := strings.ToLower(model)
 
 	// Priority 1: Check overrides (no lock needed for read-only map after construction)
@@ -152,67 +272,70 @@ func (r *ModelRegistry) Resolve(ctx context.Context, model string) (ModelMetadat
 		return meta, true
 	}
 
-	// Priority 3: Check cache (needs lock)
+	// Priority 3: Lazy cache, read-only. Entries arrive from the outside —
+	// Resolve's network tiers or SetCachedMetadata — never from this method.
 	r.mu.RLock()
-	if meta, ok := r.cache[key]; ok {
-		r.mu.RUnlock()
+	meta, ok := r.cache[key]
+	r.mu.RUnlock()
+	if ok {
 		meta.Family = resolveFamily(model, meta)
 		meta.Protocol = resolveProtocol(model, meta)
 		return meta, true
 	}
-	r.mu.RUnlock()
 
-	// Priority 3: Fetch from HuggingFace
-	meta, err := r.fetchFromHuggingFace(ctx, model)
-	if err == nil {
-		meta.Family = resolveFamily(model, meta)
-		meta.Protocol = resolveProtocol(model, meta)
-		r.mu.Lock()
-		r.cache[key] = meta
-		r.mu.Unlock()
-		return meta, true
-	}
-
-	// Priority 4: Try registered sources
-	// Copy sources slice under read lock, then call sources without lock
-	// (sources may do HTTP calls, so we don't want to hold the lock)
-	r.mu.RLock()
-	sources := make([]ModelMetadataSource, len(r.sources))
-	copy(sources, r.sources)
-	r.mu.RUnlock()
-
-	for _, src := range sources {
-		m, ok := src(model)
-		if !ok {
-			continue
-		}
-		m.Family = resolveFamily(model, m)
-		m.Protocol = resolveProtocol(model, m)
-		r.mu.Lock()
-		r.cache[key] = m
-		r.mu.Unlock()
-		return m, true
-	}
-
-	// Priority 5: Fallback to defaults.
-	// Assume attachment support optimistically: an unknown model may well be
-	// multimodal, and it is better to surface a runtime provider error than to
-	// silently deny image uploads for a model the registry does not know.
-	meta = ModelMetadata{
-		ContextWindow: 128000,
-		OutputLimit:   32768,
-		TokenizerType: "approximate",
-		Capabilities:  defaultUnknownCapabilities(),
-	}
+	// Priority 5: Fallback to defaults — identical values and rationale as
+	// Resolve's tier 5 (see fallbackMetadata).
+	meta = fallbackMetadata()
 	meta.Family = resolveFamily(model, meta)
 	meta.Protocol = resolveProtocol(model, meta)
 	return meta, false
 }
 
+// negativeCacheFresh reports whether a failed HuggingFace probe for key is
+// still inside the negativeCacheTTL window, meaning the probe must not be
+// repeated yet. An absent entry reads as stale; an EXPIRED entry is deleted
+// on the spot, so the map holds only keys inside their current TTL window
+// and cannot grow without bound for models that are never resolved again
+// after their window lapses. Either way the caller re-probes and, on another
+// failure, overwrites the recorded timestamp, restarting the window.
+func (r *ModelRegistry) negativeCacheFresh(key string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	checkedAt, ok := r.negativeCache[key]
+	if !ok {
+		return false
+	}
+	if time.Since(checkedAt) >= negativeCacheTTL {
+		delete(r.negativeCache, key)
+		return false
+	}
+	return true
+}
+
+// fallbackMetadata returns the tier-5 defaults used when no source recognizes
+// the model. The values are usable in practice — a generous context window, a
+// bounded output limit, the approximate tokenizer — plus the optimistic
+// capability set (see defaultUnknownCapabilities for why Attachment is
+// assumed). Family and Protocol are deliberately left empty for the caller to
+// derive from the model ID via resolveFamily/resolveProtocol.
+func fallbackMetadata() ModelMetadata {
+	return ModelMetadata{
+		ContextWindow: 128000,
+		OutputLimit:   32768,
+		TokenizerType: "approximate",
+		Capabilities:  defaultUnknownCapabilities(),
+	}
+}
+
 // Invalidate removes an entry from the cache map (for model change mid-session).
+// It clears both the positive cache entry and any negative-cache record, so the
+// next Resolve re-probes HuggingFace from scratch instead of waiting out the
+// negativeCacheTTL window.
 func (r *ModelRegistry) Invalidate(model string) {
 	r.mu.Lock()
-	delete(r.cache, strings.ToLower(model))
+	key := strings.ToLower(model)
+	delete(r.cache, key)
+	delete(r.negativeCache, key)
 	r.mu.Unlock()
 }
 
@@ -327,18 +450,14 @@ func (r *ModelRegistry) resolveBuiltinOrCache(model, key string) ModelMetadata {
 	if ok {
 		return meta
 	}
-	// Match Resolve's tier-5 fallback exactly, including the optimistic
-	// Capabilities. enrichPartialOverride inherits unset scalar fields from
-	// this value; if Capabilities were left at the zero value here, a
-	// protocol-only partial override for a catalog-MISS model would silently
-	// disable Attachment (and every other capability) — the same footgun the
-	// built-in inheritance path already guards against for catalog-HIT models.
-	return ModelMetadata{
-		ContextWindow: 128000,
-		OutputLimit:   32768,
-		TokenizerType: "approximate",
-		Capabilities:  defaultUnknownCapabilities(),
-	}
+	// Match Resolve's tier-5 fallback exactly (fallbackMetadata), including
+	// the optimistic Capabilities. enrichPartialOverride inherits unset scalar
+	// fields from this value; if Capabilities were left at the zero value
+	// here, a protocol-only partial override for a catalog-MISS model would
+	// silently disable Attachment (and every other capability) — the same
+	// footgun the built-in inheritance path already guards against for
+	// catalog-HIT models.
+	return fallbackMetadata()
 }
 
 // modelIDSeparators strips the punctuation real-world hosts use (or omit)

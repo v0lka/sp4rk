@@ -92,6 +92,14 @@ var shellTokenRe = map[ShellKind]*regexp.Regexp{
 //     relative path and the false negative of silently dropping a genuine
 //     parent-ref escape hidden behind a relative prefix (e.g.
 //     "./../etc/passwd", "a/../../etc/passwd", "subdir/../..").
+//   - Tokens consisting entirely of separators — a bare "//" run (POSIX) or a
+//     drive prefix followed by only separators ("C:\\") — are SKIPPED: they
+//     are shell-language artifacts (the "//" of a sed address
+//     "sed 's/.*function //'", a comment marker, an integer-division
+//     "$(( total // count ))", an escaped drive root) that carry no path
+//     component and name no out-of-root location; resolving them anyway would
+//     clean a bare "//" to the filesystem root and produce a false-positive
+//     escalation. See [isPureSeparatorRunToken].
 //   - "~" and "~user" (bash) and bare "~" (posh) expand to the current user's
 //     home directory via [os.UserHomeDir] (falling back to $HOME then
 //     $USERPROFILE). "~user" is best-effort and skipped when unresolvable.
@@ -116,6 +124,15 @@ func ResolveShellPathTokens(command string, shell ShellKind, workDir string) []s
 	for _, m := range re.FindAllStringIndex(command, -1) {
 		start, end := m[0], m[1]
 		tok := command[start:end]
+		// A token consisting entirely of separators — a bare "//" run (the
+		// trailing address of "sed 's/.*function //'", a comment marker, an
+		// integer-division "$(( a // b ))") or a drive prefix with only
+		// separators ("C:\\") — is a shell-language artifact that names no
+		// location. Skip it before dispatch: resolving a bare "//" cleans to
+		// the filesystem root and would produce a false-positive escalation.
+		if isPureSeparatorRunToken(tok) {
+			continue
+		}
 		// Boundary checks for tokens whose leading character could continue a
 		// preceding relative-path word (".." parent-refs and POSIX "/abs"
 		// paths). Env ("$VAR") and tilde ("~") tokens start with non-path
@@ -186,6 +203,35 @@ const pathComponentChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ
 // component (filename), i.e. it is one of [pathComponentChars].
 func isPathComponentChar(b byte) bool {
 	return strings.IndexByte(pathComponentChars, b) >= 0
+}
+
+// isPureSeparatorRunToken reports whether tok consists entirely of separator
+// characters: a POSIX run of two or more slashes ("//", "///", ...) or, after
+// a two-character drive prefix, a run of two or more separators with no path
+// component ("C:\\"). Such tokens are artifacts of the shell language, not
+// filesystem paths — the trailing "//" of a sed address ("sed 's/.*function
+// //'"), a comment marker ("echo \"// TODO fix\" >> notes.md"), an
+// integer-division operator ("echo $(( total // count ))") or an escaped
+// PowerShell drive root ("C:\\"). They carry no path component and therefore
+// name no out-of-root location; resolving them anyway (a bare "//" cleans to
+// the filesystem root "/") only produced false-positive escalations.
+//
+// Detection is not weakened by the skip: a bare "/" never matches [pathRegex]
+// (it requires at least one character after the leading separator), so the
+// POSIX form only skips runs of TWO or more slashes, and "cat //etc/passwd" —
+// whose token still carries the "etc/passwd" components — keeps being
+// reported. On the drive form a single trailing separator is a drive root
+// ("C:\") and a token with a component ("C:\\Windows") is a real path; both
+// remain tokens — only the pure separator run of two or more ("C:\\") is
+// skipped.
+func isPureSeparatorRunToken(tok string) bool {
+	// Drive form: two-character drive prefix ("X:"), then only separators.
+	if len(tok) > 2 && tok[1] == ':' {
+		rest := tok[2:]
+		return len(rest) >= 2 && strings.Trim(rest, "/\\") == ""
+	}
+	// POSIX form: a run of two or more slashes and nothing else.
+	return len(tok) >= 2 && strings.TrimLeft(tok, "/") == ""
 }
 
 // relativePathWordStart finds the byte offset at which the relative-path word

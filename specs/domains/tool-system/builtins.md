@@ -20,8 +20,8 @@ The SDK ships a catalog of filesystem, search, web, execution, and agent-infrast
 
 | Tool | Category | Default Policy | Untrusted | Description |
 | ---- | -------- | -------------- | --------- | ----------- |
-| `bash_exec` | Execution | `user_confirm` | yes | Shell command execution with timeout and blacklist. |
-| `posh_exec` | Execution | `user_confirm` | yes | Windows PowerShell command execution with timeout and blacklist. |
+| `bash_exec` | Execution | `user_confirm` | yes | Shell command execution with timeout, blacklist, and path-containment analysis. |
+| `posh_exec` | Execution | `user_confirm` | yes | Windows PowerShell command execution with timeout, blacklist, and path-containment analysis. |
 | `read_file` | File | `always_allow` | yes | Read file contents (streaming, O(1) memory, default 2000-line window). |
 | `write_file` | File | `user_confirm` | no | Create/overwrite a file. |
 | `edit_file` | File | `user_confirm` | no | Apply targeted find-and-replace edits. |
@@ -56,6 +56,23 @@ A tool's output is **untrusted** when it may carry adversarial content (web, MCP
 
 File tools resolve paths via context helpers (`WorkspacePathFrom`/`TempDirFrom`). Relative paths are joined with the workspace root and must stay within it; absolute paths are symlink-resolved and returned regardless of containment (containment is a policy concern, not a parse failure). Containment checks consult `SessionRoots(ctx)` — the union of workspace, temp directory, and any additional roots attached via `WithAllowedRoots` — so all roots are equal peers for path-locality auto-approval, judge fast-paths, symlink classification, and shell working-directory validation (`AllPathsInSessionRoots`, `isPathInSessionRoots`, `validateWorkDir`). `read_file` uses `ReadFileRange` for O(1)-memory streaming of line ranges and is file-backed by default in the `ToolResultCache` (zero content bytes stored; fragments streamed from disk on demand); a read wrapper that implements `ContentBackedReader` opts into content-backed caching for transformed views. Binary files (null bytes in the leading window) are detected and rejected.
 
+### Shell tools (`bash_exec`, `posh_exec`)
+
+Both shell tools share one safety model, evaluated by their `ToolJudger.Judge` before execution:
+
+1. **Blacklist** — the raw command string is matched against the constructor-supplied regex list (an invalid pattern fails construction). A match returns `allow=false` with the blacklist reason, which **takes precedence** over the containment reason.
+2. **Path containment** — `tools.PathsOutsideRoots` extracts and resolves shell path tokens (bash and PowerShell grammars; `~`, `$VAR`/`$env:VAR`, and `..` idioms included) and reports those outside the session roots. `tools.ExistingOrAnchoredPaths` then keeps a path when it exists or its nearest existing ancestor directory does, so a write whose leaf does not yet exist but whose parent directory does (e.g. `echo x > /etc/cron.d/newjob`) still escalates with `"command references existing path(s) outside session roots: …"`. A wholly non-existent subtree is dropped, keeping the false-positive rate low.
+
+**Separator-run tokens are skipped.** A token consisting entirely of separators — a POSIX run of two or more slashes (`//`, `///`) or a two-character drive prefix followed by only separators (`C:\\`) — is a shell-language artifact, not a path: the trailing `//` of a sed address (`sed 's/.*function //'`), a comment marker (`echo "// TODO fix" >> notes.md`), an integer-division operator (`$(( total // count ))`), or an escaped PowerShell drive root. It carries no path component and names no out-of-root location; resolving a bare `//` would clean it to the filesystem root `/` and force a false-positive confirmation of an entirely in-root command. The skip lives in `tools.isPureSeparatorRunToken`, applied in `ResolveShellPathTokens` and mirrored in the JSON-input extractor `tools.ExtractPaths` behind `AllPathsInSessionRoots` (where a phantom root previously defeated the fast-path's *all paths in-root* auto-allow).
+
+Guarantees the skip preserves (regression-tested in `tools/shellpaths_test.go` and `tools/judge_test.go`):
+
+- `cat /etc/passwd`, `echo x > /etc/cron.d/newjob`, and `rm -rf /.` still report out-of-root — their tokens carry real path components.
+- `cat //etc/passwd` still reports: `//etc/passwd` carries the `etc/passwd` components, so it is not a pure separator run.
+- `Get-Content C:\` (single separator — the drive root) and `Get-Content C:\\Windows\win.ini` are still extracted; only the pure `C:\\` run is skipped.
+- The blacklist fires on the raw command string **before** path analysis, so `rm -rf /` is still escalated by an `rm -rf` pattern regardless of the skip — and its separator-run spelling `rm -rf //` (whose `//` token the skip removes from path extraction, exactly as the bare `/` never matched) is covered by the same blacklist, which remains the authoritative backstop for bare-root deletions.
+- A separator-run artifact cannot mask a real escape (`sed 's/.*function //'` alongside `/etc/passwd` still fails containment — tokens are extracted independently), and alongside only in-root paths it no longer injects a phantom root, so judge fast-path auto-approval behaves correctly.
+
 ### Web search providers
 
 `web_search` is optional: it is silently not registered when no search-provider config/API key is supplied. The provider abstraction supports Brave, DuckDuckGo, Exa, and Tavily.
@@ -89,6 +106,7 @@ Blackboard-backed tools (`read_step_output`, `list_step_outputs`, `read_final_re
 - `batch` is intercepted at the executor level before reaching the registry; its own `Execute()` returns an error.
 - Blackboard-backed tools read only error-free completed steps; outputs are listed in deterministic step-ID order.
 - `read_skill_resource` resolves paths via `skills.SafeResolvePath` (path-traversal safe).
+- Shell path extraction skips pure separator-run tokens (`//`, `C:\\`) as shell-language artifacts; tokens carrying real components (`/etc/passwd`, `//etc/passwd`, `C:\`, `C:\\Windows\win.ini`), anchored out-of-root writes, and the raw-command-string blacklist are unaffected.
 - Untrusted-output tools always set `Untrusted: true` and are wrapped when injection defense is enabled.
 - `glob` and `ripgrep` share a single ignore authority (`IgnoreChecker` from context); a `nil` checker means no filtering (the opt-in, no-regression default).
 - Tool-name constants live in `tools` (`names.go`) and mirror the registration names used by `tools/builtins`; `IsShellExecTool` classifies `bash_exec`/`posh_exec` as the highest-uncertainty, intentionally deprioritized tools in grouped tool lists.

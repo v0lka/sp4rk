@@ -527,3 +527,132 @@ func systemWriteAnchorDir(t *testing.T) string {
 	}
 	return "/etc"
 }
+
+// TestPathsOutsideRoots_PureSeparatorRunNotPath is the regression test for the
+// false positive where pathRegex matched a bare separator run ("//") and
+// ResolveShellPathTokens resolved it (path.Clean("//") == "/") to the
+// filesystem root, flagging innocent commands as out-of-root and triggering a
+// needless confirmation. The "//" is a shell-language artifact — the trailing
+// address of a sed substitution ("sed 's/.*function //'"), a comment marker
+// ("echo \"// TODO fix\"") or an integer-division operator
+// ("echo $(( total // count ))") — and names no location, so it is skipped
+// before dispatch. Both sed-bearing user commands from the bug report are
+// exercised, under both shell dialects.
+func TestPathsOutsideRoots_PureSeparatorRunNotPath(t *testing.T) {
+	ws := t.TempDir()
+	ctx := WithWorkspacePath(context.Background(), ws)
+
+	commands := map[ShellKind][]string{
+		ShellBash: {
+			// Both user commands from the bug report, verbatim.
+			"rg 'func ' -n core/conductor.go | sed 's/.*function //' | sort -u",
+			"grep -rn 'function ' src/ | sed 's/.*function //' | head -5",
+			// Comment-marker spellings, including the literal "// ..." body.
+			`echo "// ..."`,
+			`echo "// TODO fix" >> notes.md`,
+			// Integer-division spellings.
+			"echo $(( x // y ))",
+			"echo $(( total // count ))",
+		},
+		ShellPosh: {
+			"rg 'func ' -n core/conductor.go | sed 's/.*function //' | sort -u",
+			"grep -rn 'function ' src/ | sed 's/.*function //' | head -5",
+			`echo "// ..."`,
+			`echo "// TODO fix" >> notes.md`,
+			"echo $(( x // y ))",
+			"echo $(( total // count ))",
+		},
+	}
+	for shell, cmds := range commands {
+		for _, cmd := range cmds {
+			got := PathsOutsideRoots(ctx, cmd, shell, ws)
+			if len(got) != 0 {
+				t.Errorf("[%s] separator-artifact cmd %q must not be flagged as out-of-root, got %v", shell, cmd, got)
+			}
+		}
+	}
+}
+
+// TestPathsOutsideRoots_SeparatorRunSkipKeepsRealPaths verifies the
+// separator-run skip does not weaken detection: genuine out-of-root references
+// — including forms built from separator runs ("cat //etc/passwd") and
+// single-component roots ("rm -rf /.") — are still reported under BOTH shell
+// dialects (pathRegex and the skip are shared between them).
+func TestPathsOutsideRoots_SeparatorRunSkipKeepsRealPaths(t *testing.T) {
+	ws := t.TempDir()
+	ctx := WithWorkspacePath(context.Background(), ws)
+
+	for _, shell := range []ShellKind{ShellBash, ShellPosh} {
+		for _, cmd := range []string{
+			"cat /etc/passwd",
+			"echo x > /etc/cron.d/newjob",
+			"cat //etc/passwd",
+			"rm -rf /.",
+		} {
+			got := PathsOutsideRoots(ctx, cmd, shell, ws)
+			if len(got) == 0 {
+				t.Errorf("[%s] cmd %q must still be flagged as out-of-root", shell, cmd)
+			}
+		}
+	}
+}
+
+// TestPathsOutsideRoots_DriveSeparatorRunForms pins the drive-letter half of
+// the separator-run skip at the command level. "C:\\" — a drive prefix
+// followed by a pure separator run — is an escaped-drive-root artifact and is
+// never reported, on any host. The genuine forms "C:\" (drive root) and
+// "C:\\Windows\win.ini" (escaped drive path) still name real locations, but a
+// Windows drive path is only absolute on Windows ([isAbsResolved]): on POSIX
+// hosts the resolver drops it by design, so the still-reported assertions are
+// guarded by GOOS.
+func TestPathsOutsideRoots_DriveSeparatorRunForms(t *testing.T) {
+	ws := t.TempDir()
+	ctx := WithWorkspacePath(context.Background(), ws)
+
+	for _, shell := range []ShellKind{ShellBash, ShellPosh} {
+		cmd := `Get-Content C:\\`
+		got := PathsOutsideRoots(ctx, cmd, shell, ws)
+		if len(got) != 0 {
+			t.Errorf("[%s] cmd %q must not be flagged (escaped drive root is an artifact), got %v", shell, cmd, got)
+		}
+	}
+
+	if runtime.GOOS != "windows" {
+		return
+	}
+	for _, shell := range []ShellKind{ShellBash, ShellPosh} {
+		for _, cmd := range []string{
+			`Get-Content C:\`,
+			`Get-Content C:\\Windows\win.ini`,
+		} {
+			got := PathsOutsideRoots(ctx, cmd, shell, ws)
+			if len(got) == 0 {
+				t.Errorf("[%s] cmd %q must still be flagged on Windows (drive path outside roots)", shell, cmd)
+			}
+		}
+	}
+}
+
+// TestIsPureSeparatorRunToken covers the token classifier behind the
+// separator-run skip shared by ResolveShellPathTokens and ExtractPaths: POSIX
+// runs of two or more slashes and drive prefixes followed by two or more pure
+// separators are artifacts; everything carrying at least one path component —
+// including the single-separator drive root "C:\" — is not.
+func TestIsPureSeparatorRunToken(t *testing.T) {
+	positive := []string{"//", "///", "////", `C:\\`, `D:\\`, `C://`}
+	for _, tok := range positive {
+		if !isPureSeparatorRunToken(tok) {
+			t.Errorf("isPureSeparatorRunToken(%q) = false, want true", tok)
+		}
+	}
+	negative := []string{
+		"", ":", "..", "a/b", "/",
+		"/.", "//etc/passwd", "/dev/null", "/etc/cron.d/newjob",
+		`C:\`, `C:/`, `C:\Windows`, `C:\\Windows`,
+	}
+	for _, tok := range negative {
+		if isPureSeparatorRunToken(tok) {
+			t.Errorf("isPureSeparatorRunToken(%q) = true, want false", tok)
+		}
+	}
+}

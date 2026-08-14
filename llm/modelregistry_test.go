@@ -2,11 +2,13 @@ package llm
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestModelRegistry_OverridePriority(t *testing.T) {
@@ -1213,6 +1215,438 @@ func TestModelRegistry_CacheAfterFetchFromHuggingFace(t *testing.T) {
 
 	if callCount != 1 {
 		t.Errorf("expected 1 HTTP call (cached on second), got %d", callCount)
+	}
+}
+
+// countingTransport counts RoundTrip calls and fails every one of them. Wiring
+// it into a registry's HTTP client turns the client into a network-usage
+// detector: any code path that is supposed to be network-free leaves the
+// counter at zero, and one that misbehaves both increments it and surfaces a
+// transport error instead of silently succeeding.
+type countingTransport struct {
+	calls int
+}
+
+func (t *countingTransport) RoundTrip(_ *http.Request) (*http.Response, error) {
+	t.calls++
+	return nil, errors.New("unexpected network call")
+}
+
+func TestModelRegistry_ResolveLocal_NeverTouchesNetwork(t *testing.T) {
+	// ResolveLocal must serve every local tier — override, built-in, fuzzy,
+	// lazy cache — and the offline fallback, without a single HTTP attempt.
+	// The counting transport enforces the guarantee: it fails every call and
+	// leaves calls == 0 only if the network was never reached.
+	registry := NewModelRegistry(map[string]ModelMetadata{
+		"my-override-model": {
+			ContextWindow: 111111,
+			OutputLimit:   2222,
+			TokenizerType: "override-tok",
+		},
+	})
+	transport := &countingTransport{}
+	registry.httpClient = &http.Client{Transport: transport}
+
+	t.Run("override tier", func(t *testing.T) {
+		meta, ok := registry.ResolveLocal("My-Override-Model")
+		if !ok {
+			t.Fatal("expected ok=true for override model")
+		}
+		if meta.ContextWindow != 111111 {
+			t.Errorf("ContextWindow = %d, want 111111", meta.ContextWindow)
+		}
+		if meta.OutputLimit != 2222 {
+			t.Errorf("OutputLimit = %d, want 2222", meta.OutputLimit)
+		}
+		if meta.TokenizerType != "override-tok" {
+			t.Errorf("TokenizerType = %q, want override-tok", meta.TokenizerType)
+		}
+	})
+
+	t.Run("built-in tier", func(t *testing.T) {
+		meta, ok := registry.ResolveLocal("GPT-4O")
+		if !ok {
+			t.Fatal("expected ok=true for built-in model")
+		}
+		if meta.ContextWindow != 128000 {
+			t.Errorf("ContextWindow = %d, want 128000", meta.ContextWindow)
+		}
+		if meta.OutputLimit != 16384 {
+			t.Errorf("OutputLimit = %d, want 16384", meta.OutputLimit)
+		}
+		if meta.Family == "" || meta.Protocol == "" {
+			t.Error("built-in tier must resolve Family and Protocol postfixes")
+		}
+	})
+
+	t.Run("fuzzy tier", func(t *testing.T) {
+		// "gpt4o" fuzzy-matches the built-in "gpt-4o" (dash dropped by host).
+		meta, ok := registry.ResolveLocal("gpt4o")
+		if !ok {
+			t.Fatal("expected ok=true for fuzzy match")
+		}
+		if meta.ContextWindow != 128000 {
+			t.Errorf("ContextWindow = %d, want 128000", meta.ContextWindow)
+		}
+		// Like Resolve, a fuzzy hit is cached under the (lowercased) query key.
+		registry.mu.RLock()
+		_, cached := registry.cache["gpt4o"]
+		registry.mu.RUnlock()
+		if !cached {
+			t.Error("fuzzy hit should be cached under the query key")
+		}
+	})
+
+	t.Run("lazy cache tier", func(t *testing.T) {
+		// Populate the cache the way the network tiers would, then confirm
+		// ResolveLocal serves the entry read-only, across casings.
+		registry.mu.Lock()
+		registry.cache["hf-cached-model"] = ModelMetadata{
+			ContextWindow: 7777,
+			OutputLimit:   1234,
+			TokenizerType: "hf-tok",
+		}
+		registry.mu.Unlock()
+
+		meta, ok := registry.ResolveLocal("HF-CACHED-MODEL")
+		if !ok {
+			t.Fatal("expected ok=true for cached model")
+		}
+		if meta.ContextWindow != 7777 {
+			t.Errorf("ContextWindow = %d, want 7777", meta.ContextWindow)
+		}
+		if meta.OutputLimit != 1234 {
+			t.Errorf("OutputLimit = %d, want 1234", meta.OutputLimit)
+		}
+	})
+
+	t.Run("unknown model falls back offline", func(t *testing.T) {
+		meta, ok := registry.ResolveLocal("definitely-not-a-real-model-xyz")
+		if ok {
+			t.Fatal("expected ok=false for unknown model")
+		}
+		if meta.ContextWindow != 128000 {
+			t.Errorf("fallback ContextWindow = %d, want 128000", meta.ContextWindow)
+		}
+		if meta.OutputLimit != 32768 {
+			t.Errorf("fallback OutputLimit = %d, want 32768", meta.OutputLimit)
+		}
+		if meta.TokenizerType != "approximate" {
+			t.Errorf("fallback TokenizerType = %q, want approximate", meta.TokenizerType)
+		}
+		if !meta.Capabilities.Attachment {
+			t.Error("fallback should keep the optimistic attachment capability")
+		}
+		if meta.Family == "" || meta.Protocol == "" {
+			t.Error("fallback must still resolve Family and Protocol postfixes")
+		}
+	})
+
+	if transport.calls != 0 {
+		t.Fatalf("ResolveLocal must never touch the network; got %d HTTP attempts", transport.calls)
+	}
+}
+
+func TestModelRegistry_ResolveLocal_UnknownSkipsRegisteredSources(t *testing.T) {
+	// Registered sources are a network-capable tier: ResolveLocal must not
+	// consult them even when they know the model — that is Resolve's job.
+	registry := NewModelRegistry(nil)
+	transport := &countingTransport{}
+	registry.httpClient = &http.Client{Transport: transport}
+	registry.RegisterSource(func(model string) (ModelMetadata, bool) {
+		return ModelMetadata{ContextWindow: 55555}, true
+	})
+
+	meta, ok := registry.ResolveLocal("source-only-model")
+	if ok {
+		t.Fatal("expected ok=false: ResolveLocal must not consult registered sources")
+	}
+	if meta.ContextWindow != 128000 {
+		t.Errorf("ContextWindow = %d, want fallback 128000", meta.ContextWindow)
+	}
+	if transport.calls != 0 {
+		t.Fatalf("ResolveLocal must never touch the network; got %d HTTP attempts", transport.calls)
+	}
+}
+
+func TestModelRegistry_NegativeCache_NoRetryWithinTTL(t *testing.T) {
+	// A 404 from HuggingFace is cached as a negative result: repeated Resolve
+	// calls inside negativeCacheTTL skip the HTTP round-trip entirely and
+	// return the offline fallback.
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		callCount++
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	registry := NewModelRegistry(nil)
+	registry.httpClient = &http.Client{
+		Transport: &rewriteTransport{base: http.DefaultTransport, serverURL: server.URL},
+	}
+
+	// First Resolve probes and fails.
+	if _, ok := registry.Resolve(context.Background(), "hf-negative-cache-model"); ok {
+		t.Fatal("expected ok=false when HuggingFace returns 404")
+	}
+	if callCount != 1 {
+		t.Fatalf("expected 1 HTTP call after first Resolve, got %d", callCount)
+	}
+
+	// Repeated resolves within the TTL must not re-probe.
+	for i := 0; i < 3; i++ {
+		meta, ok := registry.Resolve(context.Background(), "hf-negative-cache-model")
+		if ok {
+			t.Fatal("expected ok=false while the negative entry is fresh")
+		}
+		if meta.ContextWindow != 128000 {
+			t.Errorf("fallback ContextWindow = %d, want 128000", meta.ContextWindow)
+		}
+	}
+	if callCount != 1 {
+		t.Fatalf("negative cache should suppress re-probes within TTL; got %d HTTP calls", callCount)
+	}
+
+	// The failure must be recorded under the lowercased key.
+	registry.mu.RLock()
+	_, recorded := registry.negativeCache["hf-negative-cache-model"]
+	registry.mu.RUnlock()
+	if !recorded {
+		t.Error("expected a negative cache entry after the failed probe")
+	}
+}
+
+func TestModelRegistry_NegativeCache_TransportErrorAlsoCached(t *testing.T) {
+	// Timeouts, DNS failures and other transport errors are negative results
+	// too: the counting transport fails every call, so a second attempt would
+	// both increment the counter and be observable.
+	registry := NewModelRegistry(nil)
+	transport := &countingTransport{}
+	registry.httpClient = &http.Client{Transport: transport}
+
+	if _, ok := registry.Resolve(context.Background(), "hf-transport-error-model"); ok {
+		t.Fatal("expected ok=false when the probe errors")
+	}
+	if transport.calls != 1 {
+		t.Fatalf("expected exactly 1 probe, got %d", transport.calls)
+	}
+
+	if _, ok := registry.Resolve(context.Background(), "hf-transport-error-model"); ok {
+		t.Fatal("expected ok=false on repeat resolve")
+	}
+	if transport.calls != 1 {
+		t.Fatalf("transport error should be negatively cached within TTL; got %d probes", transport.calls)
+	}
+}
+
+func TestModelRegistry_NegativeCache_ExpiresAndRecovers(t *testing.T) {
+	// After the TTL elapses the probe runs again; a successful re-probe
+	// populates the positive cache, clears the negative record, and repeat
+	// resolves are served without further HTTP calls.
+	fail := true
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		callCount++
+		if fail {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"max_position_embeddings": 6543}`))
+	}))
+	defer server.Close()
+
+	registry := NewModelRegistry(nil)
+	registry.httpClient = &http.Client{
+		Transport: &rewriteTransport{base: http.DefaultTransport, serverURL: server.URL},
+	}
+
+	const model = "hf-ttl-expiry-model"
+	if _, ok := registry.Resolve(context.Background(), model); ok {
+		t.Fatal("expected ok=false while the probe fails")
+	}
+	if callCount != 1 {
+		t.Fatalf("expected 1 HTTP call, got %d", callCount)
+	}
+
+	// Simulate TTL expiry by rewinding the recorded failure time, and let the
+	// server start answering successfully.
+	registry.mu.Lock()
+	registry.negativeCache[model] = time.Now().Add(-negativeCacheTTL - time.Second)
+	registry.mu.Unlock()
+	fail = false
+
+	meta, ok := registry.Resolve(context.Background(), model)
+	if !ok {
+		t.Fatal("expected ok=true after successful re-probe past the TTL")
+	}
+	if meta.ContextWindow != 6543 {
+		t.Errorf("ContextWindow = %d, want 6543", meta.ContextWindow)
+	}
+	if callCount != 2 {
+		t.Fatalf("expected a re-probe after TTL expiry, got %d HTTP calls", callCount)
+	}
+
+	// Success must clear the negative record…
+	registry.mu.RLock()
+	_, negative := registry.negativeCache[model]
+	registry.mu.RUnlock()
+	if negative {
+		t.Error("negative cache entry should be cleared after a successful probe")
+	}
+
+	// …and the positive cache must serve repeats without further calls.
+	if _, ok := registry.Resolve(context.Background(), model); !ok {
+		t.Fatal("expected ok=true from the positive cache")
+	}
+	if callCount != 2 {
+		t.Errorf("positive cache should serve repeats without HTTP calls; got %d calls", callCount)
+	}
+}
+
+func TestModelRegistry_Invalidate_ClearsNegativeCache(t *testing.T) {
+	// Invalidate means "forget everything you know about this model" — both
+	// the positive entry and the failed-probe record, so the next Resolve
+	// re-probes instead of waiting out the TTL window.
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		callCount++
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	registry := NewModelRegistry(nil)
+	registry.httpClient = &http.Client{
+		Transport: &rewriteTransport{base: http.DefaultTransport, serverURL: server.URL},
+	}
+
+	const model = "hf-invalidate-negative-model"
+	if _, ok := registry.Resolve(context.Background(), model); ok {
+		t.Fatal("expected ok=false when the probe fails")
+	}
+	if callCount != 1 {
+		t.Fatalf("expected 1 HTTP call, got %d", callCount)
+	}
+
+	registry.Invalidate(model)
+
+	if _, ok := registry.Resolve(context.Background(), model); ok {
+		t.Fatal("expected ok=false on re-probe")
+	}
+	if callCount != 2 {
+		t.Errorf("Invalidate must clear the negative entry and force a re-probe; got %d HTTP calls", callCount)
+	}
+}
+
+// blockUntilCanceledTransport holds every request open until its context is
+// canceled, then surfaces the context error — an in-flight HuggingFace probe
+// aborted by the caller, with no real-network timing and no shared state.
+type blockUntilCanceledTransport struct{}
+
+func (blockUntilCanceledTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	<-req.Context().Done()
+	return nil, req.Context().Err()
+}
+
+func TestModelRegistry_NegativeCache_CallerCancellationNotCached(t *testing.T) {
+	// A probe aborted by the CALLER's context cancellation describes the
+	// caller (a step deadline hit, a shutdown), not HuggingFace — it must
+	// not poison the next ten minutes of resolves. A real 404 afterwards is
+	// still a genuine negative result and is cached as before.
+	registry := NewModelRegistry(nil)
+	registry.SetHTTPClient(&http.Client{Transport: blockUntilCanceledTransport{}})
+
+	const model = "hf-canceled-probe-model"
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(25*time.Millisecond, cancel)
+	if _, ok := registry.Resolve(ctx, model); ok {
+		t.Fatal("expected ok=false when the probe is canceled mid-flight")
+	}
+
+	// The canceled probe must leave no negative record…
+	registry.mu.RLock()
+	_, negative := registry.negativeCache[model]
+	registry.mu.RUnlock()
+	if negative {
+		t.Fatal("caller cancellation must not be written to the negative cache")
+	}
+
+	// …so the very next Resolve re-probes instead of riding out the TTL. If
+	// the canceled probe HAD been recorded, this Resolve would be suppressed
+	// and no negative entry could ever appear; a genuine 404 writes one.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+	registry.SetHTTPClient(&http.Client{
+		Transport: &rewriteTransport{base: http.DefaultTransport, serverURL: server.URL},
+	})
+	if _, ok := registry.Resolve(context.Background(), model); ok {
+		t.Fatal("expected ok=false when the re-probe 404s")
+	}
+
+	registry.mu.RLock()
+	_, negative = registry.negativeCache[model]
+	registry.mu.RUnlock()
+	if !negative {
+		t.Fatal("the post-cancellation re-probe must have run and 404'd (a fresh negative entry proves no suppression)")
+	}
+}
+
+func TestModelRegistry_NegativeCache_DeadlineExceededStillCached(t *testing.T) {
+	// context.DeadlineExceeded is deliberately still a negative result: the
+	// registry's own HTTP client timeout surfaces the same sentinel, so a
+	// deadline hit describes HuggingFace being too slow as much as it does
+	// the caller. Only outright cancellation is exempt.
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	registry := NewModelRegistry(nil)
+	registry.httpClient = &http.Client{
+		Transport: &rewriteTransport{base: http.DefaultTransport, serverURL: server.URL},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	if _, ok := registry.Resolve(ctx, "hf-deadline-probe-model"); ok {
+		t.Fatal("expected ok=false when the probe misses its deadline")
+	}
+
+	registry.mu.RLock()
+	_, negative := registry.negativeCache["hf-deadline-probe-model"]
+	registry.mu.RUnlock()
+	if !negative {
+		t.Error("context.DeadlineExceeded must still be negatively cached within TTL")
+	}
+}
+
+func TestModelRegistry_NegativeCache_StaleEntryEvictedOnRead(t *testing.T) {
+	// A negative record past its TTL window is not merely ignored — it is
+	// deleted at read time, so keys that are never resolved again cannot
+	// accumulate in the map forever.
+	registry := NewModelRegistry(nil)
+	transport := &countingTransport{}
+	registry.httpClient = &http.Client{Transport: transport}
+
+	const model = "hf-stale-negative-model"
+	if _, ok := registry.Resolve(context.Background(), model); ok {
+		t.Fatal("expected ok=false when the probe errors")
+	}
+
+	registry.mu.Lock()
+	registry.negativeCache[model] = time.Now().Add(-negativeCacheTTL - time.Second)
+	registry.mu.Unlock()
+
+	if registry.negativeCacheFresh(model) {
+		t.Fatal("an entry past the TTL window must read as stale")
+	}
+	registry.mu.RLock()
+	_, present := registry.negativeCache[model]
+	registry.mu.RUnlock()
+	if present {
+		t.Error("a stale negative entry must be evicted on read, not merely skipped")
 	}
 }
 

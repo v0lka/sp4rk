@@ -431,6 +431,13 @@ func ExtractJSONStrings(data any) []string {
 // start of an absolute one — mirroring ResolveShellPathTokens so the shell and
 // JSON-input extractors agree on what counts as a path. Windows drive-letter
 // alternatives ("C:\...") start with a letter and are unaffected.
+// Tokens that consist entirely of separators — a bare "//" run (POSIX) or a
+// drive prefix followed by only separators ("C:\\") — are likewise skipped:
+// they are shell-language artifacts (the "//" of a sed address
+// "sed 's/.*function //'", a comment marker, an integer-division
+// "$(( total // count ))") that carry no path component and cannot name an
+// out-of-root location; keeping them only produced false-positive escalations
+// (a bare "//" cleans to the filesystem root). See [isPureSeparatorRunToken].
 func ExtractPaths(s string) []string {
 	var out []string
 	for _, m := range pathRegex.FindAllStringIndex(s, -1) {
@@ -438,7 +445,11 @@ func ExtractPaths(s string) []string {
 		if s[start] == '/' && start > 0 && isPathComponentChar(s[start-1]) {
 			continue
 		}
-		out = append(out, s[start:m[1]])
+		tok := s[start:m[1]]
+		if isPureSeparatorRunToken(tok) {
+			continue
+		}
+		out = append(out, tok)
 	}
 	return out
 }

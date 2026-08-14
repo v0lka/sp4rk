@@ -681,6 +681,166 @@ func TestExtractPaths_RelativePathNotExtracted(t *testing.T) {
 	}
 }
 
+// TestExtractPaths_SeparatorRunNotExtracted is the regression test for the
+// false positive where ExtractPaths returned a bare separator run ("//") as a
+// path: a JSON string value carrying a shell command with a sed address
+// ("sed 's/.*function //'"), a comment marker or an integer-division operator
+// was treated as referencing the filesystem root (filepath.Clean("//") == "/")
+// and forced a confirmation. The drive-letter form of the skip is covered too:
+// "C:\\" (an escaped PowerShell drive root) is skipped, while the drive root
+// "C:\" and a component path "C:\\Windows" remain tokens — mirroring
+// ResolveShellPathTokens so the two extractors agree on what counts as a path.
+func TestExtractPaths_SeparatorRunNotExtracted(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want []string
+	}{
+		{
+			name: "sed substitution address not extracted",
+			in:   "sed 's/.*function //'",
+			want: nil,
+		},
+		{
+			name: "comment marker not extracted",
+			in:   `echo "// TODO fix" >> notes.md`,
+			want: nil,
+		},
+		{
+			name: "integer division not extracted",
+			in:   "echo $(( total // count ))",
+			want: nil,
+		},
+		{
+			name: "escaped drive root not extracted",
+			in:   `Get-Content C:\\`,
+			want: nil,
+		},
+		{
+			name: "drive root stays a token",
+			in:   `Get-Content C:\`,
+			want: []string{`C:\`},
+		},
+		{
+			name: "escaped drive path stays a token",
+			in:   `Get-Content C:\\Windows`,
+			want: []string{`C:\\Windows`},
+		},
+		{
+			name: "separator-run absolute path still extracted",
+			in:   "cat //etc/passwd",
+			want: []string{"//etc/passwd"},
+		},
+		{
+			name: "plain absolute path still extracted",
+			in:   "cat /etc/passwd",
+			want: []string{"/etc/passwd"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ExtractPaths(tt.in)
+			if len(got) == 0 && len(tt.want) == 0 {
+				return
+			}
+			if len(got) != len(tt.want) {
+				t.Errorf("ExtractPaths(%q) = %v, want %v", tt.in, got, tt.want)
+				return
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("ExtractPaths(%q)[%d] = %q, want %q", tt.in, i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestAllPathsInSessionRoots_SeparatorRunNotPath verifies the consistency
+// between ExtractPaths and AllPathsInSessionRoots after the separator-run
+// fix: a bare "//" run (sed address, comment marker, integer division) or an
+// escaped drive root ("C:\\") is no longer counted as a path, so it neither
+// surfaces as a phantom filesystem root nor forces the fast-path to fail when
+// it appears alongside in-root paths — and it does not mask a genuine
+// out-of-root path either.
+func TestAllPathsInSessionRoots_SeparatorRunNotPath(t *testing.T) {
+	ws := t.TempDir()
+	ctx := WithWorkspacePath(context.Background(), ws)
+	inRoot := filepath.ToSlash(filepath.Join(ws, "notes.md"))
+
+	tests := []struct {
+		name       string
+		cmd        string
+		wantPaths  []string // what ExtractPaths must see
+		wantInRoot bool     // what AllPathsInSessionRoots must conclude
+	}{
+		{
+			// User command #1 from the bug report, verbatim: no absolute path
+			// at all → the fast-path declines ("no paths" is pre-existing
+			// semantics). Before the fix the "//" was extracted and cleaned to
+			// the filesystem root, an out-of-root path.
+			name:       "sed address alone extracts no path",
+			cmd:        "rg 'func ' -n core/conductor.go | sed 's/.*function //' | sort -u",
+			wantPaths:  nil,
+			wantInRoot: false,
+		},
+		{
+			// The bug-report scenario: an in-root file piped through the sed
+			// command must auto-allow. Before the fix the phantom "/" failed
+			// the fast-path and forced a confirmation.
+			name:       "sed artifact alongside in-root path auto-allows",
+			cmd:        "cat " + inRoot + " | sed 's/.*function //' | sort -u",
+			wantPaths:  []string{inRoot},
+			wantInRoot: true,
+		},
+		{
+			name:       "integer division alongside in-root path auto-allows",
+			cmd:        "echo $(( x // y )) > " + inRoot,
+			wantPaths:  []string{inRoot},
+			wantInRoot: true,
+		},
+		{
+			name:       "comment marker alongside in-root path auto-allows",
+			cmd:        `echo "// ..." >> ` + inRoot,
+			wantPaths:  []string{inRoot},
+			wantInRoot: true,
+		},
+		{
+			name:       "escaped drive root alone extracts no path",
+			cmd:        `Get-Content C:\\`,
+			wantPaths:  nil,
+			wantInRoot: false,
+		},
+		{
+			name:       "sed artifact does not mask genuine out-of-root path",
+			cmd:        "cat /etc/passwd | sed 's/.*function //' | sort -u",
+			wantPaths:  []string{"/etc/passwd"},
+			wantInRoot: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotPaths := ExtractPaths(tt.cmd)
+			if len(gotPaths) != len(tt.wantPaths) {
+				t.Errorf("ExtractPaths(%q) = %v, want %v", tt.cmd, gotPaths, tt.wantPaths)
+			}
+			for _, w := range tt.wantPaths {
+				if !sliceContains(gotPaths, w) {
+					t.Errorf("ExtractPaths(%q) = %v, want it to contain %q", tt.cmd, gotPaths, w)
+				}
+			}
+
+			input, err := json.Marshal(map[string]string{"command": tt.cmd})
+			if err != nil {
+				t.Fatalf("marshal input: %v", err)
+			}
+			if got := AllPathsInSessionRoots(ctx, json.RawMessage(input)); got != tt.wantInRoot {
+				t.Errorf("AllPathsInSessionRoots(%q) = %v, want %v", tt.cmd, got, tt.wantInRoot)
+			}
+		})
+	}
+}
+
 func TestAllPathsInDir(t *testing.T) {
 	tests := []struct {
 		name  string
