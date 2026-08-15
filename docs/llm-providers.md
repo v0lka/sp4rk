@@ -268,10 +268,10 @@ Additional methods:
 
 A tier-1 override that pins only some fields — a **partial** override — inherits its unset scalar fields from the lower non-network tiers (observed runtime → built-in → cache → fallback). The inheritable fields are `ContextWindow`, `OutputLimit`, `TokenizerType`, and `Capabilities`. This closes two footguns:
 
-- A protocol-only override (e.g. `{Protocol: ChatCompletions}` for a Google-named checkpoint served locally) previously left `ContextWindow`/`OutputLimit` at zero, collapsing the context window and rejecting requests, and left `Capabilities` all-false, silently disabling tool-calling, reasoning, and image uploads. A zero-valued `ModelCapabilities` is now treated as "unset" and inherited, exactly like a zero `ContextWindow`.
+- A protocol-only override (e.g. `{Protocol: ChatCompletions}` for a Google-named checkpoint served locally) previously left `ContextWindow`/`OutputLimit` at zero, collapsing the context window and rejecting requests, and left `Capabilities` all-false, silently disabling tool-calling, reasoning, and image uploads. `ModelMetadata.Capabilities` is now a **pointer** (`*ModelCapabilities`): a nil pointer is "unset" and inherited, exactly like a zero `ContextWindow`, while a non-nil value — even with every flag false — is authoritative.
 - A protocol-only override that also carried a fallback `ContextWindow: 128000` shadowed a lazy local-model probe writing the model's real window to the cache tier via `SetCachedMetadata`. Keeping the override's window at zero lets the cache-tier probe result take effect once it arrives.
 
-A field already set in the override is authoritative; a fully-specified override (the common case: a `config.yaml` entry whose scalars are all populated) is returned verbatim. `Family` is derived, and `Protocol` is always authoritative — pinning it is precisely what a partial override exists to do. The accepted tradeoff is that the zero value is reserved for "inherit", so there is no way to express "explicitly disable every capability" via a partial override.
+A field already set in the override is authoritative; a fully-specified override (the common case: a `config.yaml` entry whose scalars and capabilities are all populated) is returned verbatim. `Family` is derived, and `Protocol` is always authoritative — pinning it is precisely what a partial override exists to do. Because "unset" is expressed by the nil pointer rather than by a zero value, "explicitly disable every capability" **is** expressible: `Capabilities: &ModelCapabilities{}` is non-nil and wins over every lower tier.
 
 ```go
 registry := llm.NewModelRegistry(map[string]llm.ModelMetadata{
@@ -291,7 +291,7 @@ type ModelMetadata struct {
     TokenizerType string
     Family        string
     Protocol      APIProtocol
-    Capabilities  ModelCapabilities
+    Capabilities  *ModelCapabilities // nil = inherit; non-nil = authoritative (even all-false)
 }
 ```
 
@@ -314,6 +314,10 @@ type ModelCapabilities struct {
 ```
 
 `ModelCapabilities` carries `json` + `yaml` struct tags (snake_case) so a single canonical type serializes consistently in both the JSON API contract and `config.yaml` without conversion boilerplate at every layer boundary.
+
+`Capabilities` is referenced through a pointer on `ModelMetadata` so a record can distinguish *declared* (non-nil, even when every flag is false) from *unset* (nil — inherit from the lower tiers; see [Partial overrides](#partial-overrides)). Ownership is symmetric: the public resolvers (`Resolve`, `ResolveLocal`, `ResolveBuiltInModel`) always return non-nil, defensively copied `Capabilities` — the caller owns the returned pointer and may mutate it freely; registry state (including the process-wide built-in catalog) is never aliased. Symmetrically, records handed *to* the registry (the `NewModelRegistry` overrides map, `SetCachedMetadata`, `SetRuntimeMetadata`) are copied on write, so later caller mutations cannot reach the stored entries.
+
+**Wire format note:** because the field is a pointer, a partial record with unset capabilities serializes as `"capabilities": null` rather than `{"attachment":false,...}`. Hosts that round-trip `ModelMetadata` through JSON (persisted probe caches, API DTOs) must treat `null` as "inherit", not as "all capabilities disabled" — and when mapping a value-typed host DTO into `ModelMetadata`, leave `Capabilities` nil for absent keys instead of pointing at a zero struct, or the all-false set becomes authoritative.
 
 The router uses `Capabilities.Temperature` to decide whether to send a temperature parameter at all — reasoning models that reject temperature are skipped automatically.
 

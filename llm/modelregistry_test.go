@@ -121,7 +121,7 @@ func TestModelRegistry_FallbackForUnknownModel(t *testing.T) {
 		TokenizerType: "approximate",
 		// Unknown models default to optimistic attachment support: better to
 		// surface a runtime provider error than to deny image uploads.
-		Capabilities: ModelCapabilities{Attachment: true},
+		Capabilities: &ModelCapabilities{Attachment: true},
 	}
 
 	if meta.ContextWindow != expected.ContextWindow {
@@ -133,7 +133,7 @@ func TestModelRegistry_FallbackForUnknownModel(t *testing.T) {
 	if meta.TokenizerType != expected.TokenizerType {
 		t.Errorf("expected TokenizerType %s, got %s", expected.TokenizerType, meta.TokenizerType)
 	}
-	if meta.Capabilities != expected.Capabilities {
+	if meta.Capabilities == nil || *meta.Capabilities != *expected.Capabilities {
 		t.Errorf("expected Capabilities %+v, got %+v", expected.Capabilities, meta.Capabilities)
 	}
 }
@@ -651,8 +651,8 @@ func TestModelRegistry_PartialOverrideCatalogMissKeepsOptimisticCapabilities(t *
 // specified override (all three scalar fields AND Capabilities set) is returned
 // verbatim and is never silently merged with lower-tier data — the prior
 // behaviour relied on by TestModelRegistry_OverridePriority and real config.yaml
-// entries. Capabilities is now a first-class inheritable field, so it must be
-// populated for the override to count as fully specified; a zero Capabilities
+// entries. Capabilities is a first-class inheritable field, so it must be
+// non-nil for the override to count as fully specified; a nil Capabilities
 // would otherwise be inherited from the built-in entry.
 func TestModelRegistry_FullySpecifiedOverrideNotEnriched(t *testing.T) {
 	registry := NewModelRegistry(map[string]ModelMetadata{
@@ -661,7 +661,7 @@ func TestModelRegistry_FullySpecifiedOverrideNotEnriched(t *testing.T) {
 			OutputLimit:   8888,
 			TokenizerType: "custom-tokenizer",
 			Protocol:      ProtocolChatCompletions,
-			Capabilities:  ModelCapabilities{ToolCall: true},
+			Capabilities:  &ModelCapabilities{ToolCall: true},
 		},
 	})
 	// Seed a cache entry whose values differ; it must NOT bleed through.
@@ -669,7 +669,7 @@ func TestModelRegistry_FullySpecifiedOverrideNotEnriched(t *testing.T) {
 		ContextWindow: 1,
 		OutputLimit:   1,
 		TokenizerType: "should-not-leak",
-		Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true},
+		Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true},
 	})
 
 	meta, ok := registry.Resolve(context.Background(), "gpt-4o")
@@ -679,8 +679,283 @@ func TestModelRegistry_FullySpecifiedOverrideNotEnriched(t *testing.T) {
 	if meta.ContextWindow != 999999 || meta.OutputLimit != 8888 || meta.TokenizerType != "custom-tokenizer" {
 		t.Errorf("fully-specified override was enriched: got %+v", meta)
 	}
-	if meta.Capabilities != (ModelCapabilities{ToolCall: true}) {
+	if meta.Capabilities == nil || *meta.Capabilities != (ModelCapabilities{ToolCall: true}) {
 		t.Errorf("fully-specified override capabilities were enriched: got %+v", meta.Capabilities)
+	}
+}
+
+// TestModelRegistry_AllFalseCapabilitiesOverrideIsAuthoritative guards the
+// pointer semantics of ModelMetadata.Capabilities: a non-nil override with
+// every flag false must WIN over the built-in catalog's capabilities instead
+// of being treated as "unset" and silently re-inherited. Under the old
+// value-struct semantics the all-false set was indistinguishable from
+// "inherit", so a user who disabled every capability in the settings dialog
+// silently got the catalog defaults back at runtime.
+func TestModelRegistry_AllFalseCapabilitiesOverrideIsAuthoritative(t *testing.T) {
+	registry := NewModelRegistry(map[string]ModelMetadata{
+		"gpt-4o": {
+			// Only capabilities pinned (all false); scalars left unset so they
+			// inherit from the built-in entry.
+			Capabilities: &ModelCapabilities{},
+		},
+	})
+
+	meta, ok := registry.Resolve(context.Background(), "gpt-4o")
+	if !ok {
+		t.Fatal("expected ok=true for overridden model")
+	}
+	if meta.Capabilities == nil {
+		t.Fatal("expected non-nil capabilities after enrichment")
+	}
+	if *meta.Capabilities != (ModelCapabilities{}) {
+		t.Errorf("all-false override was re-inherited from catalog: got %+v", *meta.Capabilities)
+	}
+	// The unset scalars still inherit from the built-in entry.
+	if meta.ContextWindow == 0 {
+		t.Errorf("expected inherited context window from built-in catalog, got 0")
+	}
+}
+
+// The three tests below are regression tests for the resolver contract
+// "Resolve/ResolveLocal output is always enriched to non-nil Capabilities".
+// Before finalizeMeta, each scenario inherited a nil pointer from a PARTIAL
+// lower-tier record: no tier declared capabilities, and the nil sailed
+// through to the caller, where the natural `meta.Capabilities.Attachment`
+// dereference panicked. The guard restores the optimistic unknown set — the
+// same assumption tier 5 makes for wholly unknown models.
+
+// TestModelRegistry_NilCapabilitiesGuard_PartialOverridePartialCache: a
+// protocol-only override enriched against a cache entry whose probe observed
+// only scalars (enrichPartialWith inherited the cache entry's nil).
+func TestModelRegistry_NilCapabilitiesGuard_PartialOverridePartialCache(t *testing.T) {
+	registry := NewModelRegistry(map[string]ModelMetadata{
+		// Catalog-miss model; the override pins only the protocol.
+		"gemma-3-27b-it": {Protocol: ProtocolChatCompletions},
+	})
+	// The probe observed scalars only; Capabilities stays nil.
+	registry.SetCachedMetadata("gemma-3-27b-it", ModelMetadata{
+		ContextWindow: 8192,
+		OutputLimit:   4096,
+		TokenizerType: "approximate",
+	})
+
+	resolvers := []struct {
+		name string
+		call func() (ModelMetadata, bool)
+	}{
+		{"Resolve", func() (ModelMetadata, bool) {
+			return registry.Resolve(context.Background(), "gemma-3-27b-it")
+		}},
+		{"ResolveLocal", func() (ModelMetadata, bool) {
+			return registry.ResolveLocal("gemma-3-27b-it")
+		}},
+	}
+	for _, r := range resolvers {
+		meta, ok := r.call()
+		if !ok {
+			t.Fatalf("%s: expected ok=true for overridden model", r.name)
+		}
+		if meta.Capabilities == nil {
+			t.Fatalf("%s: Capabilities = nil, want non-nil (optimistic default)", r.name)
+		}
+		if want := (ModelCapabilities{Attachment: true}); *meta.Capabilities != want {
+			t.Errorf("%s: Capabilities = %+v, want %+v", r.name, *meta.Capabilities, want)
+		}
+		if meta.ContextWindow != 8192 {
+			t.Errorf("%s: ContextWindow = %d, want 8192 (inherited from partial cache entry)", r.name, meta.ContextWindow)
+		}
+	}
+}
+
+// TestModelRegistry_NilCapabilitiesGuard_PartialCacheEntry: the tier-3 direct
+// read of a cache entry written by a probe that observed only the window.
+func TestModelRegistry_NilCapabilitiesGuard_PartialCacheEntry(t *testing.T) {
+	registry := NewModelRegistry(nil)
+	registry.SetCachedMetadata("local-probe-only-window", ModelMetadata{ContextWindow: 32768})
+
+	meta, ok := registry.ResolveLocal("local-probe-only-window")
+	if !ok {
+		t.Fatal("expected ok=true for cached model")
+	}
+	if meta.Capabilities == nil {
+		t.Fatal("Capabilities = nil, want non-nil (optimistic default)")
+	}
+	if !meta.Capabilities.Attachment {
+		t.Error("Capabilities.Attachment = false, want true (optimistic default)")
+	}
+	if meta.ContextWindow != 32768 {
+		t.Errorf("ContextWindow = %d, want 32768", meta.ContextWindow)
+	}
+}
+
+// TestModelRegistry_NilCapabilitiesGuard_PartialOverridePartialRuntime: a
+// partial override enriched against a PARTIAL runtime entry —
+// resolveBuiltinOrCache returned the raw entry whose nil was inherited.
+func TestModelRegistry_NilCapabilitiesGuard_PartialOverridePartialRuntime(t *testing.T) {
+	registry := NewModelRegistry(map[string]ModelMetadata{
+		// Catalog-miss model; the override pins only the protocol.
+		"local-checkpoint": {Protocol: ProtocolChatCompletions},
+	})
+	// The probe observed the window only; Capabilities stays nil.
+	registry.SetRuntimeMetadata("local-checkpoint", ModelMetadata{ContextWindow: 65536})
+
+	meta, ok := registry.Resolve(context.Background(), "local-checkpoint")
+	if !ok {
+		t.Fatal("expected ok=true for overridden model")
+	}
+	if meta.Capabilities == nil {
+		t.Fatal("Capabilities = nil, want non-nil (optimistic default)")
+	}
+	if !meta.Capabilities.Attachment {
+		t.Error("Capabilities.Attachment = false, want true (optimistic default)")
+	}
+	if meta.ContextWindow != 65536 {
+		t.Errorf("ContextWindow = %d, want 65536 (inherited from partial runtime entry)", meta.ContextWindow)
+	}
+}
+
+// TestModelRegistry_NilCapabilitiesGuard_PartialRuntimeOverPartialCache: the
+// tier-1.5 path — a partial runtime entry enriched against a partial cache
+// entry inherited the cache's nil via resolveSpecOrCache.
+func TestModelRegistry_NilCapabilitiesGuard_PartialRuntimeOverPartialCache(t *testing.T) {
+	registry := NewModelRegistry(nil)
+	registry.SetCachedMetadata("local-checkpoint", ModelMetadata{ContextWindow: 4096})
+	registry.SetRuntimeMetadata("local-checkpoint", ModelMetadata{ContextWindow: 65536})
+
+	meta, ok := registry.ResolveLocal("local-checkpoint")
+	if !ok {
+		t.Fatal("expected ok=true for runtime-observed model")
+	}
+	if meta.Capabilities == nil {
+		t.Fatal("Capabilities = nil, want non-nil (optimistic default)")
+	}
+	if meta.ContextWindow != 65536 {
+		t.Errorf("ContextWindow = %d, want 65536 (runtime entry wins over cache)", meta.ContextWindow)
+	}
+}
+
+// The tests below guard the OWNERSHIP half of the contract: metadata returned
+// by the public API must never alias registry state, and records handed to
+// the registry are copied on write. Built-in catalog entries are process-wide
+// and shared by every ModelRegistry, so a caller mutating a resolved
+// Capabilities pointer must not poison later resolutions — here or in any
+// other registry — and must not race concurrent readers.
+
+// TestModelRegistry_Resolve_CapabilitiesDefensivelyCopied covers the built-in
+// tier, the fuzzy path (whose cache write goes through cacheResolved), and
+// ResolveBuiltInModel, which reads the same global catalog.
+func TestModelRegistry_Resolve_CapabilitiesDefensivelyCopied(t *testing.T) {
+	registry := NewModelRegistry(nil)
+
+	first, ok := registry.ResolveLocal("gpt-4o")
+	if !ok {
+		t.Fatal("expected ok=true for built-in model")
+	}
+	want := *first.Capabilities
+
+	// Simulate a careless host mutating the returned metadata in place.
+	*first.Capabilities = ModelCapabilities{}
+
+	if second, _ := registry.ResolveLocal("gpt-4o"); *second.Capabilities != want {
+		t.Errorf("mutation of returned Capabilities leaked into the registry: got %+v, want %+v", *second.Capabilities, want)
+	}
+
+	// The catalog is global: a second registry must be unaffected too.
+	other := NewModelRegistry(nil)
+	if meta, _ := other.Resolve(context.Background(), "gpt-4o"); *meta.Capabilities != want {
+		t.Errorf("mutation leaked into the global built-in catalog: got %+v, want %+v", *meta.Capabilities, want)
+	}
+
+	// Fuzzy hit ("gpt4o" → "gpt-4o") caches a twin under the query key; the
+	// returned metadata must not alias the cached twin.
+	fuzzy, ok := registry.ResolveLocal("gpt4o")
+	if !ok {
+		t.Fatal("expected ok=true for fuzzy match")
+	}
+	*fuzzy.Capabilities = ModelCapabilities{}
+	if again, _ := registry.ResolveLocal("gpt4o"); *again.Capabilities != want {
+		t.Errorf("mutation of fuzzy-resolved Capabilities leaked into the cache: got %+v, want %+v", *again.Capabilities, want)
+	}
+
+	// ResolveBuiltInModel reads the same global map and must hand out its own copy.
+	builtin, _ := ResolveBuiltInModel("gpt-4o")
+	*builtin.Capabilities = ModelCapabilities{}
+	if fresh, _ := ResolveBuiltInModel("gpt-4o"); *fresh.Capabilities != want {
+		t.Errorf("ResolveBuiltInModel mutation leaked into the global catalog: got %+v, want %+v", *fresh.Capabilities, want)
+	}
+}
+
+// TestModelRegistry_OverridesCopiedOnConstruction: NewModelRegistry deep-copies
+// each override entry's Capabilities pointer, so a caller mutating its own
+// structs after hand-off cannot race the registry's concurrent readers.
+func TestModelRegistry_OverridesCopiedOnConstruction(t *testing.T) {
+	caps := &ModelCapabilities{Attachment: true, ToolCall: true}
+	registry := NewModelRegistry(map[string]ModelMetadata{
+		"my-local-model": {
+			ContextWindow: 1000,
+			OutputLimit:   500,
+			TokenizerType: "approximate",
+			Capabilities:  caps,
+		},
+	})
+
+	*caps = ModelCapabilities{} // caller mutates its own struct afterwards
+
+	meta, ok := registry.ResolveLocal("my-local-model")
+	if !ok {
+		t.Fatal("expected ok=true for overridden model")
+	}
+	if want := (ModelCapabilities{Attachment: true, ToolCall: true}); *meta.Capabilities != want {
+		t.Errorf("override Capabilities = %+v, want %+v (constructor must deep-copy)", *meta.Capabilities, want)
+	}
+}
+
+// TestModelRegistry_SetCachedMetadata_CopiesCapabilities: a caller reusing its
+// ModelMetadata value (e.g. a probe loop) must not reach the stored entry.
+func TestModelRegistry_SetCachedMetadata_CopiesCapabilities(t *testing.T) {
+	registry := NewModelRegistry(nil)
+	entry := ModelMetadata{ContextWindow: 1000, Capabilities: &ModelCapabilities{Reasoning: true}}
+	registry.SetCachedMetadata("cached-model", entry)
+	*entry.Capabilities = ModelCapabilities{}
+
+	meta, ok := registry.ResolveLocal("cached-model")
+	if !ok {
+		t.Fatal("expected ok=true for cached model")
+	}
+	if !meta.Capabilities.Reasoning {
+		t.Errorf("Capabilities.Reasoning = false, want true (setter must copy)")
+	}
+}
+
+// TestModelRegistry_SetRuntimeMetadata_CopiesCapabilities: same ownership rule
+// for the runtime tier, both via the enriched resolver and via the raw
+// RuntimeMetadata read — which hands out its own copy as well.
+func TestModelRegistry_SetRuntimeMetadata_CopiesCapabilities(t *testing.T) {
+	registry := NewModelRegistry(nil)
+	entry := ModelMetadata{ContextWindow: 1000, Capabilities: &ModelCapabilities{Reasoning: true}}
+	registry.SetRuntimeMetadata("runtime-model", entry)
+	*entry.Capabilities = ModelCapabilities{}
+
+	meta, ok := registry.ResolveLocal("runtime-model")
+	if !ok {
+		t.Fatal("expected ok=true for runtime model")
+	}
+	if !meta.Capabilities.Reasoning {
+		t.Errorf("ResolveLocal: Capabilities.Reasoning = false, want true (setter must copy)")
+	}
+
+	raw, ok := registry.RuntimeMetadata("runtime-model")
+	if !ok {
+		t.Fatal("expected ok=true from RuntimeMetadata")
+	}
+	if !raw.Capabilities.Reasoning {
+		t.Errorf("RuntimeMetadata: Capabilities.Reasoning = false, want true (setter must copy)")
+	}
+
+	// The raw read must not alias the stored entry either.
+	*raw.Capabilities = ModelCapabilities{}
+	if raw2, _ := registry.RuntimeMetadata("runtime-model"); !raw2.Capabilities.Reasoning {
+		t.Error("RuntimeMetadata returned an alias of the stored entry: caller mutation leaked back")
 	}
 }
 
@@ -2237,14 +2512,22 @@ func TestResolveBuiltInModel_KnownModel(t *testing.T) {
 }
 
 func TestResolveBuiltInModel_CaseInsensitive(t *testing.T) {
-	// Built-in lookup is case-insensitive, mirroring Resolve.
+	// Built-in lookup is case-insensitive, mirroring Resolve. Capabilities is
+	// compared by VALUE: each call hands the caller its own defensive copy
+	// (see finalizeMeta), so pointer identity between two calls is
+	// deliberately not guaranteed.
 	upper, okUpper := ResolveBuiltInModel("GPT-4O")
 	lower, okLower := ResolveBuiltInModel("gpt-4o")
 	if !okUpper || !okLower {
 		t.Fatal("expected both lookups to succeed")
 	}
+	upperCaps, lowerCaps := upper.Capabilities, lower.Capabilities
+	upper.Capabilities, lower.Capabilities = nil, nil
 	if upper != lower {
 		t.Errorf("case-insensitive lookup mismatch: %+v vs %+v", upper, lower)
+	}
+	if upperCaps == nil || lowerCaps == nil || *upperCaps != *lowerCaps {
+		t.Errorf("case-insensitive capabilities mismatch: %+v vs %+v", upperCaps, lowerCaps)
 	}
 }
 

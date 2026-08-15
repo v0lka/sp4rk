@@ -56,8 +56,21 @@ type ModelMetadata struct {
 	// speaks. Populated lazily by resolveProtocol at Resolve time from
 	// DetectProtocol (or an explicit override), so callers can route the
 	// request to the right endpoint. See DetectProtocol for the mapping.
-	Protocol     APIProtocol
-	Capabilities ModelCapabilities
+	Protocol APIProtocol
+	// Capabilities is a POINTER so a record can distinguish "capabilities
+	// declared" (non-nil — even when every flag is false) from "capabilities
+	// unset — inherit from the lower tiers" (nil). Partial records (config
+	// overrides, observed runtime entries) leave it nil for the dimensions
+	// they did not pin; fully-populated records (built-in catalog, fallback
+	// defaults) always carry a non-nil value. Readers must nil-check before
+	// dereferencing raw/partial records; Resolve, ResolveLocal, and
+	// ResolveBuiltInModel output is always enriched to non-nil AND defensively
+	// copied — the caller owns the returned pointer and may mutate it freely
+	// (registry state, including the process-global built-in catalog, is never
+	// aliased). Symmetrically, records handed TO the registry (overrides maps,
+	// SetCachedMetadata, SetRuntimeMetadata) are copied on write, so the
+	// caller's later mutations cannot reach the stored entries.
+	Capabilities *ModelCapabilities
 }
 
 // ModelMetadataSource is a function that can resolve model metadata from an external source.
@@ -83,12 +96,15 @@ type ModelRegistry struct {
 //
 // The overrides map is defensively copied at construction time so that callers
 // (e.g. config reloads) can mutate their own map without racing the registry's
-// concurrent readers.
+// concurrent readers. The copy is DEEP with respect to Capabilities: each
+// entry's pointer is cloned, so the caller mutating its capability structs
+// after hand-off cannot reach (or race) the registry's stored entries.
 func NewModelRegistry(overrides map[string]ModelMetadata) *ModelRegistry {
 	copied := make(map[string]ModelMetadata, len(overrides))
 	for k, v := range overrides {
 		// Normalize override keys to lowercase so they are matched by the
 		// case-insensitive Resolve lookup.
+		v.Capabilities = cloneCapabilities(v.Capabilities)
 		copied[strings.ToLower(k)] = v
 	}
 	return &ModelRegistry{
@@ -140,6 +156,8 @@ func (r *ModelRegistry) SetHTTPClient(client *http.Client) {
 //
 // The second return value indicates whether the model was found in a known source.
 // When ok is false, the returned metadata contains usable fallback defaults.
+// Regardless of tier, the returned Capabilities is always non-nil and
+// defensively copied — the caller owns it (see finalizeMeta).
 func (r *ModelRegistry) Resolve(ctx context.Context, model string) (ModelMetadata, bool) {
 	// Local tiers first: overrides → built-in → fuzzy → lazy cache (see
 	// ResolveLocal). A hit needs no I/O, so the network tiers below run only
@@ -158,10 +176,16 @@ func (r *ModelRegistry) Resolve(ctx context.Context, model string) (ModelMetadat
 	if !r.negativeCacheFresh(key) {
 		meta, err := r.fetchFromHuggingFace(ctx, model)
 		if err == nil {
-			meta.Family = resolveFamily(model, meta)
-			meta.Protocol = resolveProtocol(model, meta)
+			meta = finalizeMeta(model, meta)
+			// Cache a twin that owns its own Capabilities copy, so caller
+			// mutations of the returned metadata can never reach the cached
+			// entry (and race later readers). The negative-cache record is
+			// cleared under the same lock: a successful probe ends the
+			// suppression window atomically with the cache write.
+			cached := meta
+			cached.Capabilities = cloneCapabilities(meta.Capabilities)
 			r.mu.Lock()
-			r.cache[key] = meta
+			r.cache[key] = cached
 			delete(r.negativeCache, key)
 			r.mu.Unlock()
 			return meta, true
@@ -197,11 +221,8 @@ func (r *ModelRegistry) Resolve(ctx context.Context, model string) (ModelMetadat
 		if !ok {
 			continue
 		}
-		m.Family = resolveFamily(model, m)
-		m.Protocol = resolveProtocol(model, m)
-		r.mu.Lock()
-		r.cache[key] = m
-		r.mu.Unlock()
+		m = finalizeMeta(model, m)
+		r.cacheResolved(key, m)
 		return m, true
 	}
 
@@ -209,10 +230,7 @@ func (r *ModelRegistry) Resolve(ctx context.Context, model string) (ModelMetadat
 	// Assume attachment support optimistically: an unknown model may well be
 	// multimodal, and it is better to surface a runtime provider error than to
 	// silently deny image uploads for a model the registry does not know.
-	meta := fallbackMetadata()
-	meta.Family = resolveFamily(model, meta)
-	meta.Protocol = resolveProtocol(model, meta)
-	return meta, false
+	return finalizeMeta(model, fallbackMetadata()), false
 }
 
 // ResolveLocal returns model metadata using a strictly local, network-free
@@ -240,7 +258,9 @@ func (r *ModelRegistry) Resolve(ctx context.Context, model string) (ModelMetadat
 //
 // The second return value indicates whether the model was found in a known
 // local source; when it is false the returned metadata contains the same
-// usable fallback defaults Resolve returns.
+// usable fallback defaults Resolve returns. Regardless of tier, the returned
+// Capabilities is always non-nil and defensively copied — the caller owns it
+// (see finalizeMeta).
 func (r *ModelRegistry) ResolveLocal(model string) (ModelMetadata, bool) {
 	// Case-insensitive lookup: model IDs arriving from OpenAI-compatible hosts
 	// (e.g. vLLM) frequently differ only in casing from their canonical
@@ -255,9 +275,7 @@ func (r *ModelRegistry) ResolveLocal(model string) (ModelMetadata, bool) {
 		// lower non-network tiers so it does not collapse the context window
 		// or output limit to zero. See enrichPartialOverride.
 		meta = r.enrichPartialOverride(model, key, meta)
-		meta.Family = resolveFamily(model, meta)
-		meta.Protocol = resolveProtocol(model, meta)
-		return meta, true
+		return finalizeMeta(model, meta), true
 	}
 
 	// Priority 1.5: Observed runtime entry (SetRuntimeMetadata). A self-hosted
@@ -270,16 +288,12 @@ func (r *ModelRegistry) ResolveLocal(model string) (ModelMetadata, bool) {
 		meta = r.enrichPartialWith(meta, func() ModelMetadata {
 			return r.resolveSpecOrCache(model, key)
 		})
-		meta.Family = resolveFamily(model, meta)
-		meta.Protocol = resolveProtocol(model, meta)
-		return meta, true
+		return finalizeMeta(model, meta), true
 	}
 
 	// Priority 2: Check built-in registry (no lock needed for read-only map)
 	if meta, ok := r.builtIn[key]; ok {
-		meta.Family = resolveFamily(model, meta)
-		meta.Protocol = resolveProtocol(model, meta)
-		return meta, true
+		return finalizeMeta(model, meta), true
 	}
 
 	// Priority 2b: Fuzzy match — separator-insensitive lookup across
@@ -289,11 +303,8 @@ func (r *ModelRegistry) ResolveLocal(model string) (ModelMetadata, bool) {
 	// without the false-positive risk of edit-distance matching. Cache the hit
 	// under the query key so repeat resolves take the fast path.
 	if meta, ok := r.fuzzyLookup(model); ok {
-		meta.Family = resolveFamily(model, meta)
-		meta.Protocol = resolveProtocol(model, meta)
-		r.mu.Lock()
-		r.cache[key] = meta
-		r.mu.Unlock()
+		meta = finalizeMeta(model, meta)
+		r.cacheResolved(key, meta)
 		return meta, true
 	}
 
@@ -303,17 +314,12 @@ func (r *ModelRegistry) ResolveLocal(model string) (ModelMetadata, bool) {
 	meta, ok := r.cache[key]
 	r.mu.RUnlock()
 	if ok {
-		meta.Family = resolveFamily(model, meta)
-		meta.Protocol = resolveProtocol(model, meta)
-		return meta, true
+		return finalizeMeta(model, meta), true
 	}
 
 	// Priority 5: Fallback to defaults — identical values and rationale as
 	// Resolve's tier 5 (see fallbackMetadata).
-	meta = fallbackMetadata()
-	meta.Family = resolveFamily(model, meta)
-	meta.Protocol = resolveProtocol(model, meta)
-	return meta, false
+	return finalizeMeta(model, fallbackMetadata()), false
 }
 
 // negativeCacheFresh reports whether a failed HuggingFace probe for key is
@@ -380,9 +386,14 @@ func (r *ModelRegistry) Invalidate(model string) {
 // result, or a well-known model's spec is never silently clobbered.
 // Calling this for a model that already resolved from tier 1/1.5/2 will simply be
 // shadowed at Resolve time.
+//
+// The entry is defensively copied on write (Capabilities is cloned), so the
+// caller may keep mutating its own ModelMetadata afterwards without racing
+// the registry's concurrent readers.
 func (r *ModelRegistry) SetCachedMetadata(model string, meta ModelMetadata) {
 	meta.Family = resolveFamily(model, meta)
 	meta.Protocol = resolveProtocol(model, meta)
+	meta.Capabilities = cloneCapabilities(meta.Capabilities)
 	r.mu.Lock()
 	r.cache[strings.ToLower(model)] = meta
 	r.mu.Unlock()
@@ -422,9 +433,14 @@ func (r *ModelRegistry) SetCachedMetadata(model string, meta ModelMetadata) {
 // the normalized-ID fuzzy index, so a later lookup under a cosmetically
 // drifted spelling of the same id (e.g. a dropped dot) still finds the
 // observed limits.
+//
+// The entry is defensively copied on write (Capabilities is cloned), so a
+// probe that reuses its own ModelMetadata value afterwards cannot race the
+// registry's concurrent readers.
 func (r *ModelRegistry) SetRuntimeMetadata(model string, meta ModelMetadata) {
 	meta.Family = resolveFamily(model, meta)
 	meta.Protocol = resolveProtocol(model, meta)
+	meta.Capabilities = cloneCapabilities(meta.Capabilities)
 	r.mu.Lock()
 	r.runtime[strings.ToLower(model)] = meta
 	r.rebuildRuntimeIndex()
@@ -449,11 +465,13 @@ func (r *ModelRegistry) rebuildRuntimeIndex() {
 // The entry is returned AS STORED, without tier enrichment: a partial entry
 // (e.g. one carrying only the observed ContextWindow) reports zero for the
 // fields the probe did not observe. Use ResolveLocal for the effective,
-// enriched values.
+// enriched values. The Capabilities pointer is cloned so the caller owns its
+// copy — mutating the returned metadata never touches the stored entry.
 func (r *ModelRegistry) RuntimeMetadata(model string) (ModelMetadata, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	meta, ok := r.runtime[strings.ToLower(model)]
+	meta.Capabilities = cloneCapabilities(meta.Capabilities)
 	return meta, ok
 }
 
@@ -493,14 +511,13 @@ func resolveProtocol(modelID string, meta ModelMetadata) APIProtocol {
 //
 // The inheritable fields are ContextWindow, OutputLimit, TokenizerType, and
 // Capabilities. Capabilities joins the scalar set as a first-class inheritable
-// field: a zero-valued ModelCapabilities (all bools false) is treated as
-// "unset" and inherited from the lower tiers, exactly like a zero
-// ContextWindow. This closes the footgun where a minimal protocol-pinning
-// override of a well-known model (e.g. {"gpt-4o": {Protocol: ChatCompletions}})
-// silently disabled image uploads, reasoning, and tool-calling. The accepted
-// tradeoff — mirroring the scalars — is that there is no way to express
-// "explicitly disable every capability" via a partial override, since the zero
-// value is reserved for "inherit".
+// field via its nil pointer: nil = "unset, inherit from the lower tiers",
+// exactly like a zero ContextWindow, while a non-nil value is AUTHORITATIVE —
+// even when every flag is false. This closes the footgun where a minimal
+// protocol-pinning override of a well-known model (e.g. {"gpt-4o": {Protocol:
+// ChatCompletions}}) silently disabled image uploads, reasoning, and
+// tool-calling, without reserving the all-false capability set as "inherit":
+// a user who explicitly disables every capability gets exactly that.
 //
 // The motivating bug: a protocol-only override that also carried a fallback
 // ContextWindow (128000) would shadow a lazy local-model probe writing the
@@ -521,7 +538,7 @@ func (r *ModelRegistry) enrichPartialOverride(model, key string, override ModelM
 // logic in two places.
 func (r *ModelRegistry) enrichPartialWith(override ModelMetadata, baseline func() ModelMetadata) ModelMetadata {
 	if override.ContextWindow != 0 && override.OutputLimit != 0 &&
-		override.TokenizerType != "" && override.Capabilities != (ModelCapabilities{}) {
+		override.TokenizerType != "" && override.Capabilities != nil {
 		return override
 	}
 	lower := baseline()
@@ -534,7 +551,7 @@ func (r *ModelRegistry) enrichPartialWith(override ModelMetadata, baseline func(
 	if override.TokenizerType == "" {
 		override.TokenizerType = lower.TokenizerType
 	}
-	if override.Capabilities == (ModelCapabilities{}) {
+	if override.Capabilities == nil {
 		override.Capabilities = lower.Capabilities
 	}
 	return override
@@ -592,8 +609,8 @@ func (r *ModelRegistry) resolveSpecOrCache(model, key string) ModelMetadata {
 	}
 	// Match Resolve's tier-5 fallback exactly (fallbackMetadata), including
 	// the optimistic Capabilities. enrichPartialOverride inherits unset scalar
-	// fields from this value; if Capabilities were left at the zero value
-	// here, a protocol-only partial override for a catalog-MISS model would
+	// fields from this value; if Capabilities were left nil here, a
+	// protocol-only partial override for a catalog-MISS model would
 	// silently disable Attachment (and every other capability) — the same
 	// footgun the built-in inheritance path already guards against for
 	// catalog-HIT models.
@@ -725,8 +742,64 @@ func getBuiltInIndex() map[string]ModelMetadata {
 // Attachment support is assumed optimistically. It is far better to let a user
 // attach an image and surface a provider error at runtime than to silently
 // disable image uploads for a model the registry simply does not know about.
-func defaultUnknownCapabilities() ModelCapabilities {
-	return ModelCapabilities{Attachment: true}
+func defaultUnknownCapabilities() *ModelCapabilities {
+	return &ModelCapabilities{Attachment: true}
+}
+
+// cloneCapabilities returns a defensive copy of caps. A nil input yields a
+// nil output: cloning never invents capability data, it only severs pointer
+// aliasing. Callers that hand ModelMetadata across an API boundary — a public
+// resolver returning registry state, or a write method storing caller-supplied
+// state — route the pointer through this copy so neither side can mutate the
+// other's view (or race a concurrent reader on the other side).
+func cloneCapabilities(caps *ModelCapabilities) *ModelCapabilities {
+	if caps == nil {
+		return nil
+	}
+	copied := *caps
+	return &copied
+}
+
+// finalizeMeta performs the last normalization step shared by every public
+// resolver return path (Resolve, ResolveLocal, ResolveBuiltInModel): it
+// derives Family/Protocol from the model ID when the record left them empty,
+// and it guarantees the documented Capabilities contract — non-nil AND
+// privately owned by the caller:
+//
+//   - nil Capabilities (no tier declared capabilities, e.g. a partial override
+//     enriched against a partial cache entry) falls back to the optimistic
+//     unknown set, mirroring the tier-5 fallback rationale: better to surface
+//     a runtime provider error than silently deny image uploads for a model
+//     the registry knows nothing about.
+//   - non-nil Capabilities is cloned so the returned metadata never aliases
+//     registry state (built-in catalog entries are process-global; cache and
+//     runtime entries are shared across concurrent readers). Callers may
+//     mutate the returned struct freely.
+//
+// A non-nil value is otherwise returned as AUTHORITATIVE — an all-false set
+// stays all-false; the nil guard never overrides a declared value.
+func finalizeMeta(model string, meta ModelMetadata) ModelMetadata {
+	meta.Family = resolveFamily(model, meta)
+	meta.Protocol = resolveProtocol(model, meta)
+	if meta.Capabilities == nil {
+		meta.Capabilities = defaultUnknownCapabilities()
+		return meta
+	}
+	meta.Capabilities = cloneCapabilities(meta.Capabilities)
+	return meta
+}
+
+// cacheResolved stores a resolved metadata entry in the lazy cache (tier 3)
+// under its lowercased key so repeat lookups take the fast path. The stored
+// entry owns a private copy of Capabilities: the value about to be handed to
+// the resolver's caller is free to mutate its Capabilities, and the cached
+// twin must not observe (or race concurrent readers on) those mutations.
+func (r *ModelRegistry) cacheResolved(key string, meta ModelMetadata) {
+	cached := meta
+	cached.Capabilities = cloneCapabilities(meta.Capabilities)
+	r.mu.Lock()
+	r.cache[key] = cached
+	r.mu.Unlock()
 }
 
 // RegisterSource adds a metadata source to the registry.
@@ -819,133 +892,133 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   128000,
 			TokenizerType: "tiktoken/o200k_base",
 			Family:        "openai_flagship",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
 		},
 		"gpt-5.6-sol": {
 			ContextWindow: 1050000,
 			OutputLimit:   128000,
 			TokenizerType: "tiktoken/o200k_base",
 			Family:        "openai_flagship",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
 		},
 		"gpt-5.6-terra": {
 			ContextWindow: 1050000,
 			OutputLimit:   128000,
 			TokenizerType: "tiktoken/o200k_base",
 			Family:        "openai_flagship",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
 		},
 		"gpt-5.6-luna": {
 			ContextWindow: 1050000,
 			OutputLimit:   128000,
 			TokenizerType: "tiktoken/o200k_base",
 			Family:        "openai_flagship",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
 		},
 		"gpt-5.5": {
 			ContextWindow: 1050000,
 			OutputLimit:   128000,
 			TokenizerType: "tiktoken/o200k_base",
 			Family:        "openai_flagship",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
 		},
 		"gpt-5.4": {
 			ContextWindow: 1050000,
 			OutputLimit:   128000,
 			TokenizerType: "tiktoken/o200k_base",
 			Family:        "openai_flagship",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
 		},
 		"gpt-5.4-mini": {
 			ContextWindow: 400000,
 			OutputLimit:   128000,
 			TokenizerType: "tiktoken/o200k_base",
 			Family:        "openai_flagship",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
 		},
 		"gpt-5.4-nano": {
 			ContextWindow: 400000,
 			OutputLimit:   128000,
 			TokenizerType: "tiktoken/o200k_base",
 			Family:        "openai_flagship",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
 		},
 		"gpt-5": {
 			ContextWindow: 400000,
 			OutputLimit:   128000,
 			TokenizerType: "tiktoken/o200k_base",
 			Family:        "openai_flagship",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
 		},
 		"gpt-4.1": {
 			ContextWindow: 1047576,
 			OutputLimit:   32768,
 			TokenizerType: "tiktoken/o200k_base",
 			Family:        "openai_standard",
-			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
 		},
 		"gpt-4.1-mini": {
 			ContextWindow: 1047576,
 			OutputLimit:   32768,
 			TokenizerType: "tiktoken/o200k_base",
 			Family:        "openai_standard",
-			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
 		},
 		"gpt-4.1-nano": {
 			ContextWindow: 1047576,
 			OutputLimit:   32768,
 			TokenizerType: "tiktoken/o200k_base",
 			Family:        "openai_standard",
-			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
 		},
 		"o4-mini": {
 			ContextWindow: 200000,
 			OutputLimit:   100000,
 			TokenizerType: "tiktoken/o200k_base",
 			Family:        "openai_flagship",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
 		},
 		"o3": {
 			ContextWindow: 200000,
 			OutputLimit:   100000,
 			TokenizerType: "tiktoken/o200k_base",
 			Family:        "openai_flagship",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
 		},
 		"o3-mini": {
 			ContextWindow: 200000,
 			OutputLimit:   100000,
 			TokenizerType: "tiktoken/o200k_base",
 			Family:        "openai_flagship",
-			Capabilities:  ModelCapabilities{Reasoning: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, ToolCall: true},
 		},
 		"o1": {
 			ContextWindow: 200000,
 			OutputLimit:   100000,
 			TokenizerType: "tiktoken/o200k_base",
 			Family:        "openai_flagship",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
 		},
 		"o1-mini": {
 			ContextWindow: 128000,
 			OutputLimit:   65536,
 			TokenizerType: "tiktoken/o200k_base",
 			Family:        "openai_flagship",
-			Capabilities:  ModelCapabilities{Reasoning: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, ToolCall: true},
 		},
 		"gpt-4o": {
 			ContextWindow: 128000,
 			OutputLimit:   16384,
 			TokenizerType: "tiktoken/o200k_base",
 			Family:        "openai_flagship",
-			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
 		},
 		"gpt-4o-mini": {
 			ContextWindow: 128000,
 			OutputLimit:   16384,
 			TokenizerType: "tiktoken/o200k_base",
 			Family:        "openai_flagship",
-			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
 		},
 		// Codex models — use the OpenAI Responses API (/v1/responses).
 		"codex-mini-latest": {
@@ -953,14 +1026,14 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   100000,
 			TokenizerType: "tiktoken/o200k_base",
 			Family:        "openai_codex",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
 		},
 		"gpt-5.3-codex": {
 			ContextWindow: 400000,
 			OutputLimit:   128000,
 			TokenizerType: "tiktoken/o200k_base",
 			Family:        "openai_codex",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
 		},
 
 		// ── Anthropic models ────────────────────────────────────────────
@@ -975,98 +1048,98 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   128000,
 			TokenizerType: "anthropic-api",
 			Family:        "anthropic",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"claude-opus-5": {
 			ContextWindow: 1000000,
 			OutputLimit:   128000,
 			TokenizerType: "anthropic-api",
 			Family:        "anthropic",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"claude-sonnet-5": {
 			ContextWindow: 1000000,
 			OutputLimit:   128000,
 			TokenizerType: "anthropic-api",
 			Family:        "anthropic",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"claude-opus-4-8": {
 			ContextWindow: 1000000,
 			OutputLimit:   128000,
 			TokenizerType: "anthropic-api",
 			Family:        "anthropic",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"claude-opus-4-7": {
 			ContextWindow: 1000000,
 			OutputLimit:   128000,
 			TokenizerType: "anthropic-api",
 			Family:        "anthropic",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"claude-opus-4-6": {
 			ContextWindow: 1000000,
 			OutputLimit:   128000,
 			TokenizerType: "anthropic-api",
 			Family:        "anthropic",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"claude-sonnet-4-6": {
 			ContextWindow: 1000000,
 			OutputLimit:   128000,
 			TokenizerType: "anthropic-api",
 			Family:        "anthropic",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"claude-haiku-4-5": {
 			ContextWindow: 200000,
 			OutputLimit:   64000,
 			TokenizerType: "anthropic-api",
 			Family:        "anthropic",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"claude-sonnet-4-5": {
 			ContextWindow: 200000,
 			OutputLimit:   64000,
 			TokenizerType: "anthropic-api",
 			Family:        "anthropic",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"claude-opus-4-5": {
 			ContextWindow: 200000,
 			OutputLimit:   64000,
 			TokenizerType: "anthropic-api",
 			Family:        "anthropic",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"claude-sonnet-4": {
 			ContextWindow: 200000,
 			OutputLimit:   64000,
 			TokenizerType: "anthropic-api",
 			Family:        "anthropic",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"claude-opus-4": {
 			ContextWindow: 200000,
 			OutputLimit:   32000,
 			TokenizerType: "anthropic-api",
 			Family:        "anthropic",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"claude-3.5-sonnet": {
 			ContextWindow: 200000,
 			OutputLimit:   8192,
 			TokenizerType: "anthropic-api",
 			Family:        "anthropic",
-			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
 		},
 		"claude-3.5-haiku": {
 			ContextWindow: 200000,
 			OutputLimit:   8192,
 			TokenizerType: "anthropic-api",
 			Family:        "anthropic",
-			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
 		},
 
 		// ── Google Gemini models ────────────────────────────────────────
@@ -1080,63 +1153,63 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "google",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"gemini-3.5-flash-lite": {
 			ContextWindow: 1048576,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "google",
-			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
 		},
 		"gemini-3.1-pro": {
 			ContextWindow: 1048576,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "google",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"gemini-3.1-flash-lite": {
 			ContextWindow: 1048576,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "google",
-			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
 		},
 		"gemini-3-flash": {
 			ContextWindow: 1048576,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "google",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"gemini-2.5-pro": {
 			ContextWindow: 1048576,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "google",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"gemini-2.5-flash": {
 			ContextWindow: 1048576,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "google",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"gemini-2.5-flash-lite": {
 			ContextWindow: 1048576,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "google",
-			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
 		},
 		"gemini-2.0-flash": {
 			ContextWindow: 1048576,
 			OutputLimit:   8192,
 			TokenizerType: "approximate",
 			Family:        "google",
-			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
 		},
 		// Google Gemma 4 — open-weights (HF: google/gemma-4-31B-it).
 		// Multimodal (text+image), configurable thinking, native function
@@ -1146,7 +1219,7 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "google",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 
 		// ── DeepSeek models ─────────────────────────────────────────────
@@ -1157,14 +1230,14 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   384000,
 			TokenizerType: "approximate",
 			Family:        "deepseek",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"deepseek-v4-flash": {
 			ContextWindow: 1000000,
 			OutputLimit:   384000,
 			TokenizerType: "approximate",
 			Family:        "deepseek",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 
 		// ── Kimi models (Moonshot AI) ───────────────────────────────────
@@ -1191,7 +1264,7 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   131072,
 			TokenizerType: "approximate",
 			Family:        "kimi",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		// Kimi Code endpoint aliases (see the section comment above).
 		"k3": {
@@ -1199,56 +1272,56 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   131072,
 			TokenizerType: "approximate",
 			Family:        "kimi",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"k3-256k": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "kimi",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"kimi-k2.7-code": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "kimi",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"kimi-k2.7-code-highspeed": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "kimi",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"kimi-for-coding": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "kimi",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"kimi-for-coding-highspeed": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "kimi",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"kimi-k2.6": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "kimi",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"kimi-k2.5": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "kimi",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		// kimi-k2 series deprecated May 25 2026; kept for backward compat.
 		"kimi-k2": {
@@ -1256,14 +1329,14 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "kimi",
-			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Temperature: true, ToolCall: true},
 		},
 		"kimi-k2-thinking": {
 			ContextWindow: 131072,
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "kimi",
-			Capabilities:  ModelCapabilities{Reasoning: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, ToolCall: true},
 		},
 
 		// ── Qwen models (Alibaba) ───────────────────────────────────────
@@ -1277,28 +1350,28 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"qwen3.7-plus": {
 			ContextWindow: 1000000,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"qwen3.6-flash": {
 			ContextWindow: 1000000,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"qwen3-coder-plus": {
 			ContextWindow: 1000000,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		// Listed under "Legacy Qwen" in current docs.
 		"qwen-plus": {
@@ -1306,7 +1379,7 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   8192,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		// qwen-max does NOT support thinking mode per Alibaba's model table.
 		"qwen-max": {
@@ -1314,14 +1387,14 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   8192,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Temperature: true, ToolCall: true},
 		},
 		"qwq-plus": {
 			ContextWindow: 128000,
 			OutputLimit:   16384,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Reasoning: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, ToolCall: true},
 		},
 
 		// ── GLM models (Zhipu AI) ───────────────────────────────────────
@@ -1333,28 +1406,28 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   128000,
 			TokenizerType: "approximate",
 			Family:        "glm",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"glm-5.1": {
 			ContextWindow: 200000,
 			OutputLimit:   128000,
 			TokenizerType: "approximate",
 			Family:        "glm",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"glm-5": {
 			ContextWindow: 200000,
 			OutputLimit:   128000,
 			TokenizerType: "approximate",
 			Family:        "glm",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"glm-4.7": {
 			ContextWindow: 200000,
 			OutputLimit:   128000,
 			TokenizerType: "approximate",
 			Family:        "glm",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		// glm-z1-32b deprecated Nov 2025; kept for backward compat.
 		"glm-z1-32b": {
@@ -1362,7 +1435,7 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   16384,
 			TokenizerType: "approximate",
 			Family:        "glm",
-			Capabilities:  ModelCapabilities{Reasoning: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, ToolCall: true},
 		},
 
 		// ── xAI Grok models ─────────────────────────────────────────────
@@ -1376,42 +1449,42 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
 		},
 		"grok-4.3": {
 			ContextWindow: 1000000,
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
 		},
 		"grok-4.20": {
 			ContextWindow: 1000000,
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
 		},
 		"grok-4": {
 			ContextWindow: 256000,
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Temperature: true, ToolCall: true},
 		},
 		"grok-3": {
 			ContextWindow: 131072,
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Temperature: true, ToolCall: true},
 		},
 		"grok-3-mini": {
 			ContextWindow: 131072,
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 
 		// ── Local / open-weights models (LM Studio catalog) ────────────
@@ -1432,42 +1505,42 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Temperature: true, ToolCall: true},
 		},
 		"qwen/qwen3-4b-thinking-2507": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"qwen/qwen3-30b-a3b-2507": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Temperature: true, ToolCall: true},
 		},
 		"qwen/qwen3-30b-a3b-thinking-2507": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"qwen/qwen3-235b-a22b-2507": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Temperature: true, ToolCall: true},
 		},
 		"qwen/qwen3-235b-a22b-thinking-2507": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		// Qwen3 (1st generation, 2504): hybrid thinking, 128K context.
 		"qwen/qwen3-4b": {
@@ -1475,42 +1548,42 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"qwen/qwen3-8b": {
 			ContextWindow: 131072,
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"qwen/qwen3-14b": {
 			ContextWindow: 131072,
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"qwen/qwen3-32b": {
 			ContextWindow: 131072,
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"qwen/qwen3-30b-a3b": {
 			ContextWindow: 131072,
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"qwen/qwen3-235b-a22b": {
 			ContextWindow: 131072,
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		// Qwen3.5: multimodal (text+image), thinking, 256K context.
 		"qwen/qwen3.5-2b": {
@@ -1518,35 +1591,35 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"qwen/qwen3.5-4b": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"qwen/qwen3.5-9b": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"qwen/qwen3.5-27b": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"qwen/qwen3.5-35b-a3b": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		// Qwen3.5 FP8 (HuggingFace): official FP8 checkpoints of the flagship
 		// gated-delta-networks MoE members. Same multimodal (text+image),
@@ -1557,14 +1630,14 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"qwen/qwen3.5-122b-a10b-fp8": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		// Qwen3.6: multimodal, thinking, 256K context.
 		"qwen/qwen3.6-27b": {
@@ -1572,14 +1645,14 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"qwen/qwen3.6-35b-a3b": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		// Qwen3.6 FP8 (HuggingFace): FP8 checkpoint of the smaller Qwen3.6
 		// flagship — same multimodal MoE architecture and 256K context.
@@ -1589,7 +1662,7 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		// Qwen3.8: dense multimodal (text+image/video), thinking on by default
 		// (disabling per request, depth via reasoning_effort), 256K context,
@@ -1600,7 +1673,7 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		// Qwen3.8-2.4T-A95B: the open flagship — first Qwen-Max-class open
 		// release. TEXT-ONLY MoE (no vision tower), unlike the smaller dense
@@ -1613,7 +1686,7 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		// Qwen3.8 FP8 (HuggingFace): official FP8 checkpoints of the 3.8
 		// lineup — same architectures, thinking, tool support, and 256K
@@ -1626,14 +1699,14 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"qwen/qwen3.8-27b-fp8": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		// Qwen3-Coder: non-thinking coding MoE, 256K context.
 		"qwen/qwen3-coder-30b": {
@@ -1641,28 +1714,28 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Temperature: true, ToolCall: true},
 		},
 		"qwen/qwen3-coder-480b": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Temperature: true, ToolCall: true},
 		},
 		"qwen/qwen3-coder-next": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Temperature: true, ToolCall: true},
 		},
 		"qwen/qwen3-next-80b": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Temperature: true, ToolCall: true},
 		},
 		// Qwen3-VL: vision-language, thinking, 256K context.
 		"qwen/qwen3-vl-2b": {
@@ -1670,35 +1743,35 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"qwen/qwen3-vl-4b": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"qwen/qwen3-vl-8b": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"qwen/qwen3-vl-30b": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"qwen/qwen3-vl-32b": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		// Qwen2.5-VL: vision-language, 128K context.
 		"qwen/qwen2.5-vl-3b": {
@@ -1706,28 +1779,28 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   8192,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
 		},
 		"qwen/qwen2.5-vl-7b": {
 			ContextWindow: 128000,
 			OutputLimit:   8192,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
 		},
 		"qwen/qwen2.5-vl-32b": {
 			ContextWindow: 128000,
 			OutputLimit:   8192,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
 		},
 		"qwen/qwen2.5-vl-72b": {
 			ContextWindow: 128000,
 			OutputLimit:   8192,
 			TokenizerType: "approximate",
 			Family:        "qwen",
-			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
 		},
 
 		// ── DeepSeek (open reasoning distills) ─────────────────────────
@@ -1737,42 +1810,42 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "deepseek",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true},
 		},
 		"deepseek/deepseek-r1-distill-qwen-7b": {
 			ContextWindow: 131072,
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "deepseek",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true},
 		},
 		"deepseek/deepseek-r1-distill-llama-8b": {
 			ContextWindow: 131072,
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "deepseek",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true},
 		},
 		"deepseek/deepseek-r1-distill-qwen-14b": {
 			ContextWindow: 131072,
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "deepseek",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true},
 		},
 		"deepseek/deepseek-r1-distill-qwen-32b": {
 			ContextWindow: 131072,
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "deepseek",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true},
 		},
 		"deepseek/deepseek-r1-distill-llama-70b": {
 			ContextWindow: 131072,
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "deepseek",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true},
 		},
 
 		// ── GLM (Z.ai open coding) ─────────────────────────────────────
@@ -1781,14 +1854,14 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "glm",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"zai-org/glm-4.6v-flash": {
 			ContextWindow: 131072,
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "glm",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		// GLM-5.2 FP8 (HuggingFace): official FP8 checkpoint of Z.ai's
 		// flagship 753B MoE. Same reasoning/tool-calling model with native
@@ -1799,7 +1872,7 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "glm",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 
 		// ── Google Gemma (open-weights) ────────────────────────────────
@@ -1810,35 +1883,35 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "google",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"google/gemma-4-e4b": {
 			ContextWindow: 131072,
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "google",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"google/gemma-4-12b": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "google",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"google/gemma-4-26b-a4b": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "google",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"google/gemma-4-31b": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "google",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		// Gemma 4 QAT (Quantization-Aware Training): GGUF builds of the
 		// instruction-tuned 12B/26B-A4B/31B models trained to be robust to
@@ -1851,21 +1924,21 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "google",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"google/gemma-4-26b-a4b-qat": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "google",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"google/gemma-4-31b-qat": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "google",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		// Gemma 4 31B-it FP8: official FP8 checkpoint of the instruction-tuned
 		// 31B model (google/gemma-4-31B-it, image-text-to-text). FP8 only trims
@@ -1876,7 +1949,7 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "google",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		// Gemma 3: image+text (≥4B), 128K; 270M/1B text-only, 32K.
 		"google/gemma-3-270m": {
@@ -1884,35 +1957,35 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   8192,
 			TokenizerType: "approximate",
 			Family:        "google",
-			Capabilities:  ModelCapabilities{Temperature: true},
+			Capabilities:  &ModelCapabilities{Temperature: true},
 		},
 		"google/gemma-3-1b": {
 			ContextWindow: 32768,
 			OutputLimit:   8192,
 			TokenizerType: "approximate",
 			Family:        "google",
-			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Temperature: true, ToolCall: true},
 		},
 		"google/gemma-3-4b": {
 			ContextWindow: 131072,
 			OutputLimit:   8192,
 			TokenizerType: "approximate",
 			Family:        "google",
-			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
 		},
 		"google/gemma-3-12b": {
 			ContextWindow: 131072,
 			OutputLimit:   8192,
 			TokenizerType: "approximate",
 			Family:        "google",
-			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
 		},
 		"google/gemma-3-27b": {
 			ContextWindow: 131072,
 			OutputLimit:   8192,
 			TokenizerType: "approximate",
 			Family:        "google",
-			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
 		},
 		// Gemma 3n: on-device multimodal, 32K.
 		"google/gemma-3n-e2b": {
@@ -1920,14 +1993,14 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   8192,
 			TokenizerType: "approximate",
 			Family:        "google",
-			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Temperature: true},
 		},
 		"google/gemma-3n-e4b": {
 			ContextWindow: 32768,
 			OutputLimit:   8192,
 			TokenizerType: "approximate",
 			Family:        "google",
-			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Temperature: true},
 		},
 		// FunctionGemma: tiny function-calling foundation, 32K.
 		"google/functiongemma-270m": {
@@ -1935,7 +2008,7 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   8192,
 			TokenizerType: "approximate",
 			Family:        "google",
-			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Temperature: true, ToolCall: true},
 		},
 
 		// ── Mistral (open-weights) ─────────────────────────────────────
@@ -1944,21 +2017,21 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   8192,
 			TokenizerType: "approximate",
 			Family:        "mistral",
-			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Temperature: true, ToolCall: true},
 		},
 		"mistralai/mistral-nemo-instruct-2407": {
 			ContextWindow: 131072,
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "mistral",
-			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Temperature: true, ToolCall: true},
 		},
 		"mistralai/mistral-small-3.2": {
 			ContextWindow: 131072,
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "mistral",
-			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
 		},
 		// Magistral: reasoning, 128K. v1.2 (+vision) and v1.1 (text).
 		"mistralai/magistral-small-2509": {
@@ -1966,14 +2039,14 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "mistral",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"mistralai/magistral-small": {
 			ContextWindow: 131072,
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "mistral",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		// Devstral: agentic coding, 128K. Devstral 2 adds vision (123B = 256K).
 		"mistralai/devstral-small-2507": {
@@ -1981,28 +2054,28 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "mistral",
-			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Temperature: true, ToolCall: true},
 		},
 		"mistralai/devstral-small-2505": {
 			ContextWindow: 131072,
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "mistral",
-			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Temperature: true, ToolCall: true},
 		},
 		"mistralai/devstral-small-2-2512": {
 			ContextWindow: 131072,
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "mistral",
-			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
 		},
 		"mistralai/devstral-2-2512": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "mistral",
-			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
 		},
 		// Codestral: coding, 32K.
 		"mistralai/codestral-22b-v0.1": {
@@ -2010,7 +2083,7 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   8192,
 			TokenizerType: "approximate",
 			Family:        "mistral",
-			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Temperature: true, ToolCall: true},
 		},
 		// Ministral 3: multimodal, 256K (base instruct variants).
 		"mistralai/ministral-3-3b": {
@@ -2018,21 +2091,21 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "mistral",
-			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
 		},
 		"mistralai/ministral-3-8b": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "mistral",
-			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
 		},
 		"mistralai/ministral-3-14b": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "mistral",
-			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Temperature: true, ToolCall: true},
 		},
 
 		// ── OpenAI gpt-oss (open-weights) ──────────────────────────────
@@ -2042,14 +2115,14 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"openai/gpt-oss-120b": {
 			ContextWindow: 131072,
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		// gpt-oss-safeguard: content classifiers (not chat/agent models).
 		"openai/gpt-oss-safeguard-20b": {
@@ -2057,14 +2130,14 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Temperature: true},
+			Capabilities:  &ModelCapabilities{Temperature: true},
 		},
 		"openai/gpt-oss-safeguard-120b": {
 			ContextWindow: 131072,
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Temperature: true},
+			Capabilities:  &ModelCapabilities{Temperature: true},
 		},
 
 		// ── ByteDance / Baidu ──────────────────────────────────────────
@@ -2074,7 +2147,7 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   16384,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		// ERNIE 4.5: 21B MoE, 128K.
 		"baidu/ernie-4.5-21b-a3b": {
@@ -2082,7 +2155,7 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Temperature: true, ToolCall: true},
 		},
 
 		// ── NVIDIA Nemotron ────────────────────────────────────────────
@@ -2092,21 +2165,21 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   16384,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"nvidia/nemotron-3-nano-omni": {
 			ContextWindow: 131072,
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"nvidia/nemotron-3-super": {
 			ContextWindow: 1048576,
 			OutputLimit:   16384,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 
 		// ── IBM Granite ────────────────────────────────────────────────
@@ -2116,49 +2189,49 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Temperature: true, ToolCall: true},
 		},
 		"ibm/granite-4-micro": {
 			ContextWindow: 131072,
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Temperature: true, ToolCall: true},
 		},
 		"ibm/granite-4-h-tiny": {
 			ContextWindow: 131072,
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Temperature: true, ToolCall: true},
 		},
 		"ibm/granite-4-h-small": {
 			ContextWindow: 131072,
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Temperature: true, ToolCall: true},
 		},
 		"ibm/granite-4.1-3b": {
 			ContextWindow: 131072,
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Temperature: true, ToolCall: true},
 		},
 		"ibm/granite-4.1-8b": {
 			ContextWindow: 131072,
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Temperature: true, ToolCall: true},
 		},
 		"ibm/granite-4.1-30b": {
 			ContextWindow: 131072,
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Temperature: true, ToolCall: true},
 		},
 
 		// ── Liquid AI LFM2 (on-device hybrid) ──────────────────────────
@@ -2168,28 +2241,28 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   8192,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Temperature: true},
+			Capabilities:  &ModelCapabilities{Temperature: true},
 		},
 		"liquid/lfm2-700m": {
 			ContextWindow: 32768,
 			OutputLimit:   8192,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Temperature: true},
+			Capabilities:  &ModelCapabilities{Temperature: true},
 		},
 		"liquid/lfm2-1.2b": {
 			ContextWindow: 32768,
 			OutputLimit:   8192,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Temperature: true},
+			Capabilities:  &ModelCapabilities{Temperature: true},
 		},
 		"liquid/lfm2-24b-a2b": {
 			ContextWindow: 32768,
 			OutputLimit:   8192,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Temperature: true, ToolCall: true},
 		},
 
 		// ── Allen AI (Olmo / olmOCR) ───────────────────────────────────
@@ -2199,28 +2272,28 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   16384,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Temperature: true, ToolCall: true},
 		},
 		"allenai/olmo-3-7b-think": {
 			ContextWindow: 65536,
 			OutputLimit:   16384,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"allenai/olmo-3-32b-think": {
 			ContextWindow: 65536,
 			OutputLimit:   16384,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"allenai/olmocr-2-7b": {
 			ContextWindow: 128000,
 			OutputLimit:   16384,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Attachment: true, Temperature: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Temperature: true},
 		},
 
 		// ── Essential AI / MiniMax ─────────────────────────────────────
@@ -2230,14 +2303,14 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   8192,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"minimax/minimax-m2": {
 			ContextWindow: 196608,
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 
 		// ── Microsoft Phi ──────────────────────────────────────────────
@@ -2247,35 +2320,35 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   4096,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Temperature: true},
+			Capabilities:  &ModelCapabilities{Temperature: true},
 		},
 		"microsoft/phi-4-mini": {
 			ContextWindow: 131072,
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Temperature: true},
+			Capabilities:  &ModelCapabilities{Temperature: true},
 		},
 		"microsoft/phi-4-mini-reasoning": {
 			ContextWindow: 131072,
 			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"microsoft/phi-4-reasoning": {
 			ContextWindow: 32768,
 			OutputLimit:   8192,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"microsoft/phi-4-reasoning-plus": {
 			ContextWindow: 32768,
 			OutputLimit:   8192,
 			TokenizerType: "approximate",
 			Family:        "default",
-			Capabilities:  ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
 	}
 }
@@ -2324,24 +2397,14 @@ func ResolveBuiltInModel(model string) (ModelMetadata, bool) {
 	key := strings.ToLower(model)
 	builtIn := getBuiltInRegistry()
 	if meta, ok := builtIn[key]; ok {
-		meta.Family = resolveFamily(model, meta)
-		meta.Protocol = resolveProtocol(model, meta)
-		return meta, true
+		return finalizeMeta(model, meta), true
 	}
 	if want := normalizeModelID(model); want != "" {
 		if meta, ok := getBuiltInIndex()[want]; ok {
-			meta.Family = resolveFamily(model, meta)
-			meta.Protocol = resolveProtocol(model, meta)
-			return meta, true
+			return finalizeMeta(model, meta), true
 		}
 	}
-	meta := ModelMetadata{
-		ContextWindow: 128000,
-		OutputLimit:   32768,
-		TokenizerType: "approximate",
-		Capabilities:  defaultUnknownCapabilities(),
-	}
-	meta.Family = resolveFamily(model, meta)
-	meta.Protocol = resolveProtocol(model, meta)
-	return meta, false
+	// Same tier-5 defaults as Resolve (fallbackMetadata); finalizeMeta derives
+	// Family/Protocol and guarantees the non-nil, caller-owned Capabilities.
+	return finalizeMeta(model, fallbackMetadata()), false
 }

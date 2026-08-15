@@ -270,7 +270,9 @@ func (r *Router) applyDefaultTemperature(req *ChatRequest, meta ModelMetadata) {
 	}
 
 	if r.registry != nil {
-		if !meta.Capabilities.Temperature {
+		// meta may be a raw/partial record with nil capabilities; only a
+		// declared Temperature=true unlocks the sampling default.
+		if meta.Capabilities == nil || !meta.Capabilities.Temperature {
 			return // model doesn't accept temperature (e.g. reasoning models)
 		}
 	}

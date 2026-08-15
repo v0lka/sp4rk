@@ -30,7 +30,7 @@ type ModelMetadata struct {
     TokenizerType string  // "tiktoken/o200k_base", "anthropic-api", "approximate"
     Family        string
     Protocol      APIProtocol // "" ⇒ derived by DetectProtocol; set to force a protocol
-    Capabilities  ModelCapabilities
+    Capabilities  *ModelCapabilities // nil ⇒ inherit from lower tiers; non-nil ⇒ authoritative (even all-false)
 }
 
 type ModelCapabilities struct {
@@ -93,7 +93,9 @@ A **composite model identifier** `"providerName/modelName"` is the internal sele
 
 ### Partial overrides
 
-A tier-1 override that pins only some fields — a **partial** override, e.g. a protocol-only auto-remap that injects `{Protocol: ChatCompletions}` for a Google-named checkpoint served by LM Studio/vLLM — inherits its unset scalar fields from the lower **non-network** tiers (observed runtime → built-in exact → built-in fuzzy → cache → fallback defaults). The inheritable fields are `ContextWindow`, `OutputLimit`, `TokenizerType`, and `Capabilities` (a zero-valued `ModelCapabilities` is treated as "unset", so a minimal protocol-pinning override no longer silently disables tool-calling, reasoning, or image uploads). A field already set in the override is authoritative; a fully-specified override (the common case: a `config.yaml` entry whose scalars are all populated) is returned verbatim. `Family` is derived by `resolveFamily`, and `Protocol` is always authoritative — pinning the protocol is precisely what a partial override exists to do. Network tiers (HuggingFace, registered sources) are deliberately skipped so an override lookup never performs I/O. The accepted tradeoff — mirroring the scalars — is that the zero value is reserved for "inherit", so there is no way to express "explicitly disable every capability" via a partial override.
+A tier-1 override that pins only some fields — a **partial** override, e.g. a protocol-only auto-remap that injects `{Protocol: ChatCompletions}` for a Google-named checkpoint served by LM Studio/vLLM — inherits its unset scalar fields from the lower **non-network** tiers (observed runtime → built-in exact → built-in fuzzy → cache → fallback defaults). The inheritable fields are `ContextWindow`, `OutputLimit`, `TokenizerType`, and `Capabilities`. `ModelMetadata.Capabilities` is a pointer (`*ModelCapabilities`): nil means "unset" — inherited exactly like a zero `ContextWindow`, so a minimal protocol-pinning override no longer silently disables tool-calling, reasoning, or image uploads — while non-nil is AUTHORITATIVE even when every flag is false, so "explicitly disable every capability" is expressible (`Capabilities: &ModelCapabilities{}`). A field already set in the override is authoritative; a fully-specified override (the common case: a `config.yaml` entry whose scalars are all populated) is returned verbatim. `Family` is derived by `resolveFamily`, and `Protocol` is always authoritative — pinning the protocol is precisely what a partial override exists to do. Network tiers (HuggingFace, registered sources) are deliberately skipped so an override lookup never performs I/O.
+
+The public resolvers (`Resolve`, `ResolveLocal`, `ResolveBuiltInModel`) always return non-nil `Capabilities`, defensively copied: the caller owns the returned pointer — registry state, including the process-wide built-in catalog, is never aliased by a resolved value. Records handed to the registry (the `NewModelRegistry` overrides map, `SetCachedMetadata`, `SetRuntimeMetadata`) are copied on write symmetrically. When no tier declares capabilities (e.g. a partial override enriched against a partial cache or runtime entry), the optimistic unknown set — the tier-5 default — applies. On the wire, a partial record serializes `"capabilities": null`; hosts that round-trip `ModelMetadata` through JSON must treat `null` as "inherit", not as "all capabilities disabled".
 
 ### Fuzzy lookup
 

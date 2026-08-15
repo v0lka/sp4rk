@@ -278,7 +278,7 @@ func TestRouter_Call_FamilyAwareTemperature(t *testing.T) {
 			ContextWindow: 128000,
 			OutputLimit:   8192,
 			Family:        "deepseek",
-			Capabilities:  ModelCapabilities{Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Temperature: true, ToolCall: true},
 		},
 	})
 
@@ -335,7 +335,7 @@ func TestRouter_Call_SkipsTemperatureForReasoningModels(t *testing.T) {
 			ContextWindow: 200000,
 			OutputLimit:   100000,
 			Family:        "openai_flagship",
-			Capabilities:  ModelCapabilities{Reasoning: true, ToolCall: true}, // Temperature: false
+			Capabilities:  &ModelCapabilities{Reasoning: true, ToolCall: true}, // Temperature: false
 		},
 	})
 
