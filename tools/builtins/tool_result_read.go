@@ -25,6 +25,7 @@ type ToolResultReadTool struct {
 func NewToolResultReadTool() *ToolResultReadTool {
 	return &ToolResultReadTool{BaseTool: &tools.BaseTool{
 		ToolName:        "tool_result_read",
+		ToolGroup:       tools.GroupSystem,
 		ToolDescription: toolResultReadDescription,
 		Schema: json.RawMessage(`{
 		"type": "object",

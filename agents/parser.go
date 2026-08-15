@@ -149,5 +149,11 @@ func validateAgent(agent *Agent, dirPath string) error {
 		return errors.New("description field is required")
 	}
 
+	// Tools: "all"/"read-only"/group-list — unknown groups fail the profile
+	// (fail-closed: a typo must not silently grant or drop capabilities).
+	if err := validateToolsField(agent.Metadata.Tools); err != nil {
+		return err
+	}
+
 	return nil
 }

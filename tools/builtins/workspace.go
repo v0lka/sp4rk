@@ -23,6 +23,7 @@ type ReadStepOutputTool struct {
 func NewReadStepOutputTool() *ReadStepOutputTool {
 	return &ReadStepOutputTool{BaseTool: &tools.BaseTool{
 		ToolName:        "read_step_output",
+		ToolGroup:       tools.GroupSystem,
 		ToolDescription: toolReadStepOutputDescription,
 		Schema: json.RawMessage(`{
 		"type": "object",
@@ -76,6 +77,7 @@ type ListStepOutputsTool struct {
 func NewListStepOutputsTool() *ListStepOutputsTool {
 	return &ListStepOutputsTool{BaseTool: &tools.BaseTool{
 		ToolName:        "list_step_outputs",
+		ToolGroup:       tools.GroupSystem,
 		ToolDescription: toolListStepOutputsDescription,
 		Schema: json.RawMessage(`{
 		"type": "object",
@@ -140,6 +142,7 @@ type ReadFinalResultTool struct {
 func NewReadFinalResultTool() *ReadFinalResultTool {
 	return &ReadFinalResultTool{BaseTool: &tools.BaseTool{
 		ToolName:        "read_final_result",
+		ToolGroup:       tools.GroupSystem,
 		ToolDescription: toolReadFinalResultDescription,
 		Schema: json.RawMessage(`{
 		"type": "object",

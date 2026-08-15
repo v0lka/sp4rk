@@ -124,7 +124,8 @@ func TestPoshExecTool_Judge_BlacklistMatch(t *testing.T) {
 		"command": "Remove-Item -Recurse -Force C:\\",
 	})
 
-	allow, reasoning := tool.Judge(context.Background(), input)
+	judgeOut := tool.Judge(context.Background(), input)
+	allow, reasoning := judgeOut.Allow, judgeOut.Reason
 	if allow {
 		t.Error("expected Judge to return allow=false for blacklisted command")
 	}
@@ -143,7 +144,8 @@ func TestPoshExecTool_Judge_NoBlacklistMatch(t *testing.T) {
 		"command": "Write-Output hello",
 	})
 
-	allow, reasoning := tool.Judge(context.Background(), input)
+	judgeOut := tool.Judge(context.Background(), input)
+	allow, reasoning := judgeOut.Allow, judgeOut.Reason
 	if allow {
 		t.Error("expected Judge to return allow=false for non-blacklisted command")
 	}
@@ -159,7 +161,8 @@ func TestPoshExecTool_Judge_EmptyBlacklist(t *testing.T) {
 		"command": "Remove-Item -Recurse -Force C:\\",
 	})
 
-	allow, reasoning := tool.Judge(context.Background(), input)
+	judgeOut := tool.Judge(context.Background(), input)
+	allow, reasoning := judgeOut.Allow, judgeOut.Reason
 	if allow {
 		t.Error("expected Judge to return allow=false with empty blacklist")
 	}
@@ -171,7 +174,8 @@ func TestPoshExecTool_Judge_EmptyBlacklist(t *testing.T) {
 func TestPoshExecTool_Judge_InvalidJSON(t *testing.T) {
 	tool := mustNewPoshExecTool(t, []string{"Remove-Item -Recurse -Force"})
 
-	allow, reasoning := tool.Judge(context.Background(), json.RawMessage(`{invalid`))
+	judgeOut := tool.Judge(context.Background(), json.RawMessage(`{invalid`))
+	allow, reasoning := judgeOut.Allow, judgeOut.Reason
 	if allow {
 		t.Error("expected Judge to return allow=false for invalid JSON")
 	}
@@ -196,7 +200,8 @@ func TestPoshExecTool_Judge_OutOfRootPath(t *testing.T) {
 		"command": `Get-Content C:\Windows\System32\drivers\etc\hosts`,
 	})
 
-	allow, reasoning := tool.Judge(ctx, input)
+	judgeOut := tool.Judge(ctx, input)
+	allow, reasoning := judgeOut.Allow, judgeOut.Reason
 	if allow {
 		t.Error("expected Judge to return allow=false for out-of-root path")
 	}
@@ -219,7 +224,8 @@ func TestPoshExecTool_Judge_WhollyNonExistentPathSkipped(t *testing.T) {
 		"command": `Get-Content C:\zzz-qqq-nonexistent\rrr`,
 	})
 
-	allow, reasoning := tool.Judge(ctx, input)
+	judgeOut := tool.Judge(ctx, input)
+	allow, reasoning := judgeOut.Allow, judgeOut.Reason
 	if allow {
 		t.Error("expected allow=false (Judge never returns true), got true")
 	}
@@ -242,7 +248,8 @@ func TestPoshExecTool_Judge_NonExistentUnderExistingOutsideFlagged(t *testing.T)
 		"command": `Set-Content -Path C:\Windows\System32\drivers\sp4rk-nonexistent-leaf -Value x`,
 	})
 
-	allow, reasoning := tool.Judge(ctx, input)
+	judgeOut := tool.Judge(ctx, input)
+	allow, reasoning := judgeOut.Allow, judgeOut.Reason
 	if allow {
 		t.Error("expected allow=false for a write into an existing out-of-root dir")
 	}

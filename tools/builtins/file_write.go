@@ -22,6 +22,7 @@ func NewWriteFileTool() *WriteFileTool {
 	return &WriteFileTool{
 		BaseTool: &tools.BaseTool{
 			ToolName:        "write_file",
+			ToolGroup:       tools.GroupLocalWrite,
 			ToolDescription: toolWriteFileDescription,
 			Schema: json.RawMessage(`{
 				"type": "object",
@@ -49,14 +50,14 @@ type WriteFileInput struct {
 }
 
 // Judge uses session roots check for write operations.
-func (t *WriteFileTool) Judge(ctx context.Context, input json.RawMessage) (allowed bool, reason string) {
+func (t *WriteFileTool) Judge(ctx context.Context, input json.RawMessage) tools.JudgeOutcome {
 	var params WriteFileInput
 	if err := json.Unmarshal(input, &params); err != nil {
-		return false, ""
+		return tools.JudgeOutcome{}
 	}
 	params.Path = resolvePath(ctx, params.Path)
 	if err := validateResolvedPath(params.Path); err != nil {
-		return false, err.Error()
+		return softOutcome(false, err.Error())
 	}
 	return judgeWriteInSessionRoots(ctx, params.Path)
 }

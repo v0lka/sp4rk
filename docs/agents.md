@@ -95,16 +95,19 @@ Only the v1 fields above are modeled. Unknown frontmatter keys are silently igno
 ### ToolPreference
 
 ```go
-func (a *Agent) ToolPreference() any
+func (a *Agent) ToolPreference() (any, error)
 ```
 
-Translates the declarative `tools` frontmatter field into the shape a delegating runtime expects (the `tools` field of a delegation task, consumed by the runtime's tool resolver). It returns `any` so its result can be assigned directly to a delegation task's `tools` field:
+Translates the declarative `tools` frontmatter field into the shape a delegating runtime expects (the `tools` field of a delegation task, consumed by the runtime's tool resolver). It returns `any` so its result can be assigned directly to a delegation task's `tools` field (itself typed `any`); the error return surfaces an invalid field instead of silently widening it:
 
 | `tools` value | Returns | Meaning |
 | --- | --- | --- |
-| `""` or `"all"` (default) | `nil` | grant the full mutating toolset (a resolver treats nil as all tools) |
-| `"read-only"` | `"read-only"` | mandatory read-only / MCP base only |
-| comma-list (e.g. `"edit_file,bash_exec"`) | `[]string` | named mutating tools; the read-only/MCP base is always added on top by the resolver |
+| `""` or `"all"` (default; surrounding whitespace tolerated) | `nil`, no error | grant the full mutating toolset (a resolver treats nil as all tools) |
+| `"read-only"` | `"read-only"`, no error | mandatory read-only / MCP base only |
+| comma-list of tool-group tokens (e.g. `"local-read,execute"`) | `[]string`, no error | granted capability groups (kebab-case; underscores normalize); the resolver always adds the `system` group on top |
+| unknown token, empty item, or duplicate group | error | fail-closed — the token is never silently dropped; a partially-dropped list could widen to the full toolset |
+
+Valid group tokens come from `ToolGroupTokens()` (`execute`, `local-read`, `local-write`, `remote-read`, `remote-write`, `system`, `local-mcp`, `remote-mcp`). AGENT.md files are validated at parse time; the error return guards profiles constructed programmatically.
 
 ## AgentDescriptor
 
@@ -242,7 +245,11 @@ func main() {
 	agent, ok := mgr.Get("code-reviewer")
 	if ok {
 		fmt.Printf("\nAgent body:\n%s\n", agent.Body)
-		fmt.Printf("Tool preference: %v\n", agent.ToolPreference())
+		pref, err := agent.ToolPreference()
+		if err != nil {
+			log.Fatalf("invalid tools field: %v", err)
+		}
+		fmt.Printf("Tool preference: %v\n", pref)
 	}
 }
 ```

@@ -6,7 +6,8 @@ Provides the tool abstraction for the agent: a single `Tool` interface, a thread
 
 ## Key Files
 
-- `github.com/v0lka/sp4rk/tools` — `Tool` interface, `BaseTool`, `ToolResult`, `ToolPolicy`, `ToolJudger`, `ToolDescriptor`, `ToolRegistry`, `StripParamsFromSchema`
+- `github.com/v0lka/sp4rk/tools` — `Tool` interface, `BaseTool`, `ToolResult`, `ToolPolicy`, `ToolJudger` (`JudgeOutcome` + `JudgeSeverity`), `ToolDescriptor` (carries `Group`), `ToolRegistry`, `StripParamsFromSchema`
+- `github.com/v0lka/sp4rk/tools/group.go` — `ToolGroup` and the 8 declared groups (`execute`, `local_read`, `local_write`, `remote_read`, `remote_write`, `system`, `local_mcp`, `remote_mcp`), `AllToolGroups()`, `IsValidToolGroup()`, `MCPToolGroup(transport)`
 - `github.com/v0lka/sp4rk/tools` (registry) — `Register`/`RegisterWithSource`/`RegisterWithSourceCategory`, `Execute` (fail-closed policy enforcement), `List`/`ListFiltered`, MCP shadowing protection
 - `github.com/v0lka/sp4rk/tools` (context helpers) — `WithWorkspacePath`, `WithTempDir`, `WithAllowedRoots`, `SessionRoots`, `WithTaskContext`. `SessionRoots` returns the deduplicated union of workspace + temp + additional allowed roots consulted by every path-containment check.
 - `github.com/v0lka/sp4rk/tools/builtins` — built-in tool catalog
@@ -24,6 +25,8 @@ type Tool interface {
     Execute(ctx context.Context, input json.RawMessage) (ToolResult, error)
     DefaultPolicy() ToolPolicy
     IsUntrusted() bool
+    Group() ToolGroup   // required: the capability group (tools/group.go).
+                        // Zero value = undeclared = matches no allow-list (fail-closed).
 }
 
 type ToolResult struct {
@@ -81,7 +84,7 @@ The executor calls the registry through the narrow `ToolExecutor` interface (`Ex
 
 ## Configuration
 
-Policy is set per tool. Override a tool's effective policy explicitly, or relax tools for non-interactive use:
+Policy is set per tool at the engine level. Hosts are encouraged to resolve policy from the tool's capability **group** instead (c0wrk's ADR-024 pattern); the engine remains agnostic. To relax tools for non-interactive use:
 
 ```go
 registry.SetPolicyOverride("bash_exec", tools.PolicyAlwaysAllow) // deliberate opt-in

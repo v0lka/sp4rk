@@ -685,7 +685,8 @@ func TestWebFetchTool_Judge_PrivateIP(t *testing.T) {
 
 	t.Run("loopback is blocked", func(t *testing.T) {
 		input, _ := json.Marshal(map[string]string{"url": "http://127.0.0.1/secret"})
-		allow, reasoning := tool.Judge(context.Background(), input)
+		judgeOut := tool.Judge(context.Background(), input)
+		allow, reasoning := judgeOut.Allow, judgeOut.Reason
 		if allow {
 			t.Error("expected Judge to deny request to loopback address")
 		}
@@ -696,7 +697,8 @@ func TestWebFetchTool_Judge_PrivateIP(t *testing.T) {
 
 	t.Run("private RFC1918 is blocked", func(t *testing.T) {
 		input, _ := json.Marshal(map[string]string{"url": "http://192.168.1.1/admin"})
-		allow, reasoning := tool.Judge(context.Background(), input)
+		judgeOut := tool.Judge(context.Background(), input)
+		allow, reasoning := judgeOut.Allow, judgeOut.Reason
 		if allow {
 			t.Error("expected Judge to deny request to private address")
 		}
@@ -707,14 +709,16 @@ func TestWebFetchTool_Judge_PrivateIP(t *testing.T) {
 
 	t.Run("public address is allowed", func(t *testing.T) {
 		input, _ := json.Marshal(map[string]string{"url": "https://example.com"})
-		allow, _ := tool.Judge(context.Background(), input)
+		judgeOut := tool.Judge(context.Background(), input)
+		allow, _ := judgeOut.Allow, judgeOut.Reason
 		if !allow {
 			t.Error("expected Judge to allow request to public address")
 		}
 	})
 
 	t.Run("invalid input escalates to confirmation", func(t *testing.T) {
-		allow, reason := tool.Judge(context.Background(), json.RawMessage(`{invalid`))
+		judgeOut := tool.Judge(context.Background(), json.RawMessage(`{invalid`))
+		allow, reason := judgeOut.Allow, judgeOut.Reason
 		if allow {
 			t.Error("expected Judge to escalate on invalid input (fail closed)")
 		}

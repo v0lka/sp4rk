@@ -69,6 +69,7 @@ func NewTool(provider SearchProvider, limits Limits) *Tool {
 	return &Tool{
 		BaseTool: &tools.BaseTool{
 			ToolName:        "web_search",
+			ToolGroup:       tools.GroupRemoteRead,
 			ToolDescription: toolWebsearchDescription,
 			Schema:          json.RawMessage(schema),
 			Policy:          tools.PolicyAlwaysAllow,

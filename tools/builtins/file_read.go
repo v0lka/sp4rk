@@ -27,6 +27,7 @@ func NewReadFileToolWithLimits(limits FileLimits) *ReadFileTool {
 	return &ReadFileTool{
 		BaseTool: &tools.BaseTool{
 			ToolName:        "read_file",
+			ToolGroup:       tools.GroupLocalRead,
 			ToolDescription: toolReadFileDescription,
 			Schema: json.RawMessage(`{
 				"type": "object",
@@ -62,7 +63,7 @@ type ReadFileInput struct {
 
 // Judge checks whether the read targets a path inside the session roots.
 // Reads outside workspace/temp require user confirmation.
-func (t *ReadFileTool) Judge(ctx context.Context, input json.RawMessage) (allowed bool, reason string) {
+func (t *ReadFileTool) Judge(ctx context.Context, input json.RawMessage) tools.JudgeOutcome {
 	return judgeReadInSessionRoots(ctx, input)
 }
 

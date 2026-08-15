@@ -33,7 +33,8 @@ func NewCalculatorTool() *CalculatorTool {
 			},
 			"required": ["expression"]
 		}`),
-		Policy: tools.PolicyAlwaysAllow,
+		Policy:    tools.PolicyAlwaysAllow,
+		ToolGroup: tools.GroupSystem,
 	}}
 }
 

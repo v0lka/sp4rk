@@ -135,6 +135,7 @@ func NewWebFetchToolWithClient(limits WebFetchLimits, client *http.Client) *WebF
 	return &WebFetchTool{
 		BaseTool: &tools.BaseTool{
 			ToolName:        "web_fetch",
+			ToolGroup:       tools.GroupRemoteRead,
 			ToolDescription: toolWebfetchDescription,
 			Schema:          json.RawMessage(schema),
 			Policy:          tools.PolicyAlwaysAllow,
@@ -154,24 +155,39 @@ type webFetchInput struct {
 
 // Judge checks whether the target URL resolves to a private/reserved IP.
 // Private addresses require user confirmation to prevent SSRF.
-func (t *WebFetchTool) Judge(ctx context.Context, input json.RawMessage) (allowed bool, reason string) {
+//
+// Severity: every denial here is hard — SSRF is a security-control trigger
+// (private/reserved target, or the SSRF check being unavailable/unassessable),
+// and such reasons must never be weakened. The allowed path carries soft
+// severity, which is meaningless for an Allow outcome.
+func (t *WebFetchTool) Judge(ctx context.Context, input json.RawMessage) tools.JudgeOutcome {
 	var params webFetchInput
 	if err := json.Unmarshal(input, &params); err != nil || params.URL == "" {
 		// Cannot determine URL — fail closed and escalate to confirmation.
-		return false, "cannot determine target URL"
+		// The SSRF posture of the call is unassessable, so treat as hard.
+		return tools.JudgeOutcome{
+			Reason:   "cannot determine target URL",
+			Severity: tools.JudgeSeverityHard,
+		}
 	}
 
 	addr, private, initErr := resolveHostIsPrivate(ctx, params.URL)
 	if initErr != nil {
 		// CIDR list failed to initialize — SSRF protection is unavailable.
 		// Fail-safe: require user confirmation for all web fetches.
-		return false, fmt.Sprintf("SSRF protection degraded: %v", initErr)
+		return tools.JudgeOutcome{
+			Reason:   fmt.Sprintf("SSRF protection degraded: %v", initErr),
+			Severity: tools.JudgeSeverityHard,
+		}
 	}
 	if private {
-		return false, "URL resolves to private/reserved address " + addr
+		return tools.JudgeOutcome{
+			Reason:   "URL resolves to private/reserved address " + addr,
+			Severity: tools.JudgeSeverityHard,
+		}
 	}
 
-	return true, "web fetch to public address"
+	return tools.JudgeOutcome{Allow: true, Reason: "web fetch to public address"}
 }
 
 // Execute fetches the URL and returns markdown content.

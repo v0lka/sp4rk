@@ -31,6 +31,9 @@ type Tool interface {
 	// IsUntrusted reports whether this tool returns external/untrusted data
 	// (web, MCP, filesystem) that should be sanitized before LLM context.
 	IsUntrusted() bool
+	// Group returns the tool's capability group (see [ToolGroup]). Every
+	// tool declares exactly one group; there is no "unknown" value.
+	Group() ToolGroup
 }
 
 // ToolResult is the result of tool execution.
@@ -56,6 +59,11 @@ type ToolDescriptor struct {
 	InputSchema    json.RawMessage    `json:"input_schema"`
 	Source         string             `json:"source"` // "core" or the MCP server name for MCP-sourced tools
 	SourceCategory ToolSourceCategory `json:"-"`      // cached category for fast checks
+	// Group is the tool's capability group (see [ToolGroup]). It is the
+	// grouping key for group-based toolset selection (subagent delegation,
+	// verification passes). A tool whose group is not declared (zero value
+	// "") matches no group-based allow-list — fail-closed by design.
+	Group ToolGroup `json:"-"`
 }
 
 // ParseToolPolicy converts a policy string to a ToolPolicy constant.
@@ -83,13 +91,15 @@ func ParseInputError(err error) (ToolResult, error) {
 }
 
 // BaseTool provides default implementations of Name, Description, InputSchema,
-// DefaultPolicy, and IsUntrusted so concrete tools only need to implement Execute.
+// DefaultPolicy, IsUntrusted, and Group so concrete tools only need to
+// implement Execute.
 type BaseTool struct {
 	ToolName        string
 	ToolDescription string
 	Schema          json.RawMessage
 	Policy          ToolPolicy
-	Untrusted       bool // marks tool output as external/untrusted data for prompt injection defense
+	Untrusted       bool      // marks tool output as external/untrusted data for prompt injection defense
+	ToolGroup       ToolGroup // capability group; every tool must declare one (see [ToolGroup])
 }
 
 // Name returns the tool name.
@@ -106,6 +116,12 @@ func (b *BaseTool) DefaultPolicy() ToolPolicy { return b.Policy }
 
 // IsUntrusted returns whether this tool produces external/untrusted data.
 func (b *BaseTool) IsUntrusted() bool { return b.Untrusted }
+
+// Group returns the tool's declared capability group. Constructors embedding
+// BaseTool must set the ToolGroup field; an empty value means the group was
+// not declared and matches no group-based allow-list (fail-closed for group
+// filtering).
+func (b *BaseTool) Group() ToolGroup { return b.ToolGroup }
 
 // workspacePathKey is the context key for the session workspace path.
 type workspacePathKey struct{}

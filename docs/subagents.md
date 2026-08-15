@@ -259,7 +259,7 @@ A subagent may be launched under a named **Subagent Profile** (an `AGENT.md`-dec
 | Profile field | Applied to the subagent as |
 | --- | --- |
 | `Body` | the core directive / system prompt (replaces the generic orchestrator default) |
-| `Tools` (`ToolPreference`) | the tool budget (`nil`=all, `"read-only"`, or a comma-list of mutating tools) |
+| `Tools` (`ToolPreference`) | the tool budget (`nil`=all, `"read-only"`, or a comma-list of tool-group tokens; an invalid field is an error, never silently widened) |
 | `MaxSteps` | the ReAct iteration cap (0/absent → derived from task complexity) |
 | `Model` | forced per-call via `NewModelOverrideCaller` |
 | `AllowRedelegate` | whether the subagent may launch further subagents |

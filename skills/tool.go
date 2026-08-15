@@ -26,6 +26,7 @@ func NewReadSkillResourceTool(resolver SkillPathResolver) *ReadSkillResourceTool
 	return &ReadSkillResourceTool{
 		BaseTool: &sdktools.BaseTool{
 			ToolName:        "read_skill_resource",
+			ToolGroup:       sdktools.GroupSystem,
 			ToolDescription: toolReadSkillResourceDesc,
 			Schema: json.RawMessage(`{
 				"type": "object",

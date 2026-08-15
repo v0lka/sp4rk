@@ -21,6 +21,7 @@ type BatchTool struct {
 func NewBatchTool() *BatchTool {
 	return &BatchTool{BaseTool: &tools.BaseTool{
 		ToolName:        "batch",
+		ToolGroup:       tools.GroupSystem,
 		ToolDescription: batchDescription,
 		Schema: json.RawMessage(`{
 			"type": "object",

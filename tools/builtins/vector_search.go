@@ -70,6 +70,7 @@ func NewVectorSearchTool(searchFunc VectorSearchFunc, waitFunc VectorSearchWaitF
 	return &VectorSearchTool{
 		BaseTool: &tools.BaseTool{
 			ToolName:        "semantic_search",
+			ToolGroup:       tools.GroupSystem,
 			ToolDescription: toolVectorSearchDescription,
 			Schema: json.RawMessage(`{
 		"type": "object",

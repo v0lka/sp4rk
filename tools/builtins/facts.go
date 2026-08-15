@@ -28,6 +28,7 @@ type StoreFactTool struct {
 func NewStoreFactTool() *StoreFactTool {
 	return &StoreFactTool{BaseTool: &tools.BaseTool{
 		ToolName:        "store_fact",
+		ToolGroup:       tools.GroupSystem,
 		ToolDescription: toolStoreFactDescription,
 		Schema: json.RawMessage(`{
 		"type": "object",
@@ -111,6 +112,7 @@ type SearchFactsTool struct {
 func NewSearchFactsTool() *SearchFactsTool {
 	return &SearchFactsTool{BaseTool: &tools.BaseTool{
 		ToolName:        "search_facts",
+		ToolGroup:       tools.GroupSystem,
 		ToolDescription: toolSearchFactsDescription,
 		Schema: json.RawMessage(`{
 		"type": "object",

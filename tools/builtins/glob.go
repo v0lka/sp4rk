@@ -24,6 +24,7 @@ type GlobTool struct {
 func NewGlobTool() *GlobTool {
 	return &GlobTool{BaseTool: &tools.BaseTool{
 		ToolName:        "glob",
+		ToolGroup:       tools.GroupLocalRead,
 		ToolDescription: toolGlobDescription,
 		Schema: json.RawMessage(`{
 		"type": "object",
@@ -60,7 +61,7 @@ type GlobInput struct {
 // The `path` parameter is optional and defaults to the workspace root, so an
 // omitted `path` is the safest case and auto-approves. Paths outside
 // workspace/temp require user confirmation.
-func (t *GlobTool) Judge(ctx context.Context, input json.RawMessage) (allowed bool, reason string) {
+func (t *GlobTool) Judge(ctx context.Context, input json.RawMessage) tools.JudgeOutcome {
 	return judgeReadInSessionRootsOptionalPath(ctx, input)
 }
 

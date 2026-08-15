@@ -34,6 +34,7 @@ func newFetchWebpageTool() *fetchWebpageTool {
 		Schema:          json.RawMessage(`{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}`),
 		Policy:          tools.PolicyAlwaysAllow,
 		Untrusted:       true, // opt into prompt-injection defense
+		ToolGroup:       tools.GroupRemoteRead,
 	}}
 }
 
@@ -70,23 +71,29 @@ func newAppendLogTool(workspace string) *appendLogTool {
 			ToolDescription: `Append a line to a log file. Input: {"path":"...","line":"..."}.`,
 			Schema:          json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"},"line":{"type":"string"}},"required":["path","line"]}`),
 			Policy:          tools.PolicyAlwaysAllow, // the judge gates it below
+			ToolGroup:       tools.GroupLocalWrite,
 		},
 		ws: workspace,
 	}
 }
 
 // Judge is the per-tool HEURISTIC. Out-of-workspace paths are blocked.
-func (t *appendLogTool) Judge(_ context.Context, input json.RawMessage) (bool, string) {
+// Severity follows the taxonomy: unassessable input is hard, a
+// path-containment concern is soft.
+func (t *appendLogTool) Judge(_ context.Context, input json.RawMessage) tools.JudgeOutcome {
 	var in struct {
 		Path string `json:"path"`
 	}
 	if err := json.Unmarshal(input, &in); err != nil {
-		return false, "malformed input"
+		return tools.JudgeOutcome{Reason: "malformed input", Severity: tools.JudgeSeverityHard}
 	}
 	if !strings.HasPrefix(in.Path, t.ws) {
-		return false, "path outside workspace — potential sandbox escape"
+		return tools.JudgeOutcome{
+			Reason:   "path outside workspace — potential sandbox escape",
+			Severity: tools.JudgeSeveritySoft,
+		}
 	}
-	return true, ""
+	return tools.JudgeOutcome{Allow: true}
 }
 
 func (t *appendLogTool) Execute(_ context.Context, input json.RawMessage) (tools.ToolResult, error) {

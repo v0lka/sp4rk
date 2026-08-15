@@ -22,6 +22,7 @@ func NewListDirectoryTool() *ListDirectoryTool {
 	return &ListDirectoryTool{
 		BaseTool: &tools.BaseTool{
 			ToolName:        "list_directory",
+			ToolGroup:       tools.GroupLocalRead,
 			ToolDescription: toolListDirectoryDescription,
 			Schema: json.RawMessage(`{
 				"type": "object",
@@ -47,7 +48,7 @@ type ListDirectoryInput struct {
 
 // Judge checks whether the list targets a path inside the session roots.
 // Directories outside workspace/temp require user confirmation.
-func (t *ListDirectoryTool) Judge(ctx context.Context, input json.RawMessage) (allowed bool, reason string) {
+func (t *ListDirectoryTool) Judge(ctx context.Context, input json.RawMessage) tools.JudgeOutcome {
 	return judgeReadInSessionRoots(ctx, input)
 }
 

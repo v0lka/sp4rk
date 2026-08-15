@@ -27,6 +27,7 @@ type UpdateChecklistTool struct {
 func NewUpdateChecklistTool() *UpdateChecklistTool {
 	return &UpdateChecklistTool{BaseTool: &tools.BaseTool{
 		ToolName:        "update_checklist",
+		ToolGroup:       tools.GroupSystem,
 		ToolDescription: toolUpdateChecklistDescription,
 		Schema: json.RawMessage(`{
 		"type": "object",

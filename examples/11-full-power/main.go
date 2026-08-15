@@ -110,6 +110,7 @@ func newTimestampTool() *timestampTool {
 		ToolDescription: "Get the current timestamp in RFC3339 format. No input required.",
 		Schema:          json.RawMessage(`{"type":"object","properties":{}}`),
 		Policy:          tools.PolicyAlwaysAllow,
+		ToolGroup:       tools.GroupSystem,
 	}}
 }
 

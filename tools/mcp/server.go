@@ -19,6 +19,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/v0lka/sp4rk/sysproc"
+	sdktools "github.com/v0lka/sp4rk/tools"
 )
 
 // ServerConfig defines how to launch an MCP server.
@@ -32,17 +33,25 @@ type ServerConfig struct {
 	Headers    map[string]string // http: custom headers
 	WorkDir    string            // stdio: working directory for the server process
 	HTTPClient *http.Client      // http: optional proxy-configured HTTP client
+	// ToolGroupOverride optionally tags every tool served by this server with
+	// an explicit capability group instead of the transport-derived default
+	// (stdio → local_mcp, http → remote_mcp). Use it when the transport
+	// default misrepresents the server's trust boundary (e.g. an http-tunnel
+	// to a process on the same machine). An empty or undeclared value is
+	// ignored and the transport default applies.
+	ToolGroupOverride sdktools.ToolGroup
 }
 
 // Server represents a connection to an external MCP server process.
 type Server struct {
-	name          string
-	client        *mcpclient.Client
-	tools         []ToolInfo
-	lastError     string
-	transportType string
-	logger        *slog.Logger
-	mu            sync.RWMutex
+	name              string
+	client            *mcpclient.Client
+	tools             []ToolInfo
+	lastError         string
+	transportType     string
+	toolGroupOverride sdktools.ToolGroup // per-server group override from ServerConfig; empty = derive from transport
+	logger            *slog.Logger
+	mu                sync.RWMutex
 }
 
 // ToolInfo holds metadata about a tool discovered from an MCP server.
@@ -78,6 +87,10 @@ func (s *Server) Connect(ctx context.Context, cfg ServerConfig) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Capture the per-server group override up front: it reflects operator
+	// intent for this server regardless of how the connection attempt ends.
+	s.toolGroupOverride = cfg.ToolGroupOverride
+
 	// Determine transport type (default to stdio when unspecified)
 	transportType := cfg.Transport
 	if transportType == "" {
@@ -107,6 +120,22 @@ func (s *Server) Connect(ctx context.Context, cfg ServerConfig) error {
 	s.lastError = ""
 	s.log().Debug("MCP server connected", "server", s.name, "transport", transportType)
 	return nil
+}
+
+// ToolGroup returns the capability group applied to every tool served by this
+// server: the operator's per-server override (ServerConfig.ToolGroupOverride)
+// when it declares a valid group, otherwise the group derived from the active
+// transport (stdio → local_mcp, http → remote_mcp).
+func (s *Server) ToolGroup() sdktools.ToolGroup {
+	s.mu.RLock()
+	override := s.toolGroupOverride
+	transportName := s.transportType
+	s.mu.RUnlock()
+
+	if override != "" && sdktools.IsValidToolGroup(override) {
+		return override
+	}
+	return sdktools.MCPToolGroup(transportName)
 }
 
 // connectStdio creates a stdio MCP client.

@@ -18,14 +18,14 @@ func newMockToolWithPolicy(name, desc string, policy ToolPolicy) *mockTool {
 // judgerMockTool is a mock tool that also implements ToolJudger.
 type judgerMockTool struct {
 	*mockTool
-	judgeFn func(ctx context.Context, input json.RawMessage) (bool, string)
+	judgeFn func(ctx context.Context, input json.RawMessage) JudgeOutcome
 }
 
-func (j *judgerMockTool) Judge(ctx context.Context, input json.RawMessage) (allow bool, reasoning string) {
+func (j *judgerMockTool) Judge(ctx context.Context, input json.RawMessage) JudgeOutcome {
 	if j.judgeFn != nil {
 		return j.judgeFn(ctx, input)
 	}
-	return true, ""
+	return JudgeOutcome{Allow: true}
 }
 
 // --- Task 1: fail-closed policy enforcement ---
@@ -75,6 +75,11 @@ func TestExecute_UserConfirm_ConfirmFuncAllows(t *testing.T) {
 	}
 	if gotReq.ToolName != "mutating" {
 		t.Errorf("confirm request tool name = %q", gotReq.ToolName)
+	}
+	// A plain PolicyUserConfirm gate has no judge outcome to classify it —
+	// it escalates as hard (the zero value), i.e. never auto-resolvable.
+	if gotReq.JudgeSeverity != JudgeSeverityHard {
+		t.Errorf("confirm request JudgeSeverity = %v, want %v (plain gates default to hard)", gotReq.JudgeSeverity, JudgeSeverityHard)
 	}
 }
 
@@ -186,8 +191,8 @@ func TestExecute_JudgerEscalation_FailClosedWithoutConfirmFunc(t *testing.T) {
 		executed = true
 		return ToolResult{Content: "done"}, nil
 	}
-	tool := &judgerMockTool{mockTool: base, judgeFn: func(_ context.Context, _ json.RawMessage) (bool, string) {
-		return false, "dangerous pattern detected"
+	tool := &judgerMockTool{mockTool: base, judgeFn: func(_ context.Context, _ json.RawMessage) JudgeOutcome {
+		return JudgeOutcome{Reason: "dangerous pattern detected", Severity: JudgeSeverityHard}
 	}}
 	reg.Register(tool)
 
@@ -206,8 +211,8 @@ func TestExecute_JudgerEscalation_FailClosedWithoutConfirmFunc(t *testing.T) {
 func TestExecute_JudgerAllows_ExecutesDirectly(t *testing.T) {
 	reg := NewToolRegistry()
 	base := newMockToolWithPolicy("safe", "always-allow with judge", PolicyAlwaysAllow)
-	tool := &judgerMockTool{mockTool: base, judgeFn: func(_ context.Context, _ json.RawMessage) (bool, string) {
-		return true, ""
+	tool := &judgerMockTool{mockTool: base, judgeFn: func(_ context.Context, _ json.RawMessage) JudgeOutcome {
+		return JudgeOutcome{Allow: true}
 	}}
 	reg.Register(tool)
 
@@ -217,6 +222,53 @@ func TestExecute_JudgerAllows_ExecutesDirectly(t *testing.T) {
 	}
 	if res.IsError {
 		t.Fatalf("expected success, got: %q", res.Content)
+	}
+}
+
+// TestExecute_JudgerEscalation_SeveritySurfaced verifies that the judge
+// outcome's Severity reaches the host through ConfirmationRequest.JudgeSeverity
+// instead of being discarded at the escalation boundary. An unclassified
+// escalation (zero Severity) surfaces as hard — fail-closed.
+func TestExecute_JudgerEscalation_SeveritySurfaced(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		outcome JudgeOutcome
+		want    JudgeSeverity
+	}{
+		{name: "soft containment surfaces as soft", outcome: JudgeOutcome{Reason: "path outside session roots", Severity: JudgeSeveritySoft}, want: JudgeSeveritySoft},
+		{name: "hard control surfaces as hard", outcome: JudgeOutcome{Reason: "blacklist match", Severity: JudgeSeverityHard}, want: JudgeSeverityHard},
+		{name: "unclassified defaults to hard", outcome: JudgeOutcome{Reason: "dangerous"}, want: JudgeSeverityHard},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			reg := NewToolRegistry()
+			base := newMockToolWithPolicy("risky", "always-allow with judge", PolicyAlwaysAllow)
+			tool := &judgerMockTool{mockTool: base, judgeFn: func(_ context.Context, _ json.RawMessage) JudgeOutcome {
+				return tt.outcome
+			}}
+			reg.Register(tool)
+
+			var gotSeverity JudgeSeverity
+			reg.SetConfirmFunc(func(_ context.Context, req ConfirmationRequest) (ConfirmationResponse, error) {
+				gotSeverity = req.JudgeSeverity
+				return ConfirmDeny, nil
+			})
+
+			res, err := reg.Execute(context.Background(), "risky", nil)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !res.IsError {
+				t.Fatal("expected denied result")
+			}
+			if gotSeverity != tt.want {
+				t.Errorf("ConfirmationRequest.JudgeSeverity = %v, want %v", gotSeverity, tt.want)
+			}
+		})
 	}
 }
 

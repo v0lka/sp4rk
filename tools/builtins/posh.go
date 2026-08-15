@@ -56,6 +56,7 @@ func NewPoshExecToolWithTimeouts(blacklist []string, timeouts BashTimeouts) (*Po
 	return &PoshExecTool{
 		BaseTool: &tools.BaseTool{
 			ToolName:        "posh_exec",
+			ToolGroup:       tools.GroupExecute,
 			ToolDescription: toolPoshDescription,
 			Schema:          json.RawMessage(`{"type": "object", "properties": {"command": {"type": "string", "description": "The PowerShell command to execute. Supports pipes, redirects, and chained commands."}, "timeout": {"type": "string", "description": "Timeout as a Go duration string, e.g. \"30s\" or \"2m\". Default: 60s, maximum: 120s."}, "working_directory": {"type": "string", "description": "Absolute path to use as the working directory for command execution. If omitted, defaults to the workspace root when available."}}, "required": ["command"]}`),
 			Policy:          tools.PolicyUserConfirm,
@@ -76,15 +77,21 @@ type poshInput struct {
 
 // Judge evaluates whether a PowerShell command is safe to execute.
 // It checks the command against compiled blacklist patterns.
-func (t *PoshExecTool) Judge(ctx context.Context, input json.RawMessage) (allowed bool, reason string) {
+//
+// Severity mirrors BashExecTool.Judge: a blacklist match is hard, a
+// path-containment escalation is soft.
+func (t *PoshExecTool) Judge(ctx context.Context, input json.RawMessage) tools.JudgeOutcome {
 	var params poshInput
 	if err := json.Unmarshal(input, &params); err != nil {
-		return false, "" // Defer to LLM Judge on parse error
+		return tools.JudgeOutcome{} // Defer to LLM Judge on parse error
 	}
 
 	for i, re := range t.compiled {
 		if re.MatchString(params.Command) {
-			return false, "command matches blacklist pattern: " + t.blacklist[i]
+			return tools.JudgeOutcome{
+				Reason:   "command matches blacklist pattern: " + t.blacklist[i],
+				Severity: tools.JudgeSeverityHard,
+			}
 		}
 	}
 
@@ -100,10 +107,13 @@ func (t *PoshExecTool) Judge(ctx context.Context, input json.RawMessage) (allowe
 	// no real anchor) is dropped.
 	outside := tools.PathsOutsideRoots(ctx, params.Command, tools.ShellPosh, params.WorkingDirectory)
 	if outside = tools.ExistingOrAnchoredPaths(outside); len(outside) > 0 {
-		return false, "command references existing path(s) outside session roots: " + strings.Join(outside, ", ")
+		return tools.JudgeOutcome{
+			Reason:   "command references existing path(s) outside session roots: " + strings.Join(outside, ", "),
+			Severity: tools.JudgeSeveritySoft,
+		}
 	}
 
-	return false, "" // No concern to report; workspace auto-approval semantics apply.
+	return tools.JudgeOutcome{} // No concern to report; workspace auto-approval semantics apply.
 }
 
 // Execute runs the PowerShell command and returns the result.

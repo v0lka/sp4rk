@@ -71,6 +71,14 @@ func (t *Tool) DefaultPolicy() sdktools.ToolPolicy {
 // comes from external servers and may contain adversarial content.
 func (t *Tool) IsUntrusted() bool { return t.untrusted }
 
+// Group returns the capability group of the owning server: the per-server
+// override when configured, otherwise the transport-derived tag (stdio →
+// local_mcp, http → remote_mcp). Evaluated against the server's current
+// state so reconnected servers are re-tagged correctly.
+func (t *Tool) Group() sdktools.ToolGroup {
+	return t.server.ToolGroup()
+}
+
 // Execute calls the MCP server's tools/call endpoint with the provided input.
 func (t *Tool) Execute(ctx context.Context, input json.RawMessage) (sdktools.ToolResult, error) {
 	// Parse input JSON into a map for the MCP call
@@ -157,10 +165,10 @@ func (t *Tool) ServerName() string {
 }
 
 // Judge implements sdktools.ToolJudger for MCP tools.
-// MCP tools have no tool-specific safety heuristic; returning (false, "")
-// means "no tool-specific concern" — the registry executes directly under an
+// MCP tools have no tool-specific safety heuristic; a zero JudgeOutcome means
+// "no tool-specific concern" — the registry executes directly under an
 // AlwaysAllow override. MCP tools default to PolicyUserConfirm, so this is
 // only reached via an explicit override.
-func (t *Tool) Judge(_ context.Context, _ json.RawMessage) (allowed bool, reason string) {
-	return false, "" // no tool-specific concern
+func (t *Tool) Judge(_ context.Context, _ json.RawMessage) sdktools.JudgeOutcome {
+	return sdktools.JudgeOutcome{} // no tool-specific concern
 }

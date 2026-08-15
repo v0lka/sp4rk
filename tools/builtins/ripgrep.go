@@ -59,6 +59,7 @@ func NewRipgrepToolWithPath(limits RipgrepLimits, rgPath string) *RipgrepTool {
 	}
 	return &RipgrepTool{BaseTool: &tools.BaseTool{
 		ToolName:        "ripgrep",
+		ToolGroup:       tools.GroupLocalRead,
 		ToolDescription: toolRipgrepDescription,
 		Schema: json.RawMessage(`{
 		"type": "object",
@@ -144,7 +145,7 @@ type rgContextData struct {
 // The `path` parameter is optional and defaults to the workspace root, so an
 // omitted `path` is the safest case and auto-approves. Paths outside
 // workspace/temp require user confirmation.
-func (t *RipgrepTool) Judge(ctx context.Context, input json.RawMessage) (allowed bool, reason string) {
+func (t *RipgrepTool) Judge(ctx context.Context, input json.RawMessage) tools.JudgeOutcome {
 	return judgeReadInSessionRootsOptionalPath(ctx, input)
 }
 

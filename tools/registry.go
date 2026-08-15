@@ -225,6 +225,7 @@ func (r *ToolRegistry) ListFiltered(excludeNames map[string]bool) []ToolDescript
 			InputSchema:    tool.InputSchema(),
 			Source:         source,
 			SourceCategory: r.categoryForLocked(tool.Name()),
+			Group:          tool.Group(),
 		})
 	}
 	return descriptors
@@ -255,15 +256,15 @@ func (r *ToolRegistry) Execute(ctx context.Context, name string, input json.RawM
 		}, nil
 
 	case PolicyUserConfirm:
-		return r.confirmAndExecute(ctx, tool, name, input, "")
+		return r.confirmAndExecute(ctx, tool, name, input, "", JudgeSeverityHard)
 
 	default: // PolicyAlwaysAllow
 		// Tool-specific safety judge: when an always-allowed tool implements
 		// ToolJudger and flags the call, escalate to user confirmation
 		// (which fail-closes to deny if no ConfirmFunc is configured).
 		if judger, ok := tool.(ToolJudger); ok {
-			if allow, reasoning := judger.Judge(ctx, input); !allow && reasoning != "" {
-				return r.confirmAndExecute(ctx, tool, name, input, reasoning)
+			if outcome := judger.Judge(ctx, input); !outcome.Allow && outcome.Reason != "" {
+				return r.confirmAndExecute(ctx, tool, name, input, outcome.Reason, outcome.Severity)
 			}
 		}
 		return tool.Execute(ctx, input)
@@ -273,7 +274,7 @@ func (r *ToolRegistry) Execute(ctx context.Context, name string, input json.RawM
 // confirmAndExecute requests user confirmation before executing a tool.
 // FAIL-CLOSED: if no ConfirmFunc is configured, the call is denied with an
 // actionable error instead of executing silently.
-func (r *ToolRegistry) confirmAndExecute(ctx context.Context, tool Tool, name string, input json.RawMessage, reasoning string) (ToolResult, error) {
+func (r *ToolRegistry) confirmAndExecute(ctx context.Context, tool Tool, name string, input json.RawMessage, reasoning string, severity JudgeSeverity) (ToolResult, error) {
 	r.mu.RLock()
 	confirmFunc := r.confirmFunc
 	r.mu.RUnlock()
@@ -293,6 +294,7 @@ func (r *ToolRegistry) confirmAndExecute(ctx context.Context, tool Tool, name st
 		ToolName:       name,
 		Input:          input,
 		JudgeReasoning: reasoning,
+		JudgeSeverity:  severity,
 	})
 	if err != nil {
 		return ToolResult{}, err

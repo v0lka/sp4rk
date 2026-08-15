@@ -44,6 +44,7 @@ func NewBashExecToolWithTimeouts(blacklist []string, timeouts BashTimeouts) (*Ba
 	return &BashExecTool{
 		BaseTool: &tools.BaseTool{
 			ToolName:        "bash_exec",
+			ToolGroup:       tools.GroupExecute,
 			ToolDescription: toolBashDescription,
 			Schema:          json.RawMessage(`{"type": "object", "properties": {"command": {"type": "string", "description": "The bash command to execute. Supports pipes, redirects, and chained commands."}, "timeout": {"type": "string", "description": "Timeout as a Go duration string, e.g. \"30s\" or \"2m\". Default: 60s, maximum: 120s."}, "working_directory": {"type": "string", "description": "Absolute path to use as the working directory for command execution. If omitted, defaults to the workspace root when available."}}, "required": ["command"]}`),
 			Policy:          tools.PolicyUserConfirm,
@@ -68,15 +69,22 @@ type bashInput struct {
 // resolving to an absolute path outside the session roots escalates the call to
 // user confirmation, mirroring how read_file/list_directory Judges behave. With
 // no session roots configured containment is a no-op (no crash, no reason).
-func (t *BashExecTool) Judge(ctx context.Context, input json.RawMessage) (allowed bool, reason string) {
+//
+// Severity: a blacklist match is hard — a security control fired and the
+// reason must never be weakened. Path-containment escalations are soft — the
+// operation may be legitimate, only its scope is in question.
+func (t *BashExecTool) Judge(ctx context.Context, input json.RawMessage) tools.JudgeOutcome {
 	var params bashInput
 	if err := json.Unmarshal(input, &params); err != nil {
-		return false, "" // Defer to LLM Judge on parse error
+		return tools.JudgeOutcome{} // Defer to LLM Judge on parse error
 	}
 
 	for i, re := range t.compiled {
 		if re.MatchString(params.Command) {
-			return false, "command matches blacklist pattern: " + t.blacklist[i]
+			return tools.JudgeOutcome{
+				Reason:   "command matches blacklist pattern: " + t.blacklist[i],
+				Severity: tools.JudgeSeverityHard,
+			}
 		}
 	}
 
@@ -93,10 +101,13 @@ func (t *BashExecTool) Judge(ctx context.Context, input json.RawMessage) (allowe
 	// with no real anchor) is dropped, keeping the false-positive rate low.
 	outside := tools.PathsOutsideRoots(ctx, params.Command, tools.ShellBash, params.WorkingDirectory)
 	if outside = tools.ExistingOrAnchoredPaths(outside); len(outside) > 0 {
-		return false, "command references existing path(s) outside session roots: " + strings.Join(outside, ", ")
+		return tools.JudgeOutcome{
+			Reason:   "command references existing path(s) outside session roots: " + strings.Join(outside, ", "),
+			Severity: tools.JudgeSeveritySoft,
+		}
 	}
 
-	return false, "" // No concern to report; workspace auto-approval semantics apply.
+	return tools.JudgeOutcome{} // No concern to report; workspace auto-approval semantics apply.
 }
 
 // Execute runs the bash command and returns the result.

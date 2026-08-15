@@ -25,7 +25,7 @@ type Agent struct {
 type AgentMetadata struct {
     Name            string `yaml:"name"`                        // required
     Description     string `yaml:"description"`                 // required
-    Tools           string `yaml:"tools,omitempty"`             // "all"(default) | "read-only" | comma-list
+    Tools           string `yaml:"tools,omitempty"`             // "all"(default) | "read-only" | comma-list of tool-group tokens
     MaxSteps        int    `yaml:"max-steps,omitempty"`         // ReAct cap; 0/absent = derive
     Model           string `yaml:"model,omitempty"`             // per-agent model override
     AllowRedelegate bool   `yaml:"allow-redelegate,omitempty"` // nested delegation (default false)
@@ -72,13 +72,18 @@ A profile whose `name` does not match its parent directory name is rejected. A m
 
 ## ToolPreference
 
-`ToolPreference()` translates the declarative `tools` frontmatter field into the shape a delegating runtime expects (the `tools` field of a delegation task, consumed by the runtime's tool resolver). It returns `any` so its result can be assigned directly to a delegation task's `tools` field:
+`ToolPreference()` translates the declarative `tools` frontmatter field into the shape a delegating runtime expects (the `tools` field of a delegation task, consumed by the runtime's tool resolver). It returns `(any, error)` so its result can be assigned directly to a delegation task's `tools` field (itself typed `any`) while an invalid field surfaces as an explicit error:
 
 | `tools` value | Returns | Meaning |
 | ------------- | ------- | ------- |
-| `""` or `"all"` (default) | `nil` | grant the full mutating toolset (resolver treats nil as all tools) |
-| `"read-only"` | `"read-only"` | mandatory read-only/MCP base only |
-| comma-list (e.g. `"edit_file,bash_exec"`) | `[]string` | named mutating tools; the read-only/MCP base is always added on top by the resolver |
+| `""` or `"all"` (default; surrounding whitespace tolerated) | `nil`, no error | grant the full mutating toolset (resolver treats nil as all tools) |
+| `"read-only"` | `"read-only"`, no error | mandatory read-only/MCP base only |
+| comma-list of tool-group tokens (e.g. `"local-read,execute"`) | `[]string`, no error | granted capability groups (kebab-case; underscores normalize); the resolver always adds the `system` group on top. Valid tokens come from `ToolGroupTokens()` |
+| unknown token, empty item, or duplicate group (after canonicalization, including mixed kebab/underscore spellings) | error | fail-closed: the token is never silently dropped — dropping every token would widen `nil` → full toolset |
+
+AGENT.md files are validated at parse time (`validateToolsField` rejects the same shapes with a `ParseError`), so the error return matters for profiles built programmatically via the exported `Agent`/`AgentMetadata` types, which never pass through the parser. A delegating runtime propagates the error instead of applying a preference.
+
+> Migration note: an earlier draft of the `tools:` field accepted comma-separated tool **names** (e.g. `edit_file,bash_exec`). That form is a `ParseError` — the field accepts group tokens only; express `edit_file,bash_exec` as `local-write,execute` (and `read_file` as `local-read`).
 
 ## How a profile configures a subagent
 

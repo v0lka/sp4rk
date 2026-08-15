@@ -21,6 +21,7 @@ func NewCreateDirectoryTool() *CreateDirectoryTool {
 	return &CreateDirectoryTool{
 		BaseTool: &tools.BaseTool{
 			ToolName:        "create_directory",
+			ToolGroup:       tools.GroupLocalWrite,
 			ToolDescription: toolCreateDirectoryDescription,
 			Schema: json.RawMessage(`{
 				"type": "object",
@@ -43,14 +44,14 @@ type CreateDirectoryInput struct {
 }
 
 // Judge uses session roots check for write operations.
-func (t *CreateDirectoryTool) Judge(ctx context.Context, input json.RawMessage) (allowed bool, reason string) {
+func (t *CreateDirectoryTool) Judge(ctx context.Context, input json.RawMessage) tools.JudgeOutcome {
 	var params CreateDirectoryInput
 	if err := json.Unmarshal(input, &params); err != nil {
-		return false, ""
+		return tools.JudgeOutcome{}
 	}
 	params.Path = resolvePath(ctx, params.Path)
 	if err := validateResolvedPath(params.Path); err != nil {
-		return false, err.Error()
+		return softOutcome(false, err.Error())
 	}
 	return judgeWriteInSessionRoots(ctx, params.Path)
 }

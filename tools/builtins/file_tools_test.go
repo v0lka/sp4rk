@@ -427,7 +427,8 @@ func TestReadFileTool_Judge_ReadOnlyAction(t *testing.T) {
 			"path": "/some/path.txt",
 		})
 
-		allow, reasoning := tool.Judge(context.Background(), input)
+		judgeOut := tool.Judge(context.Background(), input)
+		allow, reasoning := judgeOut.Allow, judgeOut.Reason
 		if allow {
 			t.Error("expected Judge to return allow=false for path outside workspace")
 		}
@@ -445,7 +446,8 @@ func TestReadFileTool_Judge_ReadOnlyAction(t *testing.T) {
 			"path": testFile,
 		})
 
-		allow, reasoning := tool.Judge(ctx, input)
+		judgeOut := tool.Judge(ctx, input)
+		allow, reasoning := judgeOut.Allow, judgeOut.Reason
 		if !allow {
 			t.Errorf("expected Judge to return allow=true for path inside workspace, got reasoning: %s", reasoning)
 		}
@@ -460,7 +462,8 @@ func TestReadFileTool_Judge_ReadOnlyAction(t *testing.T) {
 			"path": testFile,
 		})
 
-		allow, reasoning := tool.Judge(ctx, input)
+		judgeOut := tool.Judge(ctx, input)
+		allow, reasoning := judgeOut.Allow, judgeOut.Reason
 		if !allow {
 			t.Errorf("expected Judge to return allow=true for path inside temp dir, got reasoning: %s", reasoning)
 		}
@@ -478,7 +481,8 @@ func TestWriteFileTool_Judge_WriteActionInsideWorkspace(t *testing.T) {
 		"path": testFile,
 	})
 
-	allow, reasoning := tool.Judge(ctx, input)
+	judgeOut := tool.Judge(ctx, input)
+	allow, reasoning := judgeOut.Allow, judgeOut.Reason
 	if !allow {
 		t.Error("expected Judge to return allow=true for write action inside workspace")
 	}
@@ -499,7 +503,8 @@ func TestWriteFileTool_Judge_WriteActionOutsideWorkspace(t *testing.T) {
 		"path": testFile,
 	})
 
-	allow, reasoning := tool.Judge(ctx, input)
+	judgeOut := tool.Judge(ctx, input)
+	allow, reasoning := judgeOut.Allow, judgeOut.Reason
 	if allow {
 		t.Error("expected Judge to return allow=false for write action outside workspace")
 	}
@@ -517,7 +522,8 @@ func TestWriteFileTool_Judge_WriteActionNoWorkspace(t *testing.T) {
 		"path": "/some/path.txt",
 	})
 
-	allow, reasoning := tool.Judge(ctx, input)
+	judgeOut := tool.Judge(ctx, input)
+	allow, reasoning := judgeOut.Allow, judgeOut.Reason
 	if allow {
 		t.Error("expected Judge to return allow=false when no workspace in context")
 	}
@@ -529,7 +535,8 @@ func TestWriteFileTool_Judge_WriteActionNoWorkspace(t *testing.T) {
 func TestWriteFileTool_Judge_InvalidJSON(t *testing.T) {
 	tool := NewWriteFileTool()
 
-	allow, reasoning := tool.Judge(context.Background(), json.RawMessage(`{invalid`))
+	judgeOut := tool.Judge(context.Background(), json.RawMessage(`{invalid`))
+	allow, reasoning := judgeOut.Allow, judgeOut.Reason
 	if allow {
 		t.Error("expected Judge to return allow=false for invalid JSON")
 	}
@@ -834,7 +841,8 @@ func TestCreateDirectoryTool_Judge_CreateDirectoryInsideWorkspace(t *testing.T) 
 		"path": newDir,
 	})
 
-	allow, reasoning := tool.Judge(ctx, input)
+	judgeOut := tool.Judge(ctx, input)
+	allow, reasoning := judgeOut.Allow, judgeOut.Reason
 	if !allow {
 		t.Error("expected Judge to return allow=true for create_directory inside workspace")
 	}
@@ -855,7 +863,8 @@ func TestDeleteDirectoryTool_Judge_DeleteDirectoryOutsideWorkspace(t *testing.T)
 		"recursive": true,
 	})
 
-	allow, reasoning := tool.Judge(ctx, input)
+	judgeOut := tool.Judge(ctx, input)
+	allow, reasoning := judgeOut.Allow, judgeOut.Reason
 	if allow {
 		t.Error("expected Judge to return allow=false for delete_directory outside workspace")
 	}
@@ -875,7 +884,8 @@ func TestDeleteFileTool_Judge_DeleteFileInsideWorkspace(t *testing.T) {
 		"path": testFile,
 	})
 
-	allow, reasoning := tool.Judge(ctx, input)
+	judgeOut := tool.Judge(ctx, input)
+	allow, reasoning := judgeOut.Allow, judgeOut.Reason
 	if !allow {
 		t.Error("expected Judge to return allow=true for delete_file inside workspace")
 	}
@@ -1392,7 +1402,8 @@ func TestEditFileTool_Judge_InsideWorkspace(t *testing.T) {
 	}
 	input, _ := json.Marshal(EditFileInput{Path: testFile, OldString: "hello", NewString: "world"})
 
-	allow, reasoning := tool.Judge(ctx, input)
+	judgeOut := tool.Judge(ctx, input)
+	allow, reasoning := judgeOut.Allow, judgeOut.Reason
 	if !allow {
 		t.Errorf("expected allow=true for edit inside workspace, got reasoning: %s", reasoning)
 	}
@@ -1409,7 +1420,8 @@ func TestEditFileTool_Judge_OutsideWorkspace(t *testing.T) {
 
 	input, _ := json.Marshal(EditFileInput{Path: filepath.Join(otherDir, "edit.txt"), OldString: "x", NewString: "y"})
 
-	allow, reasoning := tool.Judge(ctx, input)
+	judgeOut := tool.Judge(ctx, input)
+	allow, reasoning := judgeOut.Allow, judgeOut.Reason
 	if allow {
 		t.Error("expected allow=false for edit outside workspace")
 	}
@@ -1420,7 +1432,8 @@ func TestEditFileTool_Judge_OutsideWorkspace(t *testing.T) {
 
 func TestEditFileTool_Judge_InvalidJSON(t *testing.T) {
 	tool := NewEditFileTool()
-	allow, reasoning := tool.Judge(context.Background(), json.RawMessage(`{bad`))
+	judgeOut := tool.Judge(context.Background(), json.RawMessage(`{bad`))
+	allow, reasoning := judgeOut.Allow, judgeOut.Reason
 	if allow {
 		t.Error("expected allow=false for invalid JSON")
 	}
@@ -1436,7 +1449,8 @@ func TestListDirectoryTool_Judge_InsideWorkspace(t *testing.T) {
 
 	input, _ := json.Marshal(ListDirectoryInput{Path: tmpDir})
 
-	allow, reasoning := tool.Judge(ctx, input)
+	judgeOut := tool.Judge(ctx, input)
+	allow, reasoning := judgeOut.Allow, judgeOut.Reason
 	if !allow {
 		t.Errorf("expected allow=true for list inside workspace, got reasoning: %s", reasoning)
 	}
@@ -1453,7 +1467,8 @@ func TestListDirectoryTool_Judge_OutsideWorkspace(t *testing.T) {
 
 	input, _ := json.Marshal(ListDirectoryInput{Path: otherDir})
 
-	allow, reasoning := tool.Judge(ctx, input)
+	judgeOut := tool.Judge(ctx, input)
+	allow, reasoning := judgeOut.Allow, judgeOut.Reason
 	if allow {
 		t.Error("expected allow=false for list outside workspace")
 	}
@@ -1469,7 +1484,8 @@ func TestGlobTool_Judge_InsideWorkspace(t *testing.T) {
 
 	input, _ := json.Marshal(GlobInput{Pattern: "*.go", Path: tmpDir})
 
-	allow, reasoning := tool.Judge(ctx, input)
+	judgeOut := tool.Judge(ctx, input)
+	allow, reasoning := judgeOut.Allow, judgeOut.Reason
 	if !allow {
 		t.Errorf("expected allow=true for glob inside workspace, got reasoning: %s", reasoning)
 	}
@@ -1481,7 +1497,8 @@ func TestGlobTool_Judge_NoWorkspace(t *testing.T) {
 
 	input, _ := json.Marshal(GlobInput{Pattern: "*.go", Path: "/some/path"})
 
-	allow, reasoning := tool.Judge(ctx, input)
+	judgeOut := tool.Judge(ctx, input)
+	allow, reasoning := judgeOut.Allow, judgeOut.Reason
 	// With no workspace and no temp dir, any path is considered "outside" —
 	// the judge returns false with a descriptive reason.
 	if allow {
@@ -1499,7 +1516,8 @@ func TestRipgrepTool_Judge_InsideWorkspace(t *testing.T) {
 
 	input, _ := json.Marshal(RipgrepInput{Pattern: "hello", Path: tmpDir})
 
-	allow, reasoning := tool.Judge(ctx, input)
+	judgeOut := tool.Judge(ctx, input)
+	allow, reasoning := judgeOut.Allow, judgeOut.Reason
 	if !allow {
 		t.Errorf("expected allow=true for ripgrep inside workspace, got reasoning: %s", reasoning)
 	}
@@ -2272,7 +2290,8 @@ func TestWriteFileTool_Judge_InsideTempDir(t *testing.T) {
 	testFile := filepath.Join(tempDir, "output.txt")
 	input, _ := json.Marshal(WriteFileInput{Path: testFile, Content: "data"})
 
-	allow, reasoning := tool.Judge(ctx, input)
+	judgeOut := tool.Judge(ctx, input)
+	allow, reasoning := judgeOut.Allow, judgeOut.Reason
 	if !allow {
 		t.Errorf("expected Judge to return allow=true for write inside temp dir, got reasoning: %s", reasoning)
 	}
@@ -2293,7 +2312,8 @@ func TestEditFileTool_Judge_InsideTempDir(t *testing.T) {
 	}
 	input, _ := json.Marshal(EditFileInput{Path: target, OldString: "hello", NewString: "world"})
 
-	allow, reasoning := tool.Judge(ctx, input)
+	judgeOut := tool.Judge(ctx, input)
+	allow, reasoning := judgeOut.Allow, judgeOut.Reason
 	if !allow {
 		t.Errorf("expected Judge to return allow=true for edit inside temp dir, got reasoning: %s", reasoning)
 	}
@@ -2311,7 +2331,8 @@ func TestDeleteFileTool_Judge_InsideTempDir(t *testing.T) {
 	}
 	input, _ := json.Marshal(DeleteFileInput{Path: target})
 
-	allow, _ := tool.Judge(ctx, input)
+	judgeOut := tool.Judge(ctx, input)
+	allow, _ := judgeOut.Allow, judgeOut.Reason
 	if !allow {
 		t.Error("expected Judge to return allow=true for delete_file inside temp dir")
 	}
@@ -2326,7 +2347,8 @@ func TestCreateDirectoryTool_Judge_InsideTempDir(t *testing.T) {
 	target := filepath.Join(tempDir, "newdir")
 	input, _ := json.Marshal(CreateDirectoryInput{Path: target})
 
-	allow, _ := tool.Judge(ctx, input)
+	judgeOut := tool.Judge(ctx, input)
+	allow, _ := judgeOut.Allow, judgeOut.Reason
 	if !allow {
 		t.Error("expected Judge to return allow=true for create_directory inside temp dir")
 	}
@@ -2344,7 +2366,8 @@ func TestDeleteDirectoryTool_Judge_InsideTempDir(t *testing.T) {
 	}
 	input, _ := json.Marshal(DeleteDirectoryInput{Path: target, Recursive: false})
 
-	allow, _ := tool.Judge(ctx, input)
+	judgeOut := tool.Judge(ctx, input)
+	allow, _ := judgeOut.Allow, judgeOut.Reason
 	if !allow {
 		t.Error("expected Judge to return allow=true for delete_directory inside temp dir")
 	}
@@ -2362,7 +2385,8 @@ func TestReadFileTool_Judge_InsideTempDir_WithWorkspace(t *testing.T) {
 	}
 	input, _ := json.Marshal(map[string]string{"path": target})
 
-	allow, _ := tool.Judge(ctx, input)
+	judgeOut := tool.Judge(ctx, input)
+	allow, _ := judgeOut.Allow, judgeOut.Reason
 	if !allow {
 		t.Error("expected Judge to return allow=true for read inside temp dir (with workspace set)")
 	}
@@ -2376,7 +2400,8 @@ func TestListDirectoryTool_Judge_InsideTempDir(t *testing.T) {
 
 	input, _ := json.Marshal(ListDirectoryInput{Path: tempDir})
 
-	allow, _ := tool.Judge(ctx, input)
+	judgeOut := tool.Judge(ctx, input)
+	allow, _ := judgeOut.Allow, judgeOut.Reason
 	if !allow {
 		t.Error("expected Judge to return allow=true for list_directory inside temp dir")
 	}
@@ -2394,7 +2419,8 @@ func TestWriteFileTool_Judge_OutsideBothRoots(t *testing.T) {
 	target := filepath.Join(otherDir, "file.txt")
 	input, _ := json.Marshal(WriteFileInput{Path: target, Content: "data"})
 
-	allow, reasoning := tool.Judge(ctx, input)
+	judgeOut := tool.Judge(ctx, input)
+	allow, reasoning := judgeOut.Allow, judgeOut.Reason
 	if allow {
 		t.Error("expected Judge to return allow=false for write outside both roots")
 	}
@@ -2416,7 +2442,8 @@ func TestReadFileTool_Judge_OutsideBothRoots(t *testing.T) {
 	}
 	input, _ := json.Marshal(map[string]string{"path": target})
 
-	allow, reasoning := tool.Judge(ctx, input)
+	judgeOut := tool.Judge(ctx, input)
+	allow, reasoning := judgeOut.Allow, judgeOut.Reason
 	if allow {
 		t.Error("expected Judge to return allow=false for read outside both roots")
 	}
@@ -2578,7 +2605,8 @@ func TestGlobTool_Judge_OptionalPath(t *testing.T) {
 			// no "path" — should default to workspace
 		})
 
-		allow, reasoning := tool.Judge(ctx, input)
+		judgeOut := tool.Judge(ctx, input)
+		allow, reasoning := judgeOut.Allow, judgeOut.Reason
 		if !allow {
 			t.Errorf("expected allow=true for omitted path (workspace default), got reasoning: %s", reasoning)
 		}
@@ -2595,7 +2623,8 @@ func TestGlobTool_Judge_OptionalPath(t *testing.T) {
 			"path":    subDir,
 		})
 
-		allow, reasoning := tool.Judge(ctx, input)
+		judgeOut := tool.Judge(ctx, input)
+		allow, reasoning := judgeOut.Allow, judgeOut.Reason
 		if !allow {
 			t.Errorf("expected allow=true for path inside workspace, got reasoning: %s", reasoning)
 		}
@@ -2611,7 +2640,8 @@ func TestGlobTool_Judge_OptionalPath(t *testing.T) {
 			"path":    otherDir,
 		})
 
-		allow, _ := tool.Judge(ctx, input)
+		judgeOut := tool.Judge(ctx, input)
+		allow, _ := judgeOut.Allow, judgeOut.Reason
 		if allow {
 			t.Error("expected allow=false for path outside workspace")
 		}
@@ -2622,7 +2652,8 @@ func TestGlobTool_Judge_OptionalPath(t *testing.T) {
 			"pattern": "**/*.ts",
 		})
 
-		allow, reasoning := tool.Judge(context.Background(), input)
+		judgeOut := tool.Judge(context.Background(), input)
+		allow, reasoning := judgeOut.Allow, judgeOut.Reason
 		if allow {
 			t.Error("expected allow=false when no workspace and no path")
 		}
@@ -2646,7 +2677,8 @@ func TestRipgrepTool_Judge_OptionalPath(t *testing.T) {
 			"pattern": "foo",
 		})
 
-		allow, reasoning := tool.Judge(ctx, input)
+		judgeOut := tool.Judge(ctx, input)
+		allow, reasoning := judgeOut.Allow, judgeOut.Reason
 		if !allow {
 			t.Errorf("expected allow=true for omitted path (workspace default), got reasoning: %s", reasoning)
 		}
@@ -2662,7 +2694,8 @@ func TestRipgrepTool_Judge_OptionalPath(t *testing.T) {
 			"path":    otherDir,
 		})
 
-		allow, _ := tool.Judge(ctx, input)
+		judgeOut := tool.Judge(ctx, input)
+		allow, _ := judgeOut.Allow, judgeOut.Reason
 		if allow {
 			t.Error("expected allow=false for path outside workspace")
 		}
@@ -2679,7 +2712,8 @@ func TestReadFileTool_Judge_RequiredPathFailsClosed(t *testing.T) {
 
 	input, _ := json.Marshal(map[string]string{}) // no path
 
-	allow, reasoning := tool.Judge(ctx, input)
+	judgeOut := tool.Judge(ctx, input)
+	allow, reasoning := judgeOut.Allow, judgeOut.Reason
 	if allow {
 		t.Error("expected allow=false for empty required path")
 	}
@@ -2697,7 +2731,8 @@ func TestListDirectoryTool_Judge_RequiredPathFailsClosed(t *testing.T) {
 
 	input, _ := json.Marshal(map[string]string{}) // no path
 
-	allow, reasoning := tool.Judge(ctx, input)
+	judgeOut := tool.Judge(ctx, input)
+	allow, reasoning := judgeOut.Allow, judgeOut.Reason
 	if allow {
 		t.Error("expected allow=false for empty required path")
 	}

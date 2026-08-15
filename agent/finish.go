@@ -49,6 +49,10 @@ func (t *FinishTool) DefaultPolicy() tools.ToolPolicy {
 // IsUntrusted returns false — finish is a trusted internal tool.
 func (t *FinishTool) IsUntrusted() bool { return false }
 
+// Group returns GroupSystem — finish signals completion and touches no
+// filesystem or network resources itself.
+func (t *FinishTool) Group() tools.ToolGroup { return tools.GroupSystem }
+
 // Execute parses the input and returns the answer.
 func (t *FinishTool) Execute(ctx context.Context, input json.RawMessage) (tools.ToolResult, error) {
 	var params struct {

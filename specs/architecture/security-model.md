@@ -8,7 +8,7 @@ sp4rk executes arbitrary tools (filesystem operations, shell commands, web reque
 
 sp4rk ships the *primitives*; the host application assembles the *policy*. The SDK provides:
 
-- the `ToolPolicy` enum and per-tool policy resolution,
+- the `ToolPolicy` enum, per-tool policy resolution, and the `ToolGroup` capability groups (`tools/group.go`),
 - the `ToolJudger` interface and the fail-closed confirmation flow (`ConfirmFunc`/`ConfirmationRequest`/`ConfirmationResponse`),
 - the path-locality primitive — [`tools.IsWithinRoot`](#path-locality-primitive) and [`AllPathsInSessionRoots`](#path-locality-primitive), consulted by the judge fast-path auto-approval and every tool-argument containment check (see [Path-Locality Primitive](#path-locality-primitive)),
 - the prompt-injection defense (`security.WrapUntrustedContent`/`StripUntrustedTags`), and
@@ -89,12 +89,22 @@ The engine itself has no concept of "skill policy" or a configuration file; thos
 Tools may optionally implement `ToolJudger` to provide tool-specific safety heuristics:
 
 ```go
+type JudgeSeverity int // zero value = hard (fail-closed); constants JudgeSeverityHard, JudgeSeveritySoft; String() → "hard"/"soft"
+
+type JudgeOutcome struct {
+    Allow    bool
+    Reason   string
+    Severity JudgeSeverity
+}
+
 type ToolJudger interface {
-    Judge(ctx context.Context, input json.RawMessage) (allow bool, reasoning string)
+    Judge(ctx context.Context, input json.RawMessage) JudgeOutcome
 }
 ```
 
-For a tool whose effective policy is `PolicyAlwaysAllow`, the registry calls `Judge` **before** execution. If the judge returns `allow=false` **with non-empty reasoning**, the call is escalated to user confirmation via `ConfirmFunc`. A return of `allow=false` with empty reasoning is treated as "no concern to report" and the tool proceeds.
+For a tool whose effective policy is `PolicyAlwaysAllow`, the registry calls `Judge` **before** execution. If the judge returns `Allow=false` **with non-empty Reason**, the call is escalated to user confirmation via `ConfirmFunc`. An outcome of `Allow=false` with empty Reason is treated as "no concern to report" and the tool proceeds.
+
+The `Severity` classifies the reason so hosts can decide what an escalation means: **`hard`** marks a fired security control (shell blacklist pattern, SSRF, symlink escape out of the roots) — hosts must treat it as never auto-resolvable (c0wrk disables its advisory judge and never lets Smart Approve pass it); **`soft`** marks a scope question (path containment outside session roots) that a strict judge may resolve. The engine escalates both severities identically (user confirmation) and delivers the severity to the host via `ConfirmationRequest.JudgeSeverity`. `JudgeSeverityHard` is the zero value — a judge outcome or escalation that arrives unclassified is treated as `hard` (fail-closed).
 
 This is the SDK hook a host uses to implement its own safety checks (for example, a shell tool whose `Judge` matches a blacklist of dangerous commands, or a file tool whose `Judge` flags paths outside permitted roots). The engine provides the interface and the escalation wiring; the heuristics themselves are tool/host-specific.
 
@@ -109,6 +119,8 @@ type ConfirmationRequest struct {
     ToolName       string          `json:"tool_name"`
     Input          json.RawMessage `json:"input"`
     JudgeReasoning string          `json:"judge_reasoning,omitempty"`
+    JudgeSeverity  JudgeSeverity   `json:"judge_severity"` // hard (zero) | soft; plain PolicyUserConfirm gates escalate as hard
+    DisableJudge   bool            `json:"disable_judge,omitempty"`
 }
 
 type ConfirmationResponse int
@@ -128,7 +140,7 @@ registry.Execute()
   │
   ├─ no ConfirmFunc configured? → FAIL-CLOSED: return error ToolResult
   │                                ("no ConfirmFunc is configured")
-  ├─ ConfirmFunc(ctx, ConfirmationRequest{ToolName, Input, JudgeReasoning})
+  ├─ ConfirmFunc(ctx, ConfirmationRequest{ToolName, Input, JudgeReasoning, JudgeSeverity})
   │      │
   │      ▼
   │   host responds (Allow / Deny / Deny & Stop)

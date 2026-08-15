@@ -25,6 +25,7 @@ type ReadAttachmentTool struct {
 func NewReadAttachmentTool() *ReadAttachmentTool {
 	return &ReadAttachmentTool{BaseTool: &tools.BaseTool{
 		ToolName:        "read_attachment",
+		ToolGroup:       tools.GroupSystem,
 		ToolDescription: toolReadAttachmentDescription,
 		Schema: json.RawMessage(`{
 		"type": "object",

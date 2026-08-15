@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -28,7 +29,7 @@ func TestParseAgent_AllFields(t *testing.T) {
 	const content = `---
 name: code-reviewer
 description: Reviews pull requests for correctness and style.
-tools: edit_file,bash_exec,write_file
+tools: local-read,local-write,execute
 max-steps: 25
 model: gpt-4o
 allow-redelegate: true
@@ -48,7 +49,7 @@ You are a meticulous code reviewer. Always read the full diff before commenting.
 	wantMeta := AgentMetadata{
 		Name:            "code-reviewer",
 		Description:     "Reviews pull requests for correctness and style.",
-		Tools:           "edit_file,bash_exec,write_file",
+		Tools:           "local-read,local-write,execute",
 		MaxSteps:        25,
 		Model:           "gpt-4o",
 		AllowRedelegate: true,
@@ -204,6 +205,71 @@ func TestParseAgent_ValidNameShapes(t *testing.T) {
 				"---\nname: "+name+"\ndescription: d\n---\nBody.\n")
 			if _, err := ParseAgent(filepath.Join(dir, "AGENT.md"), dir); err != nil {
 				t.Errorf("name %q should be valid, got: %v", name, err)
+			}
+		})
+	}
+}
+
+// TestParseAgent_InvalidTools verifies the `tools` frontmatter field is
+// validated at parse time: unknown groups, empty items (stray commas), and
+// mixing "all"/"read-only" with group tokens all fail the profile with a
+// *ParseError carrying a comprehensible message (fail-closed — a typo must
+// never silently widen or narrow a subagent's toolset).
+func TestParseAgent_InvalidTools(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		tools   string
+		wantMsg string
+	}{
+		{name: "unknown group", tools: "local-read,edit_file", wantMsg: `unknown tool group "edit_file"`},
+		{name: "fully unknown single", tools: "everything", wantMsg: `unknown tool group "everything"`},
+		{name: "empty item from stray comma", tools: "local-read,,execute", wantMsg: "empty item in group list"},
+		{name: "all mixed with groups", tools: "all,execute", wantMsg: `"all" cannot be combined`},
+		{name: "read-only mixed with groups", tools: "read-only,local-read", wantMsg: `"read-only" cannot be combined`},
+		{name: "duplicate group", tools: "execute,execute", wantMsg: `duplicate group "execute"`},
+		{name: "duplicate via mixed spelling", tools: "local-read,local_read", wantMsg: `duplicate group "local_read"`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			dir := writeAgent(t, t.TempDir(), "tooler",
+				"---\nname: tooler\ndescription: d\ntools: "+tt.tools+"\n---\nBody.\n")
+
+			_, err := ParseAgent(filepath.Join(dir, "AGENT.md"), dir)
+			if err == nil {
+				t.Fatal("expected ParseError, got nil")
+			}
+			var pe *ParseError
+			if !errors.As(err, &pe) {
+				t.Fatalf("expected *ParseError, got %T: %v", err, err)
+			}
+			if !strings.Contains(pe.Message, tt.wantMsg) {
+				t.Errorf("error message %q does not contain %q", pe.Message, tt.wantMsg)
+			}
+			// The unknown-group message must teach the valid alternatives
+			// (comprehensible fail-closed error, not a bare rejection).
+			if strings.Contains(tt.wantMsg, "unknown tool group") && !strings.Contains(pe.Message, "local-mcp") {
+				t.Errorf("error message %q should list valid groups", pe.Message)
+			}
+		})
+	}
+}
+
+// TestParseAgent_ValidTools accepted `tools` spellings round-trip cleanly.
+func TestParseAgent_ValidTools(t *testing.T) {
+	t.Parallel()
+
+	valid := []string{"", "all", " all ", "read-only", "execute", "local-read", "remote-read,remote-write", "system,local-mcp,remote-mcp", "local_read", " execute , remote-write "}
+	for _, tools := range valid {
+		t.Run(tools, func(t *testing.T) {
+			t.Parallel()
+			dir := writeAgent(t, t.TempDir(), "tooler",
+				"---\nname: tooler\ndescription: d\ntools: "+tools+"\n---\nBody.\n")
+			if _, err := ParseAgent(filepath.Join(dir, "AGENT.md"), dir); err != nil {
+				t.Errorf("tools %q should be valid, got: %v", tools, err)
 			}
 		})
 	}
