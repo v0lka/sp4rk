@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 )
 
 // JudgeSeverity classifies how hard the reason behind a judge escalation is.
@@ -21,9 +22,10 @@ const (
 	// assessed at all. These reasons must never be weakened or auto-overridden.
 	JudgeSeverityHard JudgeSeverity = iota
 	// JudgeSeveritySoft marks advisory escalations: path-containment and
-	// locality concerns (a path outside session roots, an unresolvable
-	// target). The operation itself may be legitimate — only its scope is in
-	// question.
+	// locality concerns — a path that was fully assessed and resolved outside
+	// the session roots. The operation itself may be legitimate — only its
+	// scope is in question. An input that could NOT be assessed at all is not
+	// soft; it escalates as hard (see JudgeSeverityHard).
 	JudgeSeveritySoft
 )
 
@@ -35,6 +37,41 @@ func (s JudgeSeverity) String() string {
 	default:
 		return "hard"
 	}
+}
+
+// MarshalJSON renders the severity as its String() name ("hard"/"soft"), the
+// same vocabulary String() exposes, so serialized ConfirmationRequests (and
+// JSON logs) stay legible and stable across enum reordering — a bare int
+// would leak iota positions onto the wire. Out-of-range values marshal as
+// "hard", mirroring String()'s fail-closed default.
+func (s JudgeSeverity) MarshalJSON() ([]byte, error) {
+	return json.Marshal(s.String())
+}
+
+// UnmarshalJSON parses a severity name ("hard"/"soft"). An unknown name is an
+// error rather than a silent fallback to a numeric or zero value — callers
+// must notice malformed input; where a value is absent, the type's zero value
+// (hard) applies. JSON null is a no-op per the encoding/json convention: the
+// receiver keeps its current value (hard for a fresh variable), so a null
+// field behaves exactly like an omitted one — fail-closed. A bare int is
+// rejected: the canonical wire form is the name.
+func (s *JudgeSeverity) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" {
+		return nil
+	}
+	var name string
+	if err := json.Unmarshal(data, &name); err != nil {
+		return fmt.Errorf("judge severity: %w", err)
+	}
+	switch name {
+	case "hard":
+		*s = JudgeSeverityHard
+	case "soft":
+		*s = JudgeSeveritySoft
+	default:
+		return fmt.Errorf("judge severity: unknown name %q", name)
+	}
+	return nil
 }
 
 // JudgeOutcome is the result of a tool-local safety judge: whether the call is

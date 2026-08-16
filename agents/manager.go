@@ -1,6 +1,7 @@
 package agents
 
 import (
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -45,8 +46,10 @@ func (m *AgentManager) log() *slog.Logger {
 // Agents with the same name in a higher-priority directory override those in a
 // lower-priority one (first occurrence / highest priority wins). The walk is
 // performed in reverse priority order so that earlier (higher-priority)
-// directories are visited last and overwrite later entries. Invalid AGENT.md
-// files are logged at Debug level and skipped — they never abort a scan.
+// directories are visited last and overwrite later entries. An AGENT.md that
+// exists but fails validation is logged at Warn (the operator loses that
+// profile from the catalog); a directory without a readable AGENT.md is logged
+// at Debug. Skipped entries never abort a scan.
 func (m *AgentManager) Scan() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -94,8 +97,18 @@ func (m *AgentManager) scanDir(dir string) {
 
 		agent, err := ParseAgent(agentMD, agentDir)
 		if err != nil {
-			// Skip invalid agents (e.g. a directory that is not an agent at all).
-			m.log().Debug("skipped invalid agent", "dir", agentDir, "error", err)
+			var parseErr *ParseError
+			if errors.As(err, &parseErr) {
+				// An AGENT.md exists but fails validation — a profile the
+				// operator loses from the catalog. Warn so the skip is
+				// visible (e.g. a `tools:` list still using pre-group tool
+				// names after an SDK upgrade).
+				m.log().Warn("skipped invalid agent", "dir", agentDir, "error", err)
+			} else {
+				// No AGENT.md or an unreadable one — most directories are
+				// simply not agent profiles.
+				m.log().Debug("skipped non-agent directory", "dir", agentDir, "error", err)
+			}
 			continue
 		}
 

@@ -37,8 +37,12 @@ type ServerConfig struct {
 	// an explicit capability group instead of the transport-derived default
 	// (stdio → local_mcp, http → remote_mcp). Use it when the transport
 	// default misrepresents the server's trust boundary (e.g. an http-tunnel
-	// to a process on the same machine). An empty or undeclared value is
-	// ignored and the transport default applies.
+	// to a process on the same machine). An empty, undeclared, or reserved
+	// value is ignored and the transport default applies — in particular the
+	// reserved "system" group is NEVER honored: hosts treat system tools as
+	// trusted orchestration builtins that bypass policy gates, so honoring a
+	// system override would exempt an entire untrusted external server from
+	// every security check.
 	ToolGroupOverride sdktools.ToolGroup
 }
 
@@ -90,6 +94,14 @@ func (s *Server) Connect(ctx context.Context, cfg ServerConfig) error {
 	// Capture the per-server group override up front: it reflects operator
 	// intent for this server regardless of how the connection attempt ends.
 	s.toolGroupOverride = cfg.ToolGroupOverride
+	// Surface an ignored override instead of silently falling back to the
+	// transport-derived group: a typo'd or reserved value would otherwise be
+	// invisible misconfiguration (the operator believes they re-tagged the
+	// server while every tool keeps the old group).
+	if cfg.ToolGroupOverride != "" && !isValidToolGroupOverride(cfg.ToolGroupOverride) {
+		s.log().Warn("MCP server tool_group override ignored: unknown or reserved group; using the transport-derived group",
+			"server", s.name, "override", string(cfg.ToolGroupOverride))
+	}
 
 	// Determine transport type (default to stdio when unspecified)
 	transportType := cfg.Transport
@@ -124,15 +136,36 @@ func (s *Server) Connect(ctx context.Context, cfg ServerConfig) error {
 
 // ToolGroup returns the capability group applied to every tool served by this
 // server: the operator's per-server override (ServerConfig.ToolGroupOverride)
-// when it declares a valid group, otherwise the group derived from the active
-// transport (stdio → local_mcp, http → remote_mcp).
+// when it declares a valid, non-reserved group, otherwise the group derived
+// from the active transport (stdio → local_mcp, http → remote_mcp). The
+// reserved GroupSystem is ignored like an invalid override — an external MCP
+// server's tools are never host-trusted orchestration builtins.
 func (s *Server) ToolGroup() sdktools.ToolGroup {
 	s.mu.RLock()
 	override := s.toolGroupOverride
 	transportName := s.transportType
 	s.mu.RUnlock()
 
-	if override != "" && sdktools.IsValidToolGroup(override) {
+	return effectiveToolGroup(override, transportName)
+}
+
+// isValidToolGroupOverride reports whether g is usable as a per-server tool
+// group override: a declared, non-reserved group. Empty ("no override"),
+// unknown, and the reserved GroupSystem values are not (GroupSystem would
+// exempt an entire untrusted external server from every policy gate).
+func isValidToolGroupOverride(g sdktools.ToolGroup) bool {
+	return g != "" && g != sdktools.GroupSystem && sdktools.IsValidToolGroup(g)
+}
+
+// effectiveToolGroup resolves the effective capability group for an MCP
+// server: the override when it is a valid, non-reserved group, otherwise the
+// transport-derived default. This is the single normalization for the
+// override — Server.ToolGroup applies it at tool-tagging time and
+// Gateway.configChanged applies it at config-diff time, so a change that
+// does not alter the effective group (e.g. between two ignored values) is
+// not treated as a reconnect-worthy change.
+func effectiveToolGroup(override sdktools.ToolGroup, transportName string) sdktools.ToolGroup {
+	if isValidToolGroupOverride(override) {
 		return override
 	}
 	return sdktools.MCPToolGroup(transportName)

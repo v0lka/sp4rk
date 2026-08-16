@@ -247,7 +247,7 @@ import (
 
 // CalculatorTool evaluates simple arithmetic expressions.
 // It embeds tools.BaseTool which provides default implementations of
-// Name, Description, InputSchema, DefaultPolicy, and IsUntrusted.
+// Name, Description, InputSchema, DefaultPolicy, IsUntrusted, and Group.
 type CalculatorTool struct {
 	*tools.BaseTool
 }
@@ -266,7 +266,8 @@ func NewCalculatorTool() *CalculatorTool {
 			},
 			"required": ["expression"]
 		}`),
-		Policy: tools.PolicyAlwaysAllow,
+		Policy:    tools.PolicyAlwaysAllow,
+		ToolGroup: tools.GroupSystem,
 	}}
 }
 

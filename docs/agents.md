@@ -103,11 +103,13 @@ Translates the declarative `tools` frontmatter field into the shape a delegating
 | `tools` value | Returns | Meaning |
 | --- | --- | --- |
 | `""` or `"all"` (default; surrounding whitespace tolerated) | `nil`, no error | grant the full mutating toolset (a resolver treats nil as all tools) |
-| `"read-only"` | `"read-only"`, no error | mandatory read-only / MCP base only |
+| `"read-only"` | `"read-only"`, no error | the read-only preset — the resolver grants local-read + remote-read on top of the always-included `system` group, **no MCP** (the reference host resolves it this way; see the host's ADR-024 §6) |
 | comma-list of tool-group tokens (e.g. `"local-read,execute"`) | `[]string`, no error | granted capability groups (kebab-case; underscores normalize); the resolver always adds the `system` group on top |
 | unknown token, empty item, or duplicate group | error | fail-closed — the token is never silently dropped; a partially-dropped list could widen to the full toolset |
 
-Valid group tokens come from `ToolGroupTokens()` (`execute`, `local-read`, `local-write`, `remote-read`, `remote-write`, `system`, `local-mcp`, `remote-mcp`). AGENT.md files are validated at parse time; the error return guards profiles constructed programmatically.
+Valid group tokens come from `ToolGroupTokens()` (`execute`, `local-read`, `local-write`, `remote-read`, `remote-write`, `system`, `local-mcp`, `remote-mcp`). AGENT.md files are validated at parse time (both `ToolPreference()` and the parser apply the same `validateToolsField` rules and messages); the error return guards profiles constructed programmatically.
+
+> **Migration note:** an earlier form of the `tools:` field accepted comma-separated tool **names** (e.g. `edit_file,bash_exec`). That form is now a validation error — the field accepts group tokens only. Express `edit_file,bash_exec` as `local-write,execute` (and `read_file` as `local-read`). A profile whose `tools:` fails validation is skipped from the catalog and logged as a warning (`skipped invalid agent`) rather than silently dropped.
 
 ## AgentDescriptor
 

@@ -41,9 +41,13 @@ const (
     PolicyUserConfirm
 )
 
-// Optional per-tool safety heuristic.
+// Optional per-tool safety heuristic. JudgeOutcome carries Allow, Reason, and
+// Severity: JudgeSeverityHard (the zero value — fail-closed) marks a fired
+// security control (blacklist pattern, SSRF); JudgeSeveritySoft marks a scope
+// question (path containment). Allow=false with an empty Reason means
+// "no tool-specific concern" and the tool proceeds.
 type ToolJudger interface {
-    Judge(ctx context.Context, input json.RawMessage) (allow bool, reasoning string)
+    Judge(ctx context.Context, input json.RawMessage) JudgeOutcome
 }
 
 // Metadata-only representation for the planner/executor.
@@ -53,6 +57,7 @@ type ToolDescriptor struct {
     InputSchema    json.RawMessage
     Source         string             // "core" | <server-name>
     SourceCategory ToolSourceCategory // "core" | "mcp"
+    Group          ToolGroup          // capability group; zero value "" matches no group allow-list (fail-closed)
 }
 ```
 
@@ -96,7 +101,7 @@ Stage 1 truncation limits are configured per tool on the executor (see [../orche
 
 ## Extension Points
 
-- **New built-in tool**: embed `tools.BaseTool`, implement `Execute`, optionally implement `ToolJudger`, set `Untrusted: true` for external-output tools, and register. See [builtins.md](builtins.md).
+- **New built-in tool**: embed `tools.BaseTool`, implement `Execute`, declare the capability group (`BaseTool.ToolGroup` — an undeclared group matches no group allow-list, fail-closed), optionally implement `ToolJudger`, set `Untrusted: true` for external-output tools, and register. See [builtins.md](builtins.md).
 - **Transformed read view (content-backed cache)**: a read tool that returns a transformed/decoded representation of a file (not its raw bytes) implements `tools.ContentBackedReader` (`IsContentBacked(ctx, input) bool`). When it reports `true` for an input, `ToolRegistry.CacheStrategy` returns `CacheModeContentBacked`, so the executor caches the result in memory while still attaching file coherence metadata (path+mtime+size). The decision is per-input, so the same tool can stay file-backed for plain text and content-backed for transformed formats.
 - **Custom policy enforcement layer**: hosts may wrap the registry and shadow `Execute` (calling `tool.Execute` directly after their own checks); the SDK-level enforcement only applies to calls routed through `ToolRegistry.Execute`.
 - **Schema sanitization**: `StripParamsFromSchema(schema, paramsToRemove)` removes named properties from a JSON Schema's `properties` object and (if present) from `required` — used to hide source-specific parameters from the LLM. The MCP gateway applies it through `GatewayConfig.SchemaSanitizer`; hosts may also call it directly before exposing a schema.

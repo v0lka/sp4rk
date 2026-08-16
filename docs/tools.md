@@ -18,6 +18,7 @@ type Tool interface {
     Execute(ctx context.Context, input json.RawMessage) (ToolResult, error)
     DefaultPolicy() ToolPolicy
     IsUntrusted() bool
+    Group() ToolGroup
 }
 ```
 
@@ -29,10 +30,15 @@ type Tool interface {
 | `Execute(ctx, input)` | Runs the tool with the given JSON input. Returns a `ToolResult` and/or an error. |
 | `DefaultPolicy()` | The tool's default security policy (allow / deny / confirm). |
 | `IsUntrusted()` | Reports whether the tool returns external/untrusted data (web, MCP, filesystem) that should be sanitized before being placed into LLM context. |
+| `Group()` | The tool's capability group (`ToolGroup`) — required, no "unknown" value; an undeclared group matches no group allow-list (fail-closed). |
+
+## ToolGroup
+
+Every tool declares exactly one capability group — a coarse, security-relevant taxonomy used for group-based toolset selection (read-only subagent budgets) and host-side policy (per-group allow/confirm/deny). The groups (`tools/group.go`): `execute` (arbitrary shell), `local_read`, `local_write`, `remote_read`, `remote_write`, `system` (orchestration/state, no direct FS or network side effect), `local_mcp` (stdio MCP server), `remote_mcp` (http MCP server). Helpers: `AllToolGroups()`, `IsValidToolGroup(g)`, and `MCPToolGroup(transport)` (stdio → `local_mcp`, http → `remote_mcp`).
 
 ## BaseTool
 
-`BaseTool` provides default implementations of `Name`, `Description`, `InputSchema`, `DefaultPolicy`, and `IsUntrusted` so concrete tools only need to implement `Execute`. Embed it in your custom tool and set the relevant fields:
+`BaseTool` provides default implementations of `Name`, `Description`, `InputSchema`, `DefaultPolicy`, `IsUntrusted`, and `Group` so concrete tools only need to implement `Execute`. Embed it in your custom tool and set the relevant fields:
 
 ```go
 type BaseTool struct {
@@ -40,7 +46,8 @@ type BaseTool struct {
     ToolDescription string
     Schema          json.RawMessage
     Policy          ToolPolicy
-    Untrusted       bool // marks output as external/untrusted for prompt-injection defense
+    Untrusted       bool      // marks output as external/untrusted for prompt-injection defense
+    ToolGroup       ToolGroup // capability group; every tool must declare one (see [ToolGroup])
 }
 ```
 
@@ -83,13 +90,23 @@ const (
 
 ### ToolJudger (optional)
 
-A tool with `PolicyAlwaysAllow` may optionally implement `ToolJudger` to provide tool-specific safety heuristics. When a `PolicyAlwaysAllow` tool implements `ToolJudger`, `ToolRegistry.Execute` calls `Judge` before execution; if it returns `allow=false` with non-empty reasoning, the call is escalated to user confirmation via the registry's `ConfirmFunc` (and denied if none is configured — fail-closed).
+A tool with `PolicyAlwaysAllow` may optionally implement `ToolJudger` to provide tool-specific safety heuristics. When a `PolicyAlwaysAllow` tool implements `ToolJudger`, `ToolRegistry.Execute` calls `Judge` before execution; if it returns `Allow=false` with a non-empty `Reason`, the call is escalated to user confirmation via the registry's `ConfirmFunc` (and denied if none is configured — fail-closed).
 
 ```go
+type JudgeSeverity int // JudgeSeverityHard (zero value, fail-closed) | JudgeSeveritySoft
+
+type JudgeOutcome struct {
+    Allow    bool
+    Reason   string
+    Severity JudgeSeverity
+}
+
 type ToolJudger interface {
-    Judge(ctx context.Context, input json.RawMessage) (allow bool, reasoning string)
+    Judge(ctx context.Context, input json.RawMessage) JudgeOutcome
 }
 ```
+
+`Severity` classifies the escalation for the host: **hard** marks a fired security control (shell blacklist pattern, SSRF) that hosts must treat as never auto-resolvable; **soft** marks a scope question (path containment) that a strict judge may resolve. `Allow=false` with an empty `Reason` means "no tool-specific concern" and the tool proceeds. The severity reaches the host via `ConfirmationRequest.JudgeSeverity`; `JudgeSeverityHard` is the zero value, so an unclassified escalation is treated as hard.
 
 ### ContentBackedReader (optional)
 
@@ -114,10 +131,11 @@ type ToolDescriptor struct {
     InputSchema    json.RawMessage
     Source         string             // "core" | <server-name>
     SourceCategory ToolSourceCategory // "core" | "mcp" (cached for fast checks)
+    Group          ToolGroup          // capability group; the grouping key for group-based toolset selection
 }
 ```
 
-`Source` records where a tool came from. Built-in tools report `"core"`; MCP tools report their server name (e.g. `"filesystem"`). `SourceCategory` is a cached classification (`SourceCategoryCore` or `SourceCategoryMCP`) for fast routing checks.
+`Source` records where a tool came from. Built-in tools report `"core"`; MCP tools report their server name (e.g. `"filesystem"`). `SourceCategory` is a cached classification (`SourceCategoryCore` or `SourceCategoryMCP`) for fast routing checks. `Group` carries the capability group (populated from the live tool); an undeclared group (zero value `""`) matches no group-based allow-list — fail-closed by design.
 
 ## ToolRegistry
 
@@ -239,7 +257,7 @@ type CalculatorTool struct {
 
 ### 2. Write a constructor that sets the `BaseTool` fields
 
-Set `ToolName`, `ToolDescription`, `Schema` (a JSON Schema), and `Policy`.
+Set `ToolName`, `ToolDescription`, `Schema` (a JSON Schema), `Policy`, and `ToolGroup` (every tool must declare its capability group — see [ToolGroup](#toolgroup)).
 
 ```go
 func NewCalculatorTool() *CalculatorTool {
@@ -256,7 +274,8 @@ func NewCalculatorTool() *CalculatorTool {
             },
             "required": ["expression"]
         }`),
-        Policy: tools.PolicyAlwaysAllow,
+        Policy:    tools.PolicyAlwaysAllow,
+        ToolGroup: tools.GroupSystem,
     }}
 }
 ```

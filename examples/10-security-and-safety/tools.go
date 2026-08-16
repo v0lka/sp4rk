@@ -11,8 +11,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
+	"github.com/v0lka/sp4rk/pathutil"
 	"github.com/v0lka/sp4rk/security"
 	"github.com/v0lka/sp4rk/tools"
 )
@@ -77,7 +77,11 @@ func newAppendLogTool(workspace string) *appendLogTool {
 	}
 }
 
-// Judge is the per-tool HEURISTIC. Out-of-workspace paths are blocked.
+// Judge is the per-tool HEURISTIC. Out-of-workspace paths are blocked using
+// pathutil.IsWithinPath — the shared containment primitive. A hand-rolled
+// strings.HasPrefix check is bypassable (a sibling directory like
+// "<ws>-evil" passes a "<ws>" prefix) and is exactly what the SDK's own
+// guidelines forbid for containment decisions.
 // Severity follows the taxonomy: unassessable input is hard, a
 // path-containment concern is soft.
 func (t *appendLogTool) Judge(_ context.Context, input json.RawMessage) tools.JudgeOutcome {
@@ -87,7 +91,12 @@ func (t *appendLogTool) Judge(_ context.Context, input json.RawMessage) tools.Ju
 	if err := json.Unmarshal(input, &in); err != nil {
 		return tools.JudgeOutcome{Reason: "malformed input", Severity: tools.JudgeSeverityHard}
 	}
-	if !strings.HasPrefix(in.Path, t.ws) {
+	within, err := pathutil.IsWithinPath(t.ws, in.Path)
+	if err != nil {
+		// Containment cannot be assessed — fail closed and escalate.
+		return tools.JudgeOutcome{Reason: "cannot determine target path", Severity: tools.JudgeSeverityHard}
+	}
+	if !within {
 		return tools.JudgeOutcome{
 			Reason:   "path outside workspace — potential sandbox escape",
 			Severity: tools.JudgeSeveritySoft,

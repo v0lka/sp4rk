@@ -621,11 +621,6 @@ func TestGateway_Reconfigure_AddServer(t *testing.T) {
 		{Name: "tool1", Description: "tool from server1", InputSchema: json.RawMessage(`{"type":"object"}`)},
 	}
 	gateway.servers["server1"] = server1
-	gateway.config = GatewayConfig{
-		Servers: map[string]ServerEntry{
-			"server1": {Command: "cmd1"},
-		},
-	}
 	gateway.expandedConfigs["server1"] = ServerConfig{Command: "cmd1"}
 
 	// Register initial tools
@@ -683,12 +678,6 @@ func TestGateway_Reconfigure_RemoveServer(t *testing.T) {
 	}
 	gateway.servers["server1"] = server1
 	gateway.servers["server2"] = server2
-	gateway.config = GatewayConfig{
-		Servers: map[string]ServerEntry{
-			"server1": {Command: "cmd1"},
-			"server2": {Command: "cmd2"},
-		},
-	}
 	gateway.expandedConfigs["server1"] = ServerConfig{Command: "cmd1"}
 	gateway.expandedConfigs["server2"] = ServerConfig{Command: "cmd2"}
 
@@ -742,11 +731,6 @@ func TestGateway_Reconfigure_UnchangedServer(t *testing.T) {
 		{Name: "tool1", Description: "tool from server1", InputSchema: json.RawMessage(`{"type":"object"}`)},
 	}
 	gateway.servers["server1"] = server1
-	gateway.config = GatewayConfig{
-		Servers: map[string]ServerEntry{
-			"server1": {Command: "cmd1", Args: []string{"arg1"}},
-		},
-	}
 	gateway.expandedConfigs["server1"] = ServerConfig{Command: "cmd1", Args: []string{"arg1"}}
 
 	// Register initial tools
@@ -790,11 +774,6 @@ func TestGateway_Reconfigure_EmptyConfig(t *testing.T) {
 		{Name: "tool1", Description: "tool from server1", InputSchema: json.RawMessage(`{"type":"object"}`)},
 	}
 	gateway.servers["server1"] = server1
-	gateway.config = GatewayConfig{
-		Servers: map[string]ServerEntry{
-			"server1": {Command: "cmd1"},
-		},
-	}
 
 	// Register initial tools
 	_ = gateway.RegisterTools(registry)
@@ -836,11 +815,6 @@ func TestGateway_Reconfigure_ChangedConfig(t *testing.T) {
 		{Name: "tool1", Description: "tool from server1", InputSchema: json.RawMessage(`{"type":"object"}`)},
 	}
 	gateway.servers["server1"] = server1
-	gateway.config = GatewayConfig{
-		Servers: map[string]ServerEntry{
-			"server1": {Command: "cmd1"},
-		},
-	}
 	gateway.expandedConfigs["server1"] = ServerConfig{Command: "cmd1"}
 
 	// Register initial tools
@@ -884,7 +858,7 @@ func TestGateway_Reconfigure_ChangedConfig(t *testing.T) {
 
 func TestGateway_ConfigChanged(t *testing.T) {
 	// configChanged compares against the previously-expanded ServerConfig stored
-	// in g.expandedConfigs (W-7), not the raw ServerEntry on g.config.Servers.
+	// in g.expandedConfigs (W-7), not the raw ServerEntry from GatewayConfig.
 	tests := []struct {
 		name     string
 		old      ServerConfig
@@ -1351,14 +1325,6 @@ func TestStartGateway_DefaultWorkDir(t *testing.T) {
 func TestGateway_StartAppliesDefaultWorkDir(t *testing.T) {
 	gw := newGateway()
 	gw.defaultWorkDir = "/default/dir"
-
-	// Start with an invalid command but verify the WorkDir was applied
-	// by checking that the server config received the default work dir.
-	// Since we can't easily inspect the config after Start, we verify
-	// the Reconfigure path which also applies defaultWorkDir.
-	gw.config = GatewayConfig{
-		Servers: map[string]ServerEntry{},
-	}
 
 	// Verify SetDefaultWorkDir + Reconfigure propagates WorkDir
 	gw.SetDefaultWorkDir("/updated/workspace")

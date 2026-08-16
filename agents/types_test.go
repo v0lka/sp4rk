@@ -2,6 +2,7 @@ package agents
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -29,6 +30,10 @@ func TestToolPreference(t *testing.T) {
 		{name: "empty items error", tools: " , , ", wantErr: true},
 		{name: "duplicate group errors", tools: "execute,execute", wantErr: true},
 		{name: "duplicate via mixed spelling errors", tools: "local-read,local_read", wantErr: true},
+		// Presets cannot be mixed into a group list (same rule the parser
+		// enforces via validateToolsField, which ToolPreference delegates to).
+		{name: "all mixed with groups errors", tools: "all,execute", wantErr: true},
+		{name: "read-only mixed with groups errors", tools: "read-only,local-read", wantErr: true},
 	}
 
 	for _, tt := range tests {
@@ -46,6 +51,25 @@ func TestToolPreference(t *testing.T) {
 				t.Errorf("ToolPreference(%q) = %#v (%T), want %#v", tt.tools, got, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestToolPreference_MixedPresetErrorsWithParseMessage(t *testing.T) {
+	t.Parallel()
+
+	// ToolPreference delegates to validateToolsField, so a mixed
+	// "all"/"read-only" list must fail with the parser's clear "cannot be
+	// combined" message — not the self-contradictory `unknown tool group
+	// "all" (… also accepted: "all", "read-only")` wording it used to emit.
+	for _, tools := range []string{"all,execute", "read-only,local-read"} {
+		a := &Agent{Metadata: AgentMetadata{Tools: tools}}
+		_, err := a.ToolPreference()
+		if err == nil {
+			t.Fatalf("ToolPreference(%q) = nil error, want error", tools)
+		}
+		if !strings.Contains(err.Error(), "cannot be combined") {
+			t.Errorf("ToolPreference(%q) error = %q, want it to contain %q", tools, err, "cannot be combined")
+		}
 	}
 }
 

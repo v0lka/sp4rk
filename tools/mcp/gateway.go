@@ -15,11 +15,10 @@ import (
 // their tools to the agent through the ToolRegistry.
 type Gateway struct {
 	servers map[string]*Server
-	config  GatewayConfig
 	// expandedConfigs holds the env-expanded ServerConfig for each connected
 	// server, keyed by name. configChanged compares against this to avoid
-	// false positives when raw ${VAR} placeholders in g.config.Servers were
-	// already substituted before connection.
+	// false positives when raw ${VAR} placeholders in the GatewayConfig
+	// entries were already substituted before connection.
 	expandedConfigs map[string]ServerConfig
 	defaultWorkDir  string
 	schemaSanitizer SchemaSanitizer
@@ -198,28 +197,10 @@ func (g *Gateway) Reconfigure(ctx context.Context, newConfig GatewayConfig,
 
 	// Process added and changed servers
 	for name, entry := range newConfig.Servers {
-		// Build ServerConfig from ServerEntry
-		env := make(map[string]string, len(entry.Env))
-		for ek, ev := range entry.Env {
-			env[ek] = expandEnv(ev)
-		}
-
-		headers := make(map[string]string, len(entry.Headers))
-		for hk, hv := range entry.Headers {
-			headers[hk] = expandEnv(hv)
-		}
-
-		workDir := g.defaultWorkDirForLocked(entry.WorkDir)
-		newCfg := ServerConfig{
-			Transport:  entry.Transport,
-			Command:    entry.Command,
-			Args:       entry.Args,
-			Env:        env,
-			URL:        expandEnv(entry.URL),
-			Headers:    headers,
-			WorkDir:    workDir,
-			HTTPClient: newConfig.HTTPClient,
-		}
+		// Build ServerConfig from ServerEntry. WorkDir is resolved against the
+		// NEW default (applied above) so servers relying on an empty WorkDir
+		// are compared and reconnected against it, not the stale one.
+		newCfg := serverConfigFromEntry(entry, g.defaultWorkDirForLocked(entry.WorkDir), newConfig.HTTPClient, expandEnv)
 
 		if currentNames[name] {
 			// Server exists - check if config changed
@@ -288,9 +269,6 @@ func (g *Gateway) Reconfigure(ctx context.Context, newConfig GatewayConfig,
 		}
 	}
 
-	// Update stored config
-	g.config = newConfig
-
 	if len(errs) > 0 {
 		return &ReconfigureError{Errors: errs}
 	}
@@ -299,10 +277,11 @@ func (g *Gateway) Reconfigure(ctx context.Context, newConfig GatewayConfig,
 }
 
 // configChanged compares the new (env-expanded) config with the previously-
-// expanded config for a given server. Comparing against g.config.Servers
-// (raw ${VAR} placeholders) would produce false positives every time
-// Reconfigure runs and bounce all servers. We persist the expanded copy in
-// expandedConfigs at end of Reconfigure for the next comparison.
+// expanded config for a given server. Comparing against the raw
+// GatewayConfig entries (${VAR} placeholders intact) would produce false
+// positives every time Reconfigure runs and bounce all servers. The expanded
+// copy is persisted in expandedConfigs at the end of Reconfigure for the next
+// comparison.
 func (g *Gateway) configChanged(name string, newCfg ServerConfig) bool {
 	oldCfg, exists := g.expandedConfigs[name]
 	if !exists {
@@ -314,6 +293,21 @@ func (g *Gateway) configChanged(name string, newCfg ServerConfig) bool {
 		oldCfg.Command != newCfg.Command ||
 		oldCfg.URL != newCfg.URL ||
 		oldCfg.WorkDir != newCfg.WorkDir {
+		return true
+	}
+
+	// A changed group override re-tags every tool the server registers, so it
+	// requires a reconnect (tools are unregistered and re-registered with the
+	// new group). Comparing it here keeps Reconfigure from treating an
+	// override-only change as a no-op and leaving stale groups in the
+	// registry. The comparison uses the EFFECTIVE group (effectiveToolGroup),
+	// the same normalization Server.ToolGroup applies when tagging tools: a
+	// raw change between values that are both ignored (empty, unknown, or
+	// reserved — e.g. fixing one typo'd override into another) does not alter
+	// any registered tool's group, so reconnecting the server process for it
+	// would be pure churn.
+	if effectiveToolGroup(oldCfg.ToolGroupOverride, oldCfg.Transport) !=
+		effectiveToolGroup(newCfg.ToolGroupOverride, newCfg.Transport) {
 		return true
 	}
 
@@ -480,6 +474,46 @@ type ServerEntry struct {
 	URL       string            // http: server URL (may contain ${ENV_VAR} references)
 	Headers   map[string]string // http: custom headers (values may contain ${ENV_VAR} references)
 	WorkDir   string            // stdio: working directory for the server process
+	// ToolGroupOverride optionally tags every tool served by this server with
+	// an explicit capability group instead of the transport-derived default
+	// (stdio → local_mcp, http → remote_mcp). It carries the same semantics
+	// as ServerConfig.ToolGroupOverride (empty/undeclared/reserved values are
+	// ignored and the transport default applies) and is forwarded by
+	// StartGateway and Reconfigure, so the gateway-level configuration path
+	// can express the override — not only direct mcp.Server construction.
+	ToolGroupOverride sdktools.ToolGroup
+}
+
+// serverConfigFromEntry builds the runtime ServerConfig for a ServerEntry:
+// ${VAR} references in env values, URL, and header values are expanded, and
+// the entry's ToolGroupOverride is forwarded so the gateway-level
+// configuration path can express the per-server group override. workDir is
+// passed in already resolved: StartGateway resolves the default at connect
+// time (Gateway.Start), while Reconfigure resolves it eagerly so the expanded
+// config stored for diffing matches what actually connects.
+func serverConfigFromEntry(entry ServerEntry, workDir string, httpClient *http.Client, expandEnv func(string) string) ServerConfig {
+	env := make(map[string]string, len(entry.Env))
+	for ek, ev := range entry.Env {
+		env[ek] = expandEnv(ev)
+	}
+
+	headers := make(map[string]string, len(entry.Headers))
+	for hk, hv := range entry.Headers {
+		headers[hk] = expandEnv(hv)
+	}
+
+	return ServerConfig{
+		Transport:  entry.Transport,
+		Command:    entry.Command,
+		Args:       entry.Args,
+		Env:        env,
+		URL:        expandEnv(entry.URL),
+		Headers:    headers,
+		WorkDir:    workDir,
+		HTTPClient: httpClient,
+
+		ToolGroupOverride: entry.ToolGroupOverride,
+	}
 }
 
 // StartGateway creates, configures, starts, and registers an Gateway.
@@ -492,30 +526,10 @@ func StartGateway(ctx context.Context, cfg GatewayConfig, registry *sdktools.Too
 
 	mcpConfigs := make(map[string]ServerConfig, len(cfg.Servers))
 	for name, entry := range cfg.Servers {
-		env := make(map[string]string, len(entry.Env))
-		for ek, ev := range entry.Env {
-			env[ek] = expandEnv(ev)
-		}
-
-		headers := make(map[string]string, len(entry.Headers))
-		for hk, hv := range entry.Headers {
-			headers[hk] = expandEnv(hv)
-		}
-
-		mcpConfigs[name] = ServerConfig{
-			Transport:  entry.Transport,
-			Command:    entry.Command,
-			Args:       entry.Args,
-			Env:        env,
-			URL:        expandEnv(entry.URL),
-			Headers:    headers,
-			WorkDir:    entry.WorkDir,
-			HTTPClient: cfg.HTTPClient,
-		}
+		mcpConfigs[name] = serverConfigFromEntry(entry, entry.WorkDir, cfg.HTTPClient, expandEnv)
 	}
 
 	gateway := newGateway()
-	gateway.config = cfg // Store the original config for diffing in Reconfigure
 	gateway.defaultWorkDir = cfg.DefaultWorkDir
 	gateway.schemaSanitizer = cfg.SchemaSanitizer
 	gateway.logger = logger

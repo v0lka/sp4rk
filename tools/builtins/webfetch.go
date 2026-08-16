@@ -158,8 +158,9 @@ type webFetchInput struct {
 //
 // Severity: every denial here is hard — SSRF is a security-control trigger
 // (private/reserved target, or the SSRF check being unavailable/unassessable),
-// and such reasons must never be weakened. The allowed path carries soft
-// severity, which is meaningless for an Allow outcome.
+// and such reasons must never be weakened. The allowed path leaves Severity
+// at its zero value (hard), which is meaningless for an Allow outcome — the
+// registry ignores Severity when Allow is true.
 func (t *WebFetchTool) Judge(ctx context.Context, input json.RawMessage) tools.JudgeOutcome {
 	var params webFetchInput
 	if err := json.Unmarshal(input, &params); err != nil || params.URL == "" {

@@ -1,6 +1,8 @@
 package agents
 
 import (
+	"context"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -199,5 +201,70 @@ func TestAgentManager_NonexistentDirSkipped(t *testing.T) {
 	}
 	if len(mgr.List()) != 0 {
 		t.Errorf("expected no agents from missing dir, got %d", len(mgr.List()))
+	}
+}
+
+// recordingHandler captures log records emitted during a scan so tests can
+// assert on levels without string-matching stderr.
+type recordingHandler struct {
+	records []slog.Record
+}
+
+func (h *recordingHandler) Enabled(_ context.Context, _ slog.Level) bool { return true }
+
+func (h *recordingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.records = append(h.records, r)
+	return nil
+}
+
+func (h *recordingHandler) WithAttrs(_ []slog.Attr) slog.Handler { return h }
+
+func (h *recordingHandler) WithGroup(_ string) slog.Handler { return h }
+
+// hasRecord reports whether any captured record has the given level and
+// message.
+func (h *recordingHandler) hasRecord(level slog.Level, msg string) bool {
+	for _, r := range h.records {
+		if r.Level == level && r.Message == msg {
+			return true
+		}
+	}
+	return false
+}
+
+// TestAgentManager_ScanSkipLogging verifies the visibility of skipped
+// entries: an AGENT.md that exists but fails validation (e.g. a `tools:`
+// list still using pre-group tool names) is logged at Warn — the operator
+// silently loses that profile otherwise — while a directory that simply has
+// no AGENT.md stays at Debug.
+func TestAgentManager_ScanSkipLogging(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	// Invalid profile: tools uses tool names, not group tokens.
+	writeAgent(t, dir, "reviewer",
+		"---\nname: reviewer\ndescription: reviews\ntools: edit_file,bash_exec\n---\nBody.\n")
+	// Not an agent at all: no AGENT.md inside.
+	if err := os.MkdirAll(filepath.Join(dir, "not-an-agent"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	h := &recordingHandler{}
+	mgr := NewAgentManager([]string{dir}, slog.New(h))
+	if err := mgr.Scan(); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+
+	if !h.hasRecord(slog.LevelWarn, "skipped invalid agent") {
+		t.Errorf("expected a Warn record %q for the invalid profile, got records: %+v", "skipped invalid agent", h.records)
+	}
+	if h.hasRecord(slog.LevelWarn, "skipped non-agent directory") {
+		t.Error("non-agent directories must not be logged at Warn")
+	}
+	if !h.hasRecord(slog.LevelDebug, "skipped non-agent directory") {
+		t.Errorf("expected a Debug record %q for the plain directory, got records: %+v", "skipped non-agent directory", h.records)
+	}
+	if _, ok := mgr.Get("reviewer"); ok {
+		t.Error("invalid profile must not be in the catalog")
 	}
 }

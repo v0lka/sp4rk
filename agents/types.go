@@ -83,9 +83,11 @@ func (a *Agent) Descriptor() AgentDescriptor {
 // whitespace is tolerated. Any token that is not a declared tool group — or a
 // duplicate group after canonicalization — yields an error instead of being
 // silently dropped: silently dropping tokens could turn a narrow request into
-// the full toolset. Group tokens are validated at parse time for AGENT.md
-// files (see validateToolsField); the error return matters for profiles built
-// programmatically, which never pass through the parser.
+// the full toolset. The list form is validated with the same rules (and the
+// same error messages) the parser applies to AGENT.md files (see
+// validateToolsField), so the parse-time and programmatic paths can never
+// diverge; the error return matters for profiles built programmatically,
+// which never pass through the parser.
 func (a *Agent) ToolPreference() (any, error) {
 	tools := strings.TrimSpace(a.Metadata.Tools)
 	switch tools {
@@ -94,18 +96,13 @@ func (a *Agent) ToolPreference() (any, error) {
 	case "read-only":
 		return "read-only", nil
 	default:
+		if err := validateToolsField(tools); err != nil {
+			return nil, err
+		}
+		// Validation passed, so every item canonicalizes cleanly.
 		var groups []string
-		seen := make(map[string]struct{}, 4)
 		for _, part := range strings.Split(tools, ",") {
-			canonical, ok := NormalizeToolGroupToken(part)
-			if !ok {
-				return nil, fmt.Errorf("tools: unknown tool group %q (valid groups: %s; also accepted: \"all\", \"read-only\")",
-					strings.TrimSpace(part), strings.Join(toolGroupTokens, ", "))
-			}
-			if _, dup := seen[canonical]; dup {
-				return nil, fmt.Errorf("tools: duplicate group %q", canonical)
-			}
-			seen[canonical] = struct{}{}
+			canonical, _ := NormalizeToolGroupToken(part)
 			groups = append(groups, canonical)
 		}
 		return groups, nil

@@ -60,7 +60,7 @@ After connecting, each server is queried with `tools/list`. Returned tools becom
 
 - `DefaultPolicy()` → `PolicyUserConfirm` (conservative default — remote, opaque tools).
 - `IsUntrusted()` → always `true` (output from external servers may be adversarial).
-- `Judge()` → always `(false, "")`, deferring to the LLM Judge (the gateway cannot inspect remote semantics).
+- `Judge()` → always a zero `JudgeOutcome` ("no tool-specific concern"; the gateway cannot inspect remote semantics, so it offers no heuristic of its own).
 - `Execute()` → calls the MCP server's `tools/call`, extracts text content (joins it; marshals structured content to JSON when no text is present).
 
 ### SchemaSanitizer

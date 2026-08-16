@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -1944,5 +1945,88 @@ func TestParseJudgeResponse_AllowTokens(t *testing.T) {
 				t.Errorf("expected VerdictAllow for %q, got %d", tok, verdict)
 			}
 		})
+	}
+}
+
+// TestJudgeSeverity_JSONUsesNames verifies the severity marshals as its
+// String() name ("hard"/"soft") — not a bare int — and that the name form is
+// the only accepted wire input: a bare int is rejected, and an unknown name
+// errors instead of silently degrading to a numeric or zero value. JSON null
+// is a no-op per the encoding/json convention (absent value, not malformed
+// one): the receiver keeps its current value.
+func TestJudgeSeverity_JSONUsesNames(t *testing.T) {
+	for _, tc := range []struct {
+		sev      JudgeSeverity
+		wantJSON string
+	}{
+		{JudgeSeverityHard, `"hard"`},
+		{JudgeSeveritySoft, `"soft"`},
+	} {
+		got, err := json.Marshal(tc.sev)
+		if err != nil {
+			t.Fatalf("Marshal(%v): unexpected error: %v", tc.sev, err)
+		}
+		if string(got) != tc.wantJSON {
+			t.Errorf("Marshal(%v) = %s, want %s", tc.sev, got, tc.wantJSON)
+		}
+
+		var back JudgeSeverity
+		if err := json.Unmarshal(got, &back); err != nil {
+			t.Fatalf("Unmarshal(%s): unexpected error: %v", got, err)
+		}
+		if back != tc.sev {
+			t.Errorf("round-trip of %v yielded %v", tc.sev, back)
+		}
+	}
+
+	for _, bad := range []string{`0`, `1`, `"unknown"`} {
+		var sev JudgeSeverity
+		if err := json.Unmarshal([]byte(bad), &sev); err == nil {
+			t.Errorf("Unmarshal(%s) = nil error, want rejection (canonical wire form is the name)", bad)
+		}
+	}
+
+	// null is a no-op, not malformed input: a fresh variable keeps the zero
+	// value (hard, fail-closed) and a pre-set value survives untouched.
+	var fresh JudgeSeverity
+	if err := json.Unmarshal([]byte(`null`), &fresh); err != nil {
+		t.Fatalf("Unmarshal(null): unexpected error: %v", err)
+	}
+	if fresh != JudgeSeverityHard {
+		t.Errorf("Unmarshal(null) into fresh var = %v, want %v (zero value)", fresh, JudgeSeverityHard)
+	}
+	preset := JudgeSeveritySoft
+	if err := json.Unmarshal([]byte(`null`), &preset); err != nil {
+		t.Fatalf("Unmarshal(null): unexpected error: %v", err)
+	}
+	if preset != JudgeSeveritySoft {
+		t.Errorf("Unmarshal(null) into preset var = %v, want %v (unchanged)", preset, JudgeSeveritySoft)
+	}
+}
+
+// TestConfirmationRequest_SeverityOnTheWire verifies the severity travels as
+// its name inside a serialized ConfirmationRequest — the field exists for
+// hosts that persist or forward confirmation requests, and its wire form
+// must stay legible and reorder-stable.
+func TestConfirmationRequest_SeverityOnTheWire(t *testing.T) {
+	data, err := json.Marshal(ConfirmationRequest{
+		ToolName:       "bash_exec",
+		Input:          json.RawMessage(`{"command":"ls"}`),
+		JudgeReasoning: "blacklist match",
+		JudgeSeverity:  JudgeSeverityHard,
+	})
+	if err != nil {
+		t.Fatalf("Marshal: unexpected error: %v", err)
+	}
+	if !strings.Contains(string(data), `"judge_severity":"hard"`) {
+		t.Errorf("marshaled request = %s, want judge_severity as the name \"hard\"", data)
+	}
+
+	var back ConfirmationRequest
+	if err := json.Unmarshal(data, &back); err != nil {
+		t.Fatalf("Unmarshal: unexpected error: %v", err)
+	}
+	if back.JudgeSeverity != JudgeSeverityHard {
+		t.Errorf("round-trip JudgeSeverity = %v, want %v", back.JudgeSeverity, JudgeSeverityHard)
 	}
 }

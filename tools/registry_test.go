@@ -332,6 +332,40 @@ func TestListFiltered_MCPSource(t *testing.T) {
 	}
 }
 
+// TestListFiltered_GroupPopulated verifies the descriptor path that planner/
+// executor consumers read carries each tool's live capability group: the
+// Group field must mirror Tool.Group() for declared tools (the group alone
+// drives allow-lists and policy resolution per the group contract), and an
+// undeclared group must surface as empty (fail-closed for group filtering —
+// it matches no allow-list).
+func TestListFiltered_GroupPopulated(t *testing.T) {
+	reg := NewToolRegistry()
+	reader := newMockTool("reader", "declared local_read tool")
+	reader.ToolGroup = GroupLocalRead
+	reg.Register(reader)
+	writer := newMockTool("writer", "declared local_write tool")
+	writer.ToolGroup = GroupLocalWrite
+	_ = reg.RegisterWithSource(writer, "mcp:server")             // grouped tool from a non-core source
+	reg.Register(newMockTool("undeclared", "no group declared")) // zero value
+
+	byName := make(map[string]ToolDescriptor, 3)
+	for _, d := range reg.ListFiltered(nil) {
+		byName[d.Name] = d
+	}
+	if len(byName) != 3 {
+		t.Fatalf("expected 3 descriptors, got %d", len(byName))
+	}
+	if got := byName["reader"].Group; got != GroupLocalRead {
+		t.Errorf("reader descriptor group = %q, want %q", got, GroupLocalRead)
+	}
+	if got := byName["writer"].Group; got != GroupLocalWrite {
+		t.Errorf("writer descriptor group = %q, want %q (group must follow the tool, not the source)", got, GroupLocalWrite)
+	}
+	if got := byName["undeclared"].Group; got != "" {
+		t.Errorf("undeclared descriptor group = %q, want empty (fail-closed)", got)
+	}
+}
+
 func TestGetToolSource_NotFound(t *testing.T) {
 	reg := NewToolRegistry()
 	if src := reg.GetToolSource("nonexistent"); src != "" {

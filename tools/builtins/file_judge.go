@@ -15,6 +15,16 @@ func softOutcome(allowed bool, reason string) tools.JudgeOutcome {
 	return tools.JudgeOutcome{Allow: allowed, Reason: reason, Severity: tools.JudgeSeveritySoft}
 }
 
+// hardOutcome wraps an (allowed, reason) pair into a JudgeOutcome with hard
+// severity. Used for unassessable inputs ("cannot determine target path") —
+// mirroring the web_fetch judge's "cannot determine target URL" — because an
+// input that cannot be assessed at all must never be auto-resolved by Smart
+// Approve or weakened by the advisory judge (JudgeSeverityHard contract in
+// tools/safety.go).
+func hardOutcome(allowed bool, reason string) tools.JudgeOutcome {
+	return tools.JudgeOutcome{Allow: allowed, Reason: reason, Severity: tools.JudgeSeverityHard}
+}
+
 // judgeWriteInSessionRoots checks whether a write operation targets a path
 // inside the session workspace or the session temp directory. Both roots are
 // treated as equal peers: writes inside either are auto-approved (when
@@ -24,7 +34,10 @@ func softOutcome(allowed bool, reason string) tools.JudgeOutcome {
 func judgeWriteInSessionRoots(ctx context.Context, path string) tools.JudgeOutcome {
 	absPath, err := filepath.Abs(path)
 	if err != nil {
-		return tools.JudgeOutcome{Severity: tools.JudgeSeveritySoft}
+		// Cannot determine path — fail closed and escalate to confirmation
+		// (mirrors the read-side judge). Unassessable input is hard: it must
+		// not be auto-resolved by Smart Approve.
+		return hardOutcome(false, "cannot determine target path")
 	}
 	absPath = filepath.Clean(absPath)
 	if resolved, evalErr := filepath.EvalSymlinks(absPath); evalErr == nil {
@@ -56,7 +69,8 @@ func judgeReadInSessionRootsForPath(ctx context.Context, resolvedPath string) to
 	absPath, err := filepath.Abs(resolvedPath)
 	if err != nil {
 		// Cannot determine path — fail closed and escalate to confirmation.
-		return softOutcome(false, "cannot determine target path")
+		// Unassessable input is hard (see hardOutcome).
+		return hardOutcome(false, "cannot determine target path")
 	}
 	absPath = filepath.Clean(absPath)
 	if evaled, evalErr := filepath.EvalSymlinks(absPath); evalErr == nil {
@@ -110,16 +124,17 @@ func judgeReadWithPathDefault(ctx context.Context, input json.RawMessage, pathOp
 	}
 	if err := json.Unmarshal(input, &params); err != nil {
 		// Cannot determine path — fail closed and escalate to confirmation.
-		return softOutcome(false, "cannot determine target path")
+		// Unassessable input is hard (see hardOutcome).
+		return hardOutcome(false, "cannot determine target path")
 	}
 
 	if params.Path == "" {
 		if !pathOptional {
-			return softOutcome(false, "cannot determine target path")
+			return hardOutcome(false, "cannot determine target path")
 		}
 		ws := tools.WorkspacePathFrom(ctx)
 		if ws == "" {
-			return softOutcome(false, "cannot determine target path")
+			return hardOutcome(false, "cannot determine target path")
 		}
 		return judgeReadInSessionRootsForPath(ctx, ws)
 	}

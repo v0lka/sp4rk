@@ -77,7 +77,7 @@ A profile whose `name` does not match its parent directory name is rejected. A m
 | `tools` value | Returns | Meaning |
 | ------------- | ------- | ------- |
 | `""` or `"all"` (default; surrounding whitespace tolerated) | `nil`, no error | grant the full mutating toolset (resolver treats nil as all tools) |
-| `"read-only"` | `"read-only"`, no error | mandatory read-only/MCP base only |
+| `"read-only"` | `"read-only"`, no error | the read-only preset — the resolver grants local-read + remote-read on top of the always-included `system` group, **no MCP** (the reference host resolves it this way) |
 | comma-list of tool-group tokens (e.g. `"local-read,execute"`) | `[]string`, no error | granted capability groups (kebab-case; underscores normalize); the resolver always adds the `system` group on top. Valid tokens come from `ToolGroupTokens()` |
 | unknown token, empty item, or duplicate group (after canonicalization, including mixed kebab/underscore spellings) | error | fail-closed: the token is never silently dropped — dropping every token would widen `nil` → full toolset |
 

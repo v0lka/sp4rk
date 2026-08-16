@@ -185,8 +185,17 @@ Every MCP tool wrapper has these fixed behaviors:
 
 - **`DefaultPolicy()`** returns `PolicyUserConfirm` — a conservative default because MCP tools are remote and opaque.
 - **`IsUntrusted()`** always returns `true` — MCP tool output comes from external servers and may contain adversarial content, so it is treated as untrusted for prompt-injection defense.
-- **`Judge()`** (implements `ToolJudger`) always defers to the LLM Judge by returning `(false, "")`, since the gateway cannot inspect remote tool semantics.
+- **`Judge()`** (implements `ToolJudger`) returns a zero `JudgeOutcome`, i.e. "no tool-specific concern" — the gateway cannot inspect remote tool semantics, so it offers no heuristic of its own. This is only reached when a host overrides the tool's policy to `PolicyAlwaysAllow`; under the default `PolicyUserConfirm` the call escalates like any other confirmation-gated tool.
 - **`Execute()`** calls the MCP server's `tools/call` endpoint with the provided input and converts the result to a `tools.ToolResult`. Text content is extracted and joined; structured content is marshaled to JSON when no text is present.
+
+### Capability groups
+
+Every MCP tool is tagged with a capability group (`tools.ToolGroup`) so it participates in group-based toolset selection (subagent `tools:` budgets) and group-based host policy:
+
+- The **transport default** is derived by `tools.MCPToolGroup(transport)`: `stdio` servers run as local processes → `local_mcp`; `http` servers are remote → `remote_mcp`.
+- A **per-server override** can be set via the `ToolGroupOverride` field — on `ServerEntry` (the gateway configuration passed to `StartGateway`/`Reconfigure`) or directly on the low-level `ServerConfig` (used with `mcp.Server` directly) — when the transport default misrepresents the server's trust boundary — e.g. an `http`-transport tunnel to a process on the same machine may be more truthfully tagged `local_mcp`. An empty, undeclared, or reserved value is ignored and the transport default applies; the reserved `system` group is never honored — hosts treat `system` tools as trusted orchestration builtins that bypass policy gates, so an external MCP server can never opt itself (or be opted) out of the host's security checks.
+
+`Tool.Group()` is evaluated against the server's **current** state (override, else transport) at call time, so a reconnected server whose transport or override changed reports the new group without needing re-registration. An undeclared group matches no group-based allow-list (fail-closed).
 
 ## SchemaSanitizer
 

@@ -21,7 +21,7 @@ The example ships in **two variants** plus a shared `tools.go`:
 
 - `security.WrapUntrustedContent` / `StripUntrustedTags` — how untrusted content is delimited
 - `tools.BaseTool.Untrusted` — opting a tool into the prompt-injection defense
-- `tools.ToolJudger` — per-tool safety heuristic (`Judge → (allow, reasoning)`)
+- `tools.ToolJudger` — per-tool safety heuristic (`Judge → JudgeOutcome{Allow, Reason, Severity}`)
 - `ToolPolicy` + the fail-closed `ConfirmFunc` escalation path
 
 ## Two mechanisms
@@ -59,18 +59,33 @@ The model sees a single inert block — the breakout is neutralized.
 A custom `append_log` tool (`PolicyAlwaysAllow`) implements `tools.ToolJudger`:
 
 ```go
-func (t *appendLogTool) Judge(_ context.Context, input json.RawMessage) (bool, string) {
+func (t *appendLogTool) Judge(_ context.Context, input json.RawMessage) tools.JudgeOutcome {
     // … parse path …
-    if !strings.HasPrefix(path, workspace) {
-        return false, "path outside workspace — potential sandbox escape"
+    within, err := pathutil.IsWithinPath(t.ws, in.Path)
+    if err != nil {
+        // Unassessable input — fail closed, and never soft.
+        return tools.JudgeOutcome{Reason: "cannot determine target path", Severity: tools.JudgeSeverityHard}
     }
-    return true, ""
+    if !within {
+        return tools.JudgeOutcome{
+            Reason:   "path outside workspace — potential sandbox escape",
+            Severity: tools.JudgeSeveritySoft, // scope question, not a fired control
+        }
+    }
+    return tools.JudgeOutcome{Allow: true}
 }
 ```
 
+Use `pathutil.IsWithinPath` (or `IsWithinPathFold` on case-insensitive
+filesystems) for containment — never a hand-rolled `strings.HasPrefix` check,
+which a sibling directory such as `<workspace>-evil` defeats.
+
 The registry calls `Judge` before executing any `PolicyAlwaysAllow` tool. When
-the judge returns `allow=false` with a reason, the call is **escalated** to the
-`ConfirmFunc` (and DENIED if none is configured):
+the judge returns `Allow=false` with a reason, the call is **escalated** to the
+`ConfirmFunc` (and DENIED if none is configured). The outcome's `Severity`
+(`hard` for fired security controls, `soft` for scope questions) travels to the
+host via `ConfirmationRequest.JudgeSeverity`, which decides whether the
+escalation may be auto-resolved:
 
 ```
 out-of-workspace -> judge blocks -> [escalated to confirm] append_log … -> DENIED
