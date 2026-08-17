@@ -67,6 +67,7 @@ func TestJudgeStrictAlwaysCallsLLMAndIncludesContext(t *testing.T) {
 	judge.SetIsInternalFn(func(string) bool { return true })
 
 	ctx := WithWorkspacePath(context.Background(), t.TempDir())
+	ctx = WithAllowedRoots(ctx, []string{"/aux/explicit-dir"})
 	ctx = WithEnvInfo(ctx, &EnvInfo{OS: "TestOS"})
 	input := json.RawMessage(`{"path":"` + WorkspacePathFrom(ctx) + `/file.txt"}`)
 	request := StrictJudgeRequest{
@@ -103,6 +104,11 @@ func TestJudgeStrictAlwaysCallsLLMAndIncludesContext(t *testing.T) {
 		}
 		if !strings.Contains(envelope.Environment, "TestOS") {
 			t.Errorf("compact environment missing from envelope: %q", envelope.Environment)
+		}
+		if len(envelope.SessionDirectories) < 2 ||
+			envelope.SessionDirectories[0] != WorkspacePathFrom(ctx) ||
+			envelope.SessionDirectories[1] != "/aux/explicit-dir" {
+			t.Errorf("session directories missing from envelope: %v", envelope.SessionDirectories)
 		}
 		if envelope.Input != string(input) {
 			t.Errorf("input changed in envelope: got %s want %s", envelope.Input, input)
