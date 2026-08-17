@@ -15,18 +15,14 @@ const maxDescriptionLength = 1200
 
 // builtinTools returns every builtin tool registered by this package on the
 // current platform, so the guard cannot drift out of sync with registrations.
+// The platform shell tool (bash_exec on Unix, posh_exec on Windows) is
+// contributed by platformShellTools in the build-tagged files.
 func builtinTools(t *testing.T) []sdktools.Tool {
 	t.Helper()
 
-	bashTool, err := NewBashExecTool(nil)
-	if err != nil {
-		t.Fatalf("NewBashExecTool: %v", err)
-	}
-
 	vecTool := NewVectorSearchTool(nil, nil)
 
-	return []sdktools.Tool{
-		bashTool,
+	return append([]sdktools.Tool{
 		NewReadFileTool(),
 		NewWriteFileTool(),
 		NewEditFileTool(),
@@ -47,7 +43,7 @@ func builtinTools(t *testing.T) []sdktools.Tool {
 		NewStoreFactTool(),
 		NewSearchFactsTool(),
 		NewReadAttachmentTool(),
-	}
+	}, platformShellTools()...)
 }
 
 func TestBuiltinDescriptionsWithinGuardLimit(t *testing.T) {
