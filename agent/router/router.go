@@ -15,6 +15,13 @@ import (
 	"github.com/v0lka/sp4rk/tools"
 )
 
+// ErrRoutingParse is returned when the routing decision JSON could not be
+// parsed even after the built-in repair retry. Callers can detect it with
+// errors.Is to degrade gracefully (e.g. fall back to a default routing
+// decision) instead of failing the whole task. It wraps the final unmarshal
+// error of the repair attempt.
+var ErrRoutingParse = errors.New("routing decision parse failed")
+
 // toolMatchingInstruction is the prompt section injected via the TOOL-MATCHING
 // placeholder when semantic tool selection is enabled (Router.toolMatching). It
 // directs the router LLM to pick the relevant tools from the available set and
@@ -180,6 +187,9 @@ func (r *Router) Route(ctx context.Context, userMessage string, availableTools [
 	req := llm.ChatRequest{
 		Messages:        messages,
 		ReasoningEffort: r.reasoningEffort,
+		// The routing decision is parsed as JSON — request the deterministic
+		// sampling profile instead of the vendor preset.
+		CallPurpose: llm.CallPurposeRouting,
 	}
 
 	// Call LLM
@@ -208,7 +218,7 @@ func (r *Router) Route(ctx context.Context, userMessage string, availableTools [
 			Content: "Your previous response was not valid JSON. " + jsonSchema,
 		}
 
-		retryResp, retryErr := r.llm.Call(ctx, llm.ChatRequest{Messages: repairMessages, ReasoningEffort: r.reasoningEffort})
+		retryResp, retryErr := r.llm.Call(ctx, llm.ChatRequest{Messages: repairMessages, ReasoningEffort: r.reasoningEffort, CallPurpose: llm.CallPurposeRouting})
 		if retryErr != nil {
 			return nil, fmt.Errorf("router retry LLM call failed: %w", retryErr)
 		}
@@ -218,7 +228,7 @@ func (r *Router) Route(ctx context.Context, userMessage string, availableTools [
 
 		retryJSON := llm.ExtractJSON(retryResp.Message.Content)
 		if retryErr := json.Unmarshal([]byte(retryJSON), &routingDecision); retryErr != nil {
-			return nil, fmt.Errorf("failed to parse routing decision after retry: %w", retryErr)
+			return nil, fmt.Errorf("%w after repair retry: %w", ErrRoutingParse, retryErr)
 		}
 	}
 

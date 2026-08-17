@@ -9,7 +9,12 @@ import (
 	"github.com/v0lka/sp4rk/tools"
 )
 
-const toolReadFileDescription = `Reads and returns the contents of a file at the given path. Supports pagination via optional line range parameters. Output includes a metadata header showing the file name, returned line range, and total line count. When more content remains beyond the returned range, a continuation hint is appended.`
+const toolReadFileDescription = `Purpose: read the contents of a text file at a given path, optionally a line range.
+Use when: you already know the exact path — discover paths first with list_directory, glob or ripgrep.
+Inputs: path (absolute or workspace-relative); optional start_line (1-based, inclusive) and end_line (1-based, inclusive) for pagination of large files.
+Outputs: the file content with a metadata header (file name, returned range, total line count); when more content remains beyond the range, a continuation hint names the next start_line — follow it with another read_file call.
+Example: start_line=100, end_line=250 reads the second chunk of a long file.
+Anti-example: not for searching content by pattern (ripgrep), by meaning (semantic_search) or by file name (glob); do not read a huge file whole — page through ranges; binary and document formats (e.g. pdf, docx) are returned as-is, not converted.`
 
 // ReadFileTool reads file contents with pagination support.
 type ReadFileTool struct {

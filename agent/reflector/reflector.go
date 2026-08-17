@@ -90,6 +90,8 @@ func (r *Reflector) Reflect(
 	req := llm.ChatRequest{
 		Messages:        messages,
 		ReasoningEffort: r.reasoningEffort,
+		// The reflection is parsed as JSON — deterministic sampling, like routing.
+		CallPurpose: llm.CallPurposeRouting,
 	}
 
 	resp, err := r.llm.Call(ctx, req)

@@ -9,7 +9,12 @@ import (
 	"github.com/v0lka/sp4rk/tools"
 )
 
-const toolVectorSearchDescription = `Search the project codebase using hybrid (vector + BM25) similarity matching. Finds code by meaning and intent as well as by literal symbol/keyword match. Returns file paths, line ranges, fused relevance scores, per-side ranks, and content previews. Effective for: finding implementations of a concept (e.g. "authentication middleware"), locating related functionality across files, discovering architecture patterns and data flows, and pinpointing a specific identifier (e.g. +MatcherFactory). For exact string literals or known file-name patterns, use ripgrep or glob.`
+const toolVectorSearchDescription = `Purpose: hybrid (vector + BM25) code search — finds code by meaning and intent as well as by literal keywords.
+Use when: hunting a concept rather than an exact string ("authentication middleware", "retry with backoff", "connection pooling") or related functionality across files. For exact literals/identifiers use ripgrep; for file names use glob.
+Inputs: query (natural-language description of the concept); optional mode (hybrid | vector | lexical; hybrid fuses both); optional file_pattern (glob narrow, e.g. src/**/*.ts); optional must_match (literal substrings all required in a chunk); optional top_k (result count).
+Outputs: ranked matches with file path, line range, fused relevance score and a content preview; empty until the index is ready.
+Example: query "database connection pooling", top_k 10.
+Anti-example: not for exact identifiers or error strings (ripgrep is precise and instant); not for file-name lookups (glob); single-token queries score poorly — describe the intent.`
 
 // VectorSearchResult represents a single search result.
 //

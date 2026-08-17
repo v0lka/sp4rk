@@ -20,7 +20,12 @@ func limitBody(r io.Reader) io.Reader {
 	return io.LimitReader(r, maxResponseBodyBytes)
 }
 
-const toolWebsearchDescription = `Search the web and return a list of results with titles, URLs, and text snippets. Use this to find current information, external documentation, recent events, or any knowledge that may be beyond training data. Returns up to max_results entries (default 5), each with a title, URL, and a brief snippet summarizing the page content.`
+const toolWebsearchDescription = `Purpose: search the web and return up to max_results entries, each with a title, URL and a snippet summarizing the page.
+Use when: you need information beyond your training data — current docs, recent releases, library versions, external error reports. Pick a promising URL from the results and read the full page with web_fetch.
+Inputs: query (be specific — keywords beat prose); optional max_results (default 5).
+Outputs: a list of {title, URL, snippet} results.
+Example: query "modernc.org/sqlite pure-Go driver requirements", then web_fetch the top hit.
+Anti-example: not for reading a URL you already have (web_fetch directly); avoid vague one-word queries — they return noise; never paste secrets into a search query.`
 
 // SearchResult represents a single provider-agnostic search result.
 type SearchResult struct {

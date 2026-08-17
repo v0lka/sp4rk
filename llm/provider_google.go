@@ -82,6 +82,11 @@ type googleFunctionDeclaration struct {
 type googleGenerationConfig struct {
 	MaxOutputTokens int      `json:"maxOutputTokens,omitempty"`
 	Temperature     *float64 `json:"temperature,omitempty"`
+	// topP/topK are the Gemini sampling parameters; the API has no
+	// presence_penalty/repetition_penalty equivalents, so those ChatRequest
+	// fields are never serialized for Google.
+	TopP *float64 `json:"topP,omitempty"`
+	TopK *int     `json:"topK,omitempty"`
 }
 
 // googleGenerateResponse is the Google generateContent response.
@@ -255,12 +260,14 @@ func buildGoogleRequest(req ChatRequest) *googleGenerateRequest {
 		out.Tools = []googleToolDecls{{FunctionDeclarations: decls}}
 	}
 
-	if req.MaxTokens > 0 || req.Temperature != nil {
+	if req.MaxTokens > 0 || req.Temperature != nil || req.TopP != nil || req.TopK != nil {
 		gc := &googleGenerationConfig{}
 		if req.MaxTokens > 0 {
 			gc.MaxOutputTokens = req.MaxTokens
 		}
 		gc.Temperature = req.Temperature
+		gc.TopP = req.TopP
+		gc.TopK = req.TopK
 		out.GenerationConfig = gc
 	}
 

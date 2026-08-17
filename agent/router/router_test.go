@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -110,6 +111,74 @@ func TestRoute_PassesToolsInPrompt(t *testing.T) {
 	}
 	if !strings.Contains(systemMessage.Content, "Execute bash commands") {
 		t.Error("system prompt should contain tool description 'Execute bash commands'")
+	}
+}
+
+// TestRoute_ToolMatchingPromptIncludesToolNames verifies that with semantic
+// tool matching enabled the routing prompt still lists every available tool by
+// name (AVAILABLE-TOOLS is substituted unconditionally, independent of the
+// toolMatching flag) and carries the matched_tools selection instruction, so
+// the router LLM can actually pick from real tool names.
+func TestRoute_ToolMatchingPromptIncludesToolNames(t *testing.T) {
+	mock := &mockLLMCaller{
+		responses: []*llm.ChatResponse{{
+			Message: llm.Message{
+				Role:    "assistant",
+				Content: `{"domain":"code","complexity":2,"needs_clarification":false,"matched_tools":["read_file"]}`,
+			},
+		}},
+	}
+
+	r := New(mock, Config{
+		SystemPrompt:  "Tools: {{AVAILABLE-TOOLS}}\nSkills: {{AVAILABLE-SKILLS}}\nMatching: {{TOOL-MATCHING}}\nSchema: {{JSON-OUTPUT-SCHEMA}}",
+		HistoryWindow: 5,
+	})
+	r.SetToolMatching(true)
+
+	availableTools := []tools.ToolDescriptor{
+		{Name: "read_file", Description: "Read file contents"},
+		{Name: "bash_exec", Description: "Execute bash commands"},
+	}
+
+	decision, err := r.Route(context.Background(), "read the config file", availableTools, nil, nil)
+	if err != nil {
+		t.Fatalf("Route returned error: %v", err)
+	}
+	if len(decision.MatchedTools) != 1 || decision.MatchedTools[0] != "read_file" {
+		t.Errorf("expected matched_tools [read_file], got %v", decision.MatchedTools)
+	}
+
+	prompt := mock.lastCall().Messages[0].Content
+	for _, want := range []string{"read_file", "bash_exec", "matched_tools"} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("routing prompt with tool matching enabled must contain %q; prompt:\n%s", want, prompt)
+		}
+	}
+}
+
+// TestRoute_ParseErrorAfterRepairIsSentinel verifies that when the routing
+// decision JSON stays unparseable after the built-in repair retry, Route
+// returns an error matching ErrRoutingParse, so callers can detect the
+// exhausted repair cycle and degrade gracefully (e.g. fall back to a default
+// routing decision) instead of failing the whole task.
+func TestRoute_ParseErrorAfterRepairIsSentinel(t *testing.T) {
+	mock := &mockLLMCaller{
+		responses: []*llm.ChatResponse{{
+			Message: llm.Message{Role: "assistant", Content: "not json <<<"},
+		}},
+	}
+
+	r := newTestRouter(mock, 5)
+
+	_, err := r.Route(context.Background(), "do things", nil, nil, nil)
+	if err == nil {
+		t.Fatal("expected error for unparseable routing JSON")
+	}
+	if !errors.Is(err, ErrRoutingParse) {
+		t.Errorf("expected ErrRoutingParse in error chain, got: %v", err)
+	}
+	if mock.callIdx != 2 {
+		t.Errorf("expected initial call + one repair retry (2 LLM calls), got %d", mock.callIdx)
 	}
 }
 

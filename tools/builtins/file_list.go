@@ -10,7 +10,12 @@ import (
 	"github.com/v0lka/sp4rk/tools"
 )
 
-const toolListDirectoryDescription = `Lists the immediate contents of a directory, returning each entry's name, type (file or dir), and size in bytes. Does not recurse into subdirectories.`
+const toolListDirectoryDescription = `Purpose: list the immediate contents of one directory — each entry's name, type (file or dir) and size in bytes. Non-recursive.
+Use when: exploring an unfamiliar tree, verifying a path exists, or deciding which file to open next. For recursive name-pattern search use glob; for content search use ripgrep; once you know the exact file, open it with read_file.
+Inputs: path (absolute or workspace-relative directory).
+Outputs: one line per entry with name, type and size; an error if the path is missing or not a directory.
+Example: list src/ to see the packages before reading any file.
+Anti-example: not for finding files by pattern across subtrees (glob '**' does that); not for searching inside files (ripgrep).`
 
 // ListDirectoryTool lists directory contents.
 type ListDirectoryTool struct {

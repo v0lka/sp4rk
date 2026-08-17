@@ -715,6 +715,9 @@ func (p *Planner) callAndParsePlan(
 	req := llm.ChatRequest{
 		Messages:        messages,
 		ReasoningEffort: p.Cfg.ReasoningEffort,
+		// Plan generation is a structured-decision call (JSON plan output):
+		// deterministic sampling, like routing.
+		CallPurpose: llm.CallPurposeRouting,
 	}
 
 	var lastParseErr error

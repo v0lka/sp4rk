@@ -18,7 +18,12 @@ import (
 	"github.com/v0lka/sp4rk/tools"
 )
 
-const toolPoshDescription = `Execute commands via Windows PowerShell (powershell.exe -NoProfile -NonInteractive -Command). Use this for build commands, running scripts, installing packages, git operations, and system tasks on Windows. Returns combined stdout and stderr. Commands time out after 60 seconds by default (configurable up to 120s). An optional working_directory can be set for the command's execution context.`
+const toolPoshDescription = `Purpose: execute a command via Windows PowerShell (powershell.exe -NoProfile -NonInteractive -Command) — the fallback for what no dedicated tool covers on Windows: builds, test runs, package managers, git operations, system tasks.
+Use when: reading (read_file), editing (edit_file), listing (list_directory) and searching (ripgrep, glob) all have dedicated tools — reach for the shell only when they cannot do the job.
+Inputs: command (PowerShell statement; pipelines OK); optional working_directory (absolute path for the command's execution context); optional timeout (Go duration like "30s"/"2m", default 60s, capped at the configured max).
+Outputs: combined stdout and stderr; failing exit codes surface as errors carrying the output. Keep output minimal to avoid flooding context.
+Example: "go build ./... ; if ($LASTEXITCODE -ne 0) { exit 1 }".
+Anti-example: do not "Get-Content src/app.go" (read_file) or "Get-ChildItem -Recurse -Filter *.ts" (glob) — dedicated tools respect path policy and return structured results.`
 
 // PoshExecTool executes PowerShell commands via powershell.exe on Windows.
 // It is the Windows counterpart of BashExecTool: same blacklist/Judge model,

@@ -1401,6 +1401,13 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 		// Source: https://docs.z.ai + https://docs.bigmodel.cn
 		// GLM 5.x: 1M/200K context, 128K max output.
 		// GLM 4.7: 200K context, 128K max output.
+		"glm-5.3": {
+			ContextWindow: 1000000,
+			OutputLimit:   128000,
+			TokenizerType: "approximate",
+			Family:        "glm",
+			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+		},
 		"glm-5.2": {
 			ContextWindow: 1000000,
 			OutputLimit:   128000,

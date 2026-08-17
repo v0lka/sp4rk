@@ -10,7 +10,12 @@ import (
 	"github.com/v0lka/sp4rk/tools"
 )
 
-const toolWriteFileDescription = `Creates or overwrites a file with the provided content. Parent directories are created automatically if they do not exist. Use this tool to create new files or fully replace existing file contents. For making targeted changes to an existing file, prefer edit_file instead. Always read the file first before overwriting to avoid accidental data loss.`
+const toolWriteFileDescription = `Purpose: create a new file or fully replace an existing one (parent directories are created automatically, like mkdir -p).
+Use when: emitting a new artifact, or replacing a file's entire content deliberately. For surgical changes to an existing file prefer edit_file — it anchors on an exact match and cannot silently clobber unexpected content.
+Inputs: path (target location); content (the complete new file body — this replaces everything).
+Outputs: confirmation of the write, or an error (invalid path, policy denial).
+Example: writing a generated report to reports/summary.md.
+Anti-example: not for partial edits (edit_file); read the current file first if it exists — overwrite is silent and destructive; do not use for scratch outside the workspace.`
 
 // WriteFileTool creates or overwrites files.
 type WriteFileTool struct {

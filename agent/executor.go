@@ -196,14 +196,17 @@ var circuitBreakerExemptTools = map[string]struct{}{
 // Circuit-breaker nudge messages. Kept as Go constants because they use fmt.Sprintf
 // with runtime values that would require a template engine if moved to markdown.
 const (
-	repeatNudgeMessage = "[System] You have called the same tool with the same arguments " +
-		"multiple times in a row and it keeps failing. Try a different approach: " +
-		"use different arguments, a different tool, or call finish if the task cannot be completed."
+	repeatNudgeMessage = "[System] You have called the same tool with identical arguments " +
+		"multiple times in a row. Identical calls always produce identical results — " +
+		"this is an infinite loop. Change your approach: use different arguments, a " +
+		"different tool, or call finish if the task cannot be completed."
 
 	repeatErrorNudgeMessage = "[System] The previous call to this tool with " +
-		"identical arguments returned an error. Retrying the same call will produce the " +
-		"same error. You must try a different approach: use different arguments, a " +
-		"different tool, or call finish if the task cannot be completed."
+		"identical arguments returned an error, and you are repeating it unchanged — " +
+		"it will fail the same way. Retrying after you have genuinely fixed the failing " +
+		"argument is legitimate and will not be flagged; repeating identical arguments is not. " +
+		"Fix the failing argument, use a different tool, or call finish if the task " +
+		"cannot be completed."
 
 	truncationMessage = "[System] Your tool call to '%s' was NOT executed because your output " +
 		"was cut off by the model's maximum output token limit. The tool call arguments are " +
@@ -211,14 +214,28 @@ const (
 		"for example, break large file writes into multiple smaller operations, use read_file " +
 		"with line ranges instead of reading entire files, or reduce the content size."
 
-	parseErrorNudgeMessage = "[System] This tool has now failed to parse input %d times in a row. " +
-		"The arguments you are generating are malformed. Try a completely different approach: " +
-		"reduce the size of your arguments, use a different tool, or break the operation into " +
-		"smaller steps."
+	parseErrorNudgeFmt = "[System] This tool has now failed to parse input %d times in a row. " +
+		"The arguments you are generating are malformed.\n" +
+		"Parse error: %s\n" +
+		"Your raw output as received (truncated to ~%d chars): %s\n" +
+		"Respond with ONLY a valid JSON tool call — no prose before or after it, no markdown code fences. " +
+		"Try a completely different approach: reduce the size of your arguments, use a different tool, " +
+		"or break the operation into smaller steps."
 
 	executorFruitlessNudge = "[System] Your last %d tool calls returned empty or minimal results. Continuing to search with different parameters is unlikely to yield new information. Summarize what you have found so far and call the finish tool."
 
-	executorSameToolRepeatNudge = "[System] You have called '%s' %d times in a row with different arguments but consistently similar results. This suggests the information you are looking for may not exist or requires a fundamentally different approach. Summarize your findings and call the finish tool."
+	executorSameToolRepeatNudge = "[System] You have called '%s' %d times in a row with different arguments but consistently similar results. Varying arguments alone is not narrowing the results. Refine the formulation of your query to target different information, or use a different tool. If the information likely does not exist, summarize your findings and call the finish tool."
+)
+
+// Parse-error nudge excerpt limits. The parse-error nudge quotes the parse
+// error itself and a prefix of the model's raw output so the model can see
+// what actually arrived and correct the format. Both cuts are rune-safe
+// (strutil.TruncateUTF8).
+const (
+	// parseErrorNudgeErrPrefix caps the parse-error description quoted in the nudge.
+	parseErrorNudgeErrPrefix = 200
+	// parseErrorNudgeRawPrefix caps the raw model output quoted in the nudge.
+	parseErrorNudgeRawPrefix = 300
 )
 
 // Executor runs the ReAct loop: Thought → Action → Observation.
@@ -236,6 +253,11 @@ type Executor struct {
 	toolResultBudget        ToolResultBudget
 	circuitBreaker          CircuitBreakerConfig
 	hitl                    HITLHandler // human-in-the-loop hooks (uses NoopHITLHandler if nil)
+
+	// Verify-on-edit hook: mechanical verification (tests/linter) after
+	// successful file edits. Set via SetVerifyOnEdit; nil disables it.
+	verifyOnEdit    EditVerifyRunner
+	verifyOnEditCap int
 
 	// Tool result caching and per-tool truncation (Stage 1).
 	toolCache         *ToolResultCache
@@ -262,11 +284,15 @@ type Executor struct {
 	consecutiveFruitlessCount int
 	fruitlessNudgeAttempted   bool
 
-	// Same-tool repetition tracker: detect same tool with varied args but similar results
-	sameToolConsecutiveCount int
-	sameToolLastName         string
-	sameToolLastResultLen    int
-	sameToolNudgeAttempted   bool
+	// Same-tool repetition tracker: detect same tool with varied args but similar results.
+	// sameToolLastResultIsError records whether the previous tracked call to the
+	// same tool failed: an error result followed by a retry with changed
+	// arguments is legitimate iteration (retry-after-fix), not loop evidence.
+	sameToolConsecutiveCount  int
+	sameToolLastName          string
+	sameToolLastResultLen     int
+	sameToolLastResultIsError bool
+	sameToolNudgeAttempted    bool
 
 	// Finish nudge tracker: ensure explicit finish tool call before accepting implicit finish
 	finishNudgeAttempted bool
@@ -938,7 +964,7 @@ func (e *Executor) Run(ctx context.Context, taskTools []tools.ToolDescriptor, cw
 
 		// No tool calls path
 		if len(resp.Message.ToolCalls) == 0 {
-			if result, act := e.handleImplicitFinish(resp, thought, state, cw, hasTools); result != nil {
+			if result, act := e.handleImplicitFinish(ctx, resp, thought, state, cw, hasTools); result != nil {
 				return result, nil
 			} else if act == actionContinue {
 				continue

@@ -9,7 +9,12 @@ import (
 	"github.com/v0lka/sp4rk/tools"
 )
 
-const toolDeleteDirectoryDescription = `Deletes a directory at the specified path. By default, only empty directories can be deleted. Set recursive to true to remove the directory and all of its contents. Fails if the path is not a directory.`
+const toolDeleteDirectoryDescription = `Purpose: delete a directory — empty-only by default, or the whole subtree with recursive=true (like rm -rf).
+Use when: removing a generated or obsolete directory tree. Deletion is destructive: prefer the default non-recursive mode (it fails loudly on non-empty), and escalate to recursive only after verifying the contents are disposable.
+Inputs: path (must be a directory); recursive (bool — true removes the directory and all contents).
+Outputs: confirmation, or an error (not a directory, non-empty without recursive, policy denial).
+Example: delete build/tmp after verifying its contents.
+Anti-example: never recursive-delete unreviewed content "to clean up"; for a single file use delete_file.`
 
 // DeleteDirectoryTool deletes directories.
 type DeleteDirectoryTool struct {

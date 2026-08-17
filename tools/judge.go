@@ -232,6 +232,10 @@ func (j *ToolJudge) Judge(ctx context.Context, toolName string, input json.RawMe
 			{Role: "user", Content: userPrompt},
 		},
 		MaxTokens: 100, // Need more tokens for verdict + reason
+		// Verdict JSON: deterministic sampling class (routing). The judge
+		// calls the provider directly, bypassing the router — the purpose is
+		// declared for consistency and future consumers.
+		CallPurpose: llm.CallPurposeRouting,
 	}
 
 	// Create a dedicated context for the judge LLM call with its own timeout.
@@ -335,6 +339,8 @@ func (j *ToolJudge) JudgeStrict(ctx context.Context, request StrictJudgeRequest)
 			{Role: "user", Content: string(prompt)},
 		},
 		MaxTokens: 100,
+		// Verdict JSON: deterministic sampling class (routing).
+		CallPurpose: llm.CallPurposeRouting,
 	}
 
 	judgeCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)

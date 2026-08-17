@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/v0lka/sp4rk/llm"
+	"github.com/v0lka/sp4rk/strutil"
 	"github.com/v0lka/sp4rk/tools"
 )
 
@@ -36,6 +37,7 @@ type runState struct {
 	wrapUpNudgeAttempted      bool
 	reactiveCompactAttempted  bool
 	preCompactionNudgeEmitted bool
+	pendingVerifyEdit         bool // a successful file edit awaits verify-on-edit (debounce flag)
 	unlimitedSteps            bool
 	effectiveMaxSteps         int
 	finishResult              *ExecutorResult
@@ -116,6 +118,9 @@ func (e *Executor) callLLMWithReactiveCompaction(ctx context.Context, state *run
 		Tools:           toolDefs,
 		MaxTokens:       cw.OutputLimit(),
 		ReasoningEffort: e.reasoningEffort,
+		// The main agent loop: the only call class entitled to the full
+		// vendor sampling preset.
+		CallPurpose: llm.CallPurposeExecutor,
 	}
 
 	// Call LLM
@@ -411,7 +416,7 @@ func (e *Executor) checklistBatchingSuffix(state *runState, input json.RawMessag
 // For "no tool calls but NOT end_turn" (max_tokens, stop_sequence), the model
 // did not intentionally stop — we nudge up to 2 times before accepting an
 // implicit finish.
-func (e *Executor) handleImplicitFinish(resp *llm.ChatResponse, thought string, state *runState, cw ContextManager, hasTools bool) (*ExecutorResult, loopAction) {
+func (e *Executor) handleImplicitFinish(ctx context.Context, resp *llm.ChatResponse, thought string, state *runState, cw ContextManager, hasTools bool) (*ExecutorResult, loopAction) {
 	// Failure-mode: model printed tool-call syntax as text. This is not an
 	// implicit finish — the model is stuck. Apply a dedicated nudge up to 3
 	// times, then abort. Applies regardless of stop_reason (end_turn or not).
@@ -473,14 +478,22 @@ func (e *Executor) handleImplicitFinish(resp *llm.ChatResponse, thought string, 
 
 		e.emitter.StepComplete(state.stepNum, time.Since(state.stepStartTime))
 
+		// Flush any verification still pending from an intercepted response
+		// group (see flushPendingVerifyOnEdit) so the note is recorded in the
+		// final output rather than dropped at the implicit finish.
+		output := thought
+		if note := e.flushPendingVerifyOnEdit(ctx, state); note != "" {
+			output = thought + "\n\n" + note
+		}
+
 		// Emit assistant response events (unless suppressed)
 		if !e.suppressAssistantEvents {
-			e.emitter.AssistantChunk(thought)
-			e.emitter.AssistantDone(thought, resp.Usage.InputTokens, resp.Usage.OutputTokens)
+			e.emitter.AssistantChunk(output)
+			e.emitter.AssistantDone(output, resp.Usage.InputTokens, resp.Usage.OutputTokens)
 		}
 
 		return &ExecutorResult{
-			Output:   thought,
+			Output:   output,
 			Steps:    state.allSteps,
 			Finished: true,
 		}, actionNone
@@ -530,14 +543,22 @@ func (e *Executor) handleImplicitFinish(resp *llm.ChatResponse, thought string, 
 
 	e.emitter.StepComplete(state.stepNum, time.Since(state.stepStartTime))
 
+	// Flush any verification still pending from an intercepted response
+	// group (see flushPendingVerifyOnEdit) so the note is recorded in the
+	// final output rather than dropped at the implicit finish.
+	output := thought
+	if note := e.flushPendingVerifyOnEdit(ctx, state); note != "" {
+		output = thought + "\n\n" + note
+	}
+
 	// Emit assistant response events (unless suppressed)
 	if !e.suppressAssistantEvents {
-		e.emitter.AssistantChunk(thought)
-		e.emitter.AssistantDone(thought, resp.Usage.InputTokens, resp.Usage.OutputTokens)
+		e.emitter.AssistantChunk(output)
+		e.emitter.AssistantDone(output, resp.Usage.InputTokens, resp.Usage.OutputTokens)
 	}
 
 	return &ExecutorResult{
-		Output:   thought,
+		Output:   output,
 		Steps:    state.allSteps,
 		Finished: true,
 	}, actionNone
@@ -793,6 +814,12 @@ func (e *Executor) processSingleToolCall(
 		}
 		state.allSteps = append(state.allSteps, step)
 
+		// Verify-on-edit hook: when the model finishes in the same response
+		// group as an edit, the pending verification still runs and its note
+		// is attached to the finish observation (and the final output) so the
+		// verification result is recorded rather than silently dropped.
+		params.Answer = e.runVerifyOnEditHook(ctx, action.Name, false, true, state, params.Answer)
+
 		e.emitter.ToolResult(state.stepNum, callIdx, len(params.Answer), params.Answer, false)
 
 		// If mutation gate was triggered (nudge attempted) but still no mutation,
@@ -919,6 +946,13 @@ func (e *Executor) processSingleToolCall(
 	// Stage 1 + 2: truncation, caching, token budget (shared helper).
 	var cacheHash string
 	observation, cacheHash = e.processToolResult(execCtx, observation, result.Content, action.Name, action.Input, cw)
+
+	// Verify-on-edit hook: after the last call of a group containing at
+	// least one successful write_file/edit_file, run the configured
+	// verification command once and append its output as a system note.
+	// Runs BEFORE ToolResult emission so both the frontend and the LLM
+	// context see the verification output.
+	observation = e.runVerifyOnEditHook(ctx, action.Name, result.IsError, callIdx == len(toolCalls)-1, state, observation)
 
 	// Emit tool result
 	e.emitter.ToolResult(state.stepNum, callIdx, len(observation), observation, result.IsError)
@@ -1158,6 +1192,11 @@ func (e *Executor) processBatchTool(
 		// Stage 1 + 2: truncation, caching, token budget (shared helper).
 		var batchCacheHash string
 		observation, batchCacheHash = e.processToolResult(execCtx, observation, result.Content, subCall.Name, subCall.Input, cw)
+
+		// Verify-on-edit hook (debounced per response group): runs once at
+		// the last sub-call of the last batch call when any edit succeeded.
+		// Before emission so frontend + LLM context both see it.
+		observation = e.runVerifyOnEditHook(ctx, subCall.Name, result.IsError, subIdx == len(batchInput.Calls)-1 && callIdx == len(toolCalls)-1, state, observation)
 
 		// Emit tool result.
 		e.emitter.ToolResult(state.stepNum, effectiveIdx, len(observation), observation, result.IsError)
@@ -1524,6 +1563,7 @@ func (e *Executor) checkSameToolRepetition(
 		e.sameToolConsecutiveCount = 0
 		e.sameToolLastName = ""
 		e.sameToolLastResultLen = 0
+		e.sameToolLastResultIsError = false
 		return actionNone, nil, nil
 	}
 	resultLen := len(result.Content)
@@ -1537,14 +1577,29 @@ func (e *Executor) checkSameToolRepetition(
 		lenDiff = -lenDiff
 	}
 
-	if action.Name == e.sameToolLastName && lenDiff <= sizeDelta {
+	// Retry-after-fix is legitimate: when the previous tracked call to this
+	// tool returned an error and the CURRENT call succeeds, the agent is
+	// iterating (call failed → arguments fixed → retried). A successful
+	// retry must not count the prior error as "similar results" loop
+	// evidence — reset the chain so the retry-after-fix pattern starts
+	// fresh. Consecutive FAILING calls are not a retry-after-fix: they fall
+	// through to the regular same-tool accounting below, so varied-argument
+	// error loops (e.g. repeatedly failing builds) still accumulate toward
+	// the nudge/abort thresholds.
+	switch {
+	case e.sameToolLastResultIsError && !result.IsError:
+		e.sameToolConsecutiveCount = 1
+		e.sameToolLastName = action.Name
+		e.sameToolLastResultLen = resultLen
+	case action.Name == e.sameToolLastName && lenDiff <= sizeDelta:
 		e.sameToolConsecutiveCount++
 		e.sameToolLastResultLen = resultLen
-	} else {
+	default:
 		e.sameToolConsecutiveCount = 1
 		e.sameToolLastName = action.Name
 		e.sameToolLastResultLen = resultLen
 	}
+	e.sameToolLastResultIsError = result.IsError
 
 	// Check same-tool thresholds (skip if threshold is 0 = disabled)
 	if e.circuitBreaker.SameToolRepeatAbortThreshold > 0 && e.sameToolConsecutiveCount >= e.circuitBreaker.SameToolRepeatAbortThreshold {
@@ -1607,6 +1662,19 @@ func (e *Executor) checkSameToolRepetition(
 	}
 
 	return actionNone, nil, nil
+}
+
+// formatParseErrorNudge builds the parse-error nudge appended to a tool
+// observation. Beyond the generic advice it carries concrete diagnostics so
+// the model can correct the format instead of retrying blindly: the parse
+// error itself and a truncated excerpt of the raw model output that produced it.
+func formatParseErrorNudge(rawInput json.RawMessage, observation string, count int) string {
+	errDesc := strutil.TruncateUTF8(strings.TrimSpace(observation), parseErrorNudgeErrPrefix)
+	rawExcerpt := strutil.TruncateUTF8(string(rawInput), parseErrorNudgeRawPrefix)
+	if strings.TrimSpace(rawExcerpt) == "" {
+		rawExcerpt = "(empty)"
+	}
+	return fmt.Sprintf(parseErrorNudgeFmt, count, errDesc, parseErrorNudgeRawPrefix, rawExcerpt)
 }
 
 // checkParseErrors detects consecutive parse errors for the same tool and
@@ -1673,7 +1741,11 @@ func (e *Executor) checkParseErrors(
 			}, nil
 		}
 
-		observation += "\n\n" + fmt.Sprintf(parseErrorNudgeMessage, e.consecutiveParseErrorCount)
+		e.emitter.ExecutorDiagnostic(state.stepNum, "parse_error_nudge", map[string]any{
+			"tool":                     action.Name,
+			"consecutive_parse_errors": e.consecutiveParseErrorCount,
+		})
+		observation += "\n\n" + formatParseErrorNudge(action.Input, observation, e.consecutiveParseErrorCount)
 	} else if !result.IsError {
 		// Reset parse error tracker on successful execution
 		e.consecutiveParseErrorTool = ""

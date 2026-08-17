@@ -10,9 +10,12 @@ import (
 	"github.com/v0lka/sp4rk/tools"
 )
 
-const toolResultReadDescription = `Read a previously cached tool result in fragments. Provide the short hash from a truncation nudge (e.g. "[This output was truncated ... hash: abc123 ...]") along with a 1-based start_line and the number of lines to read. Use this to retrieve more content from a truncated tool output without re-executing the original tool.
-
-Line escape-hatch: pass a 1-based ` + "`line`" + ` to return the FULL raw content of a single line, bypassing the per-line MaxLineBytes cap (default 1 MiB). This is the only way to recover a line shown with a "[...line N truncated...]" marker — the default read path (and this tool's own window reads) always apply MaxLineBytes, so the tail of such a line is otherwise inaccessible. For file-backed results (e.g. plain-text read_file) the full line is read directly from disk; for content-backed results (e.g. converted documents) the cached representation is returned. ` + "`line`" + ` takes precedence over start_line/num_lines.`
+const toolResultReadDescription = `Purpose: re-read fragments of a previously truncated tool result from the output cache — without re-executing the original tool.
+Use when: a tool result was cut off and ended with a truncation nudge like "[This output was truncated ... hash: abc123 ...]". Pass that hash with a line range to retrieve exactly the fragment you need.
+Inputs: hash (from the truncation nudge); start_line (1-based); num_lines (bounded, e.g. <=2000); optional line (single-line escape hatch: returns the FULL raw content of one line, bypassing the per-line size cap — the only way to recover a line shown as "[...line N truncated...]"; takes precedence over the range).
+Outputs: the requested fragment of the cached result.
+Example: hash "abc123", start_line 1, num_lines 100 — the first hundred lines of a truncated listing.
+Anti-example: never re-run the original tool just to see more of a truncated output — the cache already holds it; do not invent a hash — only nudges carry valid ones.`
 
 const defaultResultReadLines = 500
 

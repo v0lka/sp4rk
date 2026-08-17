@@ -17,7 +17,12 @@ import (
 	"github.com/v0lka/sp4rk/tools"
 )
 
-const toolRipgrepDescription = `Search file contents using regex or literal patterns. Returns matches in "file:line: content" format with optional surrounding context lines. Automatically respects .gitignore rules and skips binary files. Use this when you need to find code patterns, function definitions, or text within files. For finding files by name or path pattern, use glob instead.`
+const toolRipgrepDescription = `Purpose: fast regex/literal content search across files, returning matches as "file:line: content" with optional context lines. Respects .gitignore and skips binary files.
+Use when: you need lines and locations matching known text — identifiers, error messages, config keys, function definitions. For finding files by name use glob; for meaning-based discovery ("retry logic", "auth middleware") use semantic_search; to read a match use read_file.
+Inputs: pattern (regex or literal); optional context_lines (lines around each match); optional file_pattern (glob filter like *.go); ignore_case; include_hidden; optional path (scope the search to a directory).
+Outputs: matched lines with file and line number, plus context when requested; empty output means no matches.
+Example: pattern "func TestOrchestrator" with file_pattern "*_test.go" locates orchestrator tests.
+Anti-example: not for file discovery by name (glob); matching is case-sensitive unless ignore_case=true; regex metacharacters in a literal string must be escaped.`
 
 // RipgrepTool searches file contents using regex patterns via the system
 // `rg` CLI (ripgrep). The rg binary is a managed runtime dependency provided

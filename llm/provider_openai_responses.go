@@ -83,8 +83,13 @@ func buildResponsesParams(req ChatRequest, baseURL string, logger *slog.Logger) 
 		params.MaxOutputTokens = param.NewOpt(int64(req.MaxTokens))
 	}
 
+	// The Responses API supports temperature and top_p; it has no
+	// presence_penalty/top_k/repetition_penalty parameters.
 	if req.Temperature != nil {
 		params.Temperature = param.NewOpt(*req.Temperature)
+	}
+	if req.TopP != nil {
+		params.TopP = param.NewOpt(*req.TopP)
 	}
 
 	// Only send reasoning if the effort value is valid for the OpenAI

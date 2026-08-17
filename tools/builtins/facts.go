@@ -11,9 +11,19 @@ import (
 	"github.com/v0lka/sp4rk/tools"
 )
 
-const toolStoreFactDescription = "Store a fact with 3-5 keywords for later retrieval by yourself or other agents. Use this to record important discoveries, decisions, or intermediate results that may be useful in subsequent steps."
+const toolStoreFactDescription = `Purpose: store a durable fact for later retrieval by yourself or other agents.
+Use when: immediately after learning cross-step information — API signatures, architectural decisions, file locations, error patterns, intermediate results — before context grows large and earlier tool outputs become unavailable. Retrieve later with search_facts; facts persist across steps and execution cycles.
+Inputs: content (the fact itself, self-contained); keywords (3-5 retrieval keywords).
+Outputs: confirmation of storage.
+Example: content "auth middleware lives in core/middleware.go, enforced via applySecurityPolicies" with keywords [auth, middleware, policy, security].
+Anti-example: not for ephemeral scratch that dies with the current turn; do not defer storing to the end of a long investigation — store early, store often.`
 
-const toolSearchFactsDescription = "Search stored facts by keywords. Returns facts matching any of the given keywords, ranked by relevance (most keyword matches first)."
+const toolSearchFactsDescription = `Purpose: search previously stored facts by keywords.
+Use when: at the start of a new step or subtask — recover prior decisions and discoveries before re-reading sources. Results rank by relevance (most keyword matches first).
+Inputs: keywords (1-5 search terms).
+Outputs: the matching stored facts, best match first; empty when nothing matches.
+Example: keywords [auth, config] to recall where auth settings live.
+Anti-example: not for discovering new information (search the codebase: ripgrep/semantic_search); if nothing matches, do not reconstruct from memory — re-read the source.`
 
 // ---------------------------------------------------------------------------
 // store_fact

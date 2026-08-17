@@ -279,6 +279,17 @@ func (p *AnthropicProvider) buildRequest(req ChatRequest) (*anthropic.MessagesRe
 		temp := float32(*req.Temperature)
 		anthropicReq.Temperature = &temp
 	}
+	// Anthropic Messages API sampling parameters (float32 in the SDK).
+	// presence_penalty/repetition_penalty are OpenAI-style controls the
+	// Anthropic API does not accept — they are never serialized here.
+	if req.TopP != nil {
+		topP := float32(*req.TopP)
+		anthropicReq.TopP = &topP
+	}
+	if req.TopK != nil {
+		topK := *req.TopK
+		anthropicReq.TopK = &topK
+	}
 
 	// Apply reasoning effort: "On" enables thinking with budget 32000.
 	// The Anthropic API requires max_tokens to be strictly greater than
@@ -295,8 +306,12 @@ func (p *AnthropicProvider) buildRequest(req ChatRequest) (*anthropic.MessagesRe
 				Type:         anthropic.ThinkingTypeEnabled,
 				BudgetTokens: budget,
 			}
-			// Anthropic requires temperature to be unset (or 1.0) when thinking is enabled
+			// Anthropic requires temperature to be unset (or 1.0) when
+			// thinking is enabled, and equally rejects top_p/top_k overrides
+			// in extended-thinking mode, so all sampling knobs are dropped.
 			anthropicReq.Temperature = nil
+			anthropicReq.TopP = nil
+			anthropicReq.TopK = nil
 		}
 	}
 

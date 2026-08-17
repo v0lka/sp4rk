@@ -3,9 +3,12 @@ package prompt
 // SamplingConfig holds family-aware generation parameter defaults.
 // Pointer fields indicate "set" vs "unset" — nil means no override.
 type SamplingConfig struct {
-	Temperature *float64
-	TopP        *float64
-	MaxTokens   *int
+	Temperature       *float64
+	TopP              *float64
+	TopK              *int
+	RepetitionPenalty *float64
+	PresencePenalty   *float64
+	MaxTokens         *int
 }
 
 // DefaultSampling returns recommended generation parameters for the given model family.
@@ -16,22 +19,59 @@ func DefaultSampling(family string) SamplingConfig {
 	case "anthropic":
 		// Anthropic recommends letting model self-select temperature
 		return SamplingConfig{} // all nil
-	case "openai_flagship", "openai_standard":
+	case "openai_flagship":
+		// GPT-5 / o-series reasoning models: the OpenAI API rejects
+		// temperature != 1 and top_p overrides for reasoning models, so no
+		// parameter is sent at all.
+		// Source: platform.openai.com API reference, reasoning models note.
+		return SamplingConfig{} // all nil
+	case "openai_codex":
+		// Codex models (e.g. gpt-5.x-codex) run on the Responses API and share
+		// the reasoning-model restriction of openai_flagship: temperature and
+		// top_p overrides are rejected. Previously this family fell through to
+		// the generic default (0.5 / 0.95), which is wrong for reasoning models.
+		// Source: platform.openai.com/docs/guides/reasoning.
+		return SamplingConfig{} // all nil
+	case "openai_standard":
+		// Pre-existing repo recommendation for gpt-4o/gpt-4.1-class models
+		// (unchanged in this update; OpenAI publishes no stricter per-model value).
 		return SamplingConfig{Temperature: fp(0.3)}
 	case "google":
-		return SamplingConfig{Temperature: fp(1.0)} // Google recommends higher; low values cause looping
+		// Source: ai.google.dev Gemini API reference — temperature "defaults to 1.0".
+		return SamplingConfig{Temperature: fp(1.0)} // low values cause looping
 	case "mistral":
-		return SamplingConfig{Temperature: fp(0.3)}
+		// La Plateforme applies a server-side default temperature of 0.7 when
+		// the parameter is omitted — no override needed.
+		// Source: docs.mistral.ai API reference (chat completions, temperature default 0.7).
+		return SamplingConfig{} // all nil — let the server default apply
 	case "deepseek":
-		return SamplingConfig{Temperature: fp(0.0)} // Recommended for coding/math; ignored when thinking enabled
+		// Pre-existing repo recommendation for coding/math tasks
+		// (unchanged in this update; ignored when thinking mode is enabled).
+		return SamplingConfig{Temperature: fp(0.0)}
 	case "qwen":
-		return SamplingConfig{Temperature: fp(0.6)} // Recommended for reasoning/analytical tasks
+		// Qwen3 general / thinking-mode default.
+		// Source: qwen.readthedocs.io quickstart — "We recommend
+		// temperature=0.6, top_p=0.95, top_k=20, and min_p=0".
+		return SamplingConfig{
+			Temperature: fp(0.6),
+			TopP:        fp(0.95),
+			TopK:        ip(20),
+		}
 	case "glm":
-		return SamplingConfig{Temperature: fp(0.2)} // Optimal for analytical/coding tasks
+		// Source: docs.z.ai "Migrate to GLM-4.6" — "temperature default value
+		// 1.0, top_p default value 0.95" (recommend tuning only one of them);
+		// top_k=40 for coding/agentic workloads per Z.AI recommended settings.
+		return SamplingConfig{
+			Temperature: fp(1.0),
+			TopP:        fp(0.95),
+			TopK:        ip(40),
+		}
 	case "kimi":
 		// Kimi server enforces temperature per model (0.6 standard, 1.0 thinking)
 		return SamplingConfig{} // all nil — let server decide
 	default:
+		// Generic fallback for families without vendor guidance — pre-existing
+		// repo default (unchanged in this update).
 		return SamplingConfig{
 			Temperature: fp(0.5),
 			TopP:        fp(0.95),
@@ -41,3 +81,6 @@ func DefaultSampling(family string) SamplingConfig {
 
 // fp is a helper that returns a pointer to a float64 value.
 func fp(v float64) *float64 { return &v }
+
+// ip is a helper that returns a pointer to an int value.
+func ip(v int) *int { return &v }

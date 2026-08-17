@@ -9,7 +9,12 @@ import (
 	"github.com/v0lka/sp4rk/tools"
 )
 
-const toolCreateDirectoryDescription = `Creates a directory at the specified path, including any necessary parent directories (like mkdir -p). Succeeds silently if the directory already exists. Use this to set up directory structure before writing files into it.`
+const toolCreateDirectoryDescription = `Purpose: create a directory including any missing parents (mkdir -p). Succeeds silently if it already exists.
+Use when: an empty directory is needed for its own sake, or you want the structure step explicit before emitting several files. Note write_file already auto-creates parent directories, so a separate create is usually unnecessary.
+Inputs: path (directory to create).
+Outputs: confirmation (idempotent — no error when it exists).
+Example: create src/gen/out before writing several generated artifacts into it.
+Anti-example: not needed before a single write_file (parents are auto-created); not for removing directories (delete_directory).`
 
 // CreateDirectoryTool creates directories.
 type CreateDirectoryTool struct {

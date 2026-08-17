@@ -4,13 +4,44 @@ import (
 	"testing"
 )
 
+// expectF64 asserts a *float64 field matches the expectation (nil-safe).
+func expectF64(t *testing.T, label string, got, want *float64) {
+	t.Helper()
+	switch {
+	case got == nil && want == nil:
+		return
+	case got == nil && want != nil:
+		t.Errorf("%s: expected %v, got nil", label, *want)
+	case got != nil && want == nil:
+		t.Errorf("%s: expected nil, got %v", label, *got)
+	case *got != *want:
+		t.Errorf("%s: expected %v, got %v", label, *want, *got)
+	}
+}
+
+// expectInt asserts a *int field matches the expectation (nil-safe).
+func expectInt(t *testing.T, label string, got, want *int) {
+	t.Helper()
+	switch {
+	case got == nil && want == nil:
+		return
+	case got == nil && want != nil:
+		t.Errorf("%s: expected %d, got nil", label, *want)
+	case got != nil && want == nil:
+		t.Errorf("%s: expected nil, got %d", label, *got)
+	case *got != *want:
+		t.Errorf("%s: expected %d, got %d", label, *want, *got)
+	}
+}
+
 func TestDefaultSampling(t *testing.T) {
 	tests := []struct {
-		name       string
-		family     string
-		wantTemp   *float64 // nil means Temperature should be nil
-		wantTopP   *float64 // nil means TopP should be nil
-		wantMaxTok bool     // whether MaxTokens should be set
+		name     string
+		family   string
+		wantTemp *float64
+		wantTopP *float64
+		wantTopK *int
+		wantRep  *float64
 	}{
 		{
 			name:     "anthropic returns all nil (model self-selects)",
@@ -19,9 +50,11 @@ func TestDefaultSampling(t *testing.T) {
 			wantTopP: nil,
 		},
 		{
-			name:     "openai_flagship returns 0.3 temperature",
+			// GPT-5 / o-series reasoning models reject temperature and top_p
+			// overrides — everything must stay nil.
+			name:     "openai_flagship returns all nil (reasoning models)",
 			family:   "openai_flagship",
-			wantTemp: fp(0.3),
+			wantTemp: nil,
 			wantTopP: nil,
 		},
 		{
@@ -37,9 +70,10 @@ func TestDefaultSampling(t *testing.T) {
 			wantTopP: nil,
 		},
 		{
-			name:     "mistral returns 0.3 temperature",
+			// Server-side default is already 0.7 — no override sent.
+			name:     "mistral returns all nil (server default 0.7)",
 			family:   "mistral",
-			wantTemp: fp(0.3),
+			wantTemp: nil,
 			wantTopP: nil,
 		},
 		{
@@ -49,16 +83,21 @@ func TestDefaultSampling(t *testing.T) {
 			wantTopP: nil,
 		},
 		{
-			name:     "qwen returns 0.6 temperature",
+			// qwen.readthedocs.io quickstart, thinking-mode default.
+			name:     "qwen returns thinking default 0.6/0.95/20",
 			family:   "qwen",
 			wantTemp: fp(0.6),
-			wantTopP: nil,
+			wantTopP: fp(0.95),
+			wantTopK: ip(20),
 		},
 		{
-			name:     "glm returns 0.2 temperature",
+			// docs.z.ai "Migrate to GLM-4.6": temperature 1.0, top_p 0.95,
+			// top_k 40.
+			name:     "glm returns 1.0/0.95/40",
 			family:   "glm",
-			wantTemp: fp(0.2),
-			wantTopP: nil,
+			wantTemp: fp(1.0),
+			wantTopP: fp(0.95),
+			wantTopK: ip(40),
 		},
 		{
 			name:     "kimi returns all nil (server-managed)",
@@ -89,40 +128,42 @@ func TestDefaultSampling(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := DefaultSampling(tt.family)
-
-			// Check Temperature
-			if tt.wantTemp == nil {
-				if got.Temperature != nil {
-					t.Errorf("Temperature: expected nil, got %v", *got.Temperature)
-				}
-			} else {
-				if got.Temperature == nil {
-					t.Errorf("Temperature: expected %v, got nil", *tt.wantTemp)
-				} else if *got.Temperature != *tt.wantTemp {
-					t.Errorf("Temperature: got %v, want %v", *got.Temperature, *tt.wantTemp)
-				}
+			expectF64(t, "Temperature", got.Temperature, tt.wantTemp)
+			expectF64(t, "TopP", got.TopP, tt.wantTopP)
+			expectInt(t, "TopK", got.TopK, tt.wantTopK)
+			expectF64(t, "RepetitionPenalty", got.RepetitionPenalty, tt.wantRep)
+			if got.PresencePenalty != nil {
+				t.Errorf("PresencePenalty: expected nil, got %v", *got.PresencePenalty)
 			}
-
-			// Check TopP
-			if tt.wantTopP == nil {
-				if got.TopP != nil {
-					t.Errorf("TopP: expected nil, got %v", *got.TopP)
-				}
-			} else {
-				if got.TopP == nil {
-					t.Errorf("TopP: expected %v, got nil", *tt.wantTopP)
-				} else if *got.TopP != *tt.wantTopP {
-					t.Errorf("TopP: got %v, want %v", *got.TopP, *tt.wantTopP)
-				}
-			}
-
-			// Check MaxTokens (should never be set in current implementation)
-			if tt.wantMaxTok && got.MaxTokens == nil {
-				t.Error("MaxTokens: expected to be set, got nil")
-			}
-			if !tt.wantMaxTok && got.MaxTokens != nil {
-				t.Errorf("MaxTokens: expected nil, got %v", *got.MaxTokens)
+			if got.MaxTokens != nil {
+				t.Errorf("MaxTokens: expected nil, got %d", *got.MaxTokens)
 			}
 		})
+	}
+}
+
+// TestDefaultSamplingCodexIsNil verifies openai_codex no longer falls through
+// to the generic default (0.5 / 0.95): Codex models are reasoning models on
+// the Responses API and must get an all-nil preset.
+func TestDefaultSamplingCodexIsNil(t *testing.T) {
+	got := DefaultSampling("openai_codex")
+
+	if got.Temperature != nil {
+		t.Errorf("Temperature: expected nil, got %v", *got.Temperature)
+	}
+	if got.TopP != nil {
+		t.Errorf("TopP: expected nil, got %v", *got.TopP)
+	}
+	if got.TopK != nil {
+		t.Errorf("TopK: expected nil, got %d", *got.TopK)
+	}
+	if got.RepetitionPenalty != nil {
+		t.Errorf("RepetitionPenalty: expected nil, got %v", *got.RepetitionPenalty)
+	}
+	if got.PresencePenalty != nil {
+		t.Errorf("PresencePenalty: expected nil, got %v", *got.PresencePenalty)
+	}
+	if got.MaxTokens != nil {
+		t.Errorf("MaxTokens: expected nil, got %d", *got.MaxTokens)
 	}
 }

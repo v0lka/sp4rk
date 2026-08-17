@@ -282,13 +282,17 @@ func TestRouter_Call_FamilyAwareTemperature(t *testing.T) {
 		},
 	})
 
-	// Sampling func returns 0.3 for deepseek
-	sampling := func(family string) *float64 {
+	// Sampling func returns a full preset for deepseek
+	sampling := func(family string) SamplingDefaults {
 		if family == "deepseek" {
-			v := 0.3
-			return &v
+			topK := 20
+			return SamplingDefaults{
+				Temperature: floatPtr(0.3),
+				TopP:        floatPtr(0.95),
+				TopK:        &topK,
+			}
 		}
-		return nil
+		return SamplingDefaults{}
 	}
 
 	router := &Router{
@@ -318,6 +322,18 @@ func TestRouter_Call_FamilyAwareTemperature(t *testing.T) {
 	if *mock.lastReq.Temperature != 0.3 {
 		t.Errorf("expected family-aware temperature 0.3, got %f", *mock.lastReq.Temperature)
 	}
+	if mock.lastReq.TopP == nil || *mock.lastReq.TopP != 0.95 {
+		t.Errorf("expected family-aware top_p 0.95, got %v", mock.lastReq.TopP)
+	}
+	if mock.lastReq.TopK == nil || *mock.lastReq.TopK != 20 {
+		t.Errorf("expected family-aware top_k 20, got %v", mock.lastReq.TopK)
+	}
+	if mock.lastReq.RepetitionPenalty != nil {
+		t.Errorf("expected nil repetition_penalty (not in preset), got %v", *mock.lastReq.RepetitionPenalty)
+	}
+	if mock.lastReq.PresencePenalty != nil {
+		t.Errorf("expected nil presence_penalty (not in preset), got %v", *mock.lastReq.PresencePenalty)
+	}
 }
 
 func TestRouter_Call_SkipsTemperatureForReasoningModels(t *testing.T) {
@@ -339,9 +355,11 @@ func TestRouter_Call_SkipsTemperatureForReasoningModels(t *testing.T) {
 		},
 	})
 
-	sampling := func(family string) *float64 {
-		v := 0.3
-		return &v // would return 0.3, but should be ignored for reasoning models
+	sampling := func(family string) SamplingDefaults {
+		return SamplingDefaults{
+			Temperature: floatPtr(0.3), // should be ignored for reasoning models
+			TopP:        floatPtr(0.9),
+		}
 	}
 
 	router := &Router{
@@ -368,7 +386,12 @@ func TestRouter_Call_SkipsTemperatureForReasoningModels(t *testing.T) {
 	if mock.lastReq.Temperature != nil {
 		t.Errorf("expected nil temperature for reasoning model, got %f", *mock.lastReq.Temperature)
 	}
+	if mock.lastReq.TopP != nil {
+		t.Errorf("expected nil top_p for reasoning model (whole preset skipped), got %f", *mock.lastReq.TopP)
+	}
 }
+
+func floatPtr(f float64) *float64 { return &f }
 
 func TestNewRouter(t *testing.T) {
 	// Test with openai provider (doesn't require external services)

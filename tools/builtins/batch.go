@@ -8,7 +8,12 @@ import (
 	"github.com/v0lka/sp4rk/tools"
 )
 
-const batchDescription = `Execute multiple tool calls sequentially in one turn. Provide an array of calls, each with a "tool" name and "input" object. All calls execute in order even if one fails — errors are captured per-call and do not abort the batch. Use this to reduce round-trips when you know all the calls you want to make.`
+const batchDescription = `Purpose: execute multiple independent tool calls sequentially in a single round-trip.
+Use when: you already know several calls you want to make and none depends on another's output (e.g. read three files, check two paths). Calls run in order and all execute even if some fail — errors are captured per call and never abort the batch.
+Inputs: calls — an array of {"tool": name, "input": {...}} objects.
+Outputs: one result per call, in order, including per-call errors.
+Example: calls=[read_file a.go, read_file b.go, list_directory src/] in one invocation.
+Anti-example: not for dependent chains (read then edit must be separate turns — later calls cannot use earlier results); a single call does not need batch — invoke the tool directly.`
 
 // BatchTool allows the LLM to batch multiple independent tool calls.
 // The actual batch logic is handled at the executor level; this tool

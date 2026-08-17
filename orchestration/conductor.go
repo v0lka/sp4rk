@@ -35,6 +35,17 @@ type ConductorConfig struct {
 	ReasoningEffort   string
 	PreWarningPercent int
 
+	// VerifyOnEdit installs a mechanical verification hook (tests/linter
+	// command) on the main-loop Executor: after any response group with a
+	// successful write_file/edit_file, the command runs once and its
+	// (truncated) output is appended to the observation as a
+	// [verify_on_edit] system note. The command must come from user
+	// configuration, never from the model. nil disables the hook (default).
+	VerifyOnEdit agent.EditVerifyRunner
+	// VerifyOnEditMaxOutputChars caps the injected verification output.
+	// <= 0 selects agent.DefaultVerifyOnEditCap.
+	VerifyOnEditMaxOutputChars int
+
 	// NonCacheableTools lists additional tool names whose results should not be
 	// cached. These are consumer-specific meta-tools (e.g. delegate, declare_plan)
 	// that extend the sp4rk-provided defaults. Empty = sp4rk defaults only.
@@ -285,6 +296,9 @@ func (c *Conductor) Run(
 	}
 	if c.cfg.PreWarningPercent > 0 {
 		executor.SetPreWarningPercent(c.cfg.PreWarningPercent)
+	}
+	if c.cfg.VerifyOnEdit != nil {
+		executor.SetVerifyOnEdit(c.cfg.VerifyOnEdit, c.cfg.VerifyOnEditMaxOutputChars)
 	}
 	if len(c.cfg.NonCacheableTools) > 0 {
 		executor.AddNonCacheableTools(c.cfg.NonCacheableTools...)

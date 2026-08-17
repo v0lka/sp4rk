@@ -105,6 +105,48 @@ type ToolCall struct {
 	Input json.RawMessage `json:"input"` // arguments (JSON)
 }
 
+// CallPurpose classifies the intent of a ChatRequest. The router uses it to
+// pick the sampling policy: executor calls (and, for backward compatibility,
+// requests with no declared purpose) receive the full vendor preset from the
+// sampling func, while routing/compaction/summarization calls get a
+// deterministic profile (temperature 0 or the family-safe floor, no
+// top_p/top_k/penalty injection) because their output is parsed as structured
+// data and must not drift with creative sampling settings.
+type CallPurpose string
+
+const (
+	// CallPurposeDefault is the zero value: the caller did not declare a
+	// purpose. Treated as executor (vendor preset applies), preserving the
+	// pre-purpose behavior for hosts that never set the field.
+	CallPurposeDefault CallPurpose = ""
+	// CallPurposeExecutor marks the main agent loop: the request that
+	// produces tool calls and free-form answers. Vendor preset applies.
+	CallPurposeExecutor CallPurpose = "executor"
+	// CallPurposeRouting marks structured-decision calls whose output is
+	// parsed as JSON (request classification, plan generation, reflection,
+	// judge verdicts). Deterministic profile applies.
+	CallPurposeRouting CallPurpose = "routing"
+	// CallPurposeCompaction marks context-compaction summarization calls.
+	// Deterministic profile applies.
+	CallPurposeCompaction CallPurpose = "compaction"
+	// CallPurposeSummarization marks auxiliary text-composition calls
+	// (titles, commit messages, prompt-optimizer steps). Deterministic
+	// profile applies.
+	CallPurposeSummarization CallPurpose = "summarization"
+)
+
+// Deterministic reports whether the purpose requires the deterministic
+// sampling profile (routing, compaction, summarization). The zero value and
+// executor return false — they get the vendor preset.
+func (p CallPurpose) Deterministic() bool {
+	switch p {
+	case CallPurposeRouting, CallPurposeCompaction, CallPurposeSummarization:
+		return true
+	default:
+		return false
+	}
+}
+
 // ChatRequest — request to LLM.
 type ChatRequest struct {
 	Model       string `json:"model"`
@@ -116,12 +158,22 @@ type ChatRequest struct {
 	// explicitly to force routing regardless of the model name, e.g. to serve a
 	// "gemma"-named local model over /chat/completions instead of
 	// :generateContent. See protocol.go.
-	Protocol        APIProtocol      `json:"protocol,omitempty"`
-	Messages        []Message        `json:"messages"`
-	Tools           []ToolDefinition `json:"tools,omitempty"`
-	MaxTokens       int              `json:"max_tokens"`
-	Temperature     *float64         `json:"temperature,omitempty"`      // nil = use provider default
-	ReasoningEffort string           `json:"reasoning_effort,omitempty"` // native reasoning value (e.g. "On", "high", "HIGH")
+	Protocol  APIProtocol      `json:"protocol,omitempty"`
+	Messages  []Message        `json:"messages"`
+	Tools     []ToolDefinition `json:"tools,omitempty"`
+	MaxTokens int              `json:"max_tokens"`
+	// CallPurpose declares what the call is for; it selects the sampling
+	// policy (see the CallPurpose type). Empty = executor (vendor preset).
+	CallPurpose CallPurpose `json:"call_purpose,omitempty"`
+	// Sampling parameters. nil = do not send (use the provider's default).
+	// Per-field priority: an explicit value here beats the family preset the
+	// router injects from its sampling func (see Router.applyDefaultSampling).
+	Temperature       *float64 `json:"temperature,omitempty"`        // nil = use provider default
+	TopP              *float64 `json:"top_p,omitempty"`              // nil = use provider default
+	TopK              *int     `json:"top_k,omitempty"`              // nil = use provider default; not part of the official OpenAI schema
+	RepetitionPenalty *float64 `json:"repetition_penalty,omitempty"` // nil = use provider default; OpenAI-compatible servers only
+	PresencePenalty   *float64 `json:"presence_penalty,omitempty"`   // nil = use provider default
+	ReasoningEffort   string   `json:"reasoning_effort,omitempty"`   // native reasoning value (e.g. "On", "high", "HIGH")
 }
 
 // ChatResponse — LLM response.

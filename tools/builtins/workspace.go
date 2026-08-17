@@ -10,9 +10,19 @@ import (
 	"github.com/v0lka/sp4rk/tools"
 )
 
-const toolReadStepOutputDescription = "Read the complete output of a specific completed step by its ID. Use this when the summary of a dependency step in your task description is insufficient and you need the full, untruncated result. Returns the raw text output exactly as the step produced it."
+const toolReadStepOutputDescription = `Purpose: read the complete, untruncated output of one completed plan step by its ID.
+Use when: the step's summary in your task description is insufficient and you need the full result of a dependency step before proceeding.
+Inputs: step_id (e.g. "step_1") of a completed step.
+Outputs: the step's raw output text exactly as it was produced, or an error if the ID is unknown/incomplete.
+Example: step_id "step_2" after seeing its one-line summary.
+Anti-example: not for the previous task's final answer (read_final_result); summaries usually suffice — pull full outputs only when the summary leaves you unable to act.`
 
-const toolListStepOutputsDescription = "List all available step outputs with short previews (up to 200 characters each). Use this to discover which completed step results are available before fetching a specific one with read_step_output."
+const toolListStepOutputsDescription = `Purpose: list every available completed-step output with a short preview (up to 200 characters each).
+Use when: you need to discover which step IDs exist and what they contain before fetching one with read_step_output.
+Inputs: none.
+Outputs: the list of available step IDs, each with a preview.
+Example: call this first when unsure which steps have finished.
+Anti-example: not for reading full outputs (read_step_output); not for the previous task's final result (read_final_result).`
 
 // ReadStepOutputTool reads the full output of a completed step from StepOutputStore.
 type ReadStepOutputTool struct {
@@ -130,7 +140,12 @@ func (t *ListStepOutputsTool) Execute(ctx context.Context, input json.RawMessage
 // read_final_result — read the prior task's final result from the blackboard
 // -----------------------------------------------------------------------------
 
-const toolReadFinalResultDescription = "Read the final result of the previously completed task on this blackboard. Use this to retrieve the outcome of the prior exchange when it is not visible in the conversation history (e.g. after a backend restart, or when the result was too large to inject verbatim). Returns the raw final answer exactly as the prior task produced it, or an error if no final result is recorded. This tool takes no parameters."
+const toolReadFinalResultDescription = `Purpose: read the final answer of the previously completed task on this blackboard.
+Use when: the prior exchange's outcome is not visible in your history — e.g. after a backend restart, or when the result was too large to inject verbatim — and it matters for the current task.
+Inputs: none.
+Outputs: the prior task's raw final answer exactly as produced, or an error if no final result is recorded.
+Example: call right after a restart to recover the prior context before planning.
+Anti-example: not for plan-step outputs (read_step_output or list_step_outputs); not for truncated tool outputs (tool_result_read).`
 
 // ReadFinalResultTool reads the final result of a previously completed task
 // from FinalResultStore (backed by the blackboard).

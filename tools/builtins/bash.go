@@ -16,7 +16,12 @@ import (
 	"github.com/v0lka/sp4rk/tools"
 )
 
-const toolBashDescription = `Execute shell commands via bash -c. Use this for build commands, running scripts, installing packages, git operations, and system tasks. Returns combined stdout and stderr. Commands time out after 60 seconds by default (configurable up to 120s). An optional working_directory can be set for the command's execution context.`
+const toolBashDescription = `Purpose: execute a shell command via bash -c — the fallback for what no dedicated tool covers: builds, test runs, package managers, git operations, system tasks.
+Use when: reading (read_file), editing (edit_file), listing (list_directory) and searching (ripgrep, glob) all have dedicated tools — reach for bash only when they cannot do the job.
+Inputs: command (pipes, redirects, chained commands OK); optional working_directory (absolute path for the command's execution context; defaults to workspace root); optional timeout (Go duration like "30s"/"2m", default 60s, capped at the configured max).
+Outputs: combined stdout and stderr; failing exit codes surface as errors carrying the output. Keep output minimal (e.g. pipe through tail) to avoid flooding context.
+Example: "go test ./core/... 2>&1 | tail -30".
+Anti-example: do not "cat src/app.go" (read_file), "find . -name '*.ts'" (glob) or "grep -rn TODO ." (ripgrep) — dedicated tools respect path policy and return structured results.`
 
 // BashExecTool executes bash commands in a shell.
 type BashExecTool struct {

@@ -9,7 +9,12 @@ import (
 	"github.com/v0lka/sp4rk/tools"
 )
 
-const toolDeleteFileDescription = `Deletes a single file at the specified path. Fails if the path points to a directory — use delete_directory for directories.`
+const toolDeleteFileDescription = `Purpose: delete a single regular file.
+Use when: removing an obsolete file you have verified is inside the workspace and truly disposable — deletion is destructive and there is no undo. Fails if the path is a directory.
+Inputs: path (must point to a regular file, not a directory).
+Outputs: confirmation, or an error (missing file, path is a directory, policy denial).
+Example: delete a scratch script after its purpose is served.
+Anti-example: not for directories (delete_directory); do not batch-delete via the shell tool — per-tool policy checks would be bypassed; prefer leaving cleanup to the user unless asked.`
 
 // DeleteFileTool deletes files.
 type DeleteFileTool struct {

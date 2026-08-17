@@ -12,9 +12,23 @@ import (
 	"time"
 )
 
-// SamplingFunc returns a default temperature for the given model family.
-// Return nil to use the provider's built-in default (no temperature parameter sent).
-type SamplingFunc func(family string) *float64
+// SamplingDefaults holds family-aware sampling defaults the router may inject
+// into a ChatRequest. It mirrors the vendor matrix in prompt/sampling.go (the
+// llm package cannot import prompt, so the shape is duplicated here and
+// converted by the host application). nil fields = no override (provider
+// default).
+type SamplingDefaults struct {
+	Temperature       *float64
+	TopP              *float64
+	TopK              *int
+	RepetitionPenalty *float64
+	PresencePenalty   *float64
+}
+
+// SamplingFunc returns family-aware sampling defaults for the given model
+// family. Return a zero-value (all nil) SamplingDefaults — or a nil field — to
+// use the provider's built-in default (parameter not sent).
+type SamplingFunc func(family string) SamplingDefaults
 
 // RouterConfig configures the LLM router.
 // All values must be pre-resolved by the caller (env vars expanded, durations parsed).
@@ -258,36 +272,74 @@ func (r *Router) validateContextWindow(model string, msgs []Message, meta ModelM
 	return nil
 }
 
-// applyDefaultTemperature sets a family-aware temperature default on the request
-// when no explicit temperature is provided. Skips models that don't support
-// the temperature parameter (e.g. reasoning models like o1, o3).
+// applyDefaultSampling fills family-aware sampling defaults on the request for
+// every parameter the caller left unset. Per-field priority: an explicit
+// ChatRequest value always wins, then the preset from the sampling func, then
+// the provider's default (field left nil). Skips models that don't support the
+// temperature parameter (e.g. reasoning models like o1, o3) — those models
+// equally reject top_p/top_k overrides, so no preset is injected at all.
 //
 // The caller resolves metadata once and passes it in (meta) so this method
 // performs no registry I/O of its own.
-func (r *Router) applyDefaultTemperature(req *ChatRequest, meta ModelMetadata) {
-	if req.Temperature != nil {
-		return // caller set explicit temperature — respect it
-	}
-
+//
+// Purpose-aware policy (CallPurpose): requests marked as routing /
+// compaction / summarization get a deterministic profile instead of the
+// vendor preset — their output is parsed as structured data (or merged into
+// persisted summaries) and must not drift with creative sampling settings.
+// Only temperature is injected (0.0, or the family-safe floor for families
+// whose vendors document instability at low temperature); top_p/top_k and
+// penalties are never preset on deterministic calls. Executor requests and
+// requests with no declared purpose keep the full vendor preset.
+func (r *Router) applyDefaultSampling(req *ChatRequest, meta ModelMetadata) {
 	if r.registry != nil {
 		// meta may be a raw/partial record with nil capabilities; only a
-		// declared Temperature=true unlocks the sampling default.
+		// declared Temperature=true unlocks the sampling defaults.
 		if meta.Capabilities == nil || !meta.Capabilities.Temperature {
-			return // model doesn't accept temperature (e.g. reasoning models)
+			return // model doesn't accept sampling params (e.g. reasoning models)
 		}
 	}
 
-	// Apply sampling function regardless of registry presence.
-	// The sampling func is responsible for handling empty family
-	// (e.g. falling back to a default family or passing through).
-	if r.sampling != nil {
-		req.Temperature = r.sampling(meta.Family)
+	if req.CallPurpose.Deterministic() {
+		// Deterministic profile: temperature only, no preset injection of
+		// top_p/top_k/penalties. An explicit caller temperature still wins.
+		if req.Temperature == nil {
+			req.Temperature = DeterministicTemperature(meta.Family)
+		}
 		return
 	}
 
-	// Fallback: no sampling func — default to deterministic (0.0)
-	temp := 0.0
-	req.Temperature = &temp
+	// Apply the sampling function regardless of registry presence.
+	// The sampling func is responsible for handling empty family
+	// (e.g. falling back to a default family or passing through).
+	var preset SamplingDefaults
+	if r.sampling != nil {
+		preset = r.sampling(meta.Family)
+	}
+
+	if req.Temperature == nil {
+		switch {
+		case preset.Temperature != nil:
+			req.Temperature = preset.Temperature
+		case r.sampling == nil:
+			// Fallback: no sampling func — default to deterministic (0.0)
+			temp := 0.0
+			req.Temperature = &temp
+		}
+	}
+	// Remaining parameters have no fallback without a sampling func: nil stays
+	// nil (provider default).
+	if req.TopP == nil {
+		req.TopP = preset.TopP
+	}
+	if req.TopK == nil {
+		req.TopK = preset.TopK
+	}
+	if req.RepetitionPenalty == nil {
+		req.RepetitionPenalty = preset.RepetitionPenalty
+	}
+	if req.PresencePenalty == nil {
+		req.PresencePenalty = preset.PresencePenalty
+	}
 }
 
 // prepareRequest fills defaults (model, temperature, wire protocol) and
@@ -295,7 +347,7 @@ func (r *Router) applyDefaultTemperature(req *ChatRequest, meta ModelMetadata) {
 // the context window.
 //
 // The model registry is resolved at most once here; the resolved ModelMetadata
-// is threaded into applyDefaultTemperature and validateContextWindow so those
+// is threaded into applyDefaultSampling and validateContextWindow so those
 // helpers never trigger their own Resolve (and thus no extra registry I/O).
 //
 // The bare model name (without provider prefix) is what is sent to the LLM API
@@ -334,7 +386,7 @@ func (r *Router) prepareRequest(ctx context.Context, req *ChatRequest, bareModel
 		}
 	}
 
-	r.applyDefaultTemperature(req, meta)
+	r.applyDefaultSampling(req, meta)
 	return r.validateContextWindow(req.Model, req.Messages, meta)
 }
 
@@ -344,7 +396,7 @@ func (r *Router) Call(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 	// release the lock before the retry loop. The retry loop includes
 	// exponential backoff sleeps (up to ~7s); holding the read lock for that
 	// duration would block SetModel (write lock) and freeze model switching
-	// during retry storms. applyDefaultTemperature and validateContextWindow
+	// during retry storms. applyDefaultSampling and validateContextWindow
 	// only read immutable fields (registry, tokenCounter, sampling, etc.), so
 	// they are safe to call without the lock after the snapshot.
 	r.mu.RLock()

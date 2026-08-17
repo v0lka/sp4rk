@@ -9,7 +9,12 @@ import (
 	"github.com/v0lka/sp4rk/tools"
 )
 
-const toolReadAttachmentDescription = "Read the markdown content of a user-attached file by its ID. The attachment IDs are provided in the user message attachment list. Use this to inspect the converted markdown content of files the user attached to the conversation (e.g. PDFs, spreadsheets, images)."
+const toolReadAttachmentDescription = `Purpose: read the markdown content of a file the user attached to the conversation, by its ID.
+Use when: the user's message lists attachments (each with an ID) and their content matters for the task — converted documents (e.g. PDFs, spreadsheets) are returned as readable markdown.
+Inputs: attachment_id (from the attachment list in the user message).
+Outputs: the attachment's converted markdown content.
+Example: attachment_id from the user's latest message.
+Anti-example: not for workspace files (read_file with a path); the ID is not a file path — guessing one fails.`
 
 // ---------------------------------------------------------------------------
 // read_attachment

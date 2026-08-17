@@ -394,6 +394,213 @@ func TestCheckSameToolRepetition_ThresholdZero_Disabled(t *testing.T) {
 	}
 }
 
+// TestCheckSameToolRepetition_RetryAfterFixDoesNotNudge covers the legitimate
+// pattern "call failed → arguments fixed → retried": an error result must not
+// count as "similar results" loop evidence, so the follow-up same-tool call
+// with changed arguments neither triggers the nudge nor increments the chain.
+func TestCheckSameToolRepetition_RetryAfterFixDoesNotNudge(t *testing.T) {
+	cfg := CircuitBreakerConfig{
+		RepeatNudgeThreshold:         3,
+		RepeatAbortThreshold:         4,
+		TruncationAbortThreshold:     3,
+		ParseErrorAbortThreshold:     3,
+		FruitlessNudgeThreshold:      50,
+		FruitlessAbortThreshold:      60,
+		FruitlessMaxResultLen:        32,
+		SameToolRepeatNudgeThreshold: 2, // a plain increment here WOULD nudge
+		SameToolRepeatAbortThreshold: 3,
+		SameToolResultSizeDelta:      64,
+	}
+	exec := newExecutorDefaultHITL(&mockLLMCaller{}, newMockToolExecutor(), &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, cfg)
+
+	// 1st call: the tool fails (bad argument).
+	errAction := llm.ToolCall{Name: "search", Input: json.RawMessage(`{"query":"misspelled-queary"}`)}
+	errResult := tools.ToolResult{Content: "error: invalid query 'misspelled-queary'", IsError: true}
+	actionBreak, result, err := exec.checkSameToolRepetition(
+		context.Background(),
+		errAction,
+		0, errResult.Content,
+		errResult,
+		&runState{effectiveMaxSteps: 10},
+		newMockContextManager(),
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if actionBreak != actionNone {
+		t.Fatalf("actionBreak = %v, want actionNone after first errored call", actionBreak)
+	}
+	if result != nil {
+		t.Fatalf("first errored call must not produce a nudge result, got %+v", result)
+	}
+	if exec.sameToolConsecutiveCount != 1 {
+		t.Fatalf("sameToolConsecutiveCount = %d after first call, want 1", exec.sameToolConsecutiveCount)
+	}
+	if !exec.sameToolLastResultIsError {
+		t.Fatal("sameToolLastResultIsError must be recorded for the error result")
+	}
+
+	// 2nd call: same tool, FIXED arguments, success with a similar-sized result.
+	fixedAction := llm.ToolCall{Name: "search", Input: json.RawMessage(`{"query":"corrected query"}`)}
+	okResult := tools.ToolResult{Content: "ok: found 3 matches for 'corrected query'"}
+	actionBreak, result, err = exec.checkSameToolRepetition(
+		context.Background(),
+		fixedAction,
+		0, okResult.Content,
+		okResult,
+		&runState{effectiveMaxSteps: 10},
+		newMockContextManager(),
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if actionBreak != actionNone {
+		t.Fatalf("actionBreak = %v, want actionNone: retry-after-fix must not break the loop", actionBreak)
+	}
+	if result != nil {
+		t.Fatalf("retry-after-fix must NOT trigger the same-tool nudge, got %+v", result)
+	}
+	if exec.sameToolConsecutiveCount != 1 {
+		t.Fatalf("sameToolConsecutiveCount = %d after retry-after-fix, want 1 (reset, not incremented)", exec.sameToolConsecutiveCount)
+	}
+	if exec.sameToolLastResultIsError {
+		t.Fatal("sameToolLastResultIsError must be cleared after the successful retry")
+	}
+}
+
+// TestCheckSameToolRepetition_ConsecutiveErrorsStillAccumulate pins the
+// error-loop half of the retry-after-fix rule: consecutive FAILING calls to
+// the same tool with varied arguments and similar-sized results are loop
+// evidence, not a retry-after-fix — they must accumulate toward the
+// same-tool nudge/abort thresholds exactly like successful repetitions.
+// Without the !result.IsError guard on the reset, every failing call reset
+// the chain to 1 and the breaker could never fire for varied-args error
+// loops (the only breaker covering that shape).
+func TestCheckSameToolRepetition_ConsecutiveErrorsStillAccumulate(t *testing.T) {
+	cfg := CircuitBreakerConfig{
+		RepeatNudgeThreshold:         3,
+		RepeatAbortThreshold:         4,
+		TruncationAbortThreshold:     3,
+		ParseErrorAbortThreshold:     3,
+		FruitlessNudgeThreshold:      50,
+		FruitlessAbortThreshold:      60,
+		FruitlessMaxResultLen:        32,
+		SameToolRepeatNudgeThreshold: 3,
+		SameToolRepeatAbortThreshold: 4,
+		SameToolResultSizeDelta:      64,
+	}
+	exec := newExecutorDefaultHITL(&mockLLMCaller{}, newMockToolExecutor(), &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, cfg)
+	state := &runState{effectiveMaxSteps: 10}
+
+	call := func(query string) (loopAction, *ExecutorResult, error) {
+		return exec.checkSameToolRepetition(
+			context.Background(),
+			llm.ToolCall{Name: "search", Input: json.RawMessage(`{"query":"` + query + `"}`)},
+			0, "error: boom",
+			tools.ToolResult{Content: "error: boom", IsError: true},
+			state,
+			newMockContextManager(),
+		)
+	}
+
+	// 1st failing call: recorded as the chain start (count=1).
+	loopAct, result, err := call("attempt-one")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if loopAct != actionNone || result != nil {
+		t.Fatalf("first call: loopAct=%v result=%v, want actionNone/nil", loopAct, result)
+	}
+	if exec.sameToolConsecutiveCount != 1 {
+		t.Fatalf("count = %d after 1st failing call, want 1", exec.sameToolConsecutiveCount)
+	}
+
+	// 2nd failing call, varied arguments, identical result size: must
+	// INCREMENT the chain (retry-after-fix does not apply — no success).
+	loopAct, result, err = call("attempt-two-different-args")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if loopAct != actionNone || result != nil {
+		t.Fatalf("second call: loopAct=%v result=%v, want actionNone/nil (below nudge threshold)", loopAct, result)
+	}
+	if exec.sameToolConsecutiveCount != 2 {
+		t.Fatalf("count = %d after 2nd consecutive failing call, want 2 (incremented, not reset)", exec.sameToolConsecutiveCount)
+	}
+	if !exec.sameToolLastResultIsError {
+		t.Fatal("sameToolLastResultIsError must stay recorded across consecutive errors")
+	}
+
+	// 3rd failing call reaches the nudge threshold → the breaker fires.
+	loopAct, result, err = call("attempt-three-other-args")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if loopAct != actionBreak || result != nil || !state.circuitBreakerTriggered {
+		t.Fatalf("3rd consecutive failing call must trigger the same-tool nudge: loopAct=%v result=%v triggered=%v", loopAct, result, state.circuitBreakerTriggered)
+	}
+	if exec.sameToolConsecutiveCount != 3 {
+		t.Fatalf("count = %d at nudge, want 3", exec.sameToolConsecutiveCount)
+	}
+}
+
+// TestCheckRepeatIdenticalTool_ErrorThenIdenticalCall_Nudges pins the behavior
+// for the truly pathological pattern "X → error → X identical": the identical
+// call is still intercepted by the repeat-error nudge (thresholds are lowered
+// by one after an errored identical call), unchanged by the retry-after-fix fix.
+func TestCheckRepeatIdenticalTool_ErrorThenIdenticalCall_Nudges(t *testing.T) {
+	cfg := CircuitBreakerConfig{
+		RepeatNudgeThreshold:         3,
+		RepeatAbortThreshold:         4,
+		TruncationAbortThreshold:     3,
+		ParseErrorAbortThreshold:     3,
+		FruitlessNudgeThreshold:      50,
+		FruitlessAbortThreshold:      60,
+		FruitlessMaxResultLen:        32,
+		SameToolRepeatNudgeThreshold: 50,
+		SameToolRepeatAbortThreshold: 60,
+		SameToolResultSizeDelta:      64,
+	}
+	exec := newExecutorDefaultHITL(&mockLLMCaller{}, newMockToolExecutor(), &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, cfg)
+
+	action := llm.ToolCall{Name: "search", Input: json.RawMessage(`{"query":"stuck"}`)}
+	resp := &llm.ChatResponse{Message: llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{action}}}
+	state := &runState{effectiveMaxSteps: 10, responseGroup: 1}
+
+	// First identical call: recorded (count=1) and allowed through.
+	loopAct, result, err := exec.checkRepeatIdenticalTool(context.Background(), action, 0, "", resp, state, newMockContextManager())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if loopAct != actionNone {
+		t.Fatalf("loopAct = %v, want actionNone for the first call", loopAct)
+	}
+	if result != nil {
+		t.Fatalf("first call must not produce a result, got %+v", result)
+	}
+	if exec.consecutiveRepeatCount != 1 {
+		t.Fatalf("consecutiveRepeatCount = %d after first call, want 1", exec.consecutiveRepeatCount)
+	}
+
+	// The first call executed and FAILED — mirror the executor's post-result state.
+	exec.lastToolResultIsError = true
+
+	// Second IDENTICAL call after the error must be intercepted by the nudge.
+	loopAct, result, err = exec.checkRepeatIdenticalTool(context.Background(), action, 0, "", resp, state, newMockContextManager())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if loopAct != actionBreak || result != nil || !state.circuitBreakerTriggered {
+		t.Fatalf("identical retry after error must trigger the nudge: loopAct=%v result=%v triggered=%v", loopAct, result, state.circuitBreakerTriggered)
+	}
+	if len(state.allSteps) != 1 {
+		t.Fatalf("expected exactly 1 nudge step, got %d", len(state.allSteps))
+	}
+	if got := state.allSteps[0].Observation; got != repeatErrorNudgeMessage {
+		t.Fatalf("nudge text = %q, want repeatErrorNudgeMessage %q", got, repeatErrorNudgeMessage)
+	}
+}
+
 // --- checkParseErrors edge cases ---
 
 func TestCheckParseErrors_NudgeBeforeAbort(t *testing.T) {
@@ -432,6 +639,90 @@ func TestCheckParseErrors_NudgeBeforeAbort(t *testing.T) {
 	}
 	if !strings.Contains(obs, "malformed") {
 		t.Error("observation should contain nudge about malformed arguments")
+	}
+}
+
+func TestCheckParseErrors_NudgeContainsDiagnostics(t *testing.T) {
+	cfg := CircuitBreakerConfig{
+		RepeatNudgeThreshold:         3,
+		RepeatAbortThreshold:         4,
+		TruncationAbortThreshold:     3,
+		ParseErrorAbortThreshold:     3,
+		FruitlessNudgeThreshold:      50,
+		FruitlessAbortThreshold:      60,
+		FruitlessMaxResultLen:        32,
+		SameToolRepeatNudgeThreshold: 50,
+		SameToolRepeatAbortThreshold: 60,
+		SameToolResultSizeDelta:      64,
+	}
+	exec := newExecutorDefaultHITL(&mockLLMCaller{}, newMockToolExecutor(), &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, cfg)
+	raw := `{"path": "/tmp/diag.txt", "content": "RAW_OUTPUT_FRAGMENT_MARKER"}`
+	obs, _, _, err := exec.checkParseErrors(
+		context.Background(),
+		llm.ToolCall{Name: "create_file", Input: json.RawMessage(raw)},
+		0,
+		"failed to parse input: bad json",
+		tools.ToolResult{Content: "failed to parse input: bad json", IsError: true},
+		&runState{effectiveMaxSteps: 10},
+		newMockContextManager(),
+	)
+	if err != nil {
+		t.Fatalf("checkParseErrors() error = %v", err)
+	}
+	if !strings.Contains(obs, "failed to parse input: bad json") {
+		t.Errorf("nudge should include the parse error description, got: %s", obs)
+	}
+	if !strings.Contains(obs, "RAW_OUTPUT_FRAGMENT_MARKER") {
+		t.Errorf("nudge should quote a fragment of the raw model output, got: %s", obs)
+	}
+	if !strings.Contains(obs, "ONLY a valid JSON tool call") {
+		t.Errorf("nudge should demand a JSON-only response format, got: %s", obs)
+	}
+}
+
+func TestCheckParseErrors_NudgeTruncatesRawOutput(t *testing.T) {
+	cfg := CircuitBreakerConfig{
+		RepeatNudgeThreshold:         3,
+		RepeatAbortThreshold:         4,
+		TruncationAbortThreshold:     3,
+		ParseErrorAbortThreshold:     3,
+		FruitlessNudgeThreshold:      50,
+		FruitlessAbortThreshold:      60,
+		FruitlessMaxResultLen:        32,
+		SameToolRepeatNudgeThreshold: 50,
+		SameToolRepeatAbortThreshold: 60,
+		SameToolResultSizeDelta:      64,
+	}
+	exec := newExecutorDefaultHITL(&mockLLMCaller{}, newMockToolExecutor(), &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, cfg)
+	long := `{"prefix_marker":"` + strings.Repeat("a", 1000) + `","tail_marker":true}`
+	obs, _, _, err := exec.checkParseErrors(
+		context.Background(),
+		llm.ToolCall{Name: "create_file", Input: json.RawMessage(long)},
+		0,
+		"failed to parse input: bad json",
+		tools.ToolResult{Content: "failed to parse input: bad json", IsError: true},
+		&runState{effectiveMaxSteps: 10},
+		newMockContextManager(),
+	)
+	if err != nil {
+		t.Fatalf("checkParseErrors() error = %v", err)
+	}
+	if !strings.Contains(obs, "prefix_marker") {
+		t.Errorf("nudge should quote the beginning of the raw model output, got: %s", obs)
+	}
+	if strings.Contains(obs, "tail_marker") {
+		t.Errorf("nudge should truncate the raw output excerpt to ~%d chars, but it contains the tail", parseErrorNudgeRawPrefix)
+	}
+	if idx := strings.Index(obs, "Your raw output as received"); idx < 0 {
+		t.Errorf("nudge should contain the raw output header, got: %s", obs)
+	} else {
+		line := obs[idx:]
+		if end := strings.IndexByte(line, '\n'); end >= 0 {
+			line = line[:end]
+		}
+		if n := len([]rune(line)); n > parseErrorNudgeRawPrefix+120 {
+			t.Errorf("raw output line should be capped near %d chars, got %d", parseErrorNudgeRawPrefix, n)
+		}
 	}
 }
 

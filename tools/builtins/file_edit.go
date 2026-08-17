@@ -11,7 +11,12 @@ import (
 	"github.com/v0lka/sp4rk/tools"
 )
 
-const toolEditFileDescription = `Performs a find-and-replace edit on an existing file. Locates a single exact occurrence of old_string in the file and replaces it with new_string. The operation fails if old_string is not found or if it matches more than once — provide enough surrounding context in old_string to ensure a unique match. Prefer this tool over write_file for surgical modifications to existing files.`
+const toolEditFileDescription = `Purpose: find-and-replace exactly one occurrence of a substring in an existing file — the surgical alternative to rewriting the whole file.
+Use when: modifying a specific fragment of an existing file. The old_string must match exactly (whitespace and indentation included) and occur exactly once — include surrounding lines for uniqueness. The call fails loudly on zero or multiple matches instead of guessing.
+Inputs: path; old_string (the exact text to replace, with enough context to be unique); new_string (the replacement — empty string deletes the matched text).
+Outputs: confirmation of the edit, or an error stating the match was not found / matched more than once.
+Example: to rename a function, put its signature plus one neighboring line into old_string and the renamed signature into new_string.
+Anti-example: not for creating files or full rewrites (write_file); one call fixes one occurrence — for bulk renames across many files ask the user or use a scripted change via the shell tool.`
 
 // EditFileTool performs find-and-replace edits on files.
 type EditFileTool struct {

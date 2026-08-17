@@ -11,7 +11,13 @@ import (
 	"github.com/v0lka/sp4rk/tools"
 )
 
-const toolUpdateChecklistDescription = "Update the checklist for the current step (or for the task as a whole if there is no declared plan). Call this as your FIRST tool call to initialize the checklist, and again after completing each item (mark it as '- [x]'). Update ONE item at a time: call update_checklist again immediately after completing each single sub-task, not several at once — batch-checking multiple items in one call is discouraged, because progress must stay visible incrementally throughout the step. Use ONLY ASCII checkboxes: '- [ ]' for unchecked, '- [x]' for checked. No nested lists, no Unicode checkboxes. When executing a declared plan inline (as the Conductor), pass step_id to associate the checklist with a specific plan step. Omit step_id for a standalone checklist (no declared plan) or when running as a delegated subagent (the step ID is inferred from the execution context)."
+const toolUpdateChecklistDescription = `Purpose: maintain the checklist of concrete sub-tasks for the current step so progress stays visible.
+Use when: as your FIRST tool call in a step (initialize with all items unchecked, "- [ ]"), and again immediately after completing each single sub-task — mark exactly one item done ("- [x]") per call. Batch-checking several items at once is discouraged; incremental updates are the point.
+Inputs: todo_list — the full updated checklist, one "- [ ]"/"- [x] " line per item (plain ASCII checkboxes only: no nesting, no Unicode checkboxes); optional step_id to attach the checklist to a specific plan step when executing a declared plan inline — omit it for standalone checklists or as a delegated subagent (inferred from context).
+Outputs: the updated checklist state.
+Example: "- [x] read config
+- [ ] update schema".
+Anti-example: do not check multiple items in one update; do not track delegated steps here (the subagent keeps its own checklist); do not drop remaining unchecked items when updating.`
 
 var (
 	// Detects lines that look like they intend to be list items but don't match the strict format.

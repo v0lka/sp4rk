@@ -255,6 +255,15 @@ func (p *OpenAIProvider) buildChatParams(req ChatRequest) oai.ChatCompletionNewP
 	if req.Temperature != nil {
 		params.Temperature = oai.Float(*req.Temperature)
 	}
+	// top_p and presence_penalty are part of the official OpenAI Chat
+	// Completions schema, so they are sent to every endpoint (strict
+	// api.openai.com and compatible gateways alike).
+	if req.TopP != nil {
+		params.TopP = oai.Float(*req.TopP)
+	}
+	if req.PresencePenalty != nil {
+		params.PresencePenalty = oai.Float(*req.PresencePenalty)
+	}
 
 	// Apply reasoning effort as native provider value
 	if req.ReasoningEffort != "" {
@@ -278,6 +287,26 @@ func (p *OpenAIProvider) buildChatParams(req ChatRequest) oai.ChatCompletionNewP
 		}
 	}
 
+	// top_k and repetition_penalty are NOT part of the official OpenAI schema
+	// and the strict api.openai.com endpoint rejects unknown request fields.
+	// OpenAI-compatible serving stacks (LM Studio, vLLM, llama.cpp, Ollama)
+	// read them from the same Chat Completions payload, so they are forwarded
+	// only when a custom baseURL is configured. Applied after the reasoning
+	// switch above because mergeExtraFields must preserve the extras it may
+	// have set ("thinking", "enable_thinking", ...).
+	if p.baseURL != "" {
+		extras := make(map[string]any)
+		if req.TopK != nil {
+			extras["top_k"] = *req.TopK
+		}
+		if req.RepetitionPenalty != nil {
+			extras["repetition_penalty"] = *req.RepetitionPenalty
+		}
+		if len(extras) > 0 {
+			mergeExtraFields(&params, extras)
+		}
+	}
+
 	if len(req.Tools) > 0 {
 		tools := make([]oai.ChatCompletionToolParam, len(req.Tools))
 		for i, tool := range req.Tools {
@@ -293,6 +322,22 @@ func (p *OpenAIProvider) buildChatParams(req ChatRequest) oai.ChatCompletionNewP
 	}
 
 	return params
+}
+
+// mergeExtraFields merges extra fields into the OpenAI SDK params without
+// clobbering values set by an earlier SetExtraFields call: the SDK's
+// SetExtraFields replaces the whole map, so extras set by the reasoning-family
+// branches in buildChatParams ("thinking", "enable_thinking", ...) must be
+// preserved.
+func mergeExtraFields(params *oai.ChatCompletionNewParams, extra map[string]any) {
+	merged := make(map[string]any, len(params.ExtraFields())+len(extra))
+	for k, v := range params.ExtraFields() {
+		merged[k] = v
+	}
+	for k, v := range extra {
+		merged[k] = v
+	}
+	params.SetExtraFields(merged)
 }
 
 // applyGLMReasoning sets the reasoning-related extra fields for GLM models.
