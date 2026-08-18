@@ -365,6 +365,58 @@ func TestAddStep(t *testing.T) {
 	}
 }
 
+// TestBuildPromptNudgeOnlyStepSkipsAssistantPlaceholder is an end-to-end guard on
+// the real BuildPrompt renderer: a nudge-only step (no thought, no action,
+// non-empty nudge) must emit ONLY a user message, not the empty assistant slot
+// rendered as "(proceeding)". Live user messages delivered at a step boundary are
+// appended as exactly such nudge-only steps, so a spurious assistant placeholder
+// would sit between the pending tool result and the user correction.
+func TestBuildPromptNudgeOnlyStepSkipsAssistantPlaceholder(t *testing.T) {
+	counter := llm.NewSimpleTokenCounter()
+	tracker := llm.NewContextTokenTracker(counter)
+	cw := NewContextWindow(ContextWindowConfig{
+		SystemPrompt: "System",
+		ModelMeta:    testModelMeta(128000),
+		Tracker:      tracker,
+		Thresholds:   testThresholds(),
+	})
+	cw.SetTask("complete the task")
+
+	// A normal tool step produces assistant + tool messages.
+	cw.AddStep(makeStep("step 1", "obs 1", 1))
+	// A nudge-only step produces only a user message.
+	const nudge = "switch to approach B instead"
+	cw.AddStep(sdkagent.Step{UserNudge: nudge})
+
+	messages := cw.BuildPrompt()
+
+	// system + task(user) + assistant + tool + nudge(user) = 5.
+	if len(messages) != 5 {
+		t.Fatalf("BuildPrompt() returned %d messages, want 5: %v", len(messages), rolesAndContents(messages))
+	}
+
+	for _, m := range messages {
+		if m.Role == "assistant" && m.Content == "(proceeding)" {
+			t.Errorf("BuildPrompt() emitted a spurious assistant '(proceeding)' placeholder for a nudge-only step: %v", rolesAndContents(messages))
+		}
+	}
+
+	last := messages[len(messages)-1]
+	if last.Role != "user" || last.Content != nudge {
+		t.Errorf("BuildPrompt() final message = (%s, %q), want nudge user message (%s, %q)",
+			last.Role, last.Content, "user", nudge)
+	}
+}
+
+// rolesAndContents is a compact diagnostic for BuildPrompt message sequences.
+func rolesAndContents(messages []llm.Message) []string {
+	out := make([]string, len(messages))
+	for i, m := range messages {
+		out[i] = fmt.Sprintf("%s:%q", m.Role, m.Content)
+	}
+	return out
+}
+
 // TestAddStepAfterCompactAppendsToCompactedPrefix is a regression test for a bug
 // where AddStep unconditionally cleared compactedMessages, forcing BuildPrompt to
 // reconvert the entire (unbounded) raw step history on the very next call. Since

@@ -106,6 +106,16 @@ type ConductorConfig struct {
 	// ANY conductor run — normal or specialized — can be paused at a step
 	// boundary.
 	PauseChecker func(context.Context) bool
+
+	// UserMessageSource, when non-nil, is installed on the Executor via
+	// SetUserMessageSource. It is invoked at every step boundary (immediately
+	// after the pause check and before the LLM call); a non-empty return lands
+	// as a {role:user} message in the very next LLM request. The host
+	// application threads its live user-message queue here so a message the
+	// user sends while a run is already executing is delivered at the next
+	// step boundary — without pausing or restarting the run. A nil source
+	// disables live injection (the default, backward-compatible behavior).
+	UserMessageSource func(context.Context) string
 }
 
 // Conductor runs a single Executor.Run that owns a task end-to-end.
@@ -310,6 +320,15 @@ func (c *Conductor) Run(
 	// the loop non-pausing and is fully backward-compatible.
 	if c.cfg.PauseChecker != nil {
 		executor.SetPauseChecker(c.cfg.PauseChecker)
+	}
+
+	// Live user message source: install it on the executor so Run polls it at
+	// every step boundary (right after the pause check). A non-empty return
+	// is appended to the trajectory and the ContextManager as a nudge-only
+	// step, landing as a {role:user} message in the very next LLM request.
+	// Nil (default) disables live injection and is fully backward-compatible.
+	if c.cfg.UserMessageSource != nil {
+		executor.SetUserMessageSource(c.cfg.UserMessageSource)
 	}
 
 	// Finish-join guard: reject finish when pending async delegations exist,

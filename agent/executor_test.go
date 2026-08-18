@@ -350,6 +350,149 @@ func TestExecutor_Run_PauseCheckerViaOption(t *testing.T) {
 	}
 }
 
+func TestExecutor_Run_UserMessageSourceDeliversOnce(t *testing.T) {
+	// A live user message queued mid-run must land in the VERY NEXT LLM
+	// request: the boundary poll drains the source, appends a nudge-only step
+	// to the trajectory, and pushes it to the ContextManager BEFORE the next
+	// BuildPrompt/Call. The source returns a message exactly once (drain
+	// semantics), so later boundaries inject nothing.
+	toolInput := json.RawMessage(`{"path": "/tmp/test"}`)
+	mockLLM := &mockLLMCaller{
+		responses: []*llm.ChatResponse{
+			llmResponseWithToolCall("step 1", "read_file", toolInput),
+			llmResponseWithToolCall("step 2", "read_file", toolInput),
+			llmResponseFinish("done", "final answer"),
+		},
+	}
+	mockTools := newMockToolExecutor()
+	mockTools.results["read_file"] = tools.ToolResult{Content: "hello world"}
+
+	// The stock mock CM records steps without rendering them; this wrapper
+	// mirrors the real memory.ContextWindow behavior the feature depends on:
+	// a nudge-only step renders as a user message in BuildPrompt.
+	cm := &nudgeRenderingCM{mockContextManager: *newMockContextManager()}
+	// The message becomes available only after the first step has completed
+	// (the user "sends" it mid-run): boundary 1 yields "", boundary 2 drains
+	// the message, later boundaries yield "" again.
+	var boundary int
+	exec := NewExecutor(mockLLM, mockTools, 10,
+		WithUserMessageSource(func(context.Context) string {
+			boundary++
+			if boundary == 2 {
+				return "use approach B instead"
+			}
+			return ""
+		}),
+	)
+
+	result, err := exec.Run(context.Background(), []tools.ToolDescriptor{
+		{Name: "read_file", Description: "read a file", Source: "core"},
+	}, cm)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.Finished {
+		t.Fatal("expected Finished=true")
+	}
+	if len(mockLLM.calls) != 3 {
+		t.Fatalf("LLM called %d times, want 3", len(mockLLM.calls))
+	}
+
+	// The message must land as the FINAL message of the request immediately
+	// following the boundary that drained it: request #1 (0-based) — right
+	// after the pending tool result, the same landing spot as a
+	// resume-with-nudge interjection.
+	second := mockLLM.calls[1].Messages
+	if len(second) == 0 {
+		t.Fatal("request #1 carries no messages")
+	}
+	tail := second[len(second)-1]
+	if tail.Role != "user" || !strings.Contains(tail.Content, "use approach B instead") {
+		t.Fatalf("request #1 final message = (%s, %q), want the live user message", tail.Role, tail.Content)
+	}
+
+	// The first request must NOT carry the message (it was not queued yet at
+	// that boundary), and the message must be appended only once — request #2
+	// contains it only as history (it precedes request #2's own new content).
+	for _, m := range mockLLM.calls[0].Messages {
+		if strings.Contains(m.Content, "use approach B instead") {
+			t.Error("live message leaked into request #0 — delivered before it was queued")
+		}
+	}
+
+	// The trajectory carries the nudge-only step exactly once.
+	nudges := 0
+	for _, s := range result.Steps {
+		if s.UserNudge == "use approach B instead" {
+			nudges++
+		}
+	}
+	if nudges != 1 {
+		t.Errorf("trajectory contains %d live-message steps, want 1", nudges)
+	}
+}
+
+// nudgeRenderingCM wraps mockContextManager so BuildPrompt renders nudge-only
+// steps as user messages — the same rendering the real memory.ContextWindow
+// applies (see memory/steps.go: a nudge-only step produces only the user
+// message, no assistant placeholder).
+type nudgeRenderingCM struct {
+	mockContextManager
+}
+
+func (m *nudgeRenderingCM) BuildPrompt() []llm.Message {
+	msgs := []llm.Message{{Role: "system", Content: "you are helpful"}}
+	m.mu.Lock()
+	steps := append([]Step(nil), m.steps...)
+	m.mu.Unlock()
+	for _, s := range steps {
+		if s.UserNudge != "" {
+			msgs = append(msgs, llm.Message{Role: "user", Content: s.UserNudge})
+		}
+		if s.Thought != "" || s.Action.Name != "" {
+			msgs = append(msgs, llm.Message{Role: "assistant", Content: s.Thought})
+		}
+		if s.Action.Name != "" {
+			msgs = append(msgs, llm.Message{Role: "tool", Content: s.Observation})
+		}
+	}
+	return msgs
+}
+
+func TestExecutor_Run_UserMessageSourceEmptyIsNoop(t *testing.T) {
+	// A source that always returns "" must leave Run identical to the default
+	// (no-source) behavior: no extra steps, no error, run finishes.
+	mockLLM := &mockLLMCaller{
+		responses: []*llm.ChatResponse{
+			llmResponseFinish("done", "final answer"),
+		},
+	}
+	cm := newMockContextManager()
+	calls := 0
+	exec := NewExecutor(mockLLM, newMockToolExecutor(), 10,
+		WithUserMessageSource(func(context.Context) string {
+			calls++
+			return ""
+		}),
+	)
+
+	result, err := exec.Run(context.Background(), nil, cm)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.Finished {
+		t.Error("expected Finished=true when source never yields a message")
+	}
+	if calls == 0 {
+		t.Error("expected the source to be polled at least once per step boundary")
+	}
+	for _, s := range result.Steps {
+		if s.UserNudge != "" {
+			t.Errorf("unexpected nudge-only step %q for an always-empty source", s.UserNudge)
+		}
+	}
+}
+
 func TestExecutor_Run_ToolExecutionError(t *testing.T) {
 	toolInput := json.RawMessage(`{}`)
 	mockLLM := &mockLLMCaller{

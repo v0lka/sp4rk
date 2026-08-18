@@ -245,3 +245,110 @@ func TestConductor_Run_PendingUserInterjection_LandsOnceThenConsumed(t *testing.
 		t.Errorf("ConsumePendingUserInterjection called %d times, want >= 1", cmRef.consumeCount)
 	}
 }
+
+// condLiveMsgCM renders nudge-only added steps as user messages — mirroring
+// memory.ContextWindow (a nudge-only step produces only the user message) — so
+// the conductor's UserMessageSource wiring can be verified end-to-end: the
+// executor polls the source at a step boundary, appends a nudge-only step to
+// the trajectory, and pushes it via AddStep BEFORE the next BuildPrompt.
+type condLiveMsgCM struct {
+	*condInterjectionCM
+}
+
+func (m *condLiveMsgCM) BuildPrompt() []llm.Message {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	msgs := []llm.Message{{Role: "system", Content: "sys"}}
+	for _, s := range m.seededSteps {
+		msgs = append(msgs, llm.Message{Role: "tool", Content: s.Observation})
+	}
+	for _, s := range m.addedSteps {
+		if s.UserNudge != "" {
+			msgs = append(msgs, llm.Message{Role: "user", Content: s.UserNudge})
+			continue
+		}
+		msgs = append(msgs, llm.Message{Role: "tool", Content: s.Observation})
+	}
+	snap := make([]llm.Message, len(msgs))
+	copy(snap, msgs)
+	m.buildCalls = append(m.buildCalls, snap)
+	return msgs
+}
+
+// TestConductor_Run_UserMessageSource_LandsInNextRequest verifies the
+// conductor's live user-message wiring: a UserMessageSource configured on
+// ConductorConfig is installed on the executor, polled at each step boundary
+// (after the pause check), and a non-empty return lands as the FINAL user
+// message of the very next LLM request. The source drains on return, so the
+// message is appended exactly once.
+func TestConductor_Run_UserMessageSource_LandsInNextRequest(t *testing.T) {
+	var cmRef *condLiveMsgCM
+	live := "switch to approach B, it is cheaper"
+	cfg := ConductorConfig{
+		LLM: &condMockLLM{responses: []*llm.ChatResponse{
+			condToolCallResponse("first step, live message not queued yet", "noop", json.RawMessage(`{}`)), // request 1
+			condToolCallResponse("second step, sees the live message", "noop", json.RawMessage(`{}`)),      // request 2 (message lands here)
+			condFinishResponse("wrapping up", "done"),                                                      // request 3
+		}},
+		Tools: condMockTools{},
+		ContextFactory: func(_ string, _ llm.ModelMetadata, _ string, _ ...PruningOverride) agent.ContextManager {
+			cm := &condLiveMsgCM{condInterjectionCM: newCondInterjectionCM()}
+			cmRef = cm
+			return cm
+		},
+		SystemPrompt: func(_ context.Context, _ string, _ llm.ModelMetadata) string { return "system prompt" },
+		MaxSteps:     10,
+		// The message becomes available only after the first step completed
+		// (the user "sends" it mid-run): boundary 1 yields "", boundary 2
+		// drains it, later boundaries yield "".
+		UserMessageSource: func() func(context.Context) string {
+			boundary := 0
+			return func(context.Context) string {
+				boundary++
+				if boundary == 2 {
+					return live
+				}
+				return ""
+			}
+		}(),
+	}
+	cond := NewConductor(cfg)
+
+	avail := []tools.ToolDescriptor{{Name: "noop", Description: "no-op tool", Source: "core"}}
+	if _, err := cond.Run(context.Background(), "continue the task", NewMapBlackboard(), avail, &agent.NoopEvents{}, "sliding_window"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if cmRef == nil {
+		t.Fatal("context factory was not invoked")
+	}
+	if len(cmRef.buildCalls) < 3 {
+		t.Fatalf("expected at least 3 BuildPrompt calls, got %d", len(cmRef.buildCalls))
+	}
+
+	// The first request must not carry the message (not queued yet).
+	for _, m := range cmRef.buildCalls[0] {
+		if m.Role == "user" && m.Content == live {
+			t.Fatal("live message leaked into the first request — delivered before it was queued")
+		}
+	}
+
+	// The second request must END with the live user message: it was drained
+	// at the boundary after step 1 and pushed via AddStep before BuildPrompt.
+	second := cmRef.buildCalls[1]
+	tail := second[len(second)-1]
+	if tail.Role != "user" || tail.Content != live {
+		t.Errorf("second BuildPrompt final message = (%s, %q), want live message %q", tail.Role, tail.Content, live)
+	}
+
+	// The message was appended exactly once as an added nudge-only step.
+	appended := 0
+	for _, s := range cmRef.addedSteps {
+		if s.UserNudge == live {
+			appended++
+		}
+	}
+	if appended != 1 {
+		t.Errorf("live message appended %d times, want exactly 1", appended)
+	}
+}

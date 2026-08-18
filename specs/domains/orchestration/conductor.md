@@ -40,8 +40,10 @@ conductor.Run(ctx, message, bb, availableTools, events, compactionStrategy)
 │
 ├─ 4. When ResumeSteps is set, seed the ContextManager (via StepSeedable) and the
 │      Executor (via WithResumeSteps) with the prior steps so the loop continues
-│      from len(steps)+1; then launch a single Executor.Run with the step
-│      description, available tools, system prompt, and finish-join guard.
+│      from len(steps)+1; install PauseChecker and UserMessageSource on the
+│      Executor when configured (cooperative pause + live user-message
+│      delivery at step boundaries); then launch a single Executor.Run with the
+│      step description, available tools, system prompt, and finish-join guard.
 │
 ├─ 5. Map the ExecutorResult onto ExecutionStatus:
 │      ├─ Finished == true                          → ExecutionStatusSuccess
@@ -66,6 +68,17 @@ type PendingDelegations interface {
 ```
 
 `Run` returns an error only when the context factory or system-prompt factory is missing, or when the underlying executor returns an error. A non-nil error is still accompanied by a non-nil `*ExecutionResult` carrying best-effort output.
+
+### Step-boundary signals (PauseChecker, UserMessageSource)
+
+Two optional `ConductorConfig` callbacks are installed on the executor so the host can interact with a run at its step boundaries:
+
+| Config | Executor hook | Effect |
+| ------ | ------------- | ------ |
+| `PauseChecker func(ctx) bool` | `SetPauseChecker` | A true return stops the loop cooperatively with `agent.ErrPaused`; `Run` maps it to `ExecutionStatusPaused` and leaves `Output` empty (a clean, resumable checkpoint — never the raw sentinel string). |
+| `UserMessageSource func(ctx) string` | `SetUserMessageSource` | A non-empty return is delivered to the model as the final `{role:user}` message of the very next LLM request (see [executor.md § Live user messages](executor.md#live-user-messages-usermessagesource)). The source drains one message per boundary. |
+
+Both are polled inside `Executor.Run` in that order — pause first, then the message poll — so a pausing run never consumes a queued message: the host's queue keeps it for the resumed run. The host threads one universal pause signal and one live-message queue here so any conductor run (normal or specialized) is pauseable and steerable. Nil (default) disables each; both are fully backward-compatible.
 
 ### Optional ContextManager capabilities
 

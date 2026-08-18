@@ -595,7 +595,18 @@ func (cw *ContextWindow) buildStandaloneMessages(step sdkagent.Step, i int, prot
 	}
 
 	var out []llm.Message
-	out = append(out, assistantMsg)
+
+	// Nudge-only steps (no thought, no reasoning, no action, non-empty nudge)
+	// emit only the user message — mirroring stepsToMessages. Without this the
+	// empty assistant slot would render as a spurious "(proceeding)" placeholder
+	// between the pending tool result and the user correction.
+	thought := strings.TrimRight(step.Thought, strutil.InvisibleTrimSet)
+	nudgeOnly := thought == "" && step.ReasoningContent == "" && len(step.ReasoningItems) == 0 &&
+		step.Action.ID == "" && strutil.HasVisibleContent(step.UserNudge)
+
+	if !nudgeOnly {
+		out = append(out, assistantMsg)
+	}
 
 	if step.Action.ID != "" {
 		out = append(out, cw.buildToolMsg(step, i, protectedIndices))
@@ -739,12 +750,12 @@ func (cw *ContextWindow) isEarlierDuplicateHash(idx int, hash string) bool {
 }
 
 // buildNudgeMsg creates a user message for step-limit/retry nudges.
-// Returns the message and true if the nudge has non-empty content.
+// Returns the message and true if the nudge has non-empty visible content.
 func (cw *ContextWindow) buildNudgeMsg(nudge string) (llm.Message, bool) {
-	content := strings.TrimRight(nudge, strutil.InvisibleTrimSet)
-	if content == "" {
+	if !strutil.HasVisibleContent(nudge) {
 		return llm.Message{}, false
 	}
+	content := strings.TrimRight(nudge, strutil.InvisibleTrimSet)
 	return llm.Message{Role: "user", Content: content}, true
 }
 

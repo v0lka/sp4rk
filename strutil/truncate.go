@@ -1,13 +1,24 @@
 // Package strutil provides string utilities such as UTF-8-safe truncation.
 package strutil
 
-import "unicode/utf8"
+import (
+	"strings"
+	"unicode/utf8"
+)
 
 // InvisibleTrimSet is the cutset of trailing invisible characters common in LLM output.
 // Includes spaces, tabs, newlines, carriage returns, null, form feed, vertical tab,
 // zero-width space (U+200B), zero-width non-joiner (U+200C), zero-width joiner (U+200D),
 // and byte-order mark (U+FEFF).
 const InvisibleTrimSet = " \t\n\r\x00\f\v\u200b\u200c\u200d\ufeff"
+
+// HasVisibleContent reports whether s contains any non-trailing-invisible
+// content. It applies the same trailing-trim semantics as InvisibleTrimSet,
+// so callers that later TrimRight with InvisibleTrimSet agree on whether the
+// string is empty. An empty or all-invisible string returns false.
+func HasVisibleContent(s string) bool {
+	return strings.TrimRight(s, InvisibleTrimSet) != ""
+}
 
 // TruncateUTF8 truncates s to at most maxChars runes, appending "…" if truncated.
 func TruncateUTF8(s string, maxChars int) string {

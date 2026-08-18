@@ -15,6 +15,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/v0lka/sp4rk/llm"
+	"github.com/v0lka/sp4rk/strutil"
 	"github.com/v0lka/sp4rk/tools"
 )
 
@@ -347,6 +348,17 @@ type Executor struct {
 	// pausing (default, backward-compatible behavior).
 	pauseChecker func(context.Context) bool
 
+	// userMessageSource, when non-nil, is invoked at every step boundary in
+	// Run, immediately after the pause check and before the LLM call. A
+	// non-empty return is appended to the trajectory as a nudge-only step
+	// (Step{UserNudge}) and pushed to the ContextManager, so it renders as a
+	// {role:user} message in the very next BuildPrompt — the same landing spot
+	// as a resume-with-nudge interjection. The source is expected to DRAIN its
+	// backing queue on return (one message is delivered per boundary). Set via
+	// WithUserMessageSource or SetUserMessageSource. Nil disables live user
+	// message injection (default, backward-compatible behavior).
+	userMessageSource func(context.Context) string
+
 	logger *slog.Logger
 }
 
@@ -363,6 +375,7 @@ type executorOptions struct {
 	hitl                    HITLHandler
 	resumeSteps             []Step
 	pauseChecker            func(context.Context) bool
+	userMessageSource       func(context.Context) string
 }
 
 // Option configures an Executor created by NewExecutor. Only types from this
@@ -381,6 +394,7 @@ var (
 	_ Option = hitlOption{}
 	_ Option = resumeStepsOption{}
 	_ Option = pauseCheckerOption{}
+	_ Option = userMessageSourceOption{}
 )
 
 type tokenCounterOption struct{ Counter llm.TokenCounter }
@@ -480,6 +494,23 @@ func WithPauseChecker(checker func(context.Context) bool) Option {
 	return pauseCheckerOption{Checker: checker}
 }
 
+type userMessageSourceOption struct{ Source func(context.Context) string }
+
+func (o userMessageSourceOption) apply(opts *executorOptions) { opts.userMessageSource = o.Source }
+
+// WithUserMessageSource installs a live user-message source polled at every
+// step boundary in Run, immediately after the pause check and before the LLM
+// call. A non-empty return is appended to the trajectory as a nudge-only step
+// (Step{UserNudge}) and pushed to the ContextManager, so it lands as a
+// {role:user} message in the very next LLM request. The source drains its
+// backing queue on return (at most one message is delivered per boundary).
+// A nil/omitted source disables the injection (the default, fully
+// backward-compatible behavior). The source must be safe to call from the Run
+// goroutine and must be cheap; it is invoked once per step.
+func WithUserMessageSource(source func(context.Context) string) Option {
+	return userMessageSourceOption{Source: source}
+}
+
 // NewExecutor creates a new Executor.
 //
 // llmRouter, toolRegistry, and maxSteps are required. Optional configuration
@@ -515,6 +546,7 @@ func NewExecutor(llmRouter LLMCaller, toolRegistry ToolExecutor, maxSteps int, o
 		nonCacheableTools:       copyNonCacheableTools(defaultNonCacheableTools),
 		resumeSteps:             o.resumeSteps,
 		pauseChecker:            o.pauseChecker,
+		userMessageSource:       o.userMessageSource,
 	}
 }
 
@@ -555,6 +587,15 @@ func (e *Executor) SetFinishGuard(fn func(ctx context.Context) error) { e.finish
 // ErrPaused sentinel. Pass nil to clear a previously installed checker and
 // restore the default non-pausing behavior. Must be called before Run.
 func (e *Executor) SetPauseChecker(fn func(context.Context) bool) { e.pauseChecker = fn }
+
+// SetUserMessageSource installs a live user-message source polled at every
+// step boundary in Run, immediately after the pause check and before the LLM
+// call. A non-empty return lands as a {role:user} message in the very next LLM
+// request (nudge-only step + ContextManager AddStep). The source drains its
+// backing queue on return — at most one message is delivered per boundary.
+// Pass nil to clear a previously installed source and restore the default
+// no-injection behavior. Must be called before Run.
+func (e *Executor) SetUserMessageSource(fn func(context.Context) string) { e.userMessageSource = fn }
 
 // log returns the executor's logger or a discard logger if none was set.
 func (e *Executor) log() *slog.Logger {
@@ -943,6 +984,27 @@ func (e *Executor) Run(ctx context.Context, taskTools []tools.ToolDescriptor, cw
 		// behaves exactly as before.
 		if e.pauseChecker != nil && e.pauseChecker(ctx) {
 			return &ExecutorResult{Steps: state.allSteps, Finished: false}, ErrPaused
+		}
+
+		// Live user message (step boundary). Polled after the pause check so a
+		// pausing run never swallows a message that would otherwise be
+		// delivered in a future LLM call: the queue keeps holding it for the
+		// resumed run (see the drain-on-return contract of userMessageSource).
+		// A non-empty message is appended to the trajectory as a nudge-only
+		// step and pushed to the ContextManager, rendering as a {role:user}
+		// message in the very next BuildPrompt — the same landing spot as a
+		// resume-with-nudge interjection, so it appears next to the pending
+		// tool result the model is about to see. With no source installed this
+		// is a no-op and the loop behaves exactly as before.
+		if e.userMessageSource != nil {
+			if msg := e.userMessageSource(ctx); strutil.HasVisibleContent(msg) {
+				nudgeStep := Step{UserNudge: msg}
+				state.allSteps = append(state.allSteps, nudgeStep)
+				cw.AddStep(nudgeStep)
+				e.emitter.ExecutorDiagnostic(state.stepNum, "live_user_message", map[string]any{
+					"length": len(msg),
+				})
+			}
 		}
 
 		// Call LLM with reactive compaction on context-exceeded

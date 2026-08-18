@@ -36,11 +36,13 @@ func (e *Executor) Run(ctx context.Context, taskTools []tools.ToolDescriptor, cw
 
 1. **Trajectory sync** — if a `TrajectoryStore` is in `ctx`, the current step history is synced so tools (e.g. a reflector) can read it.
 2. **Step-limit boundary** — if the budget is reached, `HITLHandler.OnStepLimit` decides whether to grant more steps.
-3. **LLM call** — the prompt is built from the context manager and sent. If the provider reports a context-window-exceeded error, reactive compaction runs and the call is retried.
-4. **Implicit-finish check** — if the model returns no tool calls, the executor decides whether this is a legitimate finish or a failure mode (printed tool-call syntax); a nudge may force an explicit `finish`.
-5. **Truncation detection** — `max_tokens` with tool calls present ⇒ nudge injected, truncation counter checked against the circuit breaker.
-6. **Tool execution** — each call runs after HITL approval; results are truncated in two stages, cached if applicable, recorded as observations.
-7. **Compaction** — context fill is checked; compaction runs and `ContextFill`/`ContextCompaction` events fire when thresholds cross.
+3. **Cooperative pause check** — if a pause checker is installed (`WithPauseChecker`/`SetPauseChecker`), a true return stops the loop immediately with `ErrPaused` and the trajectory so far (a resumable checkpoint).
+4. **Live user message poll** — if a user-message source is installed (`WithUserMessageSource`/`SetUserMessageSource`), a non-empty return is appended to the trajectory and the context manager as a nudge-only step, so it renders as a `{role:user}` message in this iteration's LLM call.
+5. **LLM call** — the prompt is built from the context manager and sent. If the provider reports a context-window-exceeded error, reactive compaction runs and the call is retried.
+6. **Implicit-finish check** — if the model returns no tool calls, the executor decides whether this is a legitimate finish or a failure mode (printed tool-call syntax); a nudge may force an explicit `finish`.
+7. **Truncation detection** — `max_tokens` with tool calls present ⇒ nudge injected, truncation counter checked against the circuit breaker.
+8. **Tool execution** — each call runs after HITL approval; results are truncated in two stages, cached if applicable, recorded as observations.
+9. **Compaction** — context fill is checked; compaction runs and `ContextFill`/`ContextCompaction` events fire when thresholds cross.
 
 The loop terminates when `finish` is called (`Finished: true`) or the budget is exhausted (`Finished: false`).
 
@@ -96,6 +98,17 @@ When the LLM returns no tool calls, the executor decides whether to accept an im
 Budget: the resumed steps are counted against the shared `maxSteps` budget, not in addition to it. The loop runs until `stepNum <= maxSteps+1`, so a meaningful resume needs `maxSteps` meaningfully larger than `len(steps)`; otherwise the resumed loop has little or no room for new steps.
 
 A zero value (nil/empty steps, or the option omitted) restores the default fresh-start behavior: the loop starts at step 1 with no seeded history.
+
+### Live user messages (UserMessageSource)
+
+`WithUserMessageSource(source)` / `SetUserMessageSource(fn)` installs a live user-message source polled at every step boundary, immediately after the pause check and before the LLM call. A non-empty return is delivered to the model in the **very next LLM request**:
+
+- the message is appended to the trajectory as a **nudge-only step** (`Step{UserNudge: msg}`) and pushed to the ContextManager via `AddStep` — the same rendering path as executor nudges and the resume-with-nudge interjection, so it lands as the final `{role:user}` message next to the pending tool result;
+- one message is delivered per boundary: the source **drains** its backing queue on return, later boundaries inject the next queued message (FIFO);
+- the poll order after the pause check guarantees a pausing run never swallows a queued message — the queue keeps holding it for the resumed run;
+- an `ExecutorDiagnostic` with event `live_user_message` fires per delivery.
+
+A nil/omitted source disables the injection entirely (default, backward-compatible). The source must be cheap and safe to call from the Run goroutine (invoked once per step). The executor makes no assumption about the queue's owner: the host (e.g. c0wrk) owns the queue and its epilogue semantics — what happens to undelivered messages when the run finishes is a host concern.
 
 ### Tool result cache & two-stage truncation
 
