@@ -390,7 +390,8 @@ func TestBuildPromptNudgeOnlyStepSkipsAssistantPlaceholder(t *testing.T) {
 
 	messages := cw.BuildPrompt()
 
-	// system + task(user) + assistant + tool + nudge(user) = 5.
+	// BuildPrompt emits system, task (user), assistant, tool, and nudge (user)
+	// messages: 5 total.
 	if len(messages) != 5 {
 		t.Fatalf("BuildPrompt() returned %d messages, want 5: %v", len(messages), rolesAndContents(messages))
 	}
