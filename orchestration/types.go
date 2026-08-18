@@ -124,7 +124,7 @@ type PlanStepEvent struct {
 
 // Fact represents a keyword-tagged piece of information for inter-step communication.
 type Fact struct {
-	Keywords []string `json:"keywords"` // 3-5 keywords for retrieval
+	Keywords []string `json:"keywords"` // 3-10 keywords for retrieval
 	Content  string   `json:"content"`  // the fact text
 	Author   string   `json:"author"`   // step ID that wrote it
 }

@@ -3,6 +3,7 @@ package builtins
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -109,6 +110,75 @@ func TestStoreFactTool_InvalidJSON(t *testing.T) {
 	if !result.IsError {
 		t.Fatal("expected error result for invalid JSON")
 	}
+}
+
+func TestStoreFactTool_KeywordCountLimits(t *testing.T) {
+	tool := NewStoreFactTool()
+
+	t.Run("accepts 10 keywords", func(t *testing.T) {
+		fs := &mockFactStore{}
+		ctx := ctxWithFactStore(fs)
+
+		keywords := make([]string, 10)
+		for i := range keywords {
+			keywords[i] = fmt.Sprintf("kw%d", i)
+		}
+		input, _ := json.Marshal(StoreFactInput{Keywords: keywords, Content: "fact with ten keywords"})
+
+		result, err := tool.Execute(ctx, input)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.IsError {
+			t.Fatalf("expected 10 keywords to be accepted, got error: %s", result.Content)
+		}
+		if len(fs.facts) != 1 {
+			t.Fatalf("expected 1 stored fact, got %d", len(fs.facts))
+		}
+	})
+
+	t.Run("rejects 11 keywords", func(t *testing.T) {
+		fs := &mockFactStore{}
+		ctx := ctxWithFactStore(fs)
+
+		keywords := make([]string, 11)
+		for i := range keywords {
+			keywords[i] = fmt.Sprintf("kw%d", i)
+		}
+		input, _ := json.Marshal(StoreFactInput{Keywords: keywords, Content: "fact with eleven keywords"})
+
+		result, err := tool.Execute(ctx, input)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !result.IsError {
+			t.Fatal("expected error result for 11 keywords")
+		}
+		if !strings.Contains(result.Content, "at most 10 items") {
+			t.Errorf("expected 'at most 10 items' message, got %q", result.Content)
+		}
+		if len(fs.facts) != 0 {
+			t.Errorf("expected no stored facts, got %d", len(fs.facts))
+		}
+	})
+
+	t.Run("rejects fewer than 3 keywords", func(t *testing.T) {
+		fs := &mockFactStore{}
+		ctx := ctxWithFactStore(fs)
+
+		input, _ := json.Marshal(StoreFactInput{Keywords: []string{"a", "b"}, Content: "fact with two keywords"})
+
+		result, err := tool.Execute(ctx, input)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !result.IsError {
+			t.Fatal("expected error result for 2 keywords")
+		}
+		if !strings.Contains(result.Content, "at least 3 items") {
+			t.Errorf("expected 'at least 3 items' message, got %q", result.Content)
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------

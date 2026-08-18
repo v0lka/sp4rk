@@ -13,7 +13,7 @@ import (
 
 const toolStoreFactDescription = `Purpose: store a durable fact for later retrieval by yourself or other agents.
 Use when: immediately after learning cross-step information — API signatures, architectural decisions, file locations, error patterns, intermediate results — before context grows large and earlier tool outputs become unavailable. Retrieve later with search_facts; facts persist across steps and execution cycles.
-Inputs: content (the fact itself, self-contained); keywords (3-5 retrieval keywords).
+Inputs: content (the fact itself, self-contained); keywords (3-10 retrieval keywords).
 Outputs: confirmation of storage.
 Example: content "auth middleware lives in core/middleware.go, enforced via applySecurityPolicies" with keywords [auth, middleware, policy, security].
 Anti-example: not for ephemeral scratch that dies with the current turn; do not defer storing to the end of a long investigation — store early, store often.`
@@ -47,8 +47,8 @@ func NewStoreFactTool() *StoreFactTool {
 				"type": "array",
 				"items": {"type": "string"},
 				"minItems": 3,
-				"maxItems": 5,
-				"description": "3-5 keywords for retrieval"
+				"maxItems": 10,
+				"description": "3-10 keywords for retrieval"
 			},
 			"content": {
 				"type": "string",
@@ -77,8 +77,8 @@ func (t *StoreFactTool) Execute(ctx context.Context, input json.RawMessage) (too
 	if len(params.Keywords) < 3 {
 		return tools.ToolResult{Content: fmt.Sprintf("validation error: keywords must have at least 3 items, got %d", len(params.Keywords)), IsError: true}, nil
 	}
-	if len(params.Keywords) > 5 {
-		return tools.ToolResult{Content: fmt.Sprintf("validation error: keywords must have at most 5 items, got %d", len(params.Keywords)), IsError: true}, nil
+	if len(params.Keywords) > 10 {
+		return tools.ToolResult{Content: fmt.Sprintf("validation error: keywords must have at most 10 items, got %d", len(params.Keywords)), IsError: true}, nil
 	}
 	if strings.TrimSpace(params.Content) == "" {
 		return tools.ToolResult{Content: "validation error: content is required", IsError: true}, nil
