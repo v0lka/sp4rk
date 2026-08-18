@@ -1868,11 +1868,11 @@ func TestModelRegistry_NegativeCache_CallerCancellationNotCached(t *testing.T) {
 	}
 }
 
-func TestModelRegistry_NegativeCache_DeadlineExceededStillCached(t *testing.T) {
-	// context.DeadlineExceeded is deliberately still a negative result: the
-	// registry's own HTTP client timeout surfaces the same sentinel, so a
-	// deadline hit describes HuggingFace being too slow as much as it does
-	// the caller. Only outright cancellation is exempt.
+func TestModelRegistry_NegativeCache_CallerDeadlineNotCached(t *testing.T) {
+	// A probe aborted by the CALLER's deadline describes the caller's step
+	// deadline, not HuggingFace, so it must not poison the next ten minutes
+	// of resolves — exactly like caller cancellation. The registry's OWN HTTP
+	// client timeout still records (see the client-timeout test below).
 	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		<-r.Context().Done()
 	}))
@@ -1883,17 +1883,47 @@ func TestModelRegistry_NegativeCache_DeadlineExceededStillCached(t *testing.T) {
 		Transport: &rewriteTransport{base: http.DefaultTransport, serverURL: server.URL},
 	}
 
+	const model = "hf-deadline-probe-model"
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
 	defer cancel()
-	if _, ok := registry.Resolve(ctx, "hf-deadline-probe-model"); ok {
+	if _, ok := registry.Resolve(ctx, model); ok {
 		t.Fatal("expected ok=false when the probe misses its deadline")
 	}
 
 	registry.mu.RLock()
-	_, negative := registry.negativeCache["hf-deadline-probe-model"]
+	_, negative := registry.negativeCache[model]
+	registry.mu.RUnlock()
+	if negative {
+		t.Fatal("caller deadline must not be written to the negative cache")
+	}
+}
+
+func TestModelRegistry_NegativeCache_ClientTimeoutStillCached(t *testing.T) {
+	// The registry's OWN HTTP client timeout is a genuine HuggingFace failure:
+	// the caller's context is still live (ctx.Err() == nil), so the negative
+	// record is written and suppresses re-probes for the TTL. This is the
+	// distinction the caller-deadline exemption must preserve.
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	registry := NewModelRegistry(nil)
+	registry.httpClient = &http.Client{
+		Timeout:   25 * time.Millisecond,
+		Transport: &rewriteTransport{base: http.DefaultTransport, serverURL: server.URL},
+	}
+
+	const model = "hf-client-timeout-model"
+	if _, ok := registry.Resolve(context.Background(), model); ok {
+		t.Fatal("expected ok=false when the client times out")
+	}
+
+	registry.mu.RLock()
+	_, negative := registry.negativeCache[model]
 	registry.mu.RUnlock()
 	if !negative {
-		t.Error("context.DeadlineExceeded must still be negatively cached within TTL")
+		t.Fatal("the registry's own client timeout must be negatively cached")
 	}
 }
 

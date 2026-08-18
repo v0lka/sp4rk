@@ -146,8 +146,9 @@ func (r *ModelRegistry) SetHTTPClient(client *http.Client) {
 //     A FAILED HuggingFace probe is remembered in a negative cache for
 //     negativeCacheTTL: repeat Resolve calls inside that window skip the
 //     network entirely and fall straight through to registered sources. A
-//     subsequent success clears the negative record; cancellation of the
-//     caller's context is never recorded (see the write site below).
+//     subsequent success clears the negative record; termination of the
+//     caller's context (cancellation or deadline) is never recorded (see the
+//     write site below).
 //   - 5. Fallback defaults (ok=false)
 //
 // The local, in-memory portion of the lookup (tiers 1, 2, 2b, and the cache
@@ -193,15 +194,15 @@ func (r *ModelRegistry) Resolve(ctx context.Context, model string) (ModelMetadat
 		// Every failure shape counts — 404, timeout, transport error,
 		// malformed or empty config — because each means "HuggingFace cannot
 		// resolve this model right now". Record it so the next Resolve within
-		// the TTL skips the round-trip. Cancellation of the CALLER's context
-		// is the one exception: it describes the caller's state (a step
-		// deadline hit, a shutdown), not HuggingFace's, so the next Resolve
-		// with a live context re-probes immediately instead of riding out the
-		// window on fallback metadata. context.DeadlineExceeded is
-		// deliberately NOT excepted: the registry's own HTTP client timeout
-		// surfaces the same sentinel, and that failure legitimately describes
-		// HuggingFace.
-		if !errors.Is(err, context.Canceled) {
+		// the TTL skips the round-trip. Termination of the CALLER's context is
+		// the one exception: it describes the caller's state (a step deadline
+		// hit, a shutdown, or an explicit cancel), not HuggingFace's, so the
+		// next Resolve with a live context re-probes immediately instead of
+		// riding out the window on fallback metadata. The registry's own HTTP
+		// client timeout still records: it fires while the caller's context is
+		// still live (ctx.Err() == nil), and that failure legitimately
+		// describes HuggingFace being too slow.
+		if ctx.Err() == nil {
 			r.mu.Lock()
 			r.negativeCache[key] = time.Now()
 			r.mu.Unlock()
@@ -324,23 +325,22 @@ func (r *ModelRegistry) ResolveLocal(model string) (ModelMetadata, bool) {
 
 // negativeCacheFresh reports whether a failed HuggingFace probe for key is
 // still inside the negativeCacheTTL window, meaning the probe must not be
-// repeated yet. An absent entry reads as stale; an EXPIRED entry is deleted
-// on the spot, so the map holds only keys inside their current TTL window
-// and cannot grow without bound for models that are never resolved again
-// after their window lapses. Either way the caller re-probes and, on another
-// failure, overwrites the recorded timestamp, restarting the window.
+// repeated yet. It first sweeps every expired entry so the map holds only
+// keys inside their current TTL window and cannot grow without bound even for
+// models that are never resolved again after their window lapses. An absent
+// entry reads as stale, and an EXPIRED entry is deleted on the spot. Either
+// way the caller re-probes and, on another failure, overwrites the recorded
+// timestamp, restarting the window.
 func (r *ModelRegistry) negativeCacheFresh(key string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	checkedAt, ok := r.negativeCache[key]
-	if !ok {
-		return false
+	for k, checkedAt := range r.negativeCache {
+		if time.Since(checkedAt) >= negativeCacheTTL {
+			delete(r.negativeCache, k)
+		}
 	}
-	if time.Since(checkedAt) >= negativeCacheTTL {
-		delete(r.negativeCache, key)
-		return false
-	}
-	return true
+	_, ok := r.negativeCache[key]
+	return ok
 }
 
 // fallbackMetadata returns the tier-5 defaults used when no source recognizes
@@ -669,6 +669,12 @@ func (r *ModelRegistry) fuzzyLookup(model string) (ModelMetadata, bool) {
 		return ModelMetadata{}, false
 	}
 	if meta, ok := r.overridesIndex[want]; ok {
+		// A partial override hit only via the fuzzy/normalized key must
+		// inherit its unset scalar fields exactly like the exact-tier hit
+		// (see ResolveLocal), otherwise a protocol-only override surfaced
+		// under a drifted spelling collapses ContextWindow/OutputLimit to zero.
+		key := strings.ToLower(model)
+		meta = r.enrichPartialOverride(model, key, meta)
 		return meta, true
 	}
 	if meta, ok := r.runtimeFuzzyLookup(want); ok {
