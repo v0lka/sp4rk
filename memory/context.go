@@ -560,12 +560,13 @@ func (cw *ContextWindow) buildGroupedMessages(groupStart int, protectedIndices m
 	groupSteps := cw.steps[groupStart:groupEnd]
 
 	// Build ONE assistant message with all tool calls
-	assistantMsg := cw.buildAssistantMsg(groupSteps[0].Thought, groupSteps[0].ReasoningContent, groupSteps[0].ReasoningItems)
+	var toolCalls []llm.ToolCall
 	for _, gs := range groupSteps {
 		if gs.Action.ID != "" {
-			assistantMsg.ToolCalls = append(assistantMsg.ToolCalls, gs.Action)
+			toolCalls = append(toolCalls, gs.Action)
 		}
 	}
+	assistantMsg := cw.buildAssistantMsg(groupSteps[0].Thought, groupSteps[0].ReasoningContent, groupSteps[0].ReasoningItems, toolCalls)
 
 	var out []llm.Message
 	out = append(out, assistantMsg)
@@ -589,10 +590,11 @@ func (cw *ContextWindow) buildGroupedMessages(groupStart int, protectedIndices m
 
 // buildStandaloneMessages builds assistant+tool+nudge messages for a single step.
 func (cw *ContextWindow) buildStandaloneMessages(step sdkagent.Step, i int, protectedIndices map[int]struct{}) []llm.Message {
-	assistantMsg := cw.buildAssistantMsg(step.Thought, step.ReasoningContent, step.ReasoningItems)
+	var toolCalls []llm.ToolCall
 	if step.Action.ID != "" {
-		assistantMsg.ToolCalls = []llm.ToolCall{step.Action}
+		toolCalls = []llm.ToolCall{step.Action}
 	}
+	assistantMsg := cw.buildAssistantMsg(step.Thought, step.ReasoningContent, step.ReasoningItems, toolCalls)
 
 	var out []llm.Message
 
@@ -621,15 +623,18 @@ func (cw *ContextWindow) buildStandaloneMessages(step sdkagent.Step, i int, prot
 
 // buildAssistantMsg creates a normalized assistant message from thought, reasoning,
 // and (for the Responses API) reasoning items. Empty content is replaced with a
-// placeholder to prevent API 400 errors.
-func (cw *ContextWindow) buildAssistantMsg(thought, reasoningContent string, reasoningItems []llm.ReasoningItem) llm.Message {
+// "(proceeding)" placeholder only when there are also no tool calls — a message
+// carrying tool_calls is already valid for OpenAI-compatible APIs, and adding the
+// placeholder would pollute the visible history. This mirrors stepsToMessages.
+func (cw *ContextWindow) buildAssistantMsg(thought, reasoningContent string, reasoningItems []llm.ReasoningItem, toolCalls []llm.ToolCall) llm.Message {
 	msg := llm.Message{
 		Role:             "assistant",
 		Content:          strings.TrimRight(thought, strutil.InvisibleTrimSet),
 		ReasoningContent: reasoningContent,
 		ReasoningItems:   reasoningItems,
+		ToolCalls:        toolCalls,
 	}
-	if msg.Content == "" {
+	if msg.Content == "" && len(msg.ToolCalls) == 0 {
 		msg.Content = "(proceeding)"
 	}
 	return msg

@@ -874,6 +874,73 @@ func TestBuildStepMessages_TrimsTrailingInvisibleChars(t *testing.T) {
 	}
 }
 
+// TestBuildStepMessages_EmptyThoughtWithActionKeepsEmptyContent verifies that a
+// step with an empty thought but a real tool call does NOT get the "(proceeding)"
+// placeholder. A message with tool_calls is already valid for OpenAI-compatible
+// APIs, and the placeholder would otherwise pollute the visible history.
+func TestBuildStepMessages_EmptyThoughtWithActionKeepsEmptyContent(t *testing.T) {
+	counter := llm.NewSimpleTokenCounter()
+	tracker := llm.NewContextTokenTracker(counter)
+	cw := NewContextWindow(ContextWindowConfig{SystemPrompt: "System", ModelMeta: testModelMeta(128000), Tracker: tracker, Thresholds: testThresholds()})
+
+	cw.AddStep(sdkagent.Step{
+		Thought: "",
+		Action: llm.ToolCall{
+			ID:    "call_1",
+			Name:  "test_tool",
+			Input: json.RawMessage(`{}`),
+		},
+		Observation: "Tool result",
+		TokensUsed:  100,
+	})
+
+	messages := cw.BuildPrompt()
+
+	if len(messages) < 2 {
+		t.Fatalf("Expected at least 2 messages, got %d", len(messages))
+	}
+	assistantMsg := messages[1]
+	if assistantMsg.Role != "assistant" {
+		t.Fatalf("Expected assistant message, got role=%s", assistantMsg.Role)
+	}
+	if assistantMsg.Content != "" {
+		t.Errorf("Expected empty content for thought-with-tool-call, got %q", assistantMsg.Content)
+	}
+	if len(assistantMsg.ToolCalls) != 1 {
+		t.Errorf("Expected 1 tool call, got %d", len(assistantMsg.ToolCalls))
+	}
+}
+
+// TestBuildStepMessages_GroupedEmptyThoughtWithActionKeepsEmptyContent verifies
+// the same placeholder suppression for the grouped (multi-tool-call) path: a
+// merged assistant message whose first thought is empty must not receive the
+// "(proceeding)" placeholder while it carries tool_calls.
+func TestBuildStepMessages_GroupedEmptyThoughtWithActionKeepsEmptyContent(t *testing.T) {
+	counter := llm.NewSimpleTokenCounter()
+	tracker := llm.NewContextTokenTracker(counter)
+	cw := NewContextWindow(ContextWindowConfig{SystemPrompt: "System", ModelMeta: testModelMeta(128000), Tracker: tracker, Thresholds: testThresholds()})
+
+	cw.AddStep(makeGroupedStep("", "content of a", "read_file", 1, 42))
+	cw.AddStep(makeGroupedStep("", "content of b", "read_file", 2, 42))
+
+	messages := cw.BuildPrompt()
+
+	// system (1) + assistant (1, two tool_calls) + 2 tool results = 4 messages.
+	if len(messages) != 4 {
+		t.Fatalf("Expected 4 messages, got %d", len(messages))
+	}
+	assistant := messages[1]
+	if assistant.Role != "assistant" {
+		t.Fatalf("Expected assistant message, got role=%s", assistant.Role)
+	}
+	if assistant.Content != "" {
+		t.Errorf("Expected empty content for grouped thought-with-tool-calls, got %q", assistant.Content)
+	}
+	if len(assistant.ToolCalls) != 2 {
+		t.Errorf("Expected 2 tool calls, got %d", len(assistant.ToolCalls))
+	}
+}
+
 // TestBuildStepMessages_EmptyThoughtAfterTrimmingBecomesProceeding verifies that thoughts with only
 // whitespace/invisible characters become "(proceeding)" after trimming.
 func TestBuildStepMessages_EmptyThoughtAfterTrimmingBecomesProceeding(t *testing.T) {
