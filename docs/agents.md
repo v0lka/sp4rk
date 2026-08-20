@@ -39,7 +39,7 @@ func (m *AgentManager) Scan() error
 
 `Scan` walks all discovery directories and loads valid agents. It clears any existing catalog first, so it is safe to call repeatedly (e.g. after agents are added or removed). Directories are walked in **reverse priority order** so that higher-priority entries overwrite lower-priority ones with the same name.
 
-Invalid `AGENT.md` files are logged at debug level and skipped — a directory that is not an agent is simply ignored rather than causing an error.
+An existing `AGENT.md` that fails parsing or validation is skipped and logged as a warning (`skipped invalid agent`) so a broken profile is visible to operators. Ordinary directories that do not contain `AGENT.md` are debug-level discovery noise and are ignored.
 
 **Symlink following:** `Scan` follows symlinks that point to directories (resolved via `os.Stat`, since `os.ReadDir` reports symlinks as non-directories even when they point to one).
 
@@ -92,22 +92,32 @@ type AgentMetadata struct {
 
 Only the v1 fields above are modeled. Unknown frontmatter keys are silently ignored by the parser (unknown-field-ignore, not an error), so not-yet-supported fields (temperature/top-p, per-tool policy, mode, resources) do not break parsing.
 
-### ToolPreference
+### ToolPreferenceWithError
 
 ```go
-func (a *Agent) ToolPreference() (any, error)
+func (a *Agent) ToolPreferenceWithError() (any, error)
 ```
 
-Translates the declarative `tools` frontmatter field into the shape a delegating runtime expects (the `tools` field of a delegation task, consumed by the runtime's tool resolver). It returns `any` so its result can be assigned directly to a delegation task's `tools` field (itself typed `any`); the error return surfaces an invalid field instead of silently widening it:
+Translates the declarative `tools` frontmatter field into the shape a delegating runtime expects (the `tools` field of a delegation task, consumed by the runtime's tool resolver). It returns `any` so its result can be assigned directly to a delegation task's `tools` field (itself typed `any`); the error return surfaces an invalid programmatically-constructed field instead of silently widening it:
 
 | `tools` value | Returns | Meaning |
 | --- | --- | --- |
 | `""` or `"all"` (default; surrounding whitespace tolerated) | `nil`, no error | grant the full mutating toolset (a resolver treats nil as all tools) |
-| `"read-only"` | `"read-only"`, no error | the read-only preset — the resolver grants local-read + remote-read on top of the always-included `system` group, **no MCP** (the reference host resolves it this way; see the host's ADR-024 §6) |
-| comma-list of tool-group tokens (e.g. `"local-read,execute"`) | `[]string`, no error | granted capability groups (kebab-case; underscores normalize); the resolver always adds the `system` group on top |
+| `"read-only"` | `"read-only"`, no error | the read-only preset — a conforming delegating resolver grants local-read + remote-read on top of the always-included `system` group, with no MCP groups |
+| comma-list of tool-group tokens (e.g. `"local-read,execute"`) | `[]string`, no error | granted capability groups (kebab-case; underscores normalize); a conforming resolver always adds the `system` group |
 | unknown token, empty item, or duplicate group | error | fail-closed — the token is never silently dropped; a partially-dropped list could widen to the full toolset |
 
-Valid group tokens come from `ToolGroupTokens()` (`execute`, `local-read`, `local-write`, `remote-read`, `remote-write`, `system`, `local-mcp`, `remote-mcp`). AGENT.md files are validated at parse time (both `ToolPreference()` and the parser apply the same `validateToolsField` rules and messages); the error return guards profiles constructed programmatically.
+Valid group tokens come from `ToolGroupTokens()` (`execute`, `local-read`, `local-write`, `remote-read`, `remote-write`, `system`, `local-mcp`, `remote-mcp`). AGENT.md files are validated at parse time (both `ToolPreferenceWithError()` and the parser apply the same `validateToolsField` rules and messages); the error return guards profiles constructed programmatically.
+
+The legacy widening method remains source-compatible:
+
+```go
+func (a *Agent) ToolPreference() any
+```
+
+It calls `ToolPreferenceWithError` and discards the error. Invalid programmatic metadata therefore maps to `nil`, which means the full toolset. Existing integrations keep compiling, but security-sensitive/new code must call `ToolPreferenceWithError()` and propagate the error.
+
+> **Migration note:** an earlier public draft documented `ToolPreference() (any, error)`. The strict method is now named `ToolPreferenceWithError`; replace `pref, err := profile.ToolPreference()` with `pref, err := profile.ToolPreferenceWithError()`. The one-result `ToolPreference()` method is retained only for compatibility.
 
 > **Migration note:** an earlier form of the `tools:` field accepted comma-separated tool **names** (e.g. `edit_file,bash_exec`). That form is now a validation error — the field accepts group tokens only. Express `edit_file,bash_exec` as `local-write,execute` (and `read_file` as `local-read`). A profile whose `tools:` fails validation is skipped from the catalog and logged as a warning (`skipped invalid agent`) rather than silently dropped.
 
@@ -172,7 +182,7 @@ When a subagent is launched under a named profile, the execution layer resolves 
 | Profile field | Applied to the subagent as |
 | --- | --- |
 | `Body` | the subagent's core directive / system prompt (replaces the generic orchestrator default) |
-| `Tools` (`ToolPreference`) | the subagent's tool budget |
+| `Tools` (`ToolPreferenceWithError`) | the subagent's tool budget |
 | `MaxSteps` | the ReAct iteration cap (0/absent → derived from task complexity) |
 | `Model` | forced via `agent.NewModelOverrideCaller` |
 | `AllowRedelegate` | whether the subagent may launch further subagents |
@@ -247,7 +257,7 @@ func main() {
 	agent, ok := mgr.Get("code-reviewer")
 	if ok {
 		fmt.Printf("\nAgent body:\n%s\n", agent.Body)
-		pref, err := agent.ToolPreference()
+		pref, err := agent.ToolPreferenceWithError()
 		if err != nil {
 			log.Fatalf("invalid tools field: %v", err)
 		}

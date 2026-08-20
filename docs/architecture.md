@@ -219,6 +219,8 @@ The routing decision drives two downstream behaviours:
 
 ```go
 import (
+    "errors"
+
     "github.com/v0lka/sp4rk/agent/router"
     "github.com/v0lka/sp4rk/llm"
 )
@@ -229,11 +231,17 @@ rt := router.New(llmCaller, router.Config{
 })
 
 decision, err := rt.Route(ctx, userMessage, availableTools, history, skillDescriptors)
+if errors.Is(err, router.ErrRoutingParse) {
+    // The original response and one repair attempt were both invalid JSON.
+    // Fall back to the host's conservative default routing decision.
+}
 // decision.Domain, decision.Complexity, decision.MatchedSkills, decision.NeedsClarification
 // decision.MatchedTools is populated only when tool matching is enabled.
 // The host maps decision.Domain/decision.Complexity to a compaction strategy
 // ("sliding_window" | "summarization" | "hierarchical") per the table above.
 ```
+
+`ErrRoutingParse` is the exported sentinel returned when both the initial routing JSON and the built-in repair retry fail to parse. Detect it with `errors.Is`; hosts can degrade to a conservative default decision without treating malformed classification output as a fatal task failure.
 
 ### Semantic tool matching
 

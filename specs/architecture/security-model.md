@@ -104,11 +104,23 @@ type ToolJudger interface {
 
 For a tool whose effective policy is `PolicyAlwaysAllow`, the registry calls `Judge` **before** execution. If the judge returns `Allow=false` **with non-empty Reason**, the call is escalated to user confirmation via `ConfirmFunc`. An outcome of `Allow=false` with empty Reason is treated as "no concern to report" and the tool proceeds.
 
-The `Severity` classifies the reason so hosts can decide what an escalation means: **`hard`** marks a fired security control (shell blacklist pattern, SSRF) — hosts must treat it as never auto-resolvable (c0wrk disables its advisory judge and never lets Smart Approve pass it); **`soft`** marks a scope question (path containment outside session roots — evaluated on the symlink-resolved path, so a symlink that escapes the roots is denied containment like any other out-of-roots target) that a strict judge may resolve. The engine escalates both severities identically (user confirmation) and delivers the severity to the host via `ConfirmationRequest.JudgeSeverity`. `JudgeSeverityHard` is the zero value — a judge outcome or escalation that arrives unclassified is treated as `hard` (fail-closed).
+The `Severity` classifies the reason so hosts can decide what an escalation means: **`hard`** marks a fired security control (shell blacklist pattern, SSRF) — hosts treat it as never auto-resolvable and do not pass it through an advisory auto-approval path; **`soft`** marks a scope question (path containment outside session roots — evaluated on the symlink-resolved path, so a symlink that escapes the roots is denied containment like any other out-of-roots target) that a strict judge may resolve. The engine escalates both severities identically (user confirmation) and delivers the severity to the host via `ConfirmationRequest.JudgeSeverity`. `JudgeSeverityHard` is the zero value — a judge outcome or escalation that arrives unclassified is treated as `hard` (fail-closed).
 
 This is the SDK hook a host uses to implement its own safety checks (for example, a shell tool whose `Judge` matches a blacklist of dangerous commands, or a file tool whose `Judge` flags paths outside permitted roots). The engine provides the interface and the escalation wiring; the heuristics themselves are tool/host-specific.
 
 The separate `ToolJudge` (`github.com/v0lka/sp4rk/tools` `judge.go`) is an LLM-backed **advisory** safety evaluation invoked on demand by the host — it is not an automatic gate.
+
+### Strict ToolJudge mode
+
+`ToolJudge.JudgeStrict(ctx, StrictJudgeRequest)` is the conservative LLM primitive a host may invoke when deciding whether a soft confirmation escalation can be auto-resolved. `StrictJudgeRequest` supplies `ToolName`, raw `Input`, `TaskContext`, and `ToolSource`; the judge adds compact environment information and the current `SessionRoots(ctx)`.
+
+Strict mode differs from advisory `Judge` in three security-relevant ways:
+
+1. It performs one LLM call for every invocation. Internal-tool and in-session path fast paths are disabled, and no verdict cache is read or written.
+2. It serializes a JSON envelope rather than interpolating the tool arguments into instructions. Raw input and host-supplied session-directory values are wrapped in `untrusted-content` boundaries, and directory lines are sanitized before serialization.
+3. It accepts only the strict `VERDICT`/`REASON` response contract. Missing provider, request construction failure, provider error, cancellation/timeout, nil response, and unparseable output all return `VerdictConfirm`. Provider error text is excluded from strict logs because it may echo sensitive tool input.
+
+Strict mode remains advisory to the host: it returns an allow/confirm recommendation and never bypasses `PolicyAlwaysDeny`, a hard `JudgeSeverity`, or registry confirmation policy by itself.
 
 ## Confirmation Flow
 
@@ -160,7 +172,7 @@ MCP servers are untrusted; a malicious or compromised server could advertise a t
 
 ## MCP stdio Environment Allowlist (Supply-Chain Defense)
 
-A stdio MCP server runs an arbitrary third-party command declared in config, so its subprocess inherits only an allowlisted subset of the host environment: `PATH`, `HOME`, `USER`, `SHELL`, `LANG`, `TERM`, `TMPDIR`, `TEMP`, `TMP`, and `LC_*` locale variables. Host secrets — LLM API keys, proxy credentials — are never forwarded implicitly. Explicit `cfg.Env` entries are applied on top of the allowlist and always win, so a host that wants to pass a secret to a server declares it explicitly, and one that wants stricter isolation can override inherited vars (e.g. `HOME`) through `cfg.Env`.
+A stdio MCP server runs an arbitrary third-party command declared in config, so its subprocess inherits only an allowlisted subset of the host environment (`safeStdioEnv`): `PATH`, `HOME`, `USER`, `SHELL`, `USERPROFILE`, `LANG`, `TERM`, `TMPDIR`, `TEMP`, `TMP`, `APPDATA`, `LOCALAPPDATA`, `SYSTEMROOT`, `COMSPEC`, `PATHEXT`, the proxy variables (`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`/`ALL_PROXY` in both cases, with embedded credentials stripped), CA trust anchors (`SSL_CERT_FILE`, `SSL_CERT_DIR`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`), Python venv/conda activation (`VIRTUAL_ENV`, `CONDA_*`), and `LC_*` locale variables. Host secrets — LLM API keys, proxy credentials — are never forwarded implicitly. Explicit `cfg.Env` entries are applied on top of the allowlist and always win, so a host that wants to pass a secret to a server declares it explicitly, and one that wants stricter isolation can override inherited vars (e.g. `HOME`) through `cfg.Env`.
 
 ## Indirect Prompt Injection Defense
 
@@ -252,6 +264,8 @@ File-based defaults, session roots, and blacklist regexes are host-application c
 - The untrusted-content boundary survives compaction: `ContextWindow` re-wraps untrusted tool messages retained in the frozen compacted prefix, so untrusted content never re-enters LLM context raw after compaction.
 - `WrapUntrustedContent` always sanitizes its content with `StripUntrustedTags` first.
 - An MCP tool registration can never overwrite an existing non-MCP tool.
+- The LLM-powered advisory `ToolJudge` cache key incorporates session roots and partitions cached verdicts by directory scope; its prompt carries the same wrapped scope data.
+- `ToolJudge.JudgeStrict` performs an uncached, no-fast-path LLM evaluation per invocation and maps every construction/provider/timeout/parse failure to `VerdictConfirm` without logging potentially sensitive provider diagnostics.
 - The LLM-powered `ToolJudge` verdict parser fails **safe** to `VerdictConfirm` on any unrecognized or ambiguous verdict: verdict tokens are matched whole-token (case-insensitive), so negations of allow-words (e.g. `DISALLOW`, `DISAPPROVE`) are never misclassified as `VerdictAllow`. An LLM error likewise yields `VerdictConfirm`. See [../contracts/tools.md](../contracts/tools.md) for the verdict vocabulary.
 
 ## Anti-Patterns

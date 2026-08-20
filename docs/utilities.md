@@ -146,6 +146,20 @@ strutil.TruncateUTF8("short", 100) // → "short"
 
 // Non-positive maxChars returns an empty string.
 strutil.TruncateUTF8("anything", 0) // → ""
+```
+
+### HasVisibleContent
+
+```go
+func HasVisibleContent(s string) bool
+```
+
+`HasVisibleContent` applies the same trailing trim set as LLM response normalization (`InvisibleTrimSet`) and reports whether anything remains. Empty strings and strings made entirely of spaces, control whitespace, nulls, zero-width characters, or a byte-order mark return `false`. Use it before accepting model output so the visibility check and the later `strings.TrimRight(..., strutil.InvisibleTrimSet)` normalization cannot disagree.
+
+```go
+strutil.HasVisibleContent("answer\u200b") // true
+strutil.HasVisibleContent(" \t\u200b")  // false
+```
 
 ### TruncateUTF8AtLineBoundary
 

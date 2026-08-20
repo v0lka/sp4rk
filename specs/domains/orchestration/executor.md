@@ -22,7 +22,7 @@ The Executor is **not safe for concurrent use on a single instance** — `Run` m
 func NewExecutor(llmRouter LLMCaller, toolRegistry ToolExecutor, maxSteps int, opts ...Option) *Executor
 ```
 
-The event emitter and the HITL handler are **nil-safe** — `nil` is replaced with `NoopEvents` and `NoopHITLHandler`. Options: `WithTokenCounter`, `WithEvents`, `WithSuppressAssistantEvents` (hides streaming events for sub-steps), `WithToolResultBudget` (defaults to `DefaultToolResultBudget()`), `WithCircuitBreaker` (defaults to `DefaultCircuitBreakerConfig()`), `WithHITL`, `WithResumeSteps` (seeds prior ReAct steps to resume from a checkpoint; see [Resume from a checkpoint](#resume-from-a-checkpoint)).
+The event emitter and the HITL handler are **nil-safe** — `nil` is replaced with `NoopEvents` and `NoopHITLHandler`. Options: `WithTokenCounter`, `WithEvents`, `WithSuppressAssistantEvents` (hides streaming events for sub-steps), `WithToolResultBudget` (defaults to `DefaultToolResultBudget()`), `WithCircuitBreaker` (defaults to `DefaultCircuitBreakerConfig()`), `WithHITL`, `WithResumeSteps` (seeds prior ReAct steps to resume from a checkpoint; see [Resume from a checkpoint](#resume-from-a-checkpoint)), `WithPauseChecker`, and `WithUserMessageSource`. The equivalent runtime setters are available for pause/message hooks; `SetVerifyOnEdit` installs the independent post-edit verifier.
 
 ### Run
 
@@ -99,6 +99,12 @@ Budget: the resumed steps are counted against the shared `maxSteps` budget, not 
 
 A zero value (nil/empty steps, or the option omitted) restores the default fresh-start behavior: the loop starts at step 1 with no seeded history.
 
+### Resume-with-nudge interjection
+
+A Conductor may set a one-shot pending user message on the `ContextManager` through the orchestration-level `InterjectionAware.SetPendingUserInterjection` capability. `BuildPrompt` appends that message as the final user turn after the seeded trajectory on every build until it is explicitly retired. After the first **successful** LLM response, the executor type-asserts the context manager against `agent.InterjectionConsumer` and calls `ConsumePendingUserInterjection`.
+
+Consume-on-success is required for reactive compaction: when the first LLM call returns a context-window error, the executor compacts and rebuilds the prompt; the pending nudge remains present in the retry and is consumed only after that retry succeeds. A custom context manager without `InterjectionConsumer` degrades gracefully and retains the nudge until its owner clears it.
+
 ### Live user messages (UserMessageSource)
 
 `WithUserMessageSource(source)` / `SetUserMessageSource(fn)` installs a live user-message source polled at every step boundary, immediately after the pause check and before the LLM call. A non-empty return is delivered to the model in the **very next LLM request**:
@@ -108,7 +114,15 @@ A zero value (nil/empty steps, or the option omitted) restores the default fresh
 - the poll order after the pause check guarantees a pausing run never swallows a queued message — the queue keeps holding it for the resumed run;
 - an `ExecutorDiagnostic` with event `live_user_message` fires per delivery.
 
-A nil/omitted source disables the injection entirely (default, backward-compatible). The source must be cheap and safe to call from the Run goroutine (invoked once per step). The executor makes no assumption about the queue's owner: the host (e.g. c0wrk) owns the queue and its epilogue semantics — what happens to undelivered messages when the run finishes is a host concern.
+A nil/omitted source disables the injection entirely (default, backward-compatible). The source must be cheap and safe to call from the Run goroutine (invoked once per step). The executor makes no assumption about the queue's owner: the host owns the queue and its epilogue semantics — what happens to undelivered messages when the run finishes is a host concern.
+
+### Post-edit verification
+
+`SetVerifyOnEdit(runner EditVerifyRunner, maxOutputChars int)` installs a mechanical verification cycle whose command is supplied by user configuration rather than model output. A successful `write_file` or `edit_file` marks the current LLM response group dirty; the executor runs the verifier exactly once at the group's end, even when several edits occurred, and appends a `[verify_on_edit]` note to the final call's observation before events and prompt history receive it. Reads, unsuccessful tool results, and HITL-rejected edits never mark the group dirty.
+
+`EditVerifyResult` carries combined output, exit code, timeout state/effective limit, and a runner infrastructure error. `FormatVerifyNote` distinguishes pass, verification failure, timeout, blocked/killed execution without an exit code, and inability to start. The command outcome remains an observation rather than an executor Go error. Output is capped by Unicode code points (`DefaultVerifyOnEditCap == 4000` when the configured cap is non-positive), preserving valid UTF-8 and adding an explicit truncation marker.
+
+Pending verification is flushed on response-group edge cases and before terminal/pause paths so a successful edit cannot disappear from a resumable trajectory or final output without its verification result. A nil runner is the default and leaves edit observations unchanged.
 
 ### Tool result cache & two-stage truncation
 
@@ -129,6 +143,8 @@ The `batch` tool lets the model dispatch multiple tool calls in one turn. It is 
 
 - **Fatal LLM/tool error**: `Run` returns a non-nil error.
 - **Context cancelled**: propagated immediately, no retry.
+- **Cooperative pause**: `Run` returns `ErrPaused` plus the trajectory accumulated through the previous completed boundary; pending post-edit verification is flushed before the checkpoint is returned.
+- **Verification command failure/timeout**: represented in a `[verify_on_edit]` observation and does not become a `Run` error.
 - **Budget exhausted without finish**: `Finished: false`, treated as incomplete (not an error).
 - **Tool not found / parse failure**: surfaced as `ToolResult{IsError: true}`, not a Go error.
 
@@ -137,6 +153,9 @@ The `batch` tool lets the model dispatch multiple tool calls in one turn. It is 
 - The `finish` tool is always available in every run (appended automatically if absent).
 - A single `Executor` instance is never used concurrently — parallel callers create one per step.
 - When `WithResumeSteps` supplies prior steps, the step counter starts at `len(steps)+1` and the full trajectory (seeded plus new steps) is synced to the `TrajectoryStore`; the resumed steps are counted against the shared `maxSteps` budget.
+- A pending resume interjection remains the final user message across every reactive-compaction retry and is consumed only after a successful LLM response.
+- The step-boundary order is cancellation, pause check, then one live user-message poll; a pause never drains the host queue.
+- Verify-on-edit runs once per dirty response group, only after a successful `write_file`/`edit_file`, and every pending run is flushed before finish or pause returns control.
 - When `mutationRequired` is set, finish without a prior successful mutating tool is rejected (nudge then `Finished: false`).
 - Both checklist sub-gates are soft: after one nudge attempt, finish is accepted regardless.
 - Tool results from untrusted sources are wrapped in `<untrusted-content>` tags before becoming an LLM message (when injection defense is enabled on the `ContextManager`).

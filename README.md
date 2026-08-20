@@ -5,7 +5,7 @@
 > Features, APIs, and internal parts may change without notice.
 > Use at your own risk. Do not rely on it for production or critical workflows.
 
-A standalone Go SDK for building AI agent systems with Plan & Execute orchestration, tool integration, and multi-provider LLM support.
+A standalone Go SDK for building AI agent systems with Plan & Execute orchestration, tool integration, and multi-provider LLM support. Long-running runs can be paused and resumed, steered with live user messages at step boundaries, and configured to run a trusted verifier after file edits. Tool capability groups provide fail-closed selection and policy boundaries, while purpose-aware sampling separates creative executor calls from deterministic routing, compaction, and summarization calls.
 
 ## Quick start
 
@@ -53,12 +53,13 @@ Detailed guides live in [`docs/`](docs/):
 
 - [Getting started](docs/getting-started.md) — installation, configuration, first run
 - [Architecture](docs/architecture.md) — layered design and package layout
-- [Agent executor](docs/agent-executor.md) — the execution loop
-- [Orchestration](docs/orchestration.md) — Plan & Execute mode
+- [Agent executor](docs/agent-executor.md) — the execution loop, cooperative pause/live steering, and verify-on-edit
+- [Orchestration](docs/orchestration.md) — Plan & Execute mode, resumable checkpoints, and interjections
 - [Planner](docs/planner.md) — plan generation
 - [Reflector](docs/reflector.md) — self-reflection
-- [LLM providers](docs/llm-providers.md) — Anthropic, OpenAI (Chat Completions + Responses), Google (Gemini/Gemma), OpenAI-compatible endpoints, multi-protocol routing, and multimodal content blocks
-- [Tools](docs/tools.md) — built-in tools and the registry
+- [LLM providers](docs/llm-providers.md) — Anthropic, OpenAI (Chat Completions + Responses), Google (Gemini/Gemma), OpenAI-compatible endpoints, purpose-aware sampling, multi-protocol routing, and multimodal content blocks
+- [Tools](docs/tools.md) — built-in tools, capability groups, and the registry
+- [Tool safety](docs/tool-safety.md) — advisory/strict judging, escalation severity, and execution-context safety
 - [MCP integration](docs/mcp-integration.md) — Model Context Protocol gateway
 - [Memory](docs/memory.md) — compaction and persistence
 - [Embedding & vector search](docs/embedding.md) — semantic search

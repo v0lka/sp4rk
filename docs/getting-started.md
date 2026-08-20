@@ -181,6 +181,7 @@ fmt.Println("Output:", result.Output)
 | `failed` | Steps were attempted but failed and the retry budget is exhausted. |
 | `aborted` | The reflector recommended aborting. |
 | `cancelled` | The context was cancelled mid-execution. |
+| `paused` | A cooperative pause stopped the loop at a step boundary. `Steps` is a resumable checkpoint and `Output` is empty. |
 
 ## Framework.Execute vs NewConductor
 

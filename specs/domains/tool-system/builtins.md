@@ -25,13 +25,13 @@ The SDK ships a catalog of filesystem, search, web, execution, and agent-infrast
 | `read_file` | File | `always_allow` | yes | Read file contents (streaming, O(1) memory, default 2000-line window). |
 | `write_file` | File | `user_confirm` | no | Create/overwrite a file. |
 | `edit_file` | File | `user_confirm` | no | Apply targeted find-and-replace edits. |
-| `list_directory` | File | `always_allow` | no | List directory contents. |
+| `list_directory` | File | `always_allow` | yes | List directory contents. |
 | `create_directory` | File | `user_confirm` | no | Create a directory recursively. |
 | `delete_directory` | File | `user_confirm` | no | Remove a directory recursively. |
 | `delete_file` | File | `user_confirm` | no | Remove a single file. |
 | `glob` | Search | `always_allow` | yes | Glob-pattern file matching; honours `.gitignore`/`.aiignore` via the context `IgnoreChecker` when present. |
 | `ripgrep` | Search | `always_allow` | yes | Fast regex content search (shells out to `rg`); honours `.gitignore`/`.aiignore` via the context `IgnoreChecker` when present. |
-| `semantic_search` | Search | `always_allow` | no | Vector similarity search (optional; see [../embedding.md](../embedding.md)). |
+| `semantic_search` | Search | `always_allow` | yes | Vector similarity search (optional; see [../embedding.md](../embedding.md)). |
 | `web_fetch` | Web | `always_allow` | yes | Fetch URL content as markdown. |
 | `web_search` | Web | `always_allow` | yes | Search the web (optional; needs a search-provider config). |
 | `finish` | Agent | internal | no | Signal task/step completion (auto-appended to every run). |
@@ -39,18 +39,18 @@ The SDK ships a catalog of filesystem, search, web, execution, and agent-infrast
 | `read_step_output` | Agent | `always_allow` | no | Read a specific completed step's output (blackboard-backed). |
 | `list_step_outputs` | Agent | `always_allow` | no | List completed step outputs. |
 | `read_final_result` | Agent | `always_allow` | no | Read the prior task's final result (continuation recovery). |
-| `read_attachment` | Agent | `always_allow` | no | Read the markdown content of a user-attached file by ID (blackboard-backed). |
+| `read_attachment` | Agent | `always_allow` | yes | Read the markdown content of a user-attached file by ID (blackboard-backed). |
 | `update_checklist` | Agent | `always_allow` | no | Update a step/sub-task checklist; validates Markdown checkboxes. |
 | `store_fact` | Agent | `always_allow` | no | Store a keyword-tagged fact to the blackboard. |
 | `search_facts` | Agent | `always_allow` | no | Search blackboard facts by keyword. |
-| `tool_result_read` | Agent | internal | no | Read cached tool-result fragments by hash (streaming, O(1) memory for file-backed entries). |
+| `tool_result_read` | Agent | internal | yes | Read cached tool-result fragments by hash (streaming, O(1) memory for file-backed entries). |
 | `read_skill_resource` | Agent | `always_allow` | no | Read a resource file from an activated skill directory (path-traversal safe). |
 
 `ask_user` is intentionally absent from the SDK. Interactive multi-question prompting requires host UI plumbing, so it lives in the host application; the SDK only supplies the primitives such a tool builds on.
 
 ### Trust classification
 
-A tool's output is **untrusted** when it may carry adversarial content (web, MCP, filesystem reads of external data). Such tools set `Untrusted: true` on their `BaseTool`; their observations are wrapped in `<untrusted-content>` tags before entering the LLM context when injection defense is enabled (see [../memory/README.md](../memory/README.md)). Mutating filesystem tools (`write_file`, `edit_file`, `delete_*`, `create_directory`) and `bash_exec` are not marked untrusted.
+A tool's output is **untrusted** when it may carry adversarial content (web, MCP, filesystem reads of external data). Such tools set `Untrusted: true` on their `BaseTool`; their observations are wrapped in `<untrusted-content>` tags before entering the LLM context when injection defense is enabled (see [../memory/README.md](../memory/README.md)). Mutating filesystem tools (`write_file`, `edit_file`, `delete_*`, `create_directory`) are not marked untrusted.
 
 ### File tools
 

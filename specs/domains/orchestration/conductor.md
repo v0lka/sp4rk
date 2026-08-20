@@ -7,7 +7,7 @@ The SDK-level single-loop task owner: a `Conductor` runs **one ReAct loop** that
 ## Key Files
 
 - `github.com/v0lka/sp4rk/orchestration` — `Conductor`, `ConductorConfig`, `NewConductor`, `Conductor.Run`, `WithDelegationRegistry`, `PendingDelegations`
-- `github.com/v0lka/sp4rk/agent` — `Executor.Run` (the ReAct loop the Conductor launches), `LLMCaller`, `ToolExecutor`, `Events`, `HITLHandler`
+- `github.com/v0lka/sp4rk/agent` — `Executor.Run` (the ReAct loop the Conductor launches), `LLMCaller`, `ToolExecutor`, `Events`, `HITLHandler`, `EditVerifyRunner`, `ErrPaused`, `InterjectionConsumer`
 - `github.com/v0lka/sp4rk/orchestration` (adapters) — `NewStepOutputStore`, `NewFactStore`, `NewAttachmentStore`, `NewFinalResultStore` (Blackboard → `agent.*Store`)
 - `github.com/v0lka/sp4rk/llm` — `ModelRegistry`, `TokenCounter`, `Message`
 - `github.com/v0lka/sp4rk/memory` — `ContextManager` returned by `ContextManagerFactory`
@@ -29,8 +29,9 @@ conductor.Run(ctx, message, bb, availableTools, events, compactionStrategy)
 │      empty → "sliding_window").
 │
 ├─ 2. Build a ContextManager via ContextFactory (type-asserted against the
-│      optional TaskAware / BlockTaskAware / ConversationAware / TrackerProvider
-│      capabilities; additionally asserted against StepSeedable when ResumeSteps is set).
+│      optional TaskAware / BlockTaskAware / ConversationAware / TrackerProvider /
+│      InterjectionAware capabilities; additionally asserted against StepSeedable
+│      when ResumeSteps is set).
 │
 ├─ 3. Inject blackboard-backed stores into ctx:
 │      ├─ StepOutputStore  (read_step_output / list_step_outputs)
@@ -40,14 +41,15 @@ conductor.Run(ctx, message, bb, availableTools, events, compactionStrategy)
 │
 ├─ 4. When ResumeSteps is set, seed the ContextManager (via StepSeedable) and the
 │      Executor (via WithResumeSteps) with the prior steps so the loop continues
-│      from len(steps)+1; install PauseChecker and UserMessageSource on the
-│      Executor when configured (cooperative pause + live user-message
-│      delivery at step boundaries); then launch a single Executor.Run with the
-│      step description, available tools, system prompt, and finish-join guard.
+│      from len(steps)+1. When PendingUserInterjection is set, install the one-shot
+│      nudge through InterjectionAware. Install PauseChecker, UserMessageSource,
+│      and VerifyOnEdit on the Executor when configured; then launch one
+│      Executor.Run with the finish-join guard.
 │
 ├─ 5. Map the ExecutorResult onto ExecutionStatus:
 │      ├─ Finished == true                          → ExecutionStatusSuccess
 │      ├─ loop ended without finish (budget/abort)  → ExecutionStatusPartial
+│      ├─ errors.Is(err, agent.ErrPaused)           → ExecutionStatusPaused
 │      ├─ error & cancelled (context.Canceled or    → ExecutionStatusCancelled
 │      │  ctx.Err() set)
 │      └─ Executor returned any other error         → ExecutionStatusFailed
@@ -82,7 +84,7 @@ Both are polled inside `Executor.Run` in that order — pause first, then the me
 
 ### Optional ContextManager capabilities
 
-The Conductor type-asserts the `ContextManager` returned by the factory against five named capability interfaces (the SDK's `memory.ContextWindow` implements all five):
+The Conductor type-asserts the `ContextManager` returned by the factory against six named capability interfaces (the SDK's `memory.ContextWindow` implements all six):
 
 | Capability | Purpose |
 | ---------- | ------- |
@@ -90,9 +92,10 @@ The Conductor type-asserts the `ContextManager` returned by the factory against 
 | `BlockTaskAware` (`SetTaskWithBlocks`) | Receives the formatted task text together with structured content blocks (text + images). Used when `ConductorConfig.ContentBlocks` is non-empty, giving the blocks precedence over the plain `Content` string so providers render a multimodal user message. |
 | `ConversationAware` (`SetPriorConversation`) | Receives prior conversation messages rendered before the current task, when `ConductorConfig.ConversationHistory` is set. Without this, a follow-up like "implement variant a" has no referent. |
 | `TrackerProvider` (`ContextTracker`) | Exposes the token tracker so API-reported token corrections flow back into fill accounting. |
-| `StepSeedable` (`SeedSteps`) | Receives prior ReAct steps when `ConductorConfig.ResumeSteps` is set, so a resumed run renders them in `BuildPrompt` as assistant+tool messages. Unlike the four above, this one is asserted only when `ResumeSteps` is non-empty and `Run` fails fast if it is absent (see [Resume from a checkpoint](#resume-from-a-checkpoint)). |
+| `StepSeedable` (`SeedSteps`) | Receives prior ReAct steps when `ConductorConfig.ResumeSteps` is set, so a resumed run renders them in `BuildPrompt` as assistant+tool messages. Unlike the other capabilities, this one is asserted only when `ResumeSteps` is non-empty and `Run` fails fast if it is absent (see [Resume from a checkpoint](#resume-from-a-checkpoint)). |
+| `InterjectionAware` (`SetPendingUserInterjection`) | Receives the one-shot `PendingUserInterjection` for resume-with-nudge. `BuildPrompt` keeps it as the final user message until the executor's `InterjectionConsumer` retires it after a successful LLM response. |
 
-A custom `ContextManager` that does not implement these still works — the corresponding features are simply skipped, except `StepSeedable` which is required when resuming.
+A custom `ContextManager` that does not implement these still works — the corresponding features are simply skipped. `StepSeedable` is the sole fail-fast exception because omitting seeded trajectory messages would make resume incoherent; a missing `InterjectionAware` drops only the optional nudge.
 
 ### Resume from a checkpoint
 
@@ -102,11 +105,21 @@ Budget: the resumed steps count against the shared `MaxSteps` budget, not in add
 
 `ResumeSteps` is zero-value by default (nil/empty), which is fully backward-compatible: `Run` starts a fresh loop at step 1 with no seeding.
 
+### Resume with a user interjection
+
+`ConductorConfig.PendingUserInterjection` carries a one-shot message for a resumed run. When non-empty and the context manager implements `InterjectionAware`, `Run` calls `SetPendingUserInterjection` after seeding steps. The context window renders it as the final user message after the pending tool result on every prompt build until the executor receives a successful LLM response and calls `InterjectionConsumer.ConsumePendingUserInterjection`. This preserves the nudge across a context-window failure, compaction, and retry without duplicating it after success. Empty is the backward-compatible default.
+
+### Post-edit verification
+
+`ConductorConfig.VerifyOnEdit` and `VerifyOnEditMaxOutputChars` are forwarded to `Executor.SetVerifyOnEdit`. The runner executes a command selected by user configuration, not model output, once after each response group containing a successful `write_file`/`edit_file`; its capped result becomes a `[verify_on_edit]` observation. Nil disables the hook, and a non-positive cap selects `agent.DefaultVerifyOnEditCap`.
+
 ## Error Handling
 
 - **LLM/tool fatal error**: the executor returns a non-nil error; `Run` wraps it and still returns a non-nil `*ExecutionResult` with best-effort output and `Status == ExecutionStatusFailed`.
 - **Budget exhausted / circuit-breaker abort** (no error, `Finished == false`): mapped to `Status == ExecutionStatusPartial` (resumable).
-- **Context cancelled**: propagated immediately as an executor error.
+- **Context cancelled**: mapped to `ExecutionStatusCancelled` and propagated as an executor error.
+- **Cooperative pause**: `agent.ErrPaused` is returned for `errors.Is` inspection, while the non-nil `ExecutionResult` has `Status == ExecutionStatusPaused`, empty `Output`, and the resumable trajectory in `Steps`.
+- **Verification failure/timeout/infrastructure failure**: remains a `[verify_on_edit]` observation and does not change the execution status by itself.
 - **Missing required factory**: `Run` returns an error before the loop starts.
 - **Resume without `StepSeedable`**: when `ResumeSteps` is configured but the `ContextManager` produced by the factory does not implement `StepSeedable`, `Run` returns an error before the loop starts (the steps could not be seeded into the prompt, so a silent incoherent resume is avoided).
 
@@ -118,6 +131,9 @@ Budget: the resumed steps count against the shared `MaxSteps` budget, not in add
 - The returned `Blackboard` is the same instance passed in.
 - When a `PendingDelegations` registry is in `ctx`, `finish` is rejected while it reports pending async work.
 - When `ResumeSteps` is set, `Run` fails fast unless the `ContextManager` implements `StepSeedable`; on success it seeds both the `ContextManager` and the `Executor` with the same defensive copy of the steps.
+- A configured `PendingUserInterjection` is appended after seeded history and remains pending through reactive-compaction retries until one LLM response succeeds.
+- Pause is checked before the live-message source at every boundary, so a paused run returns a checkpoint without consuming the next queued message.
+- A pending verify-on-edit run is flushed before a paused or finished result is returned.
 - A Conductor instance is reusable across steps; per-run state lives on the `ContextManager`, not on the Conductor.
 
 ## Related Specs

@@ -8,7 +8,7 @@ Discovery, parsing, and management of **Subagent Profiles** — `AGENT.md` docum
 
 - `github.com/v0lka/sp4rk/agents` — `AgentManager`, `NewAgentManager`, `Scan`, `List`, `Get`
 - `github.com/v0lka/sp4rk/agents` (parsing) — `ParseAgent`, `ParseError`, `parseFrontmatter`
-- `github.com/v0lka/sp4rk/agents` (types) — `Agent`, `AgentMetadata`, `AgentDescriptor`, `ToolPreference`
+- `github.com/v0lka/sp4rk/agents` (types) — `Agent`, `AgentMetadata`, `AgentDescriptor`, `ToolPreference`, `ToolPreferenceWithError`, `ToolGroupTokens`, `NormalizeToolGroupToken`
 
 ## Core Types
 
@@ -48,7 +48,8 @@ NewAgentManager(dirs []string, logger)        // dirs in priority order, highest
   │
   ├─ Scan()                                   // clears catalog, then walks dirs in reverse
   │      priority order so higher-priority entries overwrite lower ones of the same
-  │      name; invalid AGENT.md files are logged at debug and skipped
+  │      name; an existing invalid AGENT.md is logged at Warn and skipped,
+  │      while a directory with no AGENT.md is logged at Debug
   │        ├─ follows directory symlinks (resolved via os.Stat)
   │        └─ ParseAgent each AGENT.md → validate → catalog (keyed by name)
   │
@@ -72,7 +73,7 @@ A profile whose `name` does not match its parent directory name is rejected. A m
 
 ## ToolPreference
 
-`ToolPreference()` translates the declarative `tools` frontmatter field into the shape a delegating runtime expects (the `tools` field of a delegation task, consumed by the runtime's tool resolver). It returns `(any, error)` so its result can be assigned directly to a delegation task's `tools` field (itself typed `any`) while an invalid field surfaces as an explicit error:
+`ToolPreferenceWithError() (any, error)` is the strict translation API for the declarative `tools` field. Its result can be assigned directly to a delegation task's `tools` field (itself typed `any`), while invalid programmatic profiles fail closed:
 
 | `tools` value | Returns | Meaning |
 | ------------- | ------- | ------- |
@@ -83,6 +84,10 @@ A profile whose `name` does not match its parent directory name is rejected. A m
 
 AGENT.md files are validated at parse time (`validateToolsField` rejects the same shapes with a `ParseError`), so the error return matters for profiles built programmatically via the exported `Agent`/`AgentMetadata` types, which never pass through the parser. A delegating runtime propagates the error instead of applying a preference.
 
+`ToolPreference() any` remains as a backward-compatible widening method. It delegates to `ToolPreferenceWithError` and discards the error, so an invalid programmatic field maps to `nil` (the resolver's full-toolset value). Security-sensitive and new callers always use `ToolPreferenceWithError`; the legacy method exists only to preserve the earlier exported API.
+
+`ToolGroupTokens()` returns the accepted canonical kebab-case taxonomy, and `NormalizeToolGroupToken` trims input and canonicalizes underscore spellings before validation.
+
 > Migration note: an earlier draft of the `tools:` field accepted comma-separated tool **names** (e.g. `edit_file,bash_exec`). That form is a `ParseError` — the field accepts group tokens only; express `edit_file,bash_exec` as `local-write,execute` (and `read_file` as `local-read`).
 
 ## How a profile configures a subagent
@@ -92,7 +97,7 @@ When a subagent is launched under a named profile, the execution layer applies t
 | Field | Applied as |
 | ----- | ---------- |
 | `Body` | the subagent's core directive / system prompt |
-| `Tools` (`ToolPreference`) | the subagent's tool budget |
+| `Tools` (`ToolPreferenceWithError`) | the subagent's tool-group budget; validation errors abort preference resolution rather than widening access |
 | `MaxSteps` | the ReAct iteration cap (0/absent → derived from task complexity) |
 | `Model` | forced via `agent.NewModelOverrideCaller` (wraps the caller so `req.Model` is set before the router resolves it) |
 | `AllowRedelegate` | whether the subagent may launch further subagents |
@@ -107,7 +112,8 @@ A plan step targets a profile via the `PlanStep.Agent` field (see [orchestration
 
 - Directories are scanned in **reverse priority order** so higher-priority entries win on name collision (first occurrence / highest priority wins).
 - `Scan` is idempotent (clears the catalog first); safe to call repeatedly.
-- Invalid `AGENT.md` files are skipped at debug level, never fatal; a directory that is not an agent is ignored.
+- An existing `AGENT.md` that fails parsing or validation is skipped with a Warn record; a directory without `AGENT.md` is a non-agent and is skipped at Debug.
+- Tool-group preferences are canonicalized and validated fail-closed by `ToolPreferenceWithError`; unknown, empty, duplicate, and mixed-preset lists return an error.
 - `Scan` follows directory symlinks.
 - A profile's `name` must match its parent directory name.
 - `List()` returns lightweight descriptors including hidden agents (the consumer filters hidden out); `Get()` returns the full profile for any name, hidden or not.

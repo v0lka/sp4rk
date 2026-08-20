@@ -57,6 +57,8 @@ Available options:
 | `WithCircuitBreaker(c CircuitBreakerConfig)` | Loop-protection thresholds. Defaults to `DefaultCircuitBreakerConfig()` when unset. |
 | `WithHITL(h HITLHandler)` | Human-in-the-loop hooks (nil → `NoopHITLHandler`). |
 | `WithResumeSteps(steps []Step)` | Seeds prior ReAct steps so `Run` resumes from a checkpoint instead of starting fresh. The step counter starts at `len(steps)+1` and the full trajectory (seeded plus new steps) syncs to the `TrajectoryStore`. The resumed steps count against `maxSteps`; the caller must seed the `ContextManager` with the same steps (e.g. via `memory.ContextWindow.SeedSteps`). Nil/empty (or omitted) is the default fresh-start behavior. |
+| `WithPauseChecker(func(context.Context) bool)` | Installs a cooperative pause signal checked once per step boundary, after cancellation and before live-message polling. A true return yields `ErrPaused`, `Finished: false`, and the resumable trajectory. |
+| `WithUserMessageSource(func(context.Context) string)` | Polls a host-owned live-message queue once per step boundary. A non-empty return becomes the final user message in the next LLM request; at most one message is drained per boundary. |
 
 A minimal construction using the SDK defaults:
 
@@ -90,7 +92,7 @@ func (e *Executor) Run(
 - `taskTools` — the tools available for this run. The `finish` tool is appended automatically if not already present.
 - `cw` — the `ContextManager` that owns the prompt history and compaction logic.
 
-Returns an `*ExecutorResult` and an error. A non-nil error indicates a fatal failure (LLM error, context cancellation). A `nil` error with `Finished == false` means the step budget was exhausted or a circuit breaker aborted the loop.
+Returns an `*ExecutorResult` and an error. A non-nil error normally indicates a fatal failure (LLM error, context cancellation). The recoverable exception is `ErrPaused`: `errors.Is(err, agent.ErrPaused)` is true, the result is non-nil, `Finished` is false, and `Steps` is a resumable checkpoint. A `nil` error with `Finished == false` means the step budget was exhausted or a circuit breaker aborted the loop.
 
 ```go
 result, err := exec.Run(ctx, taskTools, cm)
@@ -110,16 +112,68 @@ Each iteration of `Run` proceeds as follows:
 
 1. **Trajectory sync** — if a `TrajectoryStore` is in the context, the current step history is synced so tools (e.g. a reflector) can read it.
 2. **Step-limit boundary** — if the step budget is reached, `OnStepLimit` is consulted via the HITL handler to decide whether to grant more steps.
-3. **StepStart event** — `emitter.StepStart(stepNum)` fires.
-4. **LLM call** — the prompt is built from the context manager and sent to the LLM. If the provider reports a context-window-exceeded error, a reactive compaction is triggered and the call is retried.
-5. **Thought event** — `emitter.Thought(stepNum, content, reasoning)` fires with the model's reasoning and content.
-6. **Implicit finish check** — if the model returns no tool calls, the executor checks whether this is a legitimate finish or a failure mode (e.g. printed tool-call syntax as text). A nudge may be injected to force an explicit `finish` call.
-7. **Truncation detection** — if the stop reason is `max_tokens` and tool calls were present, the call was truncated; a nudge is injected and the truncation counter is checked against the circuit breaker.
-8. **Tool execution** — each tool call is executed (after HITL approval). Results are truncated in two stages, cached if applicable, and recorded as observations. `ToolCall` and `ToolResult` events fire per call.
-9. **StepComplete event** — `emitter.StepComplete(stepNum, duration)` fires.
-10. **Compaction** — the context fill is checked; if it crosses a threshold, compaction runs and `ContextFill` / `ContextCompaction` events fire.
+3. **StepStart event and cancellation** — `emitter.StepStart(stepNum)` fires, then context cancellation is checked.
+4. **Cooperative pause** — a configured pause checker runs. A true result returns `ErrPaused` with the trajectory collected so far; no live message is drained on that boundary.
+5. **Live user message** — a configured source is polled. One non-empty message is recorded as a nudge-only step and becomes the final user message in this iteration's LLM request.
+6. **LLM call** — the prompt is built from the context manager and sent to the LLM. If the provider reports a context-window-exceeded error, a reactive compaction is triggered and the call is retried. A pending resume interjection is consumed only after a successful response, so it remains present on the retry.
+7. **Thought event** — `emitter.Thought(stepNum, content, reasoning)` fires with the model's reasoning and content.
+8. **Implicit finish check** — if the model returns no tool calls, the executor checks whether this is a legitimate finish or a failure mode (e.g. printed tool-call syntax as text). A nudge may be injected to force an explicit `finish` call.
+9. **Truncation detection** — if the stop reason is `max_tokens` and tool calls were present, the call was truncated; a nudge is injected and the truncation counter is checked against the circuit breaker.
+10. **Tool execution** — each tool call is executed (after HITL approval). Results are truncated in two stages, cached if applicable, and recorded as observations. `ToolCall` and `ToolResult` events fire per call. If verify-on-edit is enabled, successful `write_file`/`edit_file` calls schedule one verification run at the end of the response group.
+11. **StepComplete event** — `emitter.StepComplete(stepNum, duration)` fires.
+12. **Compaction** — the context fill is checked; if it crosses a threshold, compaction runs and `ContextFill` / `ContextCompaction` events fire.
 
 The loop terminates when the `finish` tool is called (`Finished: true`) or the budget is exhausted (`Finished: false`).
+
+## Pause, live steering, and resume interjections
+
+These three mechanisms all deliver control at an LLM step boundary, but they have different ownership and lifetime:
+
+- **Cooperative pause** — configure `WithPauseChecker` at construction or `SetPauseChecker` before `Run`. The checker runs after cancellation and before live-message polling. When it returns true, `Run` returns `ErrPaused` and the completed trajectory without consuming a queued message. Resume by seeding both the executor (`WithResumeSteps`) and context manager (`SeedSteps`).
+- **Live user messages** — configure `WithUserMessageSource` or `SetUserMessageSource`. The host callback drains at most one message per boundary; a non-empty value is recorded as `Step{UserNudge: msg}` and rendered as the final `{role:user}` message in the immediate LLM request. Delivery emits an `ExecutorDiagnostic` named `live_user_message`.
+- **Resume interjection** — the Conductor sets a one-shot `PendingUserInterjection` on a context manager implementing `orchestration.InterjectionAware`. An executor recognizes `InterjectionConsumer` and retires the nudge only after a successful LLM response. If the first call fails with context overflow and triggers reactive compaction, the rebuilt prompt still contains the nudge.
+
+```go
+exec := agent.NewExecutor(router, registry, 25,
+    agent.WithResumeSteps(checkpoint),
+    agent.WithPauseChecker(func(context.Context) bool { return pause.Load() }),
+    agent.WithUserMessageSource(func(context.Context) string {
+        return liveQueue.PopOne() // "" when empty
+    }),
+)
+
+cw.SeedSteps(checkpoint)
+result, err := exec.Run(ctx, registry.List(), cw)
+if errors.Is(err, agent.ErrPaused) {
+    checkpoint = result.Steps
+}
+```
+
+The callbacks must be cheap and safe to invoke from the `Run` goroutine. Queue persistence and undelivered-message handling remain host responsibilities.
+
+## Verify-on-edit
+
+`SetVerifyOnEdit` installs a mechanical post-edit verifier (tests, lint, or build) supplied by trusted user configuration:
+
+```go
+func (e *Executor) SetVerifyOnEdit(runner EditVerifyRunner, maxOutputChars int)
+```
+
+```go
+type EditVerifyRunner func(ctx context.Context) EditVerifyResult
+
+type EditVerifyResult struct {
+    Output   string
+    ExitCode int
+    TimedOut bool
+    Timeout  time.Duration
+    Err      error
+}
+```
+
+A successful `write_file` or `edit_file` marks the current LLM response group dirty. The runner executes **once at the end of that group**, even when the response contains several edits. Failed edits, HITL-rejected edits, reads, deletes, directory operations, and shell calls do not schedule verification. Pending verification is flushed before terminal paths that bypass normal group completion, so a finish cannot silently skip it.
+
+The formatted `[verify_on_edit]` note is appended to the final observation and visible both to the model and event consumers. Exit `0` records a pass; a positive exit code asks the model to fix failures; timeout, infrastructure failure (`Err`), or a negative/no exit status records that the edit was **not verified**. Output is trimmed and rune-safely capped; `maxOutputChars <= 0` selects `DefaultVerifyOnEditCap` (4000 characters). A nil runner disables the hook. The command itself must come from user/host configuration, never from model output.
 
 ## Step
 

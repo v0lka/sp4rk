@@ -1,6 +1,6 @@
 # Example 10 — Security & Tool-Safety
 
-A focused look at the two SDK safety subsystems no other example covers:
+A focused look at three SDK safety mechanisms:
 
 - **Prompt-injection defense** (`docs/security.md`) — untrusted tool output is
   wrapped in `<untrusted-content>` boundary tags and sanitized before it enters
@@ -8,6 +8,9 @@ A focused look at the two SDK safety subsystems no other example covers:
 - **Tool-safety / execution-context intelligence** (`docs/tool-safety.md`) — a
   per-tool `ToolJudger` heuristic lets a mutating tool block dangerous calls,
   escalating them to a `ConfirmFunc` (fail-closed to DENY if none is set).
+- **Central strict judge** — `ToolJudge.JudgeStrict` performs a fresh,
+  context-aware LLM evaluation for hosts that may auto-resolve confirmation
+  gates and fails safe to `VerdictConfirm` whenever evaluation is unavailable.
 
 The example ships in **two variants** plus a shared `tools.go`:
 
@@ -22,9 +25,11 @@ The example ships in **two variants** plus a shared `tools.go`:
 - `security.WrapUntrustedContent` / `StripUntrustedTags` — how untrusted content is delimited
 - `tools.BaseTool.Untrusted` — opting a tool into the prompt-injection defense
 - `tools.ToolJudger` — per-tool safety heuristic (`Judge → JudgeOutcome{Allow, Reason, Severity}`)
+- `tools.ToolGroupOf` — fail-closed capability metadata for custom tools
+- `tools.StrictJudgeRequest` / `ToolJudge.JudgeStrict` — conservative centralized gate evaluation
 - `ToolPolicy` + the fail-closed `ConfirmFunc` escalation path
 
-## Two mechanisms
+## Three mechanisms
 
 ### (a) Prompt-injection defense
 
@@ -92,11 +97,31 @@ out-of-workspace -> judge blocks -> [escalated to confirm] append_log … -> DEN
 in-workspace     -> judge allows  -> executes normally
 ```
 
+### (c) Central strict judge
+
+`ToolJudge.JudgeStrict` accepts a `tools.StrictJudgeRequest` containing the tool
+name, JSON input, current task context, and registration source. Unlike advisory
+`Judge`, strict mode skips internal-tool/session-root fast paths and verdict
+caching: every gate is evaluated against its current context. Provider errors,
+timeouts, malformed responses, and a missing provider all return
+`VerdictConfirm`, never `VerdictAllow`.
+
+The deterministic demo intentionally constructs `tools.NewToolJudge(nil, ...)`
+and calls `JudgeStrict`. This exercises the fail-safe branch without an API key
+or network request and prints the resulting manual-confirmation verdict.
+
 ## Run it
 
-The deterministic demo (`runSecurityDemos`) needs **no API key** — it always
-prints both transformations. The short live agent that follows needs an
-`ANTHROPIC_API_KEY`:
+The deterministic demo (`runSecurityDemos`) needs **no API key**. Its local
+contract tests also make no network requests:
+
+```bash
+cd sdk/examples
+GOWORK=off go test ./10-security-and-safety
+```
+
+The live-agent portion needs an `ANTHROPIC_API_KEY`; when it is unset, both
+variants print the three deterministic demonstrations and exit successfully:
 
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."

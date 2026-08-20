@@ -6,7 +6,7 @@
 //   - Custom Events for live observability
 //   - Human-in-the-loop tool confirmation
 //   - Planner → DAG → Conductor → Reflector orchestration
-//   - Skills discovery from a local skills directory
+//   - Skills and Subagent Profile discovery from local directories
 //   - Fact memory for inter-step communication
 //   - Context compaction configuration
 //   - Blackboard with OnBlackboardChanged callback
@@ -35,6 +35,7 @@ import (
 
 	"github.com/v0lka/sp4rk"
 	"github.com/v0lka/sp4rk/agent"
+	"github.com/v0lka/sp4rk/agents"
 	"github.com/v0lka/sp4rk/llm"
 	"github.com/v0lka/sp4rk/orchestration"
 	"github.com/v0lka/sp4rk/skills"
@@ -152,6 +153,12 @@ func run() error {
 	}
 	seedSkill(skillsDir)
 
+	agentsDir := filepath.Join(workspaceDir, ".agents", "profiles")
+	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+		return fmt.Errorf("agents dir: %w", err)
+	}
+	seedAgentProfile(agentsDir)
+
 	// ── 3. Framework via sp4rk.NewF ──
 	//
 	// CLASSIC ESCAPE (WithConfig): compaction tuning, execution tuning, and the
@@ -231,6 +238,24 @@ func run() error {
 		fmt.Printf("  • %s: %s\n", s.Name, trunc(s.Description, 60))
 	}
 
+	// Subagent Profiles are discovered independently from skills. The strict
+	// ToolPreferenceWithError method validates the declarative capability-group
+	// budget; unlike the legacy widening ToolPreference method, invalid
+	// programmatic metadata cannot silently become the full toolset.
+	agentMgr := agents.NewAgentManager([]string{agentsDir}, nil)
+	if err := agentMgr.Scan(); err != nil {
+		return fmt.Errorf("agent scan: %w", err)
+	}
+	profile, ok := agentMgr.Get("code-researcher")
+	if !ok {
+		return fmt.Errorf("seeded agent profile not discovered")
+	}
+	toolPreference, err := profile.ToolPreferenceWithError()
+	if err != nil {
+		return fmt.Errorf("agent tool preference: %w", err)
+	}
+	fmt.Printf("Discovered agent profile: %s (tool groups: %v)\n", profile.Metadata.Name, toolPreference)
+
 	// ── 5. The task ──
 	task := fmt.Sprintf(`In the workspace %s, create a Go project:
 1. Create a directory "myproject"
@@ -301,6 +326,15 @@ func seedSkill(skillsDir string) {
 	}
 	content := "---\nname: go-testing\ndescription: Use when writing Go tests with the standard testing package.\n---\n# Go Testing Skill\n\nWrite tests using `go test`. Place test files alongside source as `*_test.go`.\n"
 	_ = os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(content), 0o644)
+}
+
+func seedAgentProfile(agentsDir string) {
+	profileDir := filepath.Join(agentsDir, "code-researcher")
+	if err := os.MkdirAll(profileDir, 0o755); err != nil {
+		return
+	}
+	content := "---\nname: code-researcher\ndescription: Investigates a codebase with local reads and diagnostic commands.\ntools: local-read,execute\nmax-steps: 12\n---\nRead relevant code and report evidence before proposing changes.\n"
+	_ = os.WriteFile(filepath.Join(profileDir, "AGENT.md"), []byte(content), 0o644)
 }
 
 func trunc(s string, n int) string {

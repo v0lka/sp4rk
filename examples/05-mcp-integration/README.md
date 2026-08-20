@@ -50,7 +50,11 @@ sp4rk.New(cfg)
          [filesystem] write_file, search_files, get_file_info, …
 ```
 
-> **Name collisions**: the registry is keyed by tool name — if an MCP server exposes a tool with the same name as a built-in (e.g. `read_file`), the tool registered **last** wins. In this example the built-ins are registered after `sp4rk.New()` (which starts the MCP gateway), so they shadow same-named MCP tools. Note that the shadowed name may still be listed with the MCP server as its source.
+> **Name collisions**: the registry is keyed by tool name and applies an
+> anti-shadowing rule. An MCP-categorized tool cannot replace an already
+> registered non-MCP tool with the same name; registration is rejected. A core
+> `Register` call may replace an MCP entry, so registering built-ins after
+> gateway startup deliberately gives the built-in implementation precedence.
 
 ## Code walkthrough
 
@@ -83,6 +87,13 @@ fw, err := sp4rk.New(sp4rk.Config{
 | `WorkDir`   | Working directory              | —                             |
 | `URL`       | —                              | Server endpoint               |
 | `Headers`   | —                              | Custom HTTP headers           |
+| `ToolGroupOverride` | Optional group; default `local_mcp` | Optional group; default `remote_mcp` |
+
+`ToolGroupOverride` is useful when the transport does not reflect the actual
+trust boundary (for example an HTTP tunnel to a local service). Empty, unknown,
+or reserved `system` overrides are ignored and fall back to the
+transport-derived MCP group; an external server can never become a trusted
+system tool through configuration.
 
 Environment variable references (`${VAR}`) in `Env`, `URL`, and `Headers` values are expanded at startup.
 

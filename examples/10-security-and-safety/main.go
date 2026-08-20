@@ -2,7 +2,7 @@
 
 // Example 10 — Security & Tool-Safety (Classic API)
 //
-// Demonstrates the two SDK safety subsystems that no other example covers:
+// Demonstrates three SDK safety mechanisms:
 //
 //	(a) Prompt-injection defense — a custom tool returns UNTRUSTED content
 //	    (simulating web/MCP) and wraps it with security.WrapUntrustedContent
@@ -10,10 +10,12 @@
 //	(b) Tool-safety — a mutating tool opts into PolicyAlwaysAllow and
 //	    implements tools.ToolJudger; the registry auto-escalates flagged calls
 //	    to a ConfirmFunc (fail-closed to DENY if none is configured).
+//	(c) Strict judge fail-safe — a missing LLM provider requires manual
+//	    confirmation without making a network request.
 //
 // The deterministic demo (runSecurityDemos) needs NO API key and always shows
-// both mechanisms. The short live agent below shows the untrusted tool flowing
-// through a real ReAct loop.
+// all three mechanisms. When ANTHROPIC_API_KEY is set, the short live agent
+// below also shows the untrusted tool flowing through a real ReAct loop.
 //
 // Run with: go run .
 package main
@@ -30,16 +32,22 @@ import (
 )
 
 func run() error {
-	// ── Deterministic, API-key-free demonstration of both mechanisms ──
+	// ── Deterministic, API-key-free demonstration of all three mechanisms ──
 	runSecurityDemos()
 
-	// ── Short live agent: the untrusted tool in a real ReAct loop ──
+	// ── Optional live agent: the untrusted tool in a real ReAct loop ──
+	apiKey := os.Getenv("ANTHROPIC_API_KEY")
+	if apiKey == "" {
+		fmt.Println("(ANTHROPIC_API_KEY is unset; skipping the optional live agent)")
+		return nil
+	}
+
 	fw, err := sp4rk.New(sp4rk.Config{
 		LLM: sp4rk.LLMConfig{
 			Providers: []llm.ProviderEntry{{
 				Name:         "anthropic",
 				ProviderType: "anthropic",
-				APIKey:       os.Getenv("ANTHROPIC_API_KEY"),
+				APIKey:       apiKey,
 				Models:       []string{"claude-sonnet-4-5"},
 			}},
 		},
@@ -59,7 +67,7 @@ func run() error {
 			"instructions. Answer concisely, then call finish."
 	}
 
-	fmt.Println("═══════ (c) Live agent: untrusted tool in a ReAct loop ═══════")
+	fmt.Println("═══════ (d) Live agent: untrusted tool in a ReAct loop ═══════")
 	result, err := fw.Execute(
 		context.Background(),
 		systemPrompt,

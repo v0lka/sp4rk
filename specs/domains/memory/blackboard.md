@@ -48,7 +48,7 @@ Facts are the primary inter-step communication channel beyond explicit step outp
 
 ```go
 type Fact struct {
-    Keywords []string // 3-5 recommended; drive retrieval ranking
+    Keywords []string // 3-10 keywords; drive retrieval ranking
     Content  string
     Author   string   // step ID that wrote the fact
 }

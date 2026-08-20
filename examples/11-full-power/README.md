@@ -11,6 +11,7 @@ This example is a **fluent-first hybrid**: the Framework is assembled with `sp4r
 | Compaction / execution tuning | **Classic**| `.Config(base sp4rk.Config)` escape hatch |
 | `OnBlackboardChanged`  | **Classic**| rides in the `WithConfig` base (no dedicated fluent option) |
 | Skills discovery       | **Classic**| `skills.SkillManager` → passed to the fluent `.Skills` builder method |
+| Agent profile discovery | **Classic**| `agents.AgentManager` + strict `ToolPreferenceWithError` validation |
 | Custom events sink     | **Classic**| `consoleEvents` (embeds `orchestration.NoopEvents`) → the fluent `.Events` builder method |
 
 ## What you will learn
@@ -19,7 +20,7 @@ This example is a **fluent-first hybrid**: the Framework is assembled with `sp4r
 - When to use the fluent API vs. fall back to the classic API
 - Multi-provider LLM configuration with runtime model switching (Claude for planning/reflection, GPT-4o for execution)
 - Custom + built-in + MCP tools in one registry
-- Skills discovery, fact memory, and blackboard callbacks
+- Skills discovery, Subagent Profile capability budgets, fact memory, and blackboard callbacks
 - Full Plan → Execute → Reflect orchestration with events
 
 ## Subsystems exercised
@@ -36,6 +37,7 @@ This example is a **fluent-first hybrid**: the Framework is assembled with `sp4r
 | Conductor          | Fluent            | created internally by `fw.TaskF`              |
 | Reflector          | Fluent            | `.Reflect()` with `sp4rk.DefaultReflectorPrompt`|
 | Skills             | Classic escape    | `skills.SkillManager` → `.Skills(discovered)`    |
+| Subagent Profiles  | Classic escape    | `agents.AgentManager` + `ToolPreferenceWithError()` |
 | Fact memory        | Fluent            | `MemoryTools()` bundle + blackboard              |
 | Compaction         | Classic escape    | `.Config(base)` carrying `CompactionConfig`      |
 | Blackboard         | Classic escape    | `OnBlackboardChanged` in the `.Config(base)` base |
@@ -124,6 +126,27 @@ discoveredSkills := skillMgr.List()
 
 Skills are markdown files (`SKILL.md`) with YAML frontmatter. The `SkillManager` scans directories in priority order and parses each skill's metadata. Discovered skills are passed to the Planner (via the fluent `.Skills` builder method) so it can assign them to steps. Discovery is pre-execution setup, so it stays in the classic API.
 
+#### Subagent Profile discovery and capability groups
+
+Subagent Profiles are independent `AGENT.md` files discovered by
+`agents.AgentManager`. Their `tools:` frontmatter contains presets (`all`,
+`read-only`) or capability groups such as `local-read,execute` rather than tool
+names. The example seeds and discovers a `code-researcher` profile, then uses:
+
+```go
+profile, _ := agentMgr.Get("code-researcher")
+toolPreference, err := profile.ToolPreferenceWithError()
+```
+
+`ToolPreferenceWithError` returns `nil`, a preset string, or canonical
+`[]string` group tokens and reports unknown, duplicate, empty, or mixed values.
+Host runtimes should use this strict method. The legacy `ToolPreference() any`
+method is retained for compatibility but maps invalid metadata to `nil` (the
+full toolset), so it is unsuitable for a security-sensitive resolver.
+
+The SDK keeps profile application in the host execution layer: discovery and
+validation do not automatically launch or assign the profile to `TaskF` steps.
+
 #### Fact memory
 
 ```go
@@ -174,7 +197,15 @@ node --version
 
 ## Run
 
-This example is a single fluent-first hybrid `main.go` (no build tag):
+This example is a single fluent-first hybrid `main.go` (no build tag). Its
+profile-discovery contract test is local and needs no provider or MCP server:
+
+```bash
+cd sdk/examples
+GOWORK=off go test ./11-full-power
+```
+
+The live capstone needs the prerequisites above:
 
 ```bash
 cd sdk/examples

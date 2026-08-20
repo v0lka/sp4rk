@@ -6,7 +6,7 @@ Provides LLM provider abstractions, a model registry, and routing for multi-prov
 
 ## Key Files
 
-- `github.com/v0lka/sp4rk/llm` — `Router`, `RouterConfig`, `NewRouter`, `SetModel`/`ActiveModel`/`Call`, `Provider` interface, `ProviderEntry`
+- `github.com/v0lka/sp4rk/llm` — `Router`, `RouterConfig`, `SamplingDefaults`, `SamplingFunc`, `CallPurpose`, `DeterministicTemperature`, `NewRouter`, `SetModel`/`ActiveModel`/`Call`, `Provider` interface, `ProviderEntry`
 - `github.com/v0lka/sp4rk/llm` (metadata) — `ModelRegistry`, `ModelMetadata`, `ModelCapabilities`, `DetectFamily`, `FamilyReasoningOptions`, `ResolveBuiltInModel`, `ResolveLocal`, `SetCachedMetadata`, `SetRuntimeMetadata`, `RuntimeMetadata`
 - `github.com/v0lka/sp4rk/llm` (protocol) — `APIProtocol`, `DetectProtocol`, and the four protocol constants (`ProtocolChatCompletions`, `ProtocolResponses`, `ProtocolAnthropic`, `ProtocolGoogle`)
 - `github.com/v0lka/sp4rk/llm` (token accounting) — `TokenCounter`, `SimpleTokenCounter`, `TiktokenCounter`, `NewTokenCounter`, `ContextTokenTracker`, `UsageTracker`, `TrackingCaller`
@@ -37,6 +37,31 @@ type ModelCapabilities struct {
     Attachment, Reasoning, Temperature, ToolCall bool
 }
 
+type SamplingDefaults struct {
+    Temperature       *float64
+    TopP              *float64
+    TopK              *int
+    RepetitionPenalty *float64
+    PresencePenalty   *float64
+}
+
+type SamplingFunc func(family string) SamplingDefaults
+
+type CallPurpose string // "" | "executor" | "routing" | "compaction" | "summarization"
+
+// ChatRequest carries all sampling fields as pointers: nil means omit the
+// parameter and let the provider decide.
+type ChatRequest struct {
+    // model/messages/tools/max tokens omitted here
+    CallPurpose       CallPurpose
+    Temperature       *float64
+    TopP              *float64
+    TopK              *int
+    RepetitionPenalty *float64
+    PresencePenalty   *float64
+    ReasoningEffort   string
+}
+
 // A message may carry an ordered list of blocks (text and/or images) instead of
 // a plain Content string; providers render ContentBlocks when non-empty.
 type ContentBlock struct {
@@ -63,10 +88,13 @@ Router.Call(ctx, req)
 ├─ Resolve model metadata at most once (a single Resolve honoring a tier-1 override); when the
 │      caller left req.Protocol empty, fill it from the resolved ModelMetadata.Protocol so a
 │      registry override steers routing regardless of the model name (the documented escape hatch).
-│      The resolved metadata is reused by applyDefaultTemperature and validateContextWindow so
+│      The resolved metadata is reused by applyDefaultSampling and validateContextWindow so
 │      those helpers perform no registry I/O of their own.
-├─ Apply family-aware default temperature (via SamplingFunc) unless req.Temperature is set;
-│      skip temperature entirely for models whose Capabilities.Temperature is false.
+├─ Apply purpose-aware sampling defaults unless the model rejects temperature:
+│      explicit request fields win; executor/default calls receive the family
+│      SamplingDefaults; routing/compaction/summarization receive only a
+│      deterministic temperature (google 1.0, qwen 0.6, otherwise 0.0).
+│      No deterministic call inherits preset top_p/top_k/penalties.
 ├─ Validate estimated tokens against the effective context window (SafetyMarginPercent +
 │      OutputTokenReserve); reject oversized requests with ErrContextWindowExceeded.
 ├─ Dispatch to the active provider. The OpenAI provider honors req.Protocol when set and otherwise
@@ -111,6 +139,24 @@ The fuzzy tier (2b) bridges the cosmetic naming drift real-world model hosts int
 
 `SetCachedMetadata(model, meta)` stores a late-learned metadata entry at tier 3 (the cache). It lets a caller that discovers a model's real context window after construction — e.g. a lazy probe of a local OpenAI-compatible server — populate the result so subsequent `Resolve` calls return it without re-querying the network. Because it is tier 3, it takes effect only when no user override (tier 1) or built-in entry (tier 2) exists, so config overrides and well-known models are never silently clobbered. A **partial** override that leaves its `ContextWindow` at zero inherits the cache-tier value once it arrives, so a lazy local-model probe (notably a HuggingFace probe for a custom-served model) is not shadowed by a non-zero fallback window baked into the override.
 
+## Purpose-aware sampling
+
+`RouterConfig.SamplingFunc` has signature `func(family string) SamplingDefaults`; each pointer field is independently optional. For executor calls (`CallPurposeExecutor`) and purpose-less legacy calls, the router fills only request fields the caller left nil. An explicit request value always wins over the family preset; an all-nil preset leaves provider defaults untouched. When no sampling function is configured, executor/default calls receive a temperature-only `0.0` fallback.
+
+Structured or persisted-output calls declare `CallPurposeRouting`, `CallPurposeCompaction`, or `CallPurposeSummarization`. They bypass the vendor preset and receive only `DeterministicTemperature(family)`: `1.0` for Google, `0.6` for Qwen, and `0.0` otherwise. Caller-supplied temperature still wins. If resolved `ModelCapabilities.Temperature` is false, no sampling field is injected for any purpose. The main executor declares executor purpose; request router, planner, reflector, and tool judge declare routing purpose; compaction and auxiliary summarization declare their corresponding purposes.
+
+Each provider serializes only its wire protocol's supported subset:
+
+| Provider path | Serialized fields |
+| ------------- | ----------------- |
+| OpenAI Chat, custom compatible endpoint | temperature, top-p, top-k, repetition penalty, presence penalty |
+| OpenAI Chat, official endpoint | temperature, top-p, presence penalty |
+| OpenAI Responses | temperature, top-p |
+| Anthropic Messages | temperature, top-p, top-k; none while extended thinking is enabled |
+| Google generateContent | temperature, top-p, top-k |
+
+Nil and unsupported fields are omitted rather than sent with zero values.
+
 ## Token counting & usage tracking
 
 Two counters: `SimpleTokenCounter` (~4 chars = 1 token approximation) and `TiktokenCounter` (accurate, tiktoken-go, mutex-guarded). `NewTokenCounter(tokenizerType)` selects by metadata type (`tiktoken/*` → Tiktoken; `anthropic-api`/`approximate`/unknown → Simple; always returns a valid counter).
@@ -149,7 +195,8 @@ The Conductor accepts a multimodal task via `ConductorConfig.ContentBlocks`: whe
 - `Resolve` always returns usable metadata, even for unknown models (fallback defaults with optimistic `Attachment` capability).
 - A partial override (one that leaves some scalar fields unset) inherits its unset fields from the lower non-network tiers; a fully-specified override is returned verbatim.
 - An observed runtime entry (tier 1.5) always supersedes the built-in spec and the lazy cache, and always yields to an explicit user override; `Invalidate` clears it along with its fuzzy-index mirror.
-- `prepareRequest` resolves model metadata at most once per call and reuses it for protocol resolution, default temperature, and context-window validation.
+- `prepareRequest` resolves model metadata at most once per call and reuses it for protocol resolution, default sampling, and context-window validation.
+- Explicit sampling fields always beat injected defaults; deterministic purposes inherit no top-p/top-k/penalty preset, and providers serialize only parameters their selected wire protocol supports.
 - Model-registry lookups (overrides, observed runtime, built-ins, cache) are case-insensitive.
 - `ResolveLocal` never performs I/O: it consults no network tier and returns immediately on a local miss.
 - A probe aborted by the caller's context cancellation (`context.Canceled`) is never recorded in the negative cache; an expired negative record is evicted at read time.
@@ -169,7 +216,7 @@ The Conductor accepts a multimodal task via `ConductorConfig.ContentBlocks`: whe
 | `SafetyMarginPercent` | `5` | Effective context window fraction reserved for counting inaccuracy. |
 | `OutputTokenReserve` | `4096` | Default output reserve when metadata lacks an `OutputLimit`. |
 | `HTTPClient` | optional | Proxy-configured client. |
-| `SamplingFunc` | optional | `func(family string) *float64`; return `nil` to use the provider default. |
+| `SamplingFunc` | optional | `func(family string) SamplingDefaults`; nil fields omit individual provider parameters. Executor/default calls use the full preset; deterministic purposes use only their family-safe temperature. |
 | `Logger` | optional | Logs ambiguity warnings on bare-name resolution. |
 
 `APIKey`/`BaseURL`/`Models` must be pre-resolved by the caller (env vars expanded, durations parsed) before `NewRouter`.
@@ -180,7 +227,7 @@ The Conductor accepts a multimodal task via `ConductorConfig.ContentBlocks`: whe
 - **Anthropic-compatible endpoints**: the built-in Anthropic provider normalizes `BaseURL` to end with `/v1` (the go-anthropic SDK expects the version segment in the base URL, unlike the official Anthropic SDK convention which omits it). A URL already ending in `/v1` is left untouched; otherwise `/v1` is appended. The provider also installs a response-body-capturing transport and surfaces errors that the SDK would otherwise swallow — a `{"type":"error",...}` object or a degenerate empty response returned with HTTP 200 is reported as an error rather than a silent empty reply (common when a misconfigured base URL misses the `/v1` path segment).
 - **Custom metadata source**: `ModelRegistry.RegisterSource(src)` for a source consulted after the HuggingFace lookup (e.g. a local model server). `SetCachedMetadata` stores a late-learned entry at tier 3 (cache).
 - **Force a wire protocol**: set `ModelMetadata.Protocol` (via the overrides map, a registered source, or a built-in entry) to override substring `DetectProtocol` detection for a model whose name matches a family token but speaks a different protocol.
-- **Family-aware sampling**: supply `RouterConfig.SamplingFunc` (see [prompt-building.md](prompt-building.md) for the SDK's `DefaultSampling` defaults).
+- **Purpose-aware sampling**: supply `RouterConfig.SamplingFunc` to return a five-field family preset; set `ChatRequest.CallPurpose` at each call site so executor work receives that preset while structured/persisted-output work receives the deterministic profile (see [prompt-building.md](prompt-building.md)).
 - **Step-local callers**: `TrackingCaller.WithContextTracker` for independent context trackers in parallel branches.
 
 ## Related Specs

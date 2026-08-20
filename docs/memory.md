@@ -50,9 +50,11 @@ cw := memory.NewContextWindow(memory.ContextWindowConfig{
 
 | Method | Description |
 | --- | --- |
-| `BuildPrompt() []llm.Message` | Assembles the full prompt in priority order: system message(s) → prior conversation → task content → plan content → step history. |
+| `BuildPrompt() []llm.Message` | Assembles the full prompt in priority order: system message(s) → prior conversation → task content → plan content → step history → pending user interjection. |
 | `AddStep(step)` | Appends a step to the history and updates the token tracker with an approximate delta. |
 | `SeedSteps(steps)` | Wholesale-replaces the step history (clearing compaction state and recalculating the tracker delta for the batch). Used to resume from a checkpoint so the seeded steps render in `BuildPrompt` as assistant+tool messages; nil/empty clears the history. `ContextWindow` also satisfies the `orchestration.StepSeedable` capability interface the Conductor asserts when `ResumeSteps` is set. |
+| `SetPendingUserInterjection(msg)` | Sets (or, with `""`, clears) the one-shot resume nudge appended as the final user message after seeded steps. `ContextWindow` satisfies `orchestration.InterjectionAware`. |
+| `ConsumePendingUserInterjection()` | Retires the pending nudge after successful delivery. The executor calls it through `agent.InterjectionConsumer`; it is not consumed while merely building a prompt. |
 | `Compact(ctx) *CompactionResult` | Compresses the step history using the configured strategy. Returns before/after fill percentages, or `nil` if no compaction occurred. |
 | `SetStrategy(s)` | Changes the compaction strategy. |
 | `CheckFill() FillCheck` | Returns the current fill status: `"ok"`, `"compact"`, `"warning"`, `"emergency"`, or `"reject"`. |
@@ -68,7 +70,9 @@ cw := memory.NewContextWindow(memory.ContextWindowConfig{
 | `EffectiveMax() int` | Effective maximum token count: `ContextWindow - OutputLimit - safetyMargin`. |
 | `Tracker() *llm.ContextTokenTracker` | Returns the underlying token tracker. |
 
-`BuildPrompt` splits the system prompt on `CacheBreakMarker` into multiple system messages so that providers can apply prompt caching to the stable parts (see [Prompt Building](prompt-building.md)).
+`BuildPrompt` splits the system prompt on `CacheBreakMarker` into multiple system messages so that providers can apply prompt caching to the stable parts (see [Prompt Building](prompt-building.md)). When a pending interjection is set, it is appended after the step history as the final user message. `BuildPrompt` deliberately does not clear it: the executor calls `ConsumePendingUserInterjection` only after a successful LLM response, so a context-overflow call followed by reactive compaction and a second `BuildPrompt` does not lose the user's nudge.
+
+`ContextWindow` therefore implements both sides of the resume-with-nudge contract: `orchestration.InterjectionAware` via `SetPendingUserInterjection`, and `agent.InterjectionConsumer` via `ConsumePendingUserInterjection`. Custom context managers may implement the same optional capabilities; without the consumer, a pending nudge degrades gracefully by remaining in later prompts until the host clears it.
 
 ## CompactionThresholds
 

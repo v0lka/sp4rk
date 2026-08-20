@@ -26,7 +26,8 @@ result, err := fw.RunF(ctx).System(systemPrompt).Ask(task)
 ## What you will learn
 
 - How to implement the `tools.Tool` interface
-- How `tools.BaseTool` reduces boilerplate
+- How `tools.BaseTool` reduces boilerplate and declares a capability group
+- How optional `tools.GroupProvider` metadata supports group-based tool budgets
 - How to register built-in tools from `github.com/v0lka/sp4rk/tools/builtins`
 - How to inject a workspace path via context
 
@@ -66,6 +67,20 @@ type Tool interface {
 }
 ```
 
+Capability metadata stays backward-compatible through a separate optional
+interface rather than enlarging `Tool`:
+
+```go
+type GroupProvider interface {
+    Group() tools.ToolGroup
+}
+```
+
+Every new tool should declare exactly one capability group. `BaseTool` implements
+`GroupProvider` through its `ToolGroup` field; callers read metadata with
+`tools.ToolGroupOf(tool)`. A tool without a declared group resolves to `""` and
+matches no group-based allow-list (fail-closed).
+
 `tools.BaseTool` provides default implementations for everything except `Execute`, so concrete tools only need to implement that one method:
 
 ```go
@@ -79,6 +94,7 @@ func NewCalculatorTool() *CalculatorTool {
         ToolDescription: "Evaluate an arithmetic expression …",
         Schema:          json.RawMessage(`{ "type": "object", "properties": { … } }`),
         Policy:          tools.PolicyAlwaysAllow,
+        ToolGroup:       tools.GroupSystem,
     }}
 }
 

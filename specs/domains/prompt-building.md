@@ -17,9 +17,12 @@ A fluent API for constructing prompts with first-class support for splitting sta
 const CacheBreakMarker = "\x00CACHE_BREAK\x00"
 
 type SamplingConfig struct {
-    Temperature *float64
-    TopP        *float64
-    MaxTokens   *int
+    Temperature       *float64
+    TopP              *float64
+    TopK              *int
+    RepetitionPenalty *float64
+    PresencePenalty   *float64
+    MaxTokens         *int
 }
 // Pointer fields indicate "set" vs "unset": nil means no override.
 ```
@@ -67,22 +70,22 @@ When a system prompt contains a `CacheBreakMarker`, downstream consumers split i
 
 | Family | Default |
 | ------ | ------- |
-| `anthropic` | all nil (model self-selects) |
-| `openai_flagship`, `openai_standard` | Temperature 0.3 |
+| `anthropic`, `openai_codex`, `mistral`, `kimi` | all nil (provider self-selects or the model rejects overrides) |
+| `openai_flagship`, `openai_standard` | Temperature 0.3 (reasoning members are filtered by model capabilities) |
 | `google` | Temperature 1.0 (low values cause looping) |
-| `mistral` | Temperature 0.3 |
 | `deepseek` | Temperature 0.0 (coding/math; ignored when thinking enabled) |
-| `qwen` | Temperature 0.6 (reasoning/analytical) |
-| `glm` | Temperature 0.2 (analytical/coding) |
-| `kimi` | all nil (server enforces per model) |
+| `qwen` | Temperature 0.6, TopP 0.95, TopK 20 |
+| `glm` | Temperature 1.0, TopP 0.95, TopK 40 |
 | default | Temperature 0.5, TopP 0.95 |
+
+`DefaultSampling` is the vendor preset for executor/default calls. The root wiring converts its five generation knobs (`Temperature`, `TopP`, `TopK`, `RepetitionPenalty`, `PresencePenalty`) into `llm.SamplingDefaults`; `MaxTokens` remains a prompt-level advisory field rather than part of `llm.SamplingDefaults`. The LLM Router applies that preset only for `CallPurposeExecutor` and the backward-compatible zero purpose. Routing, compaction, and summarization calls bypass it and use `llm.DeterministicTemperature` with family-safe floors (Google 1.0, Qwen 0.6, otherwise 0.0).
 
 ## Invariants
 
 - Trusted substitutions run iteratively (up to 5 passes); untrusted substitutions run once and never expand placeholders inside the value.
 - `Build()` with a `CacheBreak` always embeds `CacheBreakMarker` between stable and dynamic parts.
 - `SplitCacheBreak` omits empty parts (returns one part when no marker, two when present).
-- `DefaultSampling` returns `nil` fields (no override) for families with provider-managed defaults.
+- `DefaultSampling` returns `nil` fields (no override) for families with provider-managed defaults, and the Router applies the preset only to executor/default purposes.
 
 ## Configuration
 
@@ -91,7 +94,7 @@ There is no runtime configuration file for this package. Behavior is driven enti
 ## Extension Points
 
 - **Custom `SystemPromptFactory`**: compose a `SystemPromptBuilder`, place `CacheBreak()` between stable and dynamic sections, and return `Build()`. The [Conductor](orchestration/conductor.md) receives model metadata so the prompt can adapt.
-- **Custom sampling**: supply a `SamplingFunc` to `RouterConfig` (see [llm-providers.md](llm-providers.md)) overriding `DefaultSampling` per family.
+- **Custom sampling**: supply an `llm.SamplingFunc` returning `llm.SamplingDefaults` to `RouterConfig`, and set `ChatRequest.CallPurpose` so executor work receives the family preset while structured/persisted-output work receives deterministic sampling (see [llm-providers.md](llm-providers.md)).
 - **Cache-aware ContextManager**: a custom `ContextManager` should split its system prompt on `CacheBreakMarker` (via `SplitCacheBreak`) into multiple system messages to benefit from provider caching.
 
 ## Related Specs

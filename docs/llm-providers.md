@@ -74,7 +74,7 @@ type RouterConfig struct {
     SafetyMarginPercent int           // default 5
     OutputTokenReserve  int           // default 4096
     HTTPClient          *http.Client  // optional proxy-configured client
-    SamplingFunc        SamplingFunc  // optional family-aware temperature defaults
+    SamplingFunc        SamplingFunc  // optional family-aware multi-parameter defaults
     Logger              *slog.Logger  // optional logger for ambiguity warnings
 }
 ```
@@ -247,7 +247,7 @@ Resolution order (first match wins; every map lookup uses the lowercased key):
 
 1. **User overrides** — from the `overrides` map passed to `NewModelRegistry`.
 1.5. **Observed runtime entries** — written by `SetRuntimeMetadata`: how the model is *actually* being served. A self-hosted server's runtime context window outranks the built-in catalog spec — the catalog describes the checkpoint's maximum capability, the runtime entry describes the context length the server is actually enforcing. An explicit user override always wins over a probe.
-2. **Built-in registry** — a hardcoded table of well-known models (OpenAI, Anthropic, Google, DeepSeek, Qwen, GLM, Kimi, xAI Grok, …).
+2. **Built-in registry** — a hardcoded table of well-known models (OpenAI, Anthropic, Google, DeepSeek, Qwen, GLM, Kimi, xAI Grok, …). Recent entries include `kimi-k2.7-code`, `kimi-k2.7-code-highspeed`, the `kimi-for-coding` aliases, and Qwen 3.8 IDs `qwen/qwen3.8-27b`, `qwen/qwen3.8-2.4t-a95b` plus their `-fp8` variants.
 2b. **Fuzzy match** — a vendor-prefix- and separator-insensitive lookup across overrides, then observed runtime entries, then built-ins. `normalizeModelID` strips the org/vendor prefix up to the first `/`, lowercases the result, and removes `.`/`-`/`_` punctuation (alphanumerics are never altered, so distinct versions stay distinct — unlike edit-distance it cannot collapse versions); on a multi-match the lexicographically smallest key wins; the hit is cached under the query key. Lookups are O(1) reads against normalized-ID indexes (`overridesIndex`/`builtInIndex` built once at construction, `runtimeIndex` rebuilt under the registry lock on every runtime write). Bridges naming drift between hosts and the registry, e.g. `"gpt4o"` matches `"gpt-4o"`, a bare `"glm-5.2-fp8"` matches the prefixed `"zai-org/glm-5.2-fp8"` — so a probe that observed a server's real window under one spelling is still found under a drifted spelling.
 3. **Cache** — results from previous external lookups.
 4. **External sources** — HuggingFace API lookup (lazy, cached), then any sources registered via `RegisterSource` (e.g. an LM Studio provider). A failed HuggingFace probe is negatively cached for 10 minutes (`negativeCacheTTL`): repeat `Resolve` calls inside the window skip the probe entirely and fall through to registered sources, so an unknown model costs at most one HTTP round-trip per window. A successful re-probe or `Invalidate` clears the record, and an expired record is evicted at read time. Cancellation of the caller's context (`context.Canceled`) is never recorded — it describes the caller, not HuggingFace — while a deadline miss is (the registry's own HTTP timeout surfaces the same sentinel).
@@ -566,33 +566,87 @@ if errors.Is(err, llm.ErrContextWindowExceeded) {
 
 > This pre-submission guard rejects obviously oversized requests. It is intentionally independent from ongoing context-fill tracking in the agent loop.
 
-## SamplingFunc for family-aware temperature defaults
+## Purpose-aware sampling
+
+`ChatRequest` exposes five optional sampling controls plus a purpose classification:
 
 ```go
-type SamplingFunc func(family string) *float64
+type CallPurpose string
+
+const (
+    CallPurposeDefault       CallPurpose = "" // backward-compatible executor behavior
+    CallPurposeExecutor      CallPurpose = "executor"
+    CallPurposeRouting       CallPurpose = "routing"
+    CallPurposeCompaction    CallPurpose = "compaction"
+    CallPurposeSummarization CallPurpose = "summarization"
+)
+
+type ChatRequest struct {
+    // ...model/messages/tools/max tokens...
+    CallPurpose       CallPurpose
+    Temperature       *float64
+    TopP              *float64
+    TopK              *int
+    RepetitionPenalty *float64
+    PresencePenalty   *float64
+    ReasoningEffort   string
+}
+
+type SamplingDefaults struct {
+    Temperature       *float64
+    TopP              *float64
+    TopK              *int
+    RepetitionPenalty *float64
+    PresencePenalty   *float64
+}
+
+type SamplingFunc func(family string) SamplingDefaults
 ```
 
-When `ChatRequest.Temperature` is nil, the router applies a default temperature based on the active model's family. Set `RouterConfig.SamplingFunc` to control this. Return `nil` to use the provider's built-in default (no temperature parameter sent).
+Pointer fields preserve the distinction between an explicit zero and "not set". Priority applies independently to every field: an explicit `ChatRequest` value wins, then the `SamplingFunc` preset, then the provider default (field remains nil). If no sampling function is configured, executor/default-purpose calls receive a fallback temperature of `0`; the other fields remain nil. When a registry is present, presets are skipped unless metadata explicitly declares `Capabilities.Temperature == true`, preventing unsupported sampling parameters from reaching reasoning models.
 
-The router skips temperature application entirely for models whose `Capabilities.Temperature` is false (e.g. reasoning models like o1/o3). When no sampling function is configured, the fallback default is deterministic (temperature 0.0).
+Purpose changes which defaults are injected:
+
+- `CallPurposeDefault` and `CallPurposeExecutor` use the full family/vendor preset. The empty purpose deliberately preserves behavior for existing callers.
+- `CallPurposeRouting`, `CallPurposeCompaction`, and `CallPurposeSummarization` use a deterministic profile because their output is parsed or persisted. The router injects **temperature only** when the caller left it unset: `0` for most families, `1.0` for Google (its safe floor), and `0.6` for Qwen. It never presets top-p, top-k, or penalties for these calls.
+- Explicit request values always win, including on deterministic calls.
 
 ```go
 router, err := llm.NewRouter(ctx, llm.RouterConfig{
     Providers: providers,
-    SamplingFunc: func(family string) *float64 {
-        switch family {
-        case "anthropic":
-            t := 1.0
-            return &t
-        case "openai_flagship":
-            t := 0.7
-            return &t
-        default:
-            return nil // use provider default
+    SamplingFunc: func(family string) llm.SamplingDefaults {
+        cfg := prompt.DefaultSampling(family)
+        return llm.SamplingDefaults{
+            Temperature:       cfg.Temperature,
+            TopP:              cfg.TopP,
+            TopK:              cfg.TopK,
+            RepetitionPenalty: cfg.RepetitionPenalty,
+            PresencePenalty:   cfg.PresencePenalty,
         }
     },
 }, registry)
+
+resp, err := router.Call(ctx, llm.ChatRequest{
+    CallPurpose: llm.CallPurposeRouting,
+    Messages:    messages,
+    MaxTokens:   256,
+})
 ```
+
+### Provider parameter filtering
+
+`ChatRequest` is protocol-neutral; each provider serializes only controls supported by its wire API:
+
+| Wire path | Sent sampling fields |
+| --- | --- |
+| OpenAI Chat Completions | `temperature`, `top_p`, `presence_penalty`; `top_k` and `repetition_penalty` only for non-`api.openai.com` compatible servers |
+| OpenAI Responses | `temperature`, `top_p` |
+| Anthropic Messages | `temperature`, `top_p`, `top_k`; all three are removed when extended thinking is enabled |
+| Google generateContent | `temperature`, `topP`, `topK` |
+
+Unsupported penalties/knobs are intentionally omitted rather than forwarded as unknown JSON. `prompt.DefaultSampling` supplies the SDK's family matrix; see [Prompt Building → Sampling defaults](prompt-building.md#sampling-defaults).
+
+> **Migration note:** `SamplingFunc` previously had the shape `func(string) *float64`. Migrate it to `func(string) llm.SamplingDefaults`; wrap an existing temperature pointer as `llm.SamplingDefaults{Temperature: old(family)}`. Code that does not configure `SamplingFunc` needs no source change.
 
 ## Error types
 

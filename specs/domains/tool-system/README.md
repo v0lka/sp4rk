@@ -6,7 +6,7 @@ Provides the tool abstraction for the agent: a single `Tool` interface, a thread
 
 ## Key Files
 
-- `github.com/v0lka/sp4rk/tools` — `Tool` interface, `BaseTool`, `ToolResult`, `ToolPolicy`, `ToolJudger` (`JudgeOutcome` + `JudgeSeverity`), `ToolDescriptor` (carries `Group`), `ToolRegistry`, `StripParamsFromSchema`
+- `github.com/v0lka/sp4rk/tools` — `Tool` interface, `BaseTool`, `ToolResult`, `ToolPolicy`, `ToolJudger` (`JudgeOutcome` + `JudgeSeverity`), `ToolJudge` (`StrictJudgeRequest`, `Judge`/`JudgeStrict`), `ToolDescriptor` (carries `Group`), `ToolRegistry`, `StripParamsFromSchema`
 - `github.com/v0lka/sp4rk/tools/group.go` — `ToolGroup` and the 8 declared groups (`execute`, `local_read`, `local_write`, `remote_read`, `remote_write`, `system`, `local_mcp`, `remote_mcp`), `AllToolGroups()`, `IsValidToolGroup()`, `MCPToolGroup(transport)`
 - `github.com/v0lka/sp4rk/tools` (registry) — `Register`/`RegisterWithSource`/`RegisterWithSourceCategory`, `Execute` (fail-closed policy enforcement), `List`/`ListFiltered`, MCP shadowing protection
 - `github.com/v0lka/sp4rk/tools` (context helpers) — `WithWorkspacePath`, `WithTempDir`, `WithAllowedRoots`, `SessionRoots`, `WithTaskContext`. `SessionRoots` returns the deduplicated union of workspace + temp + additional allowed roots consulted by every path-containment check.
@@ -25,8 +25,10 @@ type Tool interface {
     Execute(ctx context.Context, input json.RawMessage) (ToolResult, error)
     DefaultPolicy() ToolPolicy
     IsUntrusted() bool
-    Group() ToolGroup   // required: the capability group (tools/group.go).
-                        // Zero value = undeclared = matches no allow-list (fail-closed).
+    // Note: Group() is NOT part of Tool. A tool declares its capability
+    // group by additionally implementing the optional GroupProvider interface
+    // (tools/group.go); ToolGroupOf(t) returns "" for non-implementers
+    // (undeclared = matches no allow-list, fail-closed).
 }
 
 type ToolResult struct {
@@ -75,6 +77,8 @@ ToolRegistry.Execute(ctx, name, input)
 
 The executor calls the registry through the narrow `ToolExecutor` interface (`Execute`, `GetToolSource`, `IsToolUntrusted`, `CacheStrategy`). `GetToolSource` returns `"core"` or the MCP server name; `IsToolUntrusted` reports whether a tool's output is from an untrusted source (`tool.IsUntrusted()` true **or** MCP source category) — driving the `<untrusted-content>` wrapping of observations. `CacheStrategy(ctx, name, input)` reports the cache mode the executor should use for a tool's result; a read tool opts into content-backed caching by implementing the optional `ContentBackedReader` interface, otherwise `CacheModeDefault` keeps the existing file-backed heuristic.
 
+The separate LLM-backed `ToolJudge` exposes two host-invoked modes. Advisory `Judge` may auto-allow internal/session-local calls and caches by tool, input, and session roots. `JudgeStrict(ctx, StrictJudgeRequest)` always evaluates the current task/source/input/environment/session-directory envelope with the LLM, applies no fast path or cache, and fail-safes every provider, timeout, construction, or parse failure to `VerdictConfirm`. Tool input and session-directory strings are wrapped as untrusted data in the strict JSON envelope.
+
 > **Breaking change (cache_mode):** `CacheStrategy` is a required method on the exported `agent.ToolExecutor` interface. External implementors (custom registries, wrappers, mocks) must add it — returning `tools.CacheModeDefault` preserves prior behavior. On the `Tool` side the capability remains optional via `ContentBackedReader`.
 
 ## Invariants
@@ -83,13 +87,14 @@ The executor calls the registry through the narrow `ToolExecutor` interface (`Ex
 - The registry is thread-safe (`sync.RWMutex`).
 - `Execute` is **fail-closed**: a `PolicyUserConfirm` tool with no `ConfirmFunc` configured is DENIED — mutating tools never execute silently.
 - A `PolicyAlwaysAllow` tool may implement `ToolJudger` to escalate a call to confirmation; a denied escalation is also fail-closed.
+- `ToolJudge.JudgeStrict` performs one independent LLM evaluation per invocation and always maps ambiguous or failed evaluation to `VerdictConfirm`.
 - An MCP tool may **not** shadow an already-registered non-MCP tool of the same name (`RegisterWithSourceCategory` errors; the legacy path logs and skips). A built-in tool can always replace an MCP tool; an MCP server re-registering its own tools is allowed.
 - MCP tools default to `PolicyUserConfirm` and always report `IsUntrusted() == true`.
 - Built-in untrusted tools set `Untrusted: true` on their `BaseTool`.
 
 ## Configuration
 
-Policy is set per tool at the engine level. Hosts are encouraged to resolve policy from the tool's capability **group** instead (c0wrk's ADR-024 pattern); the engine remains agnostic. To relax tools for non-interactive use:
+Policy is set per tool at the engine level. Hosts are encouraged to resolve policy from the tool's capability **group** instead of its name; the engine remains agnostic. To relax tools for non-interactive use:
 
 ```go
 registry.SetPolicyOverride("bash_exec", tools.PolicyAlwaysAllow) // deliberate opt-in

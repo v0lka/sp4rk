@@ -19,6 +19,8 @@ import "github.com/v0lka/sp4rk/orchestration"
   - [Cleanup](#cleanup)
   - [SetReasoningEffort](#setreasoningeffort)
   - [WithDelegationRegistry](#withdelegationregistry)
+  - [Resume with a user interjection](#resume-with-a-user-interjection)
+  - [Verify edits mechanically](#verify-edits-mechanically)
 - [Interfaces](#interfaces)
   - [Planner](#planner)
   - [Reflector](#reflector)
@@ -92,9 +94,15 @@ type ConductorConfig struct {
     PerToolTruncation map[string]agent.ToolTruncationConfig
     ReasoningEffort   string
     PreWarningPercent int
+    VerifyOnEdit agent.EditVerifyRunner
+    VerifyOnEditMaxOutputChars int
     NonCacheableTools []string
     ConversationHistory []llm.Message
-    ResumeSteps         []agent.Step
+    ResumeSteps []agent.Step
+    ContentBlocks []llm.ContentBlock
+    PendingUserInterjection string
+    PauseChecker func(context.Context) bool
+    UserMessageSource func(context.Context) string
 }
 ```
 
@@ -116,9 +124,15 @@ type ConductorConfig struct {
 | `PerToolTruncation` | Per-tool Stage 1 truncation configuration. |
 | `ReasoningEffort` | Reasoning effort passed to reasoning-capable models (e.g. `"low"`, `"medium"`, `"high"`). |
 | `PreWarningPercent` | Context-fill percentage that triggers a pre-compaction `store_fact` nudge. `0` disables it. |
+| `VerifyOnEdit` | Trusted, user-configured `agent.EditVerifyRunner`. Runs once after each LLM response group containing a successful `write_file`/`edit_file`; nil disables verification. |
+| `VerifyOnEditMaxOutputChars` | Rune-safe cap for the injected `[verify_on_edit]` output. `<= 0` selects `agent.DefaultVerifyOnEditCap` (4000). |
 | `NonCacheableTools` | Additional tool names whose results must not be cached (e.g. meta-tools whose output is inherently volatile). Extends the SDK-provided defaults. |
 | `ConversationHistory` | Prior user/assistant exchanges from the session. When non-empty, the Conductor injects it into the `ContextManager` so the LLM sees the dialogue leading up to the current message. Without this, a follow-up like "implement variant a" has no referent. |
 | `ResumeSteps` | Prior ReAct steps to resume from a checkpoint instead of starting fresh. When non-empty, `Run` seeds the `ContextManager` (via its `StepSeedable` capability) and the `Executor` (via `agent.WithResumeSteps`) with a defensive copy, so the step counter continues from `len(steps)+1` and the full trajectory syncs to the `TrajectoryStore`. The steps count against `MaxSteps`, not in addition to it. Requires a `StepSeedable` `ContextManager`; `Run` fails fast otherwise. Nil/empty (the default) is fully backward-compatible. |
+| `ContentBlocks` | Optional text/image blocks for a multimodal task. When non-empty, requires the optional `BlockTaskAware` path; providers render blocks ahead of plain content. |
+| `PendingUserInterjection` | One-shot resume nudge appended after seeded history as the final user message. Requires `InterjectionAware`; an `InterjectionConsumer` retires it only after a successful LLM response. Empty disables it. |
+| `PauseChecker` | Cooperative step-boundary pause callback. A true return becomes `ExecutionStatusPaused` with an empty output and preserved trajectory. Nil disables pause. |
+| `UserMessageSource` | Host-owned live-message source polled after pause at each boundary. One non-empty message is delivered in the next LLM request. Nil disables live steering. |
 
 ### NewConductor
 
@@ -171,9 +185,9 @@ Launches the Conductor's single ReAct loop for one task.
 
 **Returns**
 
-An `*ExecutionResult` whose `Status` is `ExecutionStatusSuccess`, `ExecutionStatusPartial` (the loop ended without finishing), or `ExecutionStatusFailed` (an error occurred). The returned `Blackboard` is the same instance passed in, now populated with any reflections recorded during the run.
+An `*ExecutionResult` whose `Status` is `ExecutionStatusSuccess`, `ExecutionStatusPartial` (the loop ended without finishing), `ExecutionStatusPaused` (a cooperative, resumable checkpoint), or `ExecutionStatusFailed` (an error occurred). A paused result preserves `Steps` and deliberately leaves `Output` empty rather than exposing the pause sentinel. The returned `Blackboard` is the same instance passed in, now populated with any reflections recorded during the run.
 
-`Run` returns an error only when the context factory or system prompt factory is missing, when `ResumeSteps` is set but the `ContextManager` does not implement `StepSeedable`, or when the underlying executor returns an error. A non-nil error is still accompanied by a non-nil `*ExecutionResult` carrying best-effort output.
+`Run` returns an error only when the context factory or system prompt factory is missing, when `ResumeSteps` is set but the `ContextManager` does not implement `StepSeedable`, or when the underlying executor returns an error. A non-nil error is still accompanied by a non-nil `*ExecutionResult` carrying best-effort output. `agent.ErrPaused` is mapped to `ExecutionStatusPaused`; callers may still use `errors.Is(err, agent.ErrPaused)` while resuming from `result.Steps`.
 
 ```go
 result, err := conductor.Run(ctx, step.Description, bb, availableTools, events, "sliding_window")
@@ -314,7 +328,7 @@ Creates a `ContextManager` for a new task step. `pruningOverrides`, when provide
 
 ### Optional ContextManager capabilities
 
-The Conductor type-asserts the `ContextManager` returned by the factory against four named capability interfaces and uses them when implemented (the SDK's `memory.ContextWindow` implements all four):
+The Conductor type-asserts the `ContextManager` returned by the factory against six named capability interfaces; the SDK's `memory.ContextWindow` implements all six:
 
 ```go
 // Receives the formatted task content (the user message).
@@ -322,28 +336,33 @@ type TaskAware interface {
     SetTask(task string)
 }
 
-// Receives prior conversation messages (previous user/assistant exchanges)
-// rendered before the current task content. Used when
-// ConductorConfig.ConversationHistory is set.
+// Receives a multimodal task when ConductorConfig.ContentBlocks is non-empty.
+type BlockTaskAware interface {
+    SetTaskWithBlocks(task string, blocks []llm.ContentBlock)
+}
+
+// Receives prior conversation messages (previous user/assistant exchanges).
 type ConversationAware interface {
     SetPriorConversation(msgs []llm.Message)
 }
 
-// Exposes the token tracker so API-reported token corrections can be wired
-// back into the context window's fill accounting.
+// Exposes the token tracker for API-reported count correction.
 type TrackerProvider interface {
     ContextTracker() *llm.ContextTokenTracker
 }
 
-// Receives prior ReAct steps to resume from a checkpoint. Asserted (and
-// required) only when ConductorConfig.ResumeSteps is set; Run fails fast if
-// the ContextManager does not implement it.
+// Receives prior ReAct steps when resuming. Required when ResumeSteps is set.
 type StepSeedable interface {
     SeedSteps(steps []agent.Step)
 }
+
+// Receives the one-shot resume nudge after seeded history.
+type InterjectionAware interface {
+    SetPendingUserInterjection(msg string)
+}
 ```
 
-A custom `ContextManager` that does not implement these interfaces still works — the corresponding features (task content injection, prior-conversation rendering, tracker correction) are simply skipped. The exception is `StepSeedable`: when `ResumeSteps` is set, the `ContextManager` **must** implement it or `Run` returns an error before the loop starts.
+A custom `ContextManager` that omits an optional capability still runs, and the corresponding feature is skipped. `StepSeedable` is the exception: when `ResumeSteps` is non-empty, `Run` fails fast if seeding is impossible. `InterjectionAware` accepts `PendingUserInterjection`; after a successful LLM response the executor calls `ConsumePendingUserInterjection()` through its separate `agent.InterjectionConsumer` capability. This consume-on-success split keeps the nudge present if the first call overflows context and is retried after reactive compaction.
 
 ### PruningOverride
 
@@ -371,6 +390,45 @@ type RetryScopable interface {
 ```
 
 When the orchestrator detects that an events object implements one of these, it wraps it so downstream handlers know which step or retry attempt produced each event.
+
+---
+
+## Resume with a user interjection
+
+Use `PendingUserInterjection` when resuming a paused/checkpointed run and the user has supplied a one-shot correction that must land next to the pending tool result:
+
+```go
+conductor := orchestration.NewConductor(orchestration.ConductorConfig{
+    LLM:                     router,
+    Tools:                   registry,
+    ToolRegistry:            registry,
+    ContextFactory:          contextFactory,
+    SystemPrompt:            systemPromptFactory,
+    MaxSteps:                25,
+    ResumeSteps:             checkpoint,
+    PendingUserInterjection: "Use approach B and keep the public API stable.",
+})
+
+result, err := conductor.Run(ctx, task, bb, registry.List(), events, "sliding_window")
+```
+
+The context manager appends the interjection as the **final** user message after `ResumeSteps`. It remains pending across prompt rebuilds and is consumed only after one successful LLM response, preventing a context-overflow/reactive-compaction retry from silently losing the correction. This differs from `UserMessageSource`, which is a host-owned queue polled throughout a currently running loop.
+
+## Verify edits mechanically
+
+Configure `VerifyOnEdit` with a trusted runner created from user/host settings, not from model text:
+
+```go
+conductor := orchestration.NewConductor(orchestration.ConductorConfig{
+    // ...required dependencies...
+    VerifyOnEdit: func(ctx context.Context) agent.EditVerifyResult {
+        return runConfiguredTests(ctx) // host implementation
+    },
+    VerifyOnEditMaxOutputChars: 6000,
+})
+```
+
+After a response group containing one or more successful `write_file`/`edit_file` calls, the executor invokes the runner once and appends a `[verify_on_edit]` note to the last observation. Failed or rejected edits do not trigger it. The note distinguishes test failure (positive exit code) from timeout, blocked/killed execution, or infrastructure failure; non-successful runs say that the edit was not verified. See [Agent Executor → Verify-on-edit](agent-executor.md#verify-on-edit) for the result contract and truncation behavior.
 
 ---
 
@@ -664,7 +722,7 @@ See [reflector.md](reflector.md) for how reflections are produced.
 
 ```go
 type Fact struct {
-    Keywords []string `json:"keywords"` // 3-5 keywords for retrieval
+    Keywords []string `json:"keywords"` // 3-10 keywords for retrieval
     Content  string   `json:"content"`  // the fact text
     Author   string   `json:"author"`   // step ID that wrote it
 }

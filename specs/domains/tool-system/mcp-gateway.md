@@ -6,7 +6,7 @@ Manages connections to external MCP (Model Context Protocol) servers, discovers 
 
 ## Key Files
 
-- `github.com/v0lka/sp4rk/tools/mcp` — `Gateway`, `GatewayConfig`, `ServerEntry`, `StartGateway`, `Server`, `Tool`, `SchemaSanitizer`, `ServerStatus`, error types (`StartError`/`StopError`/`ReconfigureError`)
+- `github.com/v0lka/sp4rk/tools/mcp` — `Gateway`, `GatewayConfig`, `ServerEntry`, `StartGateway`, `Server`, `ServerConfig`, `Server.ToolGroup`, `Tool`, `SchemaSanitizer`, `ServerStatus`, error types (`StartError`/`StopError`/`ReconfigureError`)
 - `github.com/v0lka/sp4rk/tools` — `ToolRegistry`, `RegisterWithSource`, `RegisterWithSourceCategory`, `UnregisterBySource`, `StripParamsFromSchema`
 - `github.com/v0lka/sp4rk/sysproc` — `HideConsole` (applied to the stdio subprocess so a GUI-subsystem host spawns no console window)
 
@@ -28,6 +28,7 @@ StartGateway(ctx, cfg, registry, expandEnv, logger)
 │        └─ on failure: collect error, continue with remaining servers
 ├─ 4. gateway.RegisterTools(registry):
 │      for each discovered tool:
+│        ├─ resolve the server group (valid override, else transport default)
 │        ├─ wrap as tools.Tool via NewTool
 │        └─ registry.RegisterWithSource(tool, serverName)
 └─ returns (nil, nil) when no servers are configured — safe to call unconditionally
@@ -44,11 +45,19 @@ StartGateway(ctx, cfg, registry, expandEnv, logger)
 
 For HTTP, the client first tries the **Streamable HTTP** transport and falls back to **SSE** (Server-Sent Events) if initialization fails — compatible with both modern and legacy MCP HTTP servers.
 
+### Capability-group derivation and override
+
+Every discovered tool receives the server's effective `tools.ToolGroup`. Without an override, `stdio` maps to `local_mcp` and `http` maps to `remote_mcp`. `ServerEntry.ToolGroupOverride` is forwarded through `StartGateway`/`Reconfigure` into `ServerConfig.ToolGroupOverride`; `Server.ToolGroup()` returns a valid, non-reserved override when present, otherwise the transport-derived group.
+
+Empty, unknown, and `system` overrides are ignored and the transport default applies. `Connect` logs a warning for a non-empty ignored value. The reserved `system` group is never available to an external server because it identifies host-trusted orchestration tools that bypass policy gates.
+
+Reconfiguration compares effective groups rather than raw override strings. A change that alters the effective group reconnects and re-registers the server so live descriptors change atomically; two raw values with the same effective group do not cause reconnect churn.
+
 For stdio, the subprocess is always built through a custom command factory that merges the allowlisted host environment (see [Stdio environment allowlist](#stdio-environment-allowlist-supply-chain-defense) below) with the configured `Env` (matching the transport's default merge), applies `WorkDir`/`DefaultWorkDir` when set, and calls `sysproc.HideConsole(cmd)` so a GUI-subsystem host application does not allocate a console window for the long-lived server process (`CREATE_NO_WINDOW` on Windows; no-op elsewhere). The factory is installed unconditionally — even when no `WorkDir` is set — so window suppression applies to every stdio server.
 
 ### Stdio environment allowlist (supply-chain defense)
 
-A stdio MCP server runs an arbitrary third-party command declared in config, so it is treated as untrusted by default. The subprocess inherits only an allowlisted subset of the host environment: `PATH`, `HOME`, `USER`, `SHELL`, `LANG`, `TERM`, `TMPDIR`, `TEMP`, `TMP`, and `LC_*` locale variables (`safeStdioEnv`). Host secrets — LLM API keys, proxy credentials — are never forwarded implicitly. Explicit `cfg.Env` entries are applied on top of the allowlist and always win, so a host that wants to pass a secret to a server declares it explicitly, and one that wants stricter isolation (e.g. to block `~/.aws/credentials` reads via `HOME`) can override `HOME` through `cfg.Env`.
+A stdio MCP server runs an arbitrary third-party command declared in config, so it is treated as untrusted by default. The subprocess inherits only an allowlisted subset of the host environment (`safeStdioEnv`): `PATH`, `HOME`, `USER`, `SHELL`, `USERPROFILE`, `LANG`, `TERM`, `TMPDIR`, `TEMP`, `TMP`, `APPDATA`, `LOCALAPPDATA`, `SYSTEMROOT`, `COMSPEC`, `PATHEXT`, the proxy variables (`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`/`ALL_PROXY` in both cases, with embedded credentials stripped), CA trust anchors (`SSL_CERT_FILE`, `SSL_CERT_DIR`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`), Python venv/conda activation (`VIRTUAL_ENV`, `CONDA_*`), and `LC_*` locale variables. Host secrets — LLM API keys, proxy credentials — are never forwarded implicitly. Explicit `cfg.Env` entries are applied on top of the allowlist and always win, so a host that wants to pass a secret to a server declares it explicitly, and one that wants stricter isolation (e.g. to block `~/.aws/credentials` reads via `HOME`) can override `HOME` through `cfg.Env`.
 
 ### Environment variable expansion
 
@@ -58,6 +67,7 @@ A stdio MCP server runs an arbitrary third-party command declared in config, so 
 
 After connecting, each server is queried with `tools/list`. Returned tools become `ToolInfo` records wrapped by `NewTool` into a `Tool` implementing `tools.Tool`, and registered with the server name as `Source`. From the executor's perspective, MCP tools are indistinguishable from built-in tools. Every MCP tool wrapper has fixed behaviors:
 
+- `Group()` → the server's effective group: valid non-`system` override, otherwise `local_mcp` for stdio or `remote_mcp` for http.
 - `DefaultPolicy()` → `PolicyUserConfirm` (conservative default — remote, opaque tools).
 - `IsUntrusted()` → always `true` (output from external servers may be adversarial).
 - `Judge()` → always a zero `JudgeOutcome` ("no tool-specific concern"; the gateway cannot inspect remote semantics, so it offers no heuristic of its own).
@@ -69,7 +79,7 @@ After connecting, each server is queried with `tools/list`. Returned tools becom
 
 ### Reconfigure
 
-`Gateway.Reconfigure(ctx, newConfig, registry, expandEnv)` updates server connections based on a new config while preserving unchanged connections: removed servers are unregistered (`UnregisterBySource`) and closed; added servers are connected/discovered/registered; changed servers get a fresh connection; unchanged servers are left alive. Config comparison uses the *expanded* config.
+`Gateway.Reconfigure(ctx, newConfig, registry, expandEnv)` updates server connections based on a new config while preserving unchanged connections: removed servers are unregistered (`UnregisterBySource`) and closed; added servers are connected/discovered/registered; changed servers get a fresh connection; unchanged servers are left alive. Config comparison uses the *expanded* config and the effective tool group, so only a group change visible to registered tools forces reconnect.
 
 ### Status & introspection
 
@@ -89,7 +99,8 @@ MCP failures are **non-fatal** — a single broken server never prevents the age
 
 - MCP gateway failure is non-fatal (the application runs without MCP tools).
 - MCP tools always have source tag `<server_name>` and `SourceCategory == MCP`.
-- MCP tools default to `PolicyUserConfirm` and always report `IsUntrusted() == true`.
+- MCP tools default to `PolicyUserConfirm`, always report `IsUntrusted() == true`, and always carry a declared effective group.
+- Stdio servers default to `local_mcp`; HTTP servers default to `remote_mcp`; only a valid non-`system` override replaces that mapping.
 - An MCP tool may never shadow an already-registered non-MCP tool; an MCP server re-registering its own tools is allowed.
 - `Reconfigure` is additive/preserving: unchanged servers are not reconnected.
 - `Stop` always attempts graceful close.

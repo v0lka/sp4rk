@@ -14,7 +14,8 @@ Beyond the [`Tool` interface](tools.md) and the [policy/Judger enforcement](tool
   - [JudgeVerdict](#judgeverdict)
   - [NewToolJudge](#newtooljudge)
   - [JudgeConfig and NewToolJudgeFromConfig](#judgeconfig-and-newtooljudgefromconfig)
-  - [How judgment works](#how-judgment-works)
+  - [How advisory judgment works](#how-advisory-judgment-works)
+  - [Strict gate resolution](#strict-gate-resolution)
 - [File coherence](#file-coherence)
   - [FileCoherenceChecker](#filecoherencechecker)
   - [FileSig and CoherenceConflict](#filesig-and-coherenceconflict)
@@ -95,7 +96,7 @@ func NewToolJudgeFromConfig(cfg JudgeConfig, logger *slog.Logger) *ToolJudge
 
 `NewToolJudgeFromConfig` returns `nil` (and logs a warning) when `Provider` is unset or no model can be resolved. Callers should treat a `nil` `*ToolJudge` as "judging disabled" — always nil-check before calling `Judge`.
 
-### How judgment works
+### How advisory judgment works
 
 ```go
 func (j *ToolJudge) Judge(ctx context.Context, toolName string, input json.RawMessage, taskContext string) (JudgeVerdict, string, error)
@@ -130,7 +131,50 @@ The parser accepts the following variations and is **case-insensitive** througho
 
 The verdict value is matched on **whole tokens** (case-insensitive), so `ALLOW` is recognized but a token merely *containing* `allow` (e.g. a path, argument, or the negated compound `DISALLOW`) is not. Only these whole tokens map to `VerdictAllow` (the set that bypasses confirmation): `ALLOW`, `ALLOWED`, `APPROVE`, `APPROVED`, `SAFE`. The explicit confirm set (`CONFIRM`, `CONFIRMED`, `DENY`, `DENIED`, `BLOCK`, `BLOCKED`, `DISALLOW`, `DISAPPROVE`, `REJECT`, `MANUAL`) and any unrecognized token all map to `VerdictConfirm` — negated compounds are listed explicitly so they can never be misread as their affirmative base. A response that cannot be parsed at all is a total parse failure — the fail-safe applies and the judge returns `VerdictConfirm`.
 
-> **Tip:** the verdict cache is keyed on `tool+input+session roots` — not on `taskContext`. If your `taskContext` changes the safety assessment of the same call, the cached verdict from a prior task within the same directory scope will be reused. Keep judge prompts focused on the *intrinsic* safety of the input, not on transient task context.
+> **Tip:** the advisory verdict cache is keyed on `tool+input+session roots` — not on `taskContext`. If your `taskContext` changes the safety assessment of the same call, the cached verdict from a prior task within the same directory scope will be reused. Keep advisory prompts focused on the *intrinsic* safety of the input, not on transient task context.
+
+### Strict gate resolution
+
+`JudgeStrict` is the conservative API for attempting to resolve an existing **soft** user-confirmation gate automatically:
+
+```go
+type StrictJudgeRequest struct {
+    ToolName    string
+    Input       json.RawMessage
+    TaskContext string
+    ToolSource  string
+}
+
+func (j *ToolJudge) JudgeStrict(
+    ctx context.Context,
+    request StrictJudgeRequest,
+) (JudgeVerdict, string, error)
+```
+
+It differs deliberately from advisory `Judge`:
+
+- every call reaches the LLM — there is no internal-tool bypass, session-root allow fast path, or verdict cache;
+- the current task, tool source, input, compact environment, and session directories are serialized into a structured JSON envelope;
+- tool input and host-provided directory data are wrapped as untrusted content, and directory line separators are sanitized;
+- the strict system prompt covers agentic risks and requests a machine-readable JSON verdict;
+- request construction failure, a missing provider, timeout/provider failure, nil response, or an unparseable response all fail safe to `VerdictConfirm`;
+- provider errors are not logged because they may echo sensitive tool arguments.
+
+A strict allow verdict may resolve a scope-related **soft** escalation such as path containment. It does not override a **hard** security control such as a shell blacklist match or SSRF finding; hosts use `ConfirmationRequest.JudgeSeverity` to keep those gates manual. Strict results are intentionally never cached because the same tool input can have a different answer under a different task, source, environment, or session scope.
+
+```go
+verdict, reason, err := judge.JudgeStrict(ctx, tools.StrictJudgeRequest{
+    ToolName:    req.ToolName,
+    Input:       req.Input,
+    TaskContext: currentTask,
+    ToolSource:  req.ToolSource,
+})
+if err != nil || verdict != tools.VerdictAllow {
+    // keep the existing confirmation gate
+}
+```
+
+> **Migration note:** use `Judge` for advisory auto-approval where its documented fast paths and cache are acceptable. Use `JudgeStrict` only after a tool/policy has already requested confirmation and only when the escalation severity is soft.
 
 ---
 
@@ -321,13 +365,19 @@ The judge fast-paths and the symlink detector both need to pull path-like tokens
 ```go
 func ExtractPaths(s string) []string
 func ExtractJSONStrings(data any) []string
-func AllPathsInDir(input json.RawMessage, dir string) bool
+func HasRelativeEscape(s string) bool
+func UnresolvablePathTokens(command string, shell ShellKind) []string
+func ExistingOrAnchoredPaths(paths []string) []string
+func AllPathsInDir(ctx context.Context, input json.RawMessage, dir string) bool
 func AllPathsInWorkspace(ctx context.Context, input json.RawMessage) bool
 func AllPathsInSessionRoots(ctx context.Context, input json.RawMessage) bool
 ```
 
 - `ExtractPaths` — finds absolute POSIX-style and Windows drive-letter paths (`/usr/bin`, `C:\foo\bar`) in a string via a regex. A `/` that follows a path-component character is treated as a **separator inside a relative path** (e.g. the `/src` in `frontend/src/main.tsx`), not the start of an absolute one — so embedded relative paths are not misread as absolute escapes. Windows drive-letter alternatives (`C:\…`) start with a letter and are unaffected.
 - `ExtractJSONStrings` — recursively collects every string value from a `json.Unmarshal` result (maps, slices, strings).
+- `HasRelativeEscape` — detects a `..` path segment inside relative text (`../foo`, `a/../../etc`), while ignoring ellipses and names such as `..config`. Containment checks fail closed when it returns true instead of letting relative escapes disappear from absolute-path extraction.
+- `UnresolvablePathTokens` — returns shell path expressions that conservative resolution cannot safely expand, notably Bash `~user` and path-bearing `${VAR<operator>...}` forms. It complements `ResolveShellPathTokens` for security assessment; PowerShell's supported forms are resolved directly and yield no such tokens.
+- `ExistingOrAnchoredPaths` — retains paths that exist or whose nearest existing ancestor is below the filesystem root (including new write targets in a real directory). Wholly fabricated subtrees anchored only at the volume root are dropped; permission/unknown errors are retained fail-safe.
 - `AllPathsInDir` — returns `true` only if the input contains **at least one** absolute path **and every** such path is within `dir` (via `pathutil.IsWithinPath`). Empty/`""` when there are no paths. Harmless special-device paths (`/dev/null`, `/dev/full`; `NUL` on Windows) are exempted via `IsHarmlessDevicePath` so they do not force a confirmation when they appear alongside in-root paths.
 - `AllPathsInWorkspace` — `AllPathsInDir` bound to the workspace path from context.
 - `AllPathsInSessionRoots` — the canonical containment check consulted by the judge fast-path: returns `true` only if the input contains at least one absolute path and every such path is within at least one session root (`SessionRoots(ctx)`, the union of workspace + temp directory + `WithAllowedRoots` roots). Harmless special-device paths are exempted via `IsHarmlessDevicePath`, so `/dev/null`/`/dev/full`/`NUL` do not force a confirmation.

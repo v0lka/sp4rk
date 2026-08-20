@@ -48,7 +48,7 @@ host application: reads ExecutionResult, persists state, updates UI
 
 `orchestration.Conductor.Run` is a **thin primitive**, not the pipeline driver. It builds one `ContextManager` and one `Executor`, calls `Executor.Run` exactly once, maps the result onto an `ExecutionStatus`, and returns an `ExecutionResult` — it performs no classification, planning, DAG iteration, or reflection. The classify/plan/execute/reflect/replan coordination above is owned by the root `TaskBuilder`, which calls `Conductor.Run` once per task (single-step) or once per ready step (multi-step). This matches [ADR-005](../decisions/005-conductor-orchestration-pipeline.md): *Conductor = a single `Executor.Run` that owns a task end-to-end*.
 
-The five `ExecutionStatus` values are: `success` (loop finished), `partial` (step budget exhausted without finishing), `failed` (error), `cancelled` (context cancelled), and `aborted` (the root layer halts after the reflector recommends abort). `Conductor.Run` itself returns `success` / `partial` / `failed` / `cancelled`; `aborted` is derived by the `TaskBuilder`'s terminal-status logic.
+The six `ExecutionStatus` values are: `success` (loop finished), `partial` (step budget exhausted without finishing), `failed` (error), `cancelled` (context cancelled), `paused` (cooperative step-boundary checkpoint), and `aborted` (the root layer halts after the reflector recommends abort). `Conductor.Run` itself returns `success` / `partial` / `failed` / `cancelled` / `paused`; `aborted` is derived by the `TaskBuilder`'s terminal-status logic.
 
 ## Entry Points
 
@@ -65,18 +65,25 @@ The `Executor` (in `github.com/v0lka/sp4rk/agent`) runs a Reason → Act → Obs
 
 ```
 ┌──────────────────────────────────────────────────┐
-│  1. ContextManager.BuildPrompt()                 │
-│  2. LLMCaller.Call(ctx, ChatRequest)             │
+│  1. Check cancellation → cooperative pause       │
+│     → poll one live user message                 │
+│  2. ContextManager.BuildPrompt()                 │
+│     └─ pending resume interjection is final user │
+│  3. LLMCaller.Call(ctx, ChatRequest)             │
 │      └─ llm.Router → active provider/model       │
-│  3. Parse response → Thought + ToolCall(s)       │
-│  4. HITLHandler.OnToolCall() (if configured)     │
+│      └─ success consumes pending interjection;   │
+│         context-window failure compacts + retries│
+│  4. Parse response → Thought + ToolCall(s)       │
+│  5. HITLHandler.OnToolCall() (if configured)     │
 │      └─ may confirm / modify / reject            │
-│  5. ToolExecutor.Execute() → tools.ToolRegistry  │
-│  6. Record Observation in the Step               │
-│     └─ set Step.IsUntrusted from Tool.IsUntrusted│
-│  7. ContextManager.AddStep()                     │
-│  8. CheckFill() → maybe Compact()                │
-│  9. Check circuit breakers → maybe nudge/abort   │
+│  6. ToolExecutor.Execute() → tools.ToolRegistry  │
+│  7. After a dirty response group, run one        │
+│     configured verify-on-edit command            │
+│  8. Record Observation in the Step               │
+│     └─ trust flag + optional [verify_on_edit] note│
+│  9. ContextManager.AddStep()                     │
+│ 10. CheckFill() → maybe Compact()                │
+│ 11. Check circuit breakers → maybe nudge/abort   │
 └──────────────────────────────────────────────────┘
             │
             ▼
@@ -107,11 +114,14 @@ type Step struct {
 }
 ```
 
-The loop terminates in one of three ways:
+The loop terminates in one of four ways:
 
 1. **Finish** — the agent calls the `finish` tool. `ExecutorResult.Finished` is `true`; `ExecutionResult.Status` is `"success"`.
 2. **Budget exhausted** — `MaxSteps` iterations complete without a finish call. `HITLHandler.OnStepLimit` decides whether to grant more steps or stop. If denied, `Finished` is `false` and `Status` is `"partial"`.
 3. **Circuit breaker** — consecutive identical calls, parse errors, truncation, or fruitless results trip an abort threshold, stopping the loop early.
+4. **Cooperative pause** — the pause checker fires before the live-message poll at a step boundary. The executor returns `ErrPaused` plus the completed trajectory; the Conductor maps it to `"paused"`, preserves empty output, and leaves the host queue undrained for resume.
+
+A resumed run may seed both prior `Step` values and `PendingUserInterjection`. The interjection remains the final user turn through reactive-compaction retries and is consumed only after one LLM response succeeds. Independently, verify-on-edit runs a host-configured command once per response group containing a successful `write_file`/`edit_file`; its capped note is part of the observation and is flushed before finish/pause.
 
 ## Plan & Execute Flow
 
@@ -237,7 +247,7 @@ The `Blackboard` is the thread-safe shared state for a Plan&Execute run:
 root TaskBuilder — a Plan&Execute run
   │  (Conductor.Run is the single Executor.Run inside each step)
   │
-  ├─ Receives/creates Blackboard (MapBlackboard, or PersistentBlackboard
+  ├─ Receives/creates Blackboard (MapBlackboard, or CheckpointedBlackboard
   │   wrapping a store + Checkpointer)
   │
   ├─ Stores the Plan on the Blackboard
@@ -263,6 +273,8 @@ Steps communicate through the blackboard: one step can `StoreFact` with keywords
 - A `Blackboard` is per-task, lifecycle-tied to a single run; it is never shared across tasks.
 - Parallel steps run in separate subagent goroutines with their own `Executor` and `ContextManager`, coordinated only through the shared `Blackboard`.
 - Tool execution is fail-closed for `PolicyUserConfirm` tools when no `ConfirmFunc` is configured.
+- At every executor boundary, pause is evaluated before a live user-message source; a paused checkpoint never consumes the next queued message.
+- A pending resume interjection is retired only after successful LLM delivery, and a pending post-edit verification is flushed before terminal or paused control returns to the host.
 
 ## Anti-Patterns
 

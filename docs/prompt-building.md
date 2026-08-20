@@ -191,9 +191,12 @@ The package also provides `SamplingConfig` and `DefaultSampling` for family-awar
 
 ```go
 type SamplingConfig struct {
-    Temperature *float64
-    TopP        *float64
-    MaxTokens   *int
+    Temperature       *float64
+    TopP              *float64
+    TopK              *int
+    RepetitionPenalty *float64
+    PresencePenalty   *float64
+    MaxTokens         *int
 }
 ```
 
@@ -203,17 +206,20 @@ Pointer fields indicate "set" vs "unset": `nil` means no override.
 cfg := prompt.DefaultSampling("anthropic") // all nil — let the model self-select
 cfg = prompt.DefaultSampling("google")      // Temperature: 1.0
 cfg = prompt.DefaultSampling("deepseek")    // Temperature: 0.0 (coding/math)
-cfg = prompt.DefaultSampling("qwen")        // Temperature: 0.6 (reasoning)
+cfg = prompt.DefaultSampling("qwen")        // Temperature: 0.6, TopP: 0.95, TopK: 20
 ```
 
 | Family | Default |
 | --- | --- |
 | `anthropic` | all nil (model self-selects) |
-| `openai_flagship`, `openai_standard` | Temperature 0.3 |
+| `openai_flagship`, `openai_standard` | Temperature 0.3 (reasoning members are filtered by model capability) |
+| `openai_codex` | all nil (Responses reasoning models reject overrides) |
 | `google` | Temperature 1.0 (low values cause looping) |
-| `mistral` | Temperature 0.3 |
+| `mistral` | all nil (use server default 0.7) |
 | `deepseek` | Temperature 0.0 (coding/math; ignored when thinking enabled) |
-| `qwen` | Temperature 0.6 (reasoning/analytical) |
-| `glm` | Temperature 0.2 (analytical/coding) |
+| `qwen` | Temperature 0.6, TopP 0.95, TopK 20 |
+| `glm` | Temperature 1.0, TopP 0.95, TopK 40 |
 | `kimi` | all nil (server enforces per model) |
 | default | Temperature 0.5, TopP 0.95 |
+
+`SamplingConfig` is converted by the host into `llm.SamplingDefaults` for `RouterConfig.SamplingFunc`. The router applies the full preset only to executor/default-purpose calls. Routing, compaction, and summarization calls use `llm.DeterministicTemperature` instead (temperature-only, with Google/Qwen safe floors), and each provider filters unsupported fields before serialization. See [LLM Providers → Purpose-aware sampling](llm-providers.md#purpose-aware-sampling).

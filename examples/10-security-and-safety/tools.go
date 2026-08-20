@@ -120,8 +120,8 @@ func (t *appendLogTool) Execute(_ context.Context, input json.RawMessage) (tools
 	return tools.ToolResult{Content: "appended 1 line to " + in.Path}, nil
 }
 
-// runSecurityDemos exercises both mechanisms DETERMINISTICALLY — no LLM, no API
-// key required — so the defense is always visible regardless of model behavior.
+// runSecurityDemos exercises all three mechanisms DETERMINISTICALLY — no LLM,
+// API key, or network request required — so the defenses are always visible.
 func runSecurityDemos() {
 	ctx := context.Background()
 	workspace, err := os.MkdirTemp("", "sp4rk-security-demo-*")
@@ -158,5 +158,21 @@ func runSecurityDemos() {
 	inRes, _ := registry.Execute(ctx, "append_log",
 		json.RawMessage(fmt.Sprintf(`{"path":%q,"line":"ok"}`, filepath.Join(workspace, "app.log"))))
 	fmt.Printf("  in-workspace     -> %q (isError=%v)\n", inRes.Content, inRes.IsError)
+
+	// ── (c) Central strict judge fail-safe ──
+	// JudgeStrict is the LLM-backed gate a host can use when a confirmation
+	// request may be auto-resolved. A missing provider never degrades to ALLOW:
+	// it deterministically requires manual confirmation without making a
+	// network call. Supplying a provider makes every request receive a fresh,
+	// context-aware evaluation (strict mode deliberately has no verdict cache).
+	fmt.Println("\n═══════ (c) Central strict judge fail-safe ═══════")
+	strictJudge := tools.NewToolJudge(nil, "", 0, nil)
+	verdict, reason, err := strictJudge.JudgeStrict(ctx, tools.StrictJudgeRequest{
+		ToolName:    "append_log",
+		Input:       json.RawMessage(`{"path":"/etc/passwd","line":"blocked"}`),
+		TaskContext: "Append one diagnostic line inside the workspace",
+		ToolSource:  "core",
+	})
+	fmt.Printf("  provider unavailable -> verdict=%v reason=%q err=%v\n", verdict, reason, err)
 	fmt.Println()
 }

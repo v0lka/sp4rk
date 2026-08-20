@@ -45,8 +45,13 @@ type ConductorConfig struct {
     ReasoningEffort     string
     PreWarningPercent   int
     NonCacheableTools   []string
-    ConversationHistory []llm.Message
-    ResumeSteps         []agent.Step
+    ConversationHistory       []llm.Message
+    ResumeSteps               []agent.Step
+    PendingUserInterjection   string
+    PauseChecker              func(context.Context) bool
+    UserMessageSource         func(context.Context) string
+    VerifyOnEdit              agent.EditVerifyRunner
+    VerifyOnEditMaxOutputChars int
 }
 
 // Shared, thread-safe container for all task state.
@@ -80,7 +85,7 @@ type Plan struct {
 }
 
 // Typed terminal outcome — callers consult Status instead of parsing Output.
-type ExecutionStatus string // "success" | "partial" | "failed" | "aborted" | "cancelled"
+type ExecutionStatus string // "success" | "partial" | "failed" | "aborted" | "cancelled" | "paused"
 
 type ExecutionResult struct {
     Output       string
@@ -114,7 +119,10 @@ HandleRequest(ctx, message, bb, availableTools)
 │      │  planning, interaction, and reflection tools built atop these primitives.
 │      │
 │      ├─ reads state from the blackboard (facts, step outputs, plan)
+│      ├─ consumes resume steps and an optional pending user interjection
+│      ├─ polls pause and live-message hooks at each step boundary
 │      ├─ calls the Executor's tools (filesystem, search, web, …)
+│      ├─ runs configured post-edit verification after successful file edits
 │      └─ finish ends the task with a final answer
 │
 └─ 5. Return ExecutionResult { Status, Output, Blackboard }
@@ -132,7 +140,7 @@ The Conductor is the only top-level execution entry point this domain exposes. D
 - The Conductor's `finish`-join guard rejects `finish` while a `PendingDelegations` registry (injected via `WithDelegationRegistry`) reports pending async work.
 - The blackboard is created once per first request and restored for continuations via a `Checkpointer`.
 - The `finish` tool is always available in every run (appended automatically if absent).
-- A `ContextManager` returned by the factory that implements `TaskAware`/`BlockTaskAware`/`ConversationAware`/`TrackerProvider`/`StepSeedable` gets the corresponding capabilities wired; otherwise they are safely skipped, except `StepSeedable` which is required when `ResumeSteps` is set (else `Run` fails fast).
+- A `ContextManager` returned by the factory that implements `TaskAware`/`BlockTaskAware`/`ConversationAware`/`TrackerProvider`/`StepSeedable`/`InterjectionAware` gets the corresponding capabilities wired; otherwise they are safely skipped, except `StepSeedable` which is required when `ResumeSteps` is set (else `Run` fails fast). The executor consumes a pending interjection through `agent.InterjectionConsumer` only after a successful LLM response.
 
 ## Configuration
 
@@ -145,6 +153,10 @@ The Conductor is the only top-level execution entry point this domain exposes. D
 | `PreWarningPercent` | `0` (disabled) | Context-fill percentage that triggers a pre-compaction `store_fact` nudge. |
 | `CircuitBreaker` | `DefaultCircuitBreakerConfig()` | Loop-protection thresholds (see [executor.md](executor.md)). |
 | `ResumeSteps` | `nil` | Prior ReAct steps to resume from a checkpoint. When non-empty, `Run` seeds the `ContextManager` (via `StepSeedable`) and the `Executor` (via `WithResumeSteps`); the steps count against `MaxSteps`. Requires a `StepSeedable` `ContextManager` (see [conductor.md](conductor.md)). |
+| `PendingUserInterjection` | `""` | One-shot resume nudge appended after seeded history; retained through reactive-compaction retries and consumed after the first successful LLM response. |
+| `PauseChecker` / `UserMessageSource` | `nil` | Optional step-boundary callbacks. Pause is checked first; one live message is polled only when the run continues. |
+| `VerifyOnEdit` | `nil` | User-configured verifier run once per response group containing a successful `write_file`/`edit_file`; nil disables it. |
+| `VerifyOnEditMaxOutputChars` | `<= 0` → `4000` | Unicode-safe cap for the injected verification output. |
 | `ConversationHistory` | `nil` | Prior conversation messages (previous exchanges) rendered before the current task via the `ConversationAware` capability. |
 | `ContentBlocks` | `nil` | Structured content blocks (text + images) for the task user message. When non-empty, `Run` calls `SetTaskWithBlocks` via the `BlockTaskAware` capability so providers render a multimodal user message; `nil`/empty preserves the legacy text-only `SetTask` path. |
 | `ContextFactory` / `SystemPrompt` | required | Both must be non-nil or `Run` returns an error. |

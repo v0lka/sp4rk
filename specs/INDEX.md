@@ -7,6 +7,8 @@
 | sp4rk package layers, import rules                            | [architecture/layers.md](architecture/layers.md)                                |
 | Request lifecycle inside the engine                           | [architecture/data-flow.md](architecture/data-flow.md)                          |
 | Tool policies, confirmations, judge                           | [architecture/security-model.md](architecture/security-model.md)                |
+| Tool capability groups, MCP group overrides, agent tool budgets | [contracts/tools.md](contracts/tools.md), [domains/tool-system/README.md](domains/tool-system/README.md), [domains/tool-system/mcp-gateway.md](domains/tool-system/mcp-gateway.md), [domains/agents.md](domains/agents.md) |
+| Strict/session-aware ToolJudge evaluation                      | [architecture/security-model.md](architecture/security-model.md), [contracts/tools.md](contracts/tools.md), [domains/tool-system/README.md](domains/tool-system/README.md) |
 | Prompt-injection defense, untrusted-content wrapping          | [architecture/security-model.md](architecture/security-model.md)                |
 | Orchestration overview (Conductor pipeline)                   | [domains/orchestration/README.md](domains/orchestration/README.md)              |
 | Conductor (runs a task end-to-end)                            | [domains/orchestration/conductor.md](domains/orchestration/conductor.md)        |
@@ -16,6 +18,8 @@
 | Failure analysis, retry/replan/abort                          | [domains/orchestration/reflector.md](domains/orchestration/reflector.md)        |
 | Subagent delegation, parallel steps                           | [domains/orchestration/subagents.md](domains/orchestration/subagents.md)        |
 | Resuming execution from a checkpoint (ResumeSteps, SeedSteps) | [domains/orchestration/conductor.md](domains/orchestration/conductor.md), [domains/orchestration/executor.md](domains/orchestration/executor.md), [domains/memory/README.md](domains/memory/README.md) |
+| Cooperative pause, live user messages, resume interjections    | [architecture/data-flow.md](architecture/data-flow.md), [domains/orchestration/conductor.md](domains/orchestration/conductor.md), [domains/orchestration/executor.md](domains/orchestration/executor.md), [domains/memory/README.md](domains/memory/README.md) |
+| Post-edit verification after write_file/edit_file              | [contracts/agent-execution.md](contracts/agent-execution.md), [domains/orchestration/executor.md](domains/orchestration/executor.md), [domains/orchestration/conductor.md](domains/orchestration/conductor.md) |
 | Tool registry, execution pipeline                             | [domains/tool-system/README.md](domains/tool-system/README.md)                  |
 | Tool-result caching, file-backed vs content-backed modes      | [domains/orchestration/executor.md](domains/orchestration/executor.md), [domains/tool-system/README.md](domains/tool-system/README.md) |
 | Adding/modifying built-in tools                               | [domains/tool-system/builtins.md](domains/tool-system/builtins.md)              |
@@ -24,6 +28,7 @@
 | Context window, compaction strategies                         | [domains/memory/compaction.md](domains/memory/compaction.md)                    |
 | Blackboard, shared state, facts, attachments                  | [domains/memory/blackboard.md](domains/memory/blackboard.md)                    |
 | LLM providers, router, model registry, tokens                 | [domains/llm-providers.md](domains/llm-providers.md)                            |
+| Purpose-aware sampling and provider parameter filtering       | [contracts/llm-providers.md](contracts/llm-providers.md), [domains/llm-providers.md](domains/llm-providers.md), [domains/prompt-building.md](domains/prompt-building.md) |
 | Multi-protocol routing (Responses/Anthropic/Google/Chat), multimodal content blocks | [domains/llm-providers.md](domains/llm-providers.md)                            |
 | Skill system, activation, resources                           | [domains/skills.md](domains/skills.md)                                          |
 | Subagent Profiles, AGENT.md discovery, per-agent model/tools  | [domains/agents.md](domains/agents.md)                                          |

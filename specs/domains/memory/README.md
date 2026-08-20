@@ -6,7 +6,7 @@ Manages the agent's working memory during execution: a managed representation of
 
 ## Key Files
 
-- `github.com/v0lka/sp4rk/memory` — `ContextWindow`, `ContextWindowConfig`, `NewContextWindow`, `BuildPrompt`/`AddStep`/`SeedSteps`/`Compact`/`CheckFill`
+- `github.com/v0lka/sp4rk/memory` — `ContextWindow`, `ContextWindowConfig`, `NewContextWindow`, `BuildPrompt`/`AddStep`/`SeedSteps`/`SetPendingUserInterjection`/`ConsumePendingUserInterjection`/`Compact`/`CheckFill`
 - `github.com/v0lka/sp4rk/memory` (compaction) — `CompactionStrategy` implementations (`SlidingWindowStrategy`, `SummarizationStrategy`, `HierarchicalStrategy`), `NewCompactionStrategy` factory, `CompactionConfig`, `CompactionDeps`
 - `github.com/v0lka/sp4rk/memory` — `CompactionThresholds`, `ToolOutputPruning`, `HistoryMutation`
 - `github.com/v0lka/sp4rk/security` — untrusted-content wrapping for tool output
@@ -63,6 +63,8 @@ Executor.Run iteration
 
 History mutation runs on **every** `BuildPrompt` (unconditionally), and tool-output pruning runs on every `BuildPrompt` once fill reaches the `Pruning.ThresholdPercent` floor (default `50`) — neither depends on the `CheckFill` status. Evicted content is preserved via the `agent.ToolResultCache` (recoverable via a `tool_result_read` tool).
 
+When `SetPendingUserInterjection` holds a resume nudge, every `BuildPrompt` appends it as the final user message after the seeded step history. Prompt construction does not consume it: the executor calls `ConsumePendingUserInterjection` only after an LLM response succeeds. Therefore a context-window error followed by compaction and a second `BuildPrompt` retains the same nudge, while later successful turns do not repeat it.
+
 ### Content wrapping for untrusted tools
 
 When `InjectionDefenseEnabled` is `true`, tool outputs from untrusted sources (flagged via the step's `IsUntrusted`) are wrapped in `<untrusted-content>` tags before becoming an LLM message. Wrapping happens after pruning/mutation and before message construction — the last point before content reaches the LLM API.
@@ -76,6 +78,7 @@ When `InjectionDefenseEnabled` is `true`, tool outputs from untrusted sources (f
 - Entire response groups are protected if any step in the group is protected (prevents malformed assistant/tool message pairs).
 - Each step/subagent has its own `ContextManager` (no sharing between parallel steps).
 - `SeedSteps` wholesale-replaces the step history: it clears compaction state and recalculates the token-tracker delta for the batch, so fill accounting stays correct until the next `CorrectTokenCount`.
+- A non-empty pending user interjection remains the final prompt message across repeated builds and is cleared only by explicit `ConsumePendingUserInterjection` after successful delivery.
 
 ## Configuration
 
@@ -106,7 +109,7 @@ When `InjectionDefenseEnabled` is `true`, tool outputs from untrusted sources (f
 - **Custom thresholds / pruning**: override compaction trigger percentages and `KeepLastN`/`ProtectedTools`.
 - **Alternative token counter**: swap the `llm.TokenCounter` implementation; the `ContextTokenTracker` corrects estimates with API-reported actuals.
 - **Per-step pruning overrides**: `PruningOverride` (carried through `ContextManagerFactory`) lets a step supply its own `KeepLastN`/`ProtectedTools`.
-- **Optional `ContextManager` capabilities**: `TaskAware` (`SetTask`), `BlockTaskAware` (`SetTaskWithBlocks`), `ConversationAware` (`SetPriorConversation`), `TrackerProvider` (`ContextTracker`), and `StepSeedable` (`SeedSteps`) are type-asserted by the Conductor and wired when implemented. `BlockTaskAware` carries structured content blocks (text + images) for a multimodal user message — `BuildPrompt` emits a `Message` with `ContentBlocks` and `NormalizeContentBlocks` prepends the task text when the blocks lack a text block. `SeedSteps` wholesale-replaces the step history and clears compaction state, enabling resume from a checkpoint; it is required when the Conductor's `ResumeSteps` is set.
+- **Optional `ContextManager` capabilities**: `TaskAware` (`SetTask`), `BlockTaskAware` (`SetTaskWithBlocks`), `ConversationAware` (`SetPriorConversation`), `TrackerProvider` (`ContextTracker`), `StepSeedable` (`SeedSteps`), orchestration `InterjectionAware` (`SetPendingUserInterjection`), and agent `InterjectionConsumer` (`ConsumePendingUserInterjection`) are type-asserted by the Conductor/executor and wired when implemented. `BlockTaskAware` carries structured content blocks (text + images) for a multimodal user message — `BuildPrompt` emits a `Message` with `ContentBlocks` and `NormalizeContentBlocks` prepends the task text when the blocks lack a text block. `SeedSteps` wholesale-replaces the step history and clears compaction state, enabling resume from a checkpoint; it is required when the Conductor's `ResumeSteps` is set. The interjection pair keeps a one-shot resume nudge through reactive-compaction retries and retires it after successful delivery.
 
 ## Related Specs
 

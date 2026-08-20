@@ -25,7 +25,7 @@ sdk/examples/
 | #  | Example              | Concepts introduced                                             |
 |----|----------------------|-----------------------------------------------------------------|
 | 01 | minimal-agent        | `sp4rk.New`, `Framework.Execute`, `FinishTool`, system prompt     |
-| 02 | custom-tools         | `tools.Tool` interface, `BaseTool`, built-in tools, workspace   |
+| 02 | custom-tools         | `tools.Tool`, optional `GroupProvider`, `BaseTool`, capability groups, built-in tools |
 | 03 | event-streaming      | `Events` interface, live thought/tool/result observation        |
 | 04 | human-in-the-loop    | `HITLHandler`, tool-call confirmation, step-limit decisions     |
 | 05 | mcp-integration      | `MCPConfig`, stdio/HTTP MCP servers, external tool discovery    |
@@ -33,8 +33,8 @@ sdk/examples/
 | 07 | multi-provider-routing | `Router`, `SetModel`, composite IDs, phase-based `Models()`   |
 | 08 | parallel-subagents   | `RunSubAgent`/`RunSubAgentsParallel`, per-step Executor/CM     |
 | 09 | context-memory       | `ContextWindow`, compaction strategies, `ContextFill` events   |
-| 10 | security-and-safety  | `WrapUntrustedContent`, `ToolJudger`, `ToolPolicy`, `ConfirmFunc` |
-| 11 | full-power           | multi-provider, Plan→Reflect, MCP, event streaming, HITL, skills, compaction, fact memory |
+| 10 | security-and-safety  | `WrapUntrustedContent`, `ToolJudger`, `JudgeStrict`, fail-safe confirmation |
+| 11 | full-power           | multi-provider, Plan→Reflect, MCP, events, HITL, skills, Subagent Profiles, compaction, facts |
 
 Each example is a self-contained `package main` with its own `README.md`.
 
@@ -46,7 +46,7 @@ Go 1.26+ is required (matches the SDK's `go.mod`).
 
 ### API keys
 
-Every example needs at least one LLM provider API key:
+Live agent runs need at least one LLM provider API key:
 
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
@@ -76,8 +76,26 @@ Before running an example for the first time, resolve dependencies:
 
 ```bash
 cd sdk/examples
-go mod tidy
+GOWORK=off go mod tidy
 ```
+
+## Offline build and tests
+
+The module compiles and its local tests run without API keys, LLM requests, or
+an MCP server. `GOWORK=off` is required when the parent checkout is part of a
+workspace that does not include the standalone examples module:
+
+```bash
+cd sdk/examples
+GOWORK=off go build ./...
+GOWORK=off go test ./...
+```
+
+The tests exercise deterministic public contracts such as capability-group
+metadata, strict-judge fail-safe behavior, and Subagent Profile tool-group
+parsing. Example 10 also prints its deterministic security demonstrations before
+its optional live-agent portion; the other `go run` commands are live examples
+and need the provider credentials listed below.
 
 ## Running an example
 
