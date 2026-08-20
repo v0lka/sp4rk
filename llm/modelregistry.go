@@ -471,7 +471,15 @@ func (r *ModelRegistry) RuntimeMetadata(model string) (ModelMetadata, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	meta, ok := r.runtime[strings.ToLower(model)]
-	meta.Capabilities = cloneCapabilities(meta.Capabilities)
+	if meta.Capabilities == nil {
+		// A stored entry can carry nil Capabilities (cloneCapabilities(nil)
+		// yields nil). Normalize to the optimistic unknown set so callers can
+		// dereference Capabilities without a panic, mirroring finalizeMeta's
+		// read-side contract.
+		meta.Capabilities = defaultUnknownCapabilities()
+	} else {
+		meta.Capabilities = cloneCapabilities(meta.Capabilities)
+	}
 	return meta, ok
 }
 
@@ -581,7 +589,14 @@ func (r *ModelRegistry) runtimeLookup(key string) (ModelMetadata, bool) {
 // self-hosted server's runtime window.
 func (r *ModelRegistry) resolveBuiltinOrCache(model, key string) ModelMetadata {
 	if meta, ok := r.runtimeLookup(key); ok {
-		return meta
+		// A partial runtime entry must enrich against the tiers strictly below
+		// runtime before it can serve as the baseline for a partial override.
+		// Otherwise a protocol-only override stacked on a partial runtime entry
+		// would inherit zero ContextWindow/OutputLimit/TokenizerType instead of
+		// falling through to the built-in catalog / cache / fallback tiers.
+		return r.enrichPartialWith(meta, func() ModelMetadata {
+			return r.resolveSpecOrCache(model, key)
+		})
 	}
 	return r.resolveSpecOrCache(model, key)
 }

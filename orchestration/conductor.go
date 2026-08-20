@@ -91,8 +91,9 @@ type ConductorConfig struct {
 	// SetPendingUserInterjection (via the InterjectionAware capability) so the
 	// ContextManager appends it as the FINAL user message after the seeded
 	// step history — landing next to the pending tool result in the very next
-	// LLM call. The ContextManager consumes it on the first BuildPrompt, so it
-	// appears in exactly one LLM call and never duplicates. Empty is the
+	// LLM call. BuildPrompt appends it on every call until the executor retires
+	// it via ConsumePendingUserInterjection after a successful LLM response, so
+	// it survives a reactive-compaction retry without duplicating. Empty is the
 	// default no-nudge behavior (backward compatible).
 	PendingUserInterjection string
 
@@ -353,6 +354,13 @@ func (c *Conductor) Run(
 	ctx = agent.WithAttachmentStore(ctx, NewAttachmentStore(bb))
 	ctx = agent.WithFinalResultStore(ctx, NewFinalResultStore(bb))
 
+	// Attach the task description so context-aware tools — most importantly the
+	// tool judge, which reads it via tools.TaskContextFrom — can see the actual
+	// task rather than an empty string. RunSubAgent sets this for subagents;
+	// the main Conductor path must do the same or the strict judge emits
+	// "no stated task context" verdicts even when a task is present.
+	ctx = tools.WithTaskContext(ctx, message)
+
 	result, err := executor.Run(ctx, availableTools, cm)
 	status := ExecutionStatusSuccess
 	switch {
@@ -367,15 +375,19 @@ func (c *Conductor) Run(
 	}
 
 	output := ""
+	var steps []agent.Step
 	if result != nil {
 		output = result.Output
+		steps = result.Steps
 	}
 	// A paused run is a recoverable checkpoint, not a failure: leave Output
 	// empty rather than surfacing the raw ErrPaused sentinel string
 	// ("executor paused at step boundary"), which reads as an error. The
-	// resumable trajectory is preserved on the blackboard (via the injected
-	// TrajectoryStore, as for any conductor run). Callers detect pause via
-	// Status == ExecutionStatusPaused / errors.Is(err, agent.ErrPaused).
+	// resumable trajectory is returned in ExecutionResult.Steps so a single-shot
+	// caller (Conductor.Run / Framework.Execute) can resume via ResumeSteps;
+	// hosts that inject a TrajectoryStore additionally keep it on the
+	// blackboard. Callers detect pause via Status == ExecutionStatusPaused /
+	// errors.Is(err, agent.ErrPaused).
 	if err != nil && output == "" && status != ExecutionStatusPaused {
 		output = err.Error()
 	}
@@ -390,6 +402,7 @@ func (c *Conductor) Run(
 
 	return &ExecutionResult{
 		Output:      output,
+		Steps:       steps,
 		Blackboard:  bb,
 		Status:      status,
 		Reflections: bb.GetReflections(),

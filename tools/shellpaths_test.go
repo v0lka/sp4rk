@@ -112,18 +112,24 @@ func TestResolveShellPathTokens_PoshEnvUserprofile(t *testing.T) {
 	}
 }
 
-// TestResolveShellPathTokens_UnsetEnvVarSkipped verifies that a reference to
-// an unset environment variable is skipped (not reported, no crash) rather
-// than emitted as a literal or empty path.
-func TestResolveShellPathTokens_UnsetEnvVarSkipped(t *testing.T) {
+// TestResolveShellPathTokens_UnsetEnvVarSuffixResolved verifies the two sides of
+// an empty/unset environment variable: a bare reference names no path and is
+// skipped, while the same reference concatenated with an absolute path suffix
+// resolves to that suffix — mirroring the shell's expansion of an empty variable
+// ("$UNSET/etc/passwd" → "/etc/passwd"), so a prompt-injection command hiding an
+// absolute path behind an empty var still surfaces as an out-of-root reference.
+func TestResolveShellPathTokens_UnsetEnvVarSuffixResolved(t *testing.T) {
 	t.Setenv("NOPE_SHELLPATHS_UNDEF", "")
 	t.Setenv("NOPE", "")
 
-	got := ResolveShellPathTokens("cat $NOPE/foo/bar", ShellBash, "/tmp/ws")
-	for _, p := range got {
-		if p == "$NOPE/foo/bar" || filepath.Base(p) == "foo" || filepath.Base(p) == "bar" {
-			t.Fatalf("expected unset $NOPE reference to be skipped, got %v", got)
-		}
+	// Bare unset var names no path.
+	if got := ResolveShellPathTokens("cat $NOPE", ShellBash, "/tmp/ws"); len(got) != 0 {
+		t.Fatalf("expected bare unset $NOPE to be skipped, got %v", got)
+	}
+	// Unset var + absolute suffix expands to the suffix.
+	got := ResolveShellPathTokens("cat $NOPE/etc/passwd", ShellBash, "/tmp/ws")
+	if !sliceContains(got, "/etc/passwd") {
+		t.Fatalf("expected /etc/passwd resolved from $NOPE/etc/passwd, got %v", got)
 	}
 }
 
@@ -653,6 +659,104 @@ func TestIsPureSeparatorRunToken(t *testing.T) {
 	for _, tok := range negative {
 		if isPureSeparatorRunToken(tok) {
 			t.Errorf("isPureSeparatorRunToken(%q) = true, want false", tok)
+		}
+	}
+}
+
+// TestUnresolvablePathTokens verifies that path-like tokens the resolver
+// cannot assess are surfaced (so the Judges escalate them hard), while
+// resolvable tilde/env forms and non-tilde "~" occurrences are not.
+func TestUnresolvablePathTokens(t *testing.T) {
+	cases := []struct {
+		name    string
+		command string
+		shell   ShellKind
+		want    []string
+	}{
+		{
+			name:    "tilde-user",
+			command: "cat ~root/.ssh/id_rsa",
+			shell:   ShellBash,
+			want:    []string{"~root"},
+		},
+		{
+			name:    "tilde-current-user-home-not-unresolvable",
+			command: "cat ~/.ssh/id_rsa",
+			shell:   ShellBash,
+			want:    nil,
+		},
+		{
+			name:    "git-revision-tilde-not-tilde-expansion",
+			command: "git log HEAD~3",
+			shell:   ShellBash,
+			want:    nil,
+		},
+		{
+			name:    "param-default-value",
+			command: "cat ${VAR:-/etc/passwd}",
+			shell:   ShellBash,
+			want:    []string{"${VAR:-/etc/passwd}"},
+		},
+		{
+			name:    "param-benign-default-not-unresolvable",
+			command: "echo ${GREETING:-hello}",
+			shell:   ShellBash,
+			want:    nil,
+		},
+		{
+			name:    "param-plain-var-not-unresolvable",
+			command: "cat ${VAR}/config",
+			shell:   ShellBash,
+			want:    nil,
+		},
+		{
+			name:    "posh-has-no-unresolvable-idioms",
+			command: "cat ~user/.ssh/id_rsa",
+			shell:   ShellPosh,
+			want:    nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := UnresolvablePathTokens(tc.command, tc.shell)
+			if len(got) != len(tc.want) {
+				t.Fatalf("UnresolvablePathTokens(%q, %q) = %v, want %v", tc.command, tc.shell, got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("UnresolvablePathTokens(%q, %q) = %v, want %v", tc.command, tc.shell, got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+// TestHasRelativeEscape verifies that a ".." parent-ref inside a relative path
+// is detected (so the JSON judge fast-path fails closed) while plain relative
+// names, absolute paths, ellipses, and ".."-prefixed filenames are not.
+func TestHasRelativeEscape(t *testing.T) {
+	positive := []string{
+		"a/../../etc/passwd",
+		"../foo",
+		"subdir/../..",
+		"../etc/passwd",
+	}
+	for _, s := range positive {
+		if !HasRelativeEscape(s) {
+			t.Errorf("HasRelativeEscape(%q) = false, want true", s)
+		}
+	}
+	negative := []string{
+		"frontend/src/main.tsx",
+		"/ws/notes.txt",
+		"...",
+		"..config",
+		"",
+		"plain",
+	}
+	for _, s := range negative {
+		if HasRelativeEscape(s) {
+			t.Errorf("HasRelativeEscape(%q) = true, want false", s)
 		}
 	}
 }

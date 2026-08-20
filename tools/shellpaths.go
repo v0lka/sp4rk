@@ -79,6 +79,103 @@ var shellTokenRe = map[ShellKind]*regexp.Regexp{
 	ShellPosh: regexp.MustCompile(`(?:` + poshEnvBraceRe + `|` + poshEnvRe + `|` + tildePoshRe + `|` + pathRegex.String() + `|` + relDotDotRe + `)`),
 }
 
+// tildeUserRe matches a bash "~user" form: a tilde followed by one or more
+// username characters. Unlike "~" and "~/…" (which resolve to the current
+// user's home), "~user" expands to the named user's home directory and cannot
+// be resolved without a user-database lookup. The word-boundary requirement is
+// enforced in [UnresolvablePathTokens], not in the regex, because RE2 lacks
+// lookbehind.
+const tildeUserRe = `~[a-zA-Z0-9_.\-]+`
+
+// bashParamExpansionRe matches any bash "${...}" brace form. The plain
+// "${VAR}" and "${VAR}/suffix" forms are handled by [resolveEnvToken]; a
+// parameter-expansion operator form (e.g. "${VAR:-/etc/passwd}") is not
+// assessed and, when path-bearing, must be escalated (see
+// [isPathBearingParamExpansion]).
+const bashParamExpansionRe = `\$\{[^{}]*\}`
+
+var unresolvableTokenRe = map[ShellKind]*regexp.Regexp{
+	ShellBash: regexp.MustCompile(`(?:` + tildeUserRe + `|` + bashParamExpansionRe + `)`),
+}
+
+// isPathBearingParamExpansion reports whether a "${...}" token is a parameter
+// expansion whose operand references a path — i.e. the part after the variable
+// name contains "/", "~", or "$". Plain "${VAR}" and benign defaults such as
+// "${VAR:-hello}" or "${count:=5}" are not path-bearing and are NOT escalated;
+// only an expansion that could hide an out-of-root path (e.g.
+// "${VAR:-/etc/passwd}") is.
+func isPathBearingParamExpansion(tok string) bool {
+	inner := tok[2 : len(tok)-1] // strip "${" and "}"
+	i := 0
+	for i < len(inner) {
+		c := inner[i]
+		isName := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+		if !isName {
+			break
+		}
+		i++
+	}
+	if i == 0 || i == len(inner) {
+		return false // malformed or plain "${VAR}"
+	}
+	return strings.ContainsAny(inner[i:], "/~$")
+}
+
+// UnresolvablePathTokens returns the path-like tokens in command that
+// [ResolveShellPathTokens] cannot resolve to an absolute path, and that
+// therefore represent an out-of-root reference that was NOT assessed. Callers
+// (the shell-exec Judges) escalate these as HARD — an input that cannot be
+// assessed at all must never be silently let through (see JudgeSeverityHard).
+//
+// It is the conservative counterpart to [ResolveShellPathTokens], which favours
+// false negatives (skipping unresolvable tokens) so its output stays clean of
+// fabricated paths. For a security containment check the dangerous direction is
+// a false negative, so the skipped tokens are recovered here.
+//
+// Two bash forms are detected:
+//
+//   - "~user": a "~" at a word boundary followed by username characters. The
+//     word-boundary check skips "~" that continues a path-component word (e.g.
+//     the "~3" in "git log HEAD~3", which is a revision suffix, not a tilde
+//     expansion). PowerShell has no "~user" form.
+//   - a path-bearing "${VAR<operator>…}" parameter expansion (see
+//     [isPathBearingParamExpansion]). PowerShell has no equivalent operator
+//     form (its "~" and "$env:"/"${env:}" idioms are all resolved by
+//     [resolveEnvToken] and [resolveTildeToken]), so the PowerShell dialect
+//     reports nothing.
+func UnresolvablePathTokens(command string, shell ShellKind) []string {
+	re := unresolvableTokenRe[shell]
+	if re == nil {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	var out []string
+	for _, m := range re.FindAllStringIndex(command, -1) {
+		start, end := m[0], m[1]
+		tok := command[start:end]
+		// "~user" only: require a word start. A "~" glued to a preceding
+		// path-component character (e.g. "HEAD~3") is not a tilde expansion.
+		switch tok[0] {
+		case '~':
+			if start > 0 && isPathComponentChar(command[start-1]) {
+				continue
+			}
+		case '$':
+			// Only flag parameter expansions whose operand could hide a path,
+			// so benign "${VAR:-hello}" defaults are not escalated.
+			if !isPathBearingParamExpansion(tok) {
+				continue
+			}
+		}
+		if _, dup := seen[tok]; dup {
+			continue
+		}
+		seen[tok] = struct{}{}
+		out = append(out, tok)
+	}
+	return out
+}
+
 // ResolveShellPathTokens extracts path-like tokens from a shell command string
 // and resolves shell idioms to absolute paths:
 //
@@ -501,7 +598,9 @@ func resolveTildeToken(token string) (string, bool) {
 
 // resolveEnvToken expands a "$VAR"/"${VAR}" (bash) or
 // "$env:VAR"/"${env:VAR}" (posh) reference plus an optional path remainder.
-// Tokens whose expansion is empty are skipped.
+// A bare empty/unset variable is skipped; with a path suffix it resolves to the
+// suffix alone, mirroring the shell's concatenation of an empty expansion with
+// the literal suffix.
 //
 // Note: an env var that resolves to an absolute path outside the session roots
 // (e.g. "$HOME", "$USERPROFILE") is reported by PathsOutsideRoots. This is
@@ -530,10 +629,19 @@ func resolveEnvToken(token string, shell ShellKind) (string, bool) {
 	// "$VAR"/"${VAR}" forms and posh tokens are the "$env:"/"${env:" forms, so
 	// no cross-dialect mismatch can reach here.
 	val := os.Getenv(name)
-	if val == "" {
-		return "", false
-	}
 	rest = normalizeSeparators(rest)
+	if val == "" {
+		// An unset or empty variable concatenated with a literal suffix expands
+		// in the shell to just the suffix (e.g. "$UNSET/etc/passwd" →
+		// "/etc/passwd"). Resolve the suffix rather than dropping the token, so
+		// a prompt-injection command that hides an absolute path behind an empty
+		// env var still surfaces as an out-of-root reference. A bare empty var
+		// (no suffix) names no path and remains skipped.
+		if rest == "" {
+			return "", false
+		}
+		return cleanJoined(rest), true
+	}
 	if rest != "" {
 		return cleanJoined(val, rest), true
 	}

@@ -873,6 +873,11 @@ func (e *Executor) processSingleToolCall(
 			reason = "rejected by user"
 		}
 		obs := fmt.Sprintf("[Tool call rejected: %s]", reason)
+		// A successful edit earlier in this response group may have left
+		// verification pending. When the rejected call is the final sibling,
+		// flush it now while ctx is still live so a pause/cancel/step-limit at
+		// the next boundary cannot discard the verification result.
+		obs = e.runVerifyOnEditHook(ctx, action.Name, true, callIdx == len(toolCalls)-1, state, obs)
 		e.emitter.ToolResult(state.stepNum, callIdx, len(obs), obs, true)
 		step := Step{
 			Thought:       thought,
@@ -1142,6 +1147,11 @@ func (e *Executor) processBatchTool(
 					reason = "rejected by user"
 				}
 				obs := fmt.Sprintf("[Tool call rejected: %s]", reason)
+				// Match standalone calls: if this rejected sub-call closes the
+				// response group, flush verification pending from an earlier edit
+				// before a terminal boundary can discard it.
+				lastCallInGroup := subIdx == len(batchInput.Calls)-1 && callIdx == len(toolCalls)-1
+				obs = e.runVerifyOnEditHook(ctx, subCall.Name, true, lastCallInGroup, state, obs)
 				e.emitter.ToolResult(state.stepNum, effectiveIdx, len(obs), obs, true)
 				step := Step{
 					Thought:       thought,

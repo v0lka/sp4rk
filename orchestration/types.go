@@ -105,6 +105,7 @@ const (
 // ExecutionResult is the output of Orchestrator.Execute.
 type ExecutionResult struct {
 	Output       string          `json:"output"`
+	Steps        []agent.Step    `json:"-"`
 	Plan         *Plan           `json:"plan,omitempty"`
 	Blackboard   Blackboard      `json:"-"`
 	AttemptCount int             `json:"attempt_count,omitempty"`

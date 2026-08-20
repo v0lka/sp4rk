@@ -9,8 +9,10 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
 
@@ -186,13 +188,16 @@ func (s *Server) connectStdio(ctx context.Context, cfg ServerConfig) (*mcpclient
 		env = append(env, fmt.Sprintf("%s=%s", key, value))
 	}
 
-	// Always install a custom command factory so the spawned MCP server process
-	// runs without a visible console window (CREATE_NO_WINDOW on Windows). The
-	// mcp-go transport's default path does not set this flag, which causes a
-	// console window to flash or stay open for every stdio MCP server under a
-	// GUI-subsystem host application. cmdEnv already carries os.Environ()+cfg.Env,
-	// matching the default merge performed by the transport, so behaviour is
-	// preserved apart from window suppression.
+	// Always install a custom command factory for two reasons:
+	//  1. It hides the spawned process's console window (CREATE_NO_WINDOW on
+	//     Windows). The mcp-go transport's default path does not set this flag,
+	//     so a console window flashes or stays open for every stdio MCP server
+	//     under a GUI-subsystem host application.
+	//  2. It keeps the env allowlist effective. cmdEnv is the filtered slice
+	//     built above (safeStdioEnv(os.Environ()) + cfg.Env), so the child never
+	//     receives the transport's default os.Environ() merge. Do not remove this
+	//     factory or let cmd.Env fall back to the parent's full environment —
+	//     that would forward host secrets to the MCP child process.
 	workDir := cfg.WorkDir
 	opts := []transport.StdioOption{
 		transport.WithCommandFunc(
@@ -225,58 +230,189 @@ func (s *Server) connectStdio(ctx context.Context, cfg ServerConfig) (*mcpclient
 }
 
 // stdioEnvAllowlist is the set of environment variables that are inherited
-// from the host by stdio MCP server processes. These are the minimal vars a
-// process needs to locate its own executables (PATH, HOME), identify the user
-// (USER, SHELL), select a locale (LANG, LC_*), and place temp files (TMPDIR,
-// TEMP/TMP). Everything else must be declared explicitly in the server's
-// cfg.Env. Secrets — LLM API keys, proxy credentials, etc. — must never be
-// forwarded implicitly (ASI04).
+// from the host by stdio MCP server processes. These are the vars a process
+// needs to locate its own executables (PATH), resolve its home and user
+// identity (HOME, USER, SHELL on POSIX; USERPROFILE on Windows), select a
+// locale (LANG, LC_*), place temp files (TMPDIR, TEMP/TMP), reach the network
+// through a configured proxy (HTTP_PROXY and friends), trust a private CA
+// (SSL_CERT_FILE and friends), and activate a Python virtualenv or conda
+// environment (VIRTUAL_ENV, CONDA_*). Windows-essential variables (APPDATA,
+// LOCALAPPDATA, SystemRoot, ComSpec, PATHEXT) are also allowlisted so
+// Node/Python MCP servers can start under a GUI host that was launched
+// without a console environment. Everything else must be declared explicitly
+// in the server's cfg.Env — LLM API keys and application credentials are
+// never forwarded implicitly (ASI04).
 //
-// HOME is intentionally included: many Node/Python MCP servers read
-// ~/.config, ~/.npmrc or ~/.cache at startup and misbehave or crash without
-// it. HOME is not itself a secret. An operator who wants strict isolation
-// (e.g. to block ~/.aws/credentials reads) can strip HOME via cfg.Env —
-// explicit cfg.Env entries are applied after this filter and win.
+// Variable names are matched case-insensitively on Windows (environment names
+// are case-insensitive there) and case-sensitively elsewhere; the keys below
+// use the canonical uppercase spelling. The proxy variables are additionally
+// allowlisted in lowercase (http_proxy et al.) because toolchains disagree on
+// case: Go's net/http uses the uppercase forms while curl and many shells use
+// the lowercase ones.
+//
+// Proxy variables are forwarded so a stdio MCP server can reach the network
+// through a configured proxy, but any credentials embedded in their userinfo
+// component (user:password@host) are stripped first — an authenticated proxy
+// URL must not leak its password into an untrusted third-party child process
+// (ASI04). NO_PROXY is a hostname list and never carries credentials, so it is
+// forwarded unchanged. Operators who want stricter isolation can override or
+// clear any of these via cfg.Env — explicit cfg.Env entries are applied after
+// this filter and win (the same escape hatch as HOME).
 var stdioEnvAllowlist = map[string]struct{}{
-	"PATH":   {},
-	"HOME":   {},
-	"USER":   {},
-	"SHELL":  {},
-	"LANG":   {},
-	"TERM":   {},
+	// Executable and identity resolution.
+	"PATH":        {},
+	"HOME":        {},
+	"USER":        {},
+	"SHELL":       {},
+	"USERPROFILE": {},
+
+	// Locale and terminal.
+	"LANG": {},
+	"TERM": {},
+
+	// Temp directories.
 	"TMPDIR": {},
 	"TEMP":   {},
 	"TMP":    {},
-	// Locale variables share the LC_ prefix.
+
+	// Windows essentials.
+	"APPDATA":      {},
+	"LOCALAPPDATA": {},
+	"SYSTEMROOT":   {},
+	"COMSPEC":      {},
+	"PATHEXT":      {},
+
+	// Network proxy configuration (upper- and lower-case spellings).
+	"HTTP_PROXY":  {},
+	"HTTPS_PROXY": {},
+	"NO_PROXY":    {},
+	"ALL_PROXY":   {},
+	"http_proxy":  {},
+	"https_proxy": {},
+	"no_proxy":    {},
+	"all_proxy":   {},
+
+	// CA certificate trust anchors (private root CAs from corporate MITM
+	// proxies).
+	"SSL_CERT_FILE":       {},
+	"SSL_CERT_DIR":        {},
+	"REQUESTS_CA_BUNDLE":  {},
+	"CURL_CA_BUNDLE":      {},
+	"NODE_EXTRA_CA_CERTS": {},
+
+	// Python virtualenv activation.
+	"VIRTUAL_ENV": {},
+
+	// Conda environment activation.
+	"CONDA_PREFIX":          {},
+	"CONDA_DEFAULT_ENV":     {},
+	"CONDA_SHLVL":           {},
+	"CONDA_PREFIX_1":        {},
+	"CONDA_PROMPT_MODIFIER": {},
+	"CONDA_EXE":             {},
+	"CONDA_PYTHON_EXE":      {},
 }
 
 // isAllowedStdioEnvVar reports whether the given env var (NAME=value form)
-// is on the allowlist (exact match on NAME, or an LC_* locale variable).
+// is on the allowlist (exact match on NAME, or an LC_* locale variable) for
+// the current host OS.
 func isAllowedStdioEnvVar(entry string) bool {
+	return isAllowedStdioEnvVarForOS(entry, runtime.GOOS)
+}
+
+// isAllowedStdioEnvVarForOS is the OS-parameterized core of
+// isAllowedStdioEnvVar. On Windows, environment variable names are
+// case-insensitive, so allowlist membership is decided with a case-folded key;
+// elsewhere names are compared exactly.
+func isAllowedStdioEnvVarForOS(entry, goos string) bool {
 	key, _, ok := strings.Cut(entry, "=")
 	if !ok {
 		return false
 	}
-	if _, allowed := stdioEnvAllowlist[key]; allowed {
+	if stdioEnvKeyAllowed(key, goos) {
 		return true
 	}
 	return strings.HasPrefix(key, "LC_")
+}
+
+// stdioEnvKeyAllowed reports whether key is on the allowlist for the given
+// host OS.
+func stdioEnvKeyAllowed(key, goos string) bool {
+	if goos == "windows" {
+		_, ok := stdioEnvAllowlist[strings.ToUpper(key)]
+		return ok
+	}
+	_, ok := stdioEnvAllowlist[key]
+	return ok
 }
 
 // safeStdioEnv filters a raw os.Environ()-style slice down to the allowlisted
 // variables only. Explicit server cfg.Env values are applied on top by the
 // caller, so they always win and are not subject to this filter.
 func safeStdioEnv(raw []string) []string {
+	return safeStdioEnvForOS(raw, runtime.GOOS)
+}
+
+// safeStdioEnvForOS is the OS-parameterized core of safeStdioEnv.
+func safeStdioEnvForOS(raw []string, goos string) []string {
 	if len(raw) == 0 {
 		return nil
 	}
 	out := make([]string, 0, len(stdioEnvAllowlist)+4)
 	for _, e := range raw {
-		if isAllowedStdioEnvVar(e) {
-			out = append(out, e)
+		if !isAllowedStdioEnvVarForOS(e, goos) {
+			continue
 		}
+		out = append(out, sanitizeProxyEntry(e))
 	}
 	return out
+}
+
+// sanitizeProxyEntry strips embedded credentials from allowlisted proxy
+// variables before they are forwarded to a stdio MCP child process. Only the
+// credential-capable proxy variables (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY in
+// either case) are touched; everything else is returned unchanged.
+func sanitizeProxyEntry(entry string) string {
+	key, value, ok := strings.Cut(entry, "=")
+	if !ok {
+		return entry
+	}
+	if !isCredentialedProxyVar(key) {
+		return entry
+	}
+	stripped := stripUserinfo(value)
+	if stripped == value {
+		return entry
+	}
+	return key + "=" + stripped
+}
+
+// isCredentialedProxyVar reports whether key names a proxy variable whose
+// value may embed credentials in its userinfo component.
+func isCredentialedProxyVar(key string) bool {
+	switch {
+	case strings.EqualFold(key, "HTTP_PROXY"),
+		strings.EqualFold(key, "HTTPS_PROXY"),
+		strings.EqualFold(key, "ALL_PROXY"):
+		return true
+	}
+	return false
+}
+
+// stripUserinfo removes the userinfo component (user:password@) from a proxy
+// URL value. Values that carry no userinfo, or that cannot be parsed as a URL,
+// are returned unchanged. A scheme-less "user:password@host:port" value, which
+// url.Parse misreads as an opaque URL, is handled by the trailing fallback.
+func stripUserinfo(value string) string {
+	u, err := url.Parse(value)
+	if err == nil && u.User != nil {
+		u.User = nil
+		return u.String()
+	}
+	if i := strings.LastIndex(value, "@"); i >= 0 && !strings.Contains(value[:i], "/") {
+		return value[i+1:]
+	}
+	return value
 }
 
 // connectHTTP creates an HTTP MCP client with fallback from Streamable HTTP to SSE.

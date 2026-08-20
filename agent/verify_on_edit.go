@@ -151,11 +151,10 @@ func (e *Executor) runVerifyOnEditHook(ctx context.Context, toolName string, res
 // flushPendingVerifyOnEdit runs the pending verification, if any, and
 // returns its formatted note ("" when nothing awaits verification). It is
 // the last-resort flush for finishes that bypass the per-group hook sites:
-// early-return interceptions (HITL rejections, circuit breakers, parse-error
-// aborts) can skip the last call of a response group, and an implicit
-// text-only finish afterwards would otherwise drop the pending verification
-// silently. Called from the implicit-finish acceptance branches so the note
-// lands in the final output instead of vanishing.
+// circuit breakers and parse-error aborts can skip the last call of a response
+// group, and an implicit text-only finish afterwards would otherwise drop the
+// pending verification silently. Called from the implicit-finish acceptance
+// branches so the note lands in the final output instead of vanishing.
 func (e *Executor) flushPendingVerifyOnEdit(ctx context.Context, state *runState) string {
 	if e.verifyOnEdit == nil || !state.pendingVerifyEdit {
 		return ""

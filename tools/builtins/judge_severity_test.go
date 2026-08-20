@@ -110,7 +110,7 @@ func TestFileToolGroupsByCapability(t *testing.T) {
 		{NewDeleteDirectoryTool(), tools.GroupLocalWrite},
 	}
 	for _, tt := range tests {
-		if got := tt.tool.Group(); got != tt.want {
+		if got := tools.ToolGroupOf(tt.tool); got != tt.want {
 			t.Errorf("tool %q group = %q, want %q", tt.tool.Name(), got, tt.want)
 		}
 	}

@@ -22,6 +22,14 @@ const (
 )
 
 // Tool is the unified interface for all tools (Core and MCP).
+//
+// The interface is deliberately minimal and stable: external tool implementors
+// only need to implement the methods below. Capability-group metadata (see
+// [ToolGroup]) is exposed through the OPTIONAL [GroupProvider] interface, not
+// as a required method, so adding group awareness does not break existing
+// tool implementations. Read a tool's group via [ToolGroupOf], which is
+// fail-closed to the undeclared "" group when the tool does not implement
+// [GroupProvider].
 type Tool interface {
 	Name() string
 	Description() string
@@ -31,9 +39,26 @@ type Tool interface {
 	// IsUntrusted reports whether this tool returns external/untrusted data
 	// (web, MCP, filesystem) that should be sanitized before LLM context.
 	IsUntrusted() bool
-	// Group returns the tool's capability group (see [ToolGroup]). Every
-	// tool declares exactly one group; there is no "unknown" value.
+}
+
+// GroupProvider is the OPTIONAL interface a tool implements to declare its
+// capability group (see [ToolGroup]). It is intentionally not part of [Tool]:
+// tools that do not declare a group simply omit the method, and [ToolGroupOf]
+// treats them as undeclared (""), which matches no group-based allow-list
+// (fail-closed for group filtering).
+type GroupProvider interface {
+	// Group returns the tool's capability group.
 	Group() ToolGroup
+}
+
+// ToolGroupOf returns the capability group of t, or "" when t does not
+// implement [GroupProvider]. An empty group means the group was not declared
+// and matches no group-based allow-list (fail-closed).
+func ToolGroupOf(t Tool) ToolGroup {
+	if gp, ok := t.(GroupProvider); ok {
+		return gp.Group()
+	}
+	return ""
 }
 
 // ToolResult is the result of tool execution.

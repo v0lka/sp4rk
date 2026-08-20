@@ -340,7 +340,6 @@ func TestIsAllowedStdioEnvVar_RejectsSecrets(t *testing.T) {
 	rejected := []string{
 		"ANTHROPIC_API_KEY=sk-ant-xxx",
 		"OPENAI_API_KEY=sk-xxx",
-		"HTTP_PROXY=http://user:pass@proxy:8080",
 		"AWS_SECRET_ACCESS_KEY=abcdef",
 		"GITHUB_TOKEN=ghp_xxx",
 		"DATABASE_URL=postgres://user:pass@host/db",
@@ -348,6 +347,41 @@ func TestIsAllowedStdioEnvVar_RejectsSecrets(t *testing.T) {
 	for _, e := range rejected {
 		if isAllowedStdioEnvVar(e) {
 			t.Errorf("expected %q to be REJECTED (not on allowlist)", e)
+		}
+	}
+}
+
+// TestIsAllowedStdioEnvVar_AllowsProxyAndRuntimeVars verifies that network
+// proxy configuration (whose credentials are stripped at forwarding time by
+// safeStdioEnv), CA trust anchors, and Python venv/conda activation variables
+// are allowlisted for stdio MCP servers.
+func TestIsAllowedStdioEnvVar_AllowsProxyAndRuntimeVars(t *testing.T) {
+	allowed := []string{
+		"HTTP_PROXY=http://user:pass@proxy:8080",
+		"HTTPS_PROXY=http://proxy:8443",
+		"NO_PROXY=localhost,127.0.0.1,.internal",
+		"ALL_PROXY=socks5://proxy:1080",
+		"http_proxy=http://proxy:8080",
+		"https_proxy=http://proxy:8443",
+		"no_proxy=localhost",
+		"all_proxy=socks5://proxy:1080",
+		"SSL_CERT_FILE=/etc/ssl/certs/corp-root.pem",
+		"SSL_CERT_DIR=/etc/ssl/certs",
+		"REQUESTS_CA_BUNDLE=/etc/ssl/certs/corp-root.pem",
+		"CURL_CA_BUNDLE=/etc/ssl/certs/corp-root.pem",
+		"NODE_EXTRA_CA_CERTS=/etc/ssl/certs/corp-root.pem",
+		"VIRTUAL_ENV=/home/user/.venv",
+		"CONDA_PREFIX=/opt/miniconda3/envs/proj",
+		"CONDA_DEFAULT_ENV=proj",
+		"CONDA_SHLVL=1",
+		"CONDA_PREFIX_1=/opt/miniconda3",
+		"CONDA_PROMPT_MODIFIER=(proj) ",
+		"CONDA_EXE=/opt/miniconda3/bin/conda",
+		"CONDA_PYTHON_EXE=/opt/miniconda3/bin/python",
+	}
+	for _, e := range allowed {
+		if !isAllowedStdioEnvVar(e) {
+			t.Errorf("expected %q to be allowed", e)
 		}
 	}
 }
@@ -373,8 +407,111 @@ func TestSafeStdioEnv_FiltersToAllowlist(t *testing.T) {
 	}
 }
 
+func TestIsAllowedStdioEnvVarForOS_Windows(t *testing.T) {
+	allowed := []string{
+		// Windows spells PATH as "Path"; the matcher must be case-insensitive.
+		"Path=C:\\Windows;C:\\Windows\\System32",
+		"SystemRoot=C:\\Windows",
+		"ComSpec=C:\\Windows\\system32\\cmd.exe",
+		"PATHEXT=.COM;.EXE;.BAT;.CMD",
+		"USERPROFILE=C:\\Users\\alice",
+		"APPDATA=C:\\Users\\alice\\AppData\\Roaming",
+		"LOCALAPPDATA=C:\\Users\\alice\\AppData\\Local",
+		"TEMP=C:\\Users\\alice\\AppData\\Local\\Temp",
+		"TMP=C:\\Users\\alice\\AppData\\Local\\Temp",
+	}
+	for _, e := range allowed {
+		if !isAllowedStdioEnvVarForOS(e, "windows") {
+			t.Errorf("expected %q to be allowed on Windows", e)
+		}
+	}
+
+	rejected := []string{
+		"ANTHROPIC_API_KEY=sk-ant-xxx",
+		"AWS_SECRET_ACCESS_KEY=abcdef",
+		"GITHUB_TOKEN=ghp_xxx",
+	}
+	for _, e := range rejected {
+		if isAllowedStdioEnvVarForOS(e, "windows") {
+			t.Errorf("expected %q to be REJECTED on Windows", e)
+		}
+	}
+
+	// The Windows case-insensitivity must not leak into POSIX hosts.
+	if isAllowedStdioEnvVarForOS("Path=/bin", "linux") {
+		t.Errorf("expected mixed-case %q to be REJECTED on POSIX (case-sensitive)", "Path")
+	}
+	if isAllowedStdioEnvVarForOS("systemroot=C:\\Windows", "linux") {
+		t.Errorf("expected mixed-case %q to be REJECTED on POSIX (case-sensitive)", "systemroot")
+	}
+}
+
+func TestSafeStdioEnvForOS_Windows(t *testing.T) {
+	raw := []string{
+		"Path=C:\\Windows",
+		"SystemRoot=C:\\Windows",
+		"ComSpec=C:\\Windows\\system32\\cmd.exe",
+		"ANTHROPIC_API_KEY=sk-ant-secret",
+	}
+	got := safeStdioEnvForOS(raw, "windows")
+	if len(got) != 3 {
+		t.Fatalf("expected 3 Windows allowlisted vars, got %d: %v", len(got), got)
+	}
+	for _, e := range got {
+		if strings.Contains(e, "secret") {
+			t.Errorf("secret leaked through filter: %q", e)
+		}
+	}
+}
+
 func TestSafeStdioEnv_EmptyReturnsNil(t *testing.T) {
 	if got := safeStdioEnv(nil); got != nil {
 		t.Errorf("expected nil for empty input, got %v", got)
+	}
+}
+
+func TestSafeStdioEnv_StripsProxyCredentials(t *testing.T) {
+	raw := []string{
+		"PATH=/usr/bin",
+		"HTTP_PROXY=http://alice:s3cret@proxy.example.com:8080",
+		"HTTPS_PROXY=https://bob:hunter2@secure-proxy.example.com:8443",
+		"ALL_PROXY=socks5://carol:p@ss@proxy.example.com:1080",
+		"NO_PROXY=localhost,.internal,10.0.0.0/8",
+		"http_proxy=http://dave:pw@proxy.example.com:8080",
+	}
+	got := safeStdioEnv(raw)
+
+	want := map[string]string{
+		"PATH":        "/usr/bin",
+		"HTTP_PROXY":  "http://proxy.example.com:8080",
+		"HTTPS_PROXY": "https://secure-proxy.example.com:8443",
+		"ALL_PROXY":   "socks5://proxy.example.com:1080",
+		"NO_PROXY":    "localhost,.internal,10.0.0.0/8",
+		"http_proxy":  "http://proxy.example.com:8080",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("expected %d allowlisted vars, got %d: %v", len(want), len(got), got)
+	}
+	for _, e := range got {
+		key, val, _ := strings.Cut(e, "=")
+		if want[key] != val {
+			t.Errorf("unexpected value for %s: got %q, want %q", key, val, want[key])
+		}
+		if strings.Contains(e, "@") {
+			t.Errorf("userinfo component not stripped: %q", e)
+		}
+	}
+}
+
+func TestSafeStdioEnv_StripsSchemeLessProxyCredentials(t *testing.T) {
+	raw := []string{
+		"HTTP_PROXY=alice:s3cret@proxy.example.com:8080",
+	}
+	got := safeStdioEnv(raw)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 var, got %d: %v", len(got), got)
+	}
+	if got[0] != "HTTP_PROXY=proxy.example.com:8080" {
+		t.Errorf("expected scheme-less credential stripped, got %q", got[0])
 	}
 }

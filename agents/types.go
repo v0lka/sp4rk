@@ -64,9 +64,20 @@ func (a *Agent) Descriptor() AgentDescriptor {
 	}
 }
 
-// ToolPreference translates the declarative `tools` frontmatter field into the
-// shape a delegating runtime expects (e.g. the `tools` field of a delegation
-// task, consumed by the runtime's tool resolver):
+// ToolPreference returns the tool preference for this agent in the shape a
+// delegating runtime expects (see [Agent.ToolPreferenceWithError] for the full
+// contract). It is the backward-compatible form: an invalid `tools` field is
+// silently mapped to nil (meaning "grant the full toolset"). Callers that must
+// distinguish an invalid `tools` field from the default should use
+// [Agent.ToolPreferenceWithError] instead.
+func (a *Agent) ToolPreference() any {
+	pref, _ := a.ToolPreferenceWithError()
+	return pref
+}
+
+// ToolPreferenceWithError translates the declarative `tools` frontmatter field
+// into the shape a delegating runtime expects (e.g. the `tools` field of a
+// delegation task, consumed by the runtime's tool resolver):
 //
 //   - "" or "all" (the default) → nil, meaning "grant the full toolset"
 //     (a resolver treats a nil request as all tools).
@@ -88,7 +99,7 @@ func (a *Agent) Descriptor() AgentDescriptor {
 // validateToolsField), so the parse-time and programmatic paths can never
 // diverge; the error return matters for profiles built programmatically,
 // which never pass through the parser.
-func (a *Agent) ToolPreference() (any, error) {
+func (a *Agent) ToolPreferenceWithError() (any, error) {
 	tools := strings.TrimSpace(a.Metadata.Tools)
 	switch tools {
 	case "", "all":

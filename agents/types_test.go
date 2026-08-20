@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func TestToolPreference(t *testing.T) {
+func TestToolPreferenceWithError(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -31,7 +31,7 @@ func TestToolPreference(t *testing.T) {
 		{name: "duplicate group errors", tools: "execute,execute", wantErr: true},
 		{name: "duplicate via mixed spelling errors", tools: "local-read,local_read", wantErr: true},
 		// Presets cannot be mixed into a group list (same rule the parser
-		// enforces via validateToolsField, which ToolPreference delegates to).
+		// enforces via validateToolsField, which ToolPreferenceWithError delegates to).
 		{name: "all mixed with groups errors", tools: "all,execute", wantErr: true},
 		{name: "read-only mixed with groups errors", tools: "read-only,local-read", wantErr: true},
 	}
@@ -40,7 +40,7 @@ func TestToolPreference(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			a := &Agent{Metadata: AgentMetadata{Tools: tt.tools}}
-			got, err := a.ToolPreference()
+			got, err := a.ToolPreferenceWithError()
 			if gotErr := err != nil; gotErr != tt.wantErr {
 				t.Fatalf("ToolPreference(%q) error = %v, want error presence = %t", tt.tools, err, tt.wantErr)
 			}
@@ -54,16 +54,16 @@ func TestToolPreference(t *testing.T) {
 	}
 }
 
-func TestToolPreference_MixedPresetErrorsWithParseMessage(t *testing.T) {
+func TestToolPreferenceWithError_MixedPresetErrorsWithParseMessage(t *testing.T) {
 	t.Parallel()
 
-	// ToolPreference delegates to validateToolsField, so a mixed
+	// ToolPreferenceWithError delegates to validateToolsField, so a mixed
 	// "all"/"read-only" list must fail with the parser's clear "cannot be
 	// combined" message — not the self-contradictory `unknown tool group
 	// "all" (… also accepted: "all", "read-only")` wording it used to emit.
 	for _, tools := range []string{"all,execute", "read-only,local-read"} {
 		a := &Agent{Metadata: AgentMetadata{Tools: tools}}
-		_, err := a.ToolPreference()
+		_, err := a.ToolPreferenceWithError()
 		if err == nil {
 			t.Fatalf("ToolPreference(%q) = nil error, want error", tools)
 		}

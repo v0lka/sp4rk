@@ -50,11 +50,14 @@ func TestDefaultSampling(t *testing.T) {
 			wantTopP: nil,
 		},
 		{
-			// GPT-5 / o-series reasoning models reject temperature and top_p
-			// overrides — everything must stay nil.
-			name:     "openai_flagship returns all nil (reasoning models)",
+			// openai_flagship mixes reasoning (o-series) and non-reasoning
+			// (gpt-4o) members. The preset returns the non-reasoning
+			// temperature; applyDefaultSampling skips models whose
+			// Capabilities do not declare Temperature=true (the reasoning
+			// members), so they still receive no override.
+			name:     "openai_flagship returns 0.3 temperature",
 			family:   "openai_flagship",
-			wantTemp: nil,
+			wantTemp: fp(0.3),
 			wantTopP: nil,
 		},
 		{

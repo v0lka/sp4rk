@@ -52,13 +52,16 @@ var harmlessPOSIXDevices = map[string]bool{
 // out-of-workspace operations.
 //
 // Recognized harmless devices:
-//   - POSIX: /dev/null and /dev/full (matched as cleaned absolute paths).
+//   - POSIX: /dev/null and /dev/full (matched as cleaned absolute paths), only
+//     on non-Windows hosts — on Windows /dev/null is an ordinary out-of-root
+//     path, not a device.
 //   - Windows: NUL — the /dev/null equivalent — matched case-insensitively as
-//     the final path component, with or without a drive/path prefix or verbatim
-//     long-path prefix (e.g. "NUL", "nul", "C:\\NUL", "\\\\?\\C:\\NUL"). A file
-//     extension is NOT stripped, so "nul.go" or "NUL.txt" are treated as real
-//     files, not the device. NUL is a reserved device name only on Windows, so
-//     the check is host-gated.
+//     the final path component, with or without a drive/path prefix, and with a
+//     device-namespace prefix ("\\.\NUL"). A verbatim long-path prefix ("\\?\")
+//     disables reserved-name interpretation, so "\\?\C:\NUL" names a literal
+//     file and is NOT matched. A file extension is NOT stripped, so "nul.go" or
+//     "NUL.txt" are treated as real files, not the device. NUL is a reserved
+//     device name only on Windows, so the check is host-gated.
 //
 // absPath is cleaned and separator-normalized before the lookup. Returns false
 // for the empty string and for any path that is not one of the listed devices.
@@ -66,14 +69,21 @@ func IsHarmlessDevicePath(absPath string) bool {
 	if absPath == "" {
 		return false
 	}
-	// POSIX device paths are forward-slash-rooted on every platform (shell-
-	// token resolution keeps them so). Normalize separators and clean with the
-	// POSIX path cleaner: drive letters / UNC prefixes never occur in /dev
-	// paths, so path.Clean is exact for this lookup, and ToSlash guarantees the
-	// forward-slash form on Windows hosts too.
-	normalized := path.Clean(filepath.ToSlash(absPath))
-	if harmlessPOSIXDevices[normalized] {
-		return true
+	// POSIX device paths are only devices on non-Windows hosts. On Windows
+	// /dev/null is an ordinary out-of-root path, so exempting it there would
+	// skip the containment check — the same host-gating applied to NUL below
+	// (a file literally named "nul" is ordinary on POSIX). The lookup is
+	// therefore skipped on Windows.
+	if runtime.GOOS != "windows" {
+		// POSIX device paths are forward-slash-rooted on every platform (shell-
+		// token resolution keeps them so). Normalize separators and clean with
+		// the POSIX path cleaner: drive letters / UNC prefixes never occur in
+		// /dev paths, so path.Clean is exact for this lookup, and ToSlash
+		// guarantees the forward-slash form.
+		normalized := path.Clean(filepath.ToSlash(absPath))
+		if harmlessPOSIXDevices[normalized] {
+			return true
+		}
 	}
 	return isNullDeviceForOS(absPath, runtime.GOOS)
 }
@@ -86,13 +96,18 @@ func IsHarmlessDevicePath(absPath string) bool {
 // device. Separated from the runtime call so the matching logic is unit-testable
 // on any platform.
 //
+// A verbatim long-path prefix (\\?\) disables reserved-name interpretation, so
+// "\\?\C:\NUL" is a literal file, not the device, and is therefore never matched.
+// A device-namespace prefix (\\.\) keeps device interpretation: "\\.\NUL" IS the
+// null device and is matched.
+//
 // A file extension is deliberately NOT stripped: a name like "nul.go" or
 // "NUL.txt" is far more likely a real source file than a device reference, and
 // exempting it would skip the containment check (a security gap). Prompting on a
 // genuine "NUL.txt" device reference is the safe, conservative trade-off.
 //
 // Examples that match when goos == "windows": "NUL", "nul", "C:\\NUL", "D:/nul",
-// "\\\\?\\C:\\NUL", "\\\\.\\NUL", "C:\\dir\\nul" (reserved in the last component).
+// "\\\\.\\NUL", "C:\\dir\\nul" (reserved in the last component).
 func isNullDeviceForOS(p, goos string) bool {
 	if goos != "windows" {
 		return false
@@ -100,14 +115,16 @@ func isNullDeviceForOS(p, goos string) bool {
 	if p == "" {
 		return false
 	}
-	// Strip a Windows long-path verbatim prefix (\\?\ or \\.\) if present.
-	s := p
-	for _, pre := range []string{`\\?\`, `\\.\`} {
-		if strings.HasPrefix(p, pre) {
-			s = strings.TrimPrefix(p, pre)
-			break
-		}
+	// A verbatim long-path prefix (\\?\) disables Windows' reserved-name
+	// interpretation: "\\?\C:\NUL" names a literal file named "NUL", not the
+	// null device. Exempting it would skip the out-of-root containment check
+	// for an ordinary file, so such paths must never match.
+	if strings.HasPrefix(p, `\\?\`) {
+		return false
 	}
+	// A device-namespace prefix (\\.\) keeps reserved-name interpretation:
+	// "\\.\NUL" IS the null device. Strip it and match the reserved name below.
+	s := strings.TrimPrefix(p, `\\.\`)
 	// Isolate the final path component.
 	base := s
 	if idx := strings.LastIndexAny(s, `\/`); idx >= 0 {

@@ -20,11 +20,13 @@ func DefaultSampling(family string) SamplingConfig {
 		// Anthropic recommends letting model self-select temperature
 		return SamplingConfig{} // all nil
 	case "openai_flagship":
-		// GPT-5 / o-series reasoning models: the OpenAI API rejects
-		// temperature != 1 and top_p overrides for reasoning models, so no
-		// parameter is sent at all.
-		// Source: platform.openai.com API reference, reasoning models note.
-		return SamplingConfig{} // all nil
+		// This family mixes reasoning (o-series) and non-reasoning (gpt-4o /
+		// gpt-4o-mini) members. Reasoning models reject temperature/top_p
+		// overrides, but applyDefaultSampling already skips any model whose
+		// Capabilities do not declare Temperature=true, so returning the
+		// non-reasoning preset (0.3) here only affects gpt-4o/gpt-4o-mini.
+		// gpt-4.1-class models live in openai_standard.
+		return SamplingConfig{Temperature: fp(0.3)}
 	case "openai_codex":
 		// Codex models (e.g. gpt-5.x-codex) run on the Responses API and share
 		// the reasoning-model restriction of openai_flagship: temperature and

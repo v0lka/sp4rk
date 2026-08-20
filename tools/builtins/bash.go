@@ -93,6 +93,17 @@ func (t *BashExecTool) Judge(ctx context.Context, input json.RawMessage) tools.J
 		}
 	}
 
+	// Unresolvable path-like tokens ("~user", "${VAR:-/etc/passwd}") reference
+	// locations the resolver cannot assess. Escalate as HARD: an input that
+	// cannot be assessed at all must never be silently let through under
+	// auto-approval (see JudgeSeverityHard).
+	if unresolved := tools.UnresolvablePathTokens(params.Command, tools.ShellBash); len(unresolved) > 0 {
+		return tools.JudgeOutcome{
+			Reason:   "command contains unresolvable path-like token(s): " + strings.Join(unresolved, ", "),
+			Severity: tools.JudgeSeverityHard,
+		}
+	}
+
 	// Path-containment analysis: out-of-root paths escalate to confirmation
 	// even under always_allow, closing the documented-invariant gap. The Judge
 	// runs before auto-approval, so a non-empty reason here forces a prompt.

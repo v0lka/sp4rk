@@ -258,8 +258,8 @@ func TestExecutor_VerifyOnEdit_FinishAfterEdit_StillVerifies(t *testing.T) {
 }
 
 // rejectingLastCallHITL allows every tool call except the named one, which
-// it rejects — reproducing the early-return interception that skips the
-// last-call verify-on-edit hook site.
+// it rejects — reproducing a final sibling intercepted before normal tool
+// execution.
 type rejectingLastCallHITL struct {
 	NoopHITLHandler
 	reject string
@@ -272,12 +272,104 @@ func (h *rejectingLastCallHITL) OnToolCall(_ context.Context, toolName string, _
 	return nil, nil
 }
 
-// TestExecutor_VerifyOnEdit_ImplicitFinishFlushesPendingVerification: an
-// edit followed by an interception of the group's last call (HITL rejection
-// returns before the hook site) leaves the verification pending; a
-// subsequent text-only end_turn must still flush it and record the note in
-// the final output instead of silently dropping it.
-func TestExecutor_VerifyOnEdit_ImplicitFinishFlushesPendingVerification(t *testing.T) {
+// TestExecutor_VerifyOnEdit_RejectedLastSiblingFlushesBeforePause verifies the
+// response-group boundary directly: a successful edit followed by a rejected
+// final sibling must run verification before the next boundary can pause the
+// executor. The note is persisted on the rejected sibling in the checkpoint.
+func TestExecutor_VerifyOnEdit_RejectedLastSiblingFlushesBeforePause(t *testing.T) {
+	exec, _, calls := newVerifyTestExecutor(t, []*llm.ChatResponse{
+		llmResponseWithMultipleToolCalls("edit then shell", []llm.ToolCall{
+			{ID: "call_a", Name: "edit_file", Input: editInput()},
+			{ID: "call_b", Name: "bash", Input: json.RawMessage(`{"command":"ls"}`)},
+		}),
+	}, func(context.Context) EditVerifyResult {
+		return EditVerifyResult{Output: "PASS", ExitCode: 0}
+	}, 0)
+	exec.SetHITLHandler(&rejectingLastCallHITL{reject: "bash"})
+	boundaryChecks := 0
+	exec.SetPauseChecker(func(context.Context) bool {
+		boundaryChecks++
+		return boundaryChecks == 2
+	})
+
+	result, err := exec.Run(context.Background(), []tools.ToolDescriptor{
+		{Name: "edit_file", Description: "edit", Source: "core"},
+		{Name: "bash", Description: "shell", Source: "core"},
+	}, newMockContextManager())
+	if !errors.Is(err, ErrPaused) {
+		t.Fatalf("expected ErrPaused, got %v", err)
+	}
+	if result == nil {
+		t.Fatal("expected paused checkpoint result")
+	}
+	if *calls != 1 {
+		t.Errorf("verify runner calls = %d, want 1 before pause", *calls)
+	}
+	if len(result.Steps) != 2 {
+		t.Fatalf("len(Steps) = %d, want edit and rejected sibling", len(result.Steps))
+	}
+	last := result.Steps[len(result.Steps)-1]
+	if last.Action.Name != "bash" || !last.IsError {
+		t.Fatalf("last step = %#v, want rejected bash call", last)
+	}
+	if !strings.Contains(last.Observation, "[Tool call rejected:") ||
+		!strings.Contains(last.Observation, "[verify_on_edit]") {
+		t.Errorf("rejected sibling observation should carry rejection and verify note, got %q", last.Observation)
+	}
+}
+
+func TestExecutor_VerifyOnEdit_BatchRejectedLastSiblingFlushesBeforePause(t *testing.T) {
+	type batchCall struct {
+		Tool  string          `json:"tool"`
+		Input json.RawMessage `json:"input"`
+	}
+	batchInput, err := json.Marshal(map[string][]batchCall{
+		"calls": {
+			{Tool: "edit_file", Input: editInput()},
+			{Tool: "bash", Input: json.RawMessage(`{"command":"ls"}`)},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal batch input: %v", err)
+	}
+
+	exec, _, calls := newVerifyTestExecutor(t, []*llm.ChatResponse{
+		llmResponseWithToolCall("batch edit then shell", tools.ToolBatch, batchInput),
+	}, func(context.Context) EditVerifyResult {
+		return EditVerifyResult{Output: "PASS", ExitCode: 0}
+	}, 0)
+	exec.SetHITLHandler(&rejectingLastCallHITL{reject: "bash"})
+	boundaryChecks := 0
+	exec.SetPauseChecker(func(context.Context) bool {
+		boundaryChecks++
+		return boundaryChecks == 2
+	})
+
+	result, err := exec.Run(context.Background(), []tools.ToolDescriptor{
+		{Name: tools.ToolBatch, Description: "batch", Source: "core"},
+		{Name: "edit_file", Description: "edit", Source: "core"},
+		{Name: "bash", Description: "shell", Source: "core"},
+	}, newMockContextManager())
+	if !errors.Is(err, ErrPaused) {
+		t.Fatalf("expected ErrPaused, got %v", err)
+	}
+	if result == nil || len(result.Steps) != 2 {
+		t.Fatalf("paused batch result = %#v, want two completed sub-calls", result)
+	}
+	if *calls != 1 {
+		t.Errorf("verify runner calls = %d, want 1 before pause", *calls)
+	}
+	last := result.Steps[len(result.Steps)-1]
+	if last.Action.Name != "bash" || !last.IsError ||
+		!strings.Contains(last.Observation, "[verify_on_edit]") {
+		t.Errorf("rejected final batch sibling should retain verify note, got %#v", last)
+	}
+}
+
+// TestExecutor_VerifyOnEdit_ImplicitFinishDoesNotRepeatFlushedVerification:
+// after the rejected final sibling flushes the group, a later text-only finish
+// must not run verification a second time.
+func TestExecutor_VerifyOnEdit_ImplicitFinishDoesNotRepeatFlushedVerification(t *testing.T) {
 	exec, _, calls := newVerifyTestExecutor(t, []*llm.ChatResponse{
 		llmResponseWithMultipleToolCalls("edit then shell", []llm.ToolCall{
 			{ID: "call_a", Name: "edit_file", Input: editInput()},
@@ -300,10 +392,13 @@ func TestExecutor_VerifyOnEdit_ImplicitFinishFlushesPendingVerification(t *testi
 		t.Fatalf("expected finished run")
 	}
 	if *calls != 1 {
-		t.Errorf("verify runner calls = %d, want 1 (pending verification must flush at implicit finish)", *calls)
+		t.Errorf("verify runner calls = %d, want exactly 1 for the response group", *calls)
 	}
-	if !strings.Contains(result.Output, "[verify_on_edit]") {
-		t.Errorf("implicit finish output should carry verify note, got %q", result.Output)
+	if strings.Contains(result.Output, "[verify_on_edit]") {
+		t.Errorf("implicit finish must not repeat an already-recorded verify note, got %q", result.Output)
+	}
+	if len(result.Steps) < 2 || !strings.Contains(result.Steps[1].Observation, "[verify_on_edit]") {
+		t.Errorf("rejected sibling should retain the verify note in trajectory: %#v", result.Steps)
 	}
 }
 

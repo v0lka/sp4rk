@@ -186,31 +186,42 @@ func (t *SearchFactsTool) Execute(ctx context.Context, input json.RawMessage) (t
 // either "=" (env/shell) or a quoted value (JSON/YAML config); the quoted-value
 // requirement is the discriminator that separates structured secrets from
 // prose without sacrificing recall for "OPENAI_API_KEY=sk-..." prefixes.
-var secretPatterns = []*regexp.Regexp{
+type secretPattern struct {
+	re    *regexp.Regexp
+	label string
+}
+
+var secretPatterns = []secretPattern{
 	// "=" assignments: KEY=value (env, shell, .env files). Matches prefixed
 	// identifiers like OPENAI_API_KEY or ANTHROPIC_API_KEY.
-	regexp.MustCompile(`(?i)(?:api[_-]?key|password|passwd|secret|token|access[_-]?key|auth)\s*=\s*\S{8,}`),
+	{
+		re:    regexp.MustCompile(`(?i)(?:api[_-]?key|password|passwd|secret|token|access[_-]?key|auth)\s*=\s*\S{8,}`),
+		label: "credential assignment (key/password/token = value)",
+	},
 	// ":" assignments with a quoted value (JSON/YAML/TOML config). The value
 	// must be quoted so prose like "the token: abcd1234" never matches.
-	regexp.MustCompile(`(?i)["']?(?:api[_-]?key|password|passwd|secret|token|access[_-]?key|auth)["']?\s*:\s*["']\S{8,}["']`),
+	{
+		re:    regexp.MustCompile(`(?i)["']?(?:api[_-]?key|password|passwd|secret|token|access[_-]?key|auth)["']?\s*:\s*["']\S{8,}["']`),
+		label: "quoted credential assignment (JSON/YAML config)",
+	},
 	// OpenAI-style keys.
-	regexp.MustCompile(`sk-[A-Za-z0-9]{20,}`),
+	{re: regexp.MustCompile(`sk-[A-Za-z0-9]{20,}`), label: "OpenAI-style API key"},
 	// Anthropic-style keys.
-	regexp.MustCompile(`sk-ant-[A-Za-z0-9_-]{20,}`),
+	{re: regexp.MustCompile(`sk-ant-[A-Za-z0-9_-]{20,}`), label: "Anthropic-style API key"},
 	// Generic long hex/base64 "bearer" tokens.
-	regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._-]{20,}`),
+	{re: regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._-]{20,}`), label: "bearer token"},
 	// AWS access keys.
-	regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+	{re: regexp.MustCompile(`AKIA[0-9A-Z]{16}`), label: "AWS access key"},
 	// GitHub PATs.
-	regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{36,}`),
+	{re: regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{36,}`), label: "GitHub personal access token"},
 }
 
 // matchesSecretPattern returns a human-readable label of the first secret
 // pattern matched by content, or "" if none match.
 func matchesSecretPattern(content string) string {
-	for _, re := range secretPatterns {
-		if re.MatchString(content) {
-			return re.String()
+	for _, sp := range secretPatterns {
+		if sp.re.MatchString(content) {
+			return sp.label
 		}
 	}
 	return ""

@@ -112,11 +112,10 @@ type ContextWindow struct {
 	// user nudge (e.g. "try variant B instead") that must land next to the
 	// pending tool result in the very next LLM call.
 	//
-	// BuildPrompt consumes it on read: the FIRST BuildPrompt that includes it
-	// appends the message and clears the field, so the nudge appears in exactly
-	// one LLM call and never duplicates across subsequent steps. (BuildPrompt is
-	// only called at the LLM-call site in the executor loop, so consume-on-read
-	// is equivalent to "resets after the first LLM call".)
+	// BuildPrompt appends it on every call; it is NOT cleared here. The executor
+	// retires the nudge via ConsumePendingUserInterjection after a successful
+	// LLM response, so it survives a reactive-compaction retry without
+	// duplicating across subsequent steps.
 	pendingUserInterjection string
 }
 

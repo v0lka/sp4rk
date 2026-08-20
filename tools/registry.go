@@ -225,7 +225,7 @@ func (r *ToolRegistry) ListFiltered(excludeNames map[string]bool) []ToolDescript
 			InputSchema:    tool.InputSchema(),
 			Source:         source,
 			SourceCategory: r.categoryForLocked(tool.Name()),
-			Group:          tool.Group(),
+			Group:          ToolGroupOf(tool),
 		})
 	}
 	return descriptors

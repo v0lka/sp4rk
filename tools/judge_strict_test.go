@@ -105,13 +105,15 @@ func TestJudgeStrictAlwaysCallsLLMAndIncludesContext(t *testing.T) {
 		if !strings.Contains(envelope.Environment, "TestOS") {
 			t.Errorf("compact environment missing from envelope: %q", envelope.Environment)
 		}
-		if len(envelope.SessionDirectories) < 2 ||
-			envelope.SessionDirectories[0] != WorkspacePathFrom(ctx) ||
-			envelope.SessionDirectories[1] != "/aux/explicit-dir" {
-			t.Errorf("session directories missing from envelope: %v", envelope.SessionDirectories)
+		if !strings.Contains(envelope.SessionDirectories, WorkspacePathFrom(ctx)) ||
+			!strings.Contains(envelope.SessionDirectories, "/aux/explicit-dir") {
+			t.Errorf("session directories missing from envelope: %q", envelope.SessionDirectories)
 		}
-		if envelope.Input != string(input) {
-			t.Errorf("input changed in envelope: got %s want %s", envelope.Input, input)
+		if !strings.Contains(envelope.SessionDirectories, "<untrusted-content") {
+			t.Errorf("session directories not wrapped in an untrusted-content boundary: %q", envelope.SessionDirectories)
+		}
+		if !strings.Contains(envelope.Input, string(input)) || !strings.Contains(envelope.Input, "tool_input") {
+			t.Errorf("input not preserved or wrapped in envelope: got %q want %q", envelope.Input, input)
 		}
 	}
 }
@@ -138,8 +140,8 @@ func TestJudgeStrictCallsLLMForMalformedInput(t *testing.T) {
 	if err := json.Unmarshal([]byte(requests[0].Messages[1].Content), &envelope); err != nil {
 		t.Fatalf("decode strict envelope: %v", err)
 	}
-	if envelope.Input != string(input) {
-		t.Fatalf("malformed input changed: got %q want %q", envelope.Input, input)
+	if !strings.Contains(envelope.Input, string(input)) {
+		t.Fatalf("malformed input not preserved: got %q want %q", envelope.Input, input)
 	}
 }
 

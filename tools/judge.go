@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -72,18 +73,32 @@ type StrictJudgeRequest struct {
 }
 
 // strictJudgeEnvelope is serialized as JSON to keep untrusted data fields
-// structurally separated in the LLM request. SessionDirectories is the only
-// host-provided scope field: the session's containment roots (workspace,
-// session temp directory, auxiliary work directories — whether configured
-// explicitly by the user or injected implicitly by the host), listed so the
-// judge can recognize in-scope paths.
+// structurally separated in the LLM request. The untrusted fields — the tool
+// Input and the host-provided SessionDirectories — are wrapped in
+// security.WrapUntrustedContent boundaries and the directories are
+// line-sanitized before serialization, mirroring the advisory judge path, so
+// hostile values cannot forge prompt structure or break out of the envelope.
 type strictJudgeEnvelope struct {
-	TaskContext        string   `json:"task_context"`
-	ToolName           string   `json:"tool_name"`
-	ToolSource         string   `json:"tool_source"`
-	Input              string   `json:"input"`
-	Environment        string   `json:"environment,omitempty"`
-	SessionDirectories []string `json:"session_directories,omitempty"`
+	TaskContext        string `json:"task_context"`
+	ToolName           string `json:"tool_name"`
+	ToolSource         string `json:"tool_source"`
+	Input              string `json:"input"`
+	Environment        string `json:"environment,omitempty"`
+	SessionDirectories string `json:"session_directories,omitempty"`
+}
+
+// marshalStrictEnvelope serializes the strict judge envelope with HTML
+// escaping disabled so that security.WrapUntrustedContent boundaries (the
+// <untrusted-content> XML tags) reach the LLM as literal tags instead of
+// being JSON-escaped to \u003c, which would defeat the structural boundary.
+func marshalStrictEnvelope(envelope strictJudgeEnvelope) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(envelope); err != nil {
+		return nil, err
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
 }
 
 // judgeResult holds both verdict and reasoning for caching.
@@ -391,14 +406,14 @@ func (j *ToolJudge) JudgeStrict(ctx context.Context, request StrictJudgeRequest)
 		TaskContext:        request.TaskContext,
 		ToolName:           request.ToolName,
 		ToolSource:         request.ToolSource,
-		Input:              string(request.Input),
+		Input:              security.WrapUntrustedContent(string(request.Input), "tool_input", nil),
 		Environment:        FormatCompactEnvBlock(EnvInfoFrom(ctx)),
-		SessionDirectories: roots,
+		SessionDirectories: formatSessionRootsBlock(ctx, roots),
 	}
-	prompt, err := json.Marshal(envelope)
+	prompt, err := marshalStrictEnvelope(envelope)
 	if err != nil {
 		// Defensive: strictJudgeEnvelope contains only string fields, so
-		// json.Marshal cannot fail in practice. Keep the fail-safe anyway for
+		// marshaling cannot fail in practice. Keep the fail-safe anyway for
 		// forward compatibility if the struct ever gains an unmarshalable field.
 		if log != nil {
 			log.Warn("strict judge: invalid evaluation context, fail-safe to CONFIRM", "tool", request.ToolName)
@@ -543,6 +558,27 @@ func ExtractPaths(s string) []string {
 	return out
 }
 
+// parentRefRe matches a ".." parent-directory reference that is a full path
+// segment (preceded by the start or a separator and followed by a separator or
+// the end), so "..." (ellipsis) and "..config" (a filename) are not mistaken
+// for a parent-ref.
+var parentRefRe = regexp.MustCompile(`(?:^|[\\/])\.\.(?:[\\/]|$)`)
+
+// HasRelativeEscape reports whether s contains a ".." parent-directory
+// reference inside a relative path, i.e. a relative path that could escape the
+// containment root. A plain relative name ("frontend/src/main.tsx") has none;
+// a relative escape ("a/../../etc/passwd", "../foo") does.
+//
+// It is the fail-closed counterpart to [ExtractPaths]: ExtractPaths drops a
+// relative-path fragment (delegating plain relative names to the tool's own
+// in-root path handling), but a ".." parent-ref must never be silently dropped
+// because the judge fast-path ([AllPathsInSessionRoots]) would otherwise
+// auto-approve a mixed input that hides an out-of-root escape behind an
+// in-root path.
+func HasRelativeEscape(s string) bool {
+	return parentRefRe.MatchString(s)
+}
+
 // AllPathsInDir returns true if the JSON input contains at least one absolute
 // path and every such path is within the specified directory. Containment
 // respects the session case-sensitivity flag (see [CaseInsensitivePathsFrom]):
@@ -560,6 +596,9 @@ func AllPathsInDir(ctx context.Context, input json.RawMessage, dir string) bool 
 	strValues := ExtractJSONStrings(parsed)
 	var allPaths []string
 	for _, s := range strValues {
+		if HasRelativeEscape(s) {
+			return false // relative ".." escape cannot be assessed — fail closed.
+		}
 		allPaths = append(allPaths, ExtractPaths(s)...)
 	}
 
@@ -623,6 +662,9 @@ func AllPathsInSessionRoots(ctx context.Context, input json.RawMessage) bool {
 	strValues := ExtractJSONStrings(parsed)
 	var allPaths []string
 	for _, s := range strValues {
+		if HasRelativeEscape(s) {
+			return false // relative ".." escape cannot be assessed — fail closed.
+		}
 		allPaths = append(allPaths, ExtractPaths(s)...)
 	}
 

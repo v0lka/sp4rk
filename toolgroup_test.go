@@ -69,7 +69,7 @@ func TestEveryBuiltinToolDeclaresValidGroup(t *testing.T) {
 		t.Fatalf("assembled %d tools, expected at least %d — construction list is stale", len(ts), len(expectedToolGroups))
 	}
 	for _, tool := range ts {
-		g := tool.Group()
+		g := tools.ToolGroupOf(tool)
 		if !tools.IsValidToolGroup(g) {
 			t.Errorf("tool %q declares invalid/empty group %q", tool.Name(), g)
 		}
@@ -95,7 +95,7 @@ func TestBuiltinToolGroups_ExactMapping(t *testing.T) {
 			continue
 		}
 		seen[name] = true
-		if got := tool.Group(); got != want {
+		if got := tools.ToolGroupOf(tool); got != want {
 			t.Errorf("tool %q group = %q, want %q", name, got, want)
 		}
 	}

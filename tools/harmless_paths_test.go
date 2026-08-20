@@ -12,8 +12,8 @@ func TestIsHarmlessDevicePath(t *testing.T) {
 		want bool
 	}{
 		{"empty", "", false},
-		{"null", "/dev/null", true},
-		{"full", "/dev/full", true},
+		{"null", "/dev/null", runtime.GOOS != "windows"},
+		{"full", "/dev/full", runtime.GOOS != "windows"},
 		// Process streams are deliberately NOT harmless: their targets are
 		// host-defined file descriptors, so writing can exfiltrate and reading
 		// consumes the agent's input. On macOS these are symlinks into /dev/fd/*.
@@ -34,10 +34,11 @@ func TestIsHarmlessDevicePath(t *testing.T) {
 		// is thus host-dependent, matching IsHarmlessDevicePath's OS-gating.
 		{"bare nul", "nul", runtime.GOOS == "windows"},
 		{"ordinary file named devnull", "/home/me/devnull", false},
-		// Variations that should still match after normalization.
-		{"trailing slash cleaned", "/dev/null/", true},
-		{"double slash cleaned", "/dev//null", true},
-		{"dot resolved", "/dev/./null", true},
+		// On Windows /dev/null is an ordinary path, not a device, so these POSIX
+		// variations match only on non-Windows hosts.
+		{"trailing slash cleaned", "/dev/null/", runtime.GOOS != "windows"},
+		{"double slash cleaned", "/dev//null", runtime.GOOS != "windows"},
+		{"dot resolved", "/dev/./null", runtime.GOOS != "windows"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -64,8 +65,13 @@ func TestIsNullDeviceForOS(t *testing.T) {
 		{"win bare lower", "nul", "windows", true},
 		{"win drive upper", `C:\NUL`, "windows", true},
 		{"win drive slash lower", `D:/nul`, "windows", true},
-		{"win verbatim prefix", `\\?\C:\NUL`, "windows", true},
+		// A verbatim long-path prefix (\\?\) disables reserved-name
+		// interpretation, so "\\?\C:\NUL" names a literal file, not the device.
+		{"win verbatim prefix literal file", `\\?\C:\NUL`, "windows", false},
+		{"win verbatim prefix in subdir", `\\?\C:\dir\nul`, "windows", false},
+		// A device-namespace prefix (\\.\) keeps device interpretation.
 		{"win device prefix", `\\.\NUL`, "windows", true},
+		{"win device prefix lower", `\\.\nul`, "windows", true},
 		// "nul" is reserved in the LAST component on Windows, so a path like
 		// C:\dir\nul is still the device (Windows forbids a real file named
 		// "nul" with no extension).
