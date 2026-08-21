@@ -2501,12 +2501,19 @@ func TestIsPathInSessionRoots_NoRoots(t *testing.T) {
 }
 
 // TestIsPathInSessionRoots_HarmlessDevice verifies harmless special-device
-// paths (/dev/null, /dev/full) are treated as local by the file-tool judges,
-// so read_file/write_file targeting them do not force a confirmation.
+// paths are treated as local by the file-tool judges, so read_file/write_file
+// targeting them do not force a confirmation. The harmless set is host-
+// dependent: POSIX exempts /dev/null and /dev/full, Windows exempts the
+// reserved NUL device (its /dev/null equivalent) — on Windows /dev/null and
+// /dev/full are ordinary out-of-root paths, not devices.
 func TestIsPathInSessionRoots_HarmlessDevice(t *testing.T) {
 	ws := t.TempDir()
 	ctx := tools.WithWorkspacePath(context.Background(), ws)
-	for _, p := range []string{"/dev/null", "/dev/full"} {
+	harmless := []string{"/dev/null", "/dev/full"}
+	if runtime.GOOS == "windows" {
+		harmless = []string{"NUL"}
+	}
+	for _, p := range harmless {
 		if !isPathInSessionRoots(ctx, p) {
 			t.Errorf("expected harmless device %q to be treated as local", p)
 		}

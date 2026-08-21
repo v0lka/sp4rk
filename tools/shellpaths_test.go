@@ -395,17 +395,29 @@ func sliceContains(ss []string, s string) bool {
 }
 
 // TestPathsOutsideRoots_HarmlessDeviceNotReported verifies that harmless
-// special-device paths (e.g. /dev/null, /dev/full) are NOT reported as
-// outside the session roots, even though they are not contained in any root.
+// special-device paths are NOT reported as outside the session roots, even
+// though they are not contained in any root. The harmless device is host-
+// dependent: POSIX exempts /dev/null and /dev/full; Windows exempts the
+// reserved NUL device, while /dev/null and /dev/full are ordinary out-of-root
+// paths there.
 func TestPathsOutsideRoots_HarmlessDeviceNotReported(t *testing.T) {
 	ws := t.TempDir()
 	ctx := WithWorkspacePath(context.Background(), ws)
-	for _, cmd := range []string{
+	cmds := []string{
 		"cat foo > /dev/null",
 		"echo hi > /dev/null",
 		"cat /dev/null",
 		"echo x > /dev/full",
-	} {
+	}
+	if runtime.GOOS == "windows" {
+		cmds = []string{
+			"cat foo > NUL",
+			"echo hi > NUL",
+			"cat NUL",
+			"echo x > NUL",
+		}
+	}
+	for _, cmd := range cmds {
 		got := PathsOutsideRoots(ctx, cmd, ShellBash, ws)
 		if len(got) != 0 {
 			t.Errorf("harmless-device cmd %q must not be flagged as out-of-root, got %v", cmd, got)
@@ -415,17 +427,24 @@ func TestPathsOutsideRoots_HarmlessDeviceNotReported(t *testing.T) {
 
 // TestPathsOutsideRoots_HarmlessDeviceAlongsideOutsided verifies that a
 // harmless device does not mask genuinely out-of-root paths: the real escape
-// (/etc/passwd) is still reported when it appears alongside /dev/null.
+// (/etc/passwd) is still reported when it appears alongside the harmless
+// device (/dev/null on POSIX, the reserved NUL device on Windows).
 func TestPathsOutsideRoots_HarmlessDeviceAlongsideOutside(t *testing.T) {
 	ws := t.TempDir()
 	ctx := WithWorkspacePath(context.Background(), ws)
-	got := PathsOutsideRoots(ctx, "cat /etc/passwd > /dev/null", ShellBash, ws)
+	cmd := "cat /etc/passwd > /dev/null"
+	harmless := "/dev/null"
+	if runtime.GOOS == "windows" {
+		cmd = "cat /etc/passwd > NUL"
+		harmless = "NUL"
+	}
+	got := PathsOutsideRoots(ctx, cmd, ShellBash, ws)
 	if !sliceContains(got, "/etc/passwd") {
-		t.Fatalf("expected /etc/passwd reported alongside /dev/null, got %v", got)
+		t.Fatalf("expected /etc/passwd reported alongside %s, got %v", harmless, got)
 	}
 	for _, p := range got {
-		if p == "/dev/null" {
-			t.Fatalf("/dev/null must not be reported as out-of-root, got %v", got)
+		if p == harmless {
+			t.Fatalf("%s must not be reported as out-of-root, got %v", harmless, got)
 		}
 	}
 }

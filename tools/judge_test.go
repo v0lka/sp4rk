@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -1152,29 +1153,47 @@ func TestAllPathsInSessionRoots(t *testing.T) {
 }
 
 // TestAllPathsInSessionRoots_HarmlessDevice verifies that harmless
-// special-device paths (e.g. /dev/null) do not force the fast-path to fail
-// even though they fall outside the session roots, and do not mask a genuine
-// out-of-root path when one appears alongside them.
+// special-device paths do not force the fast-path to fail even though they
+// fall outside the session roots, and do not mask a genuine out-of-root path
+// when one appears alongside them. The harmless device is host-dependent:
+// POSIX exempts /dev/null; Windows exempts the reserved NUL device (referenced
+// via a drive-letter form so the judge's path extractor recognizes it — a bare
+// "NUL" carries no separator and is dropped, not exempted).
 func TestAllPathsInSessionRoots_HarmlessDevice(t *testing.T) {
 	ws := t.TempDir()
 	ctx := WithWorkspacePath(context.Background(), ws)
 
-	// /dev/null alone is harmless — auto-allow.
-	if got := AllPathsInSessionRoots(ctx, json.RawMessage(`{"path":"/dev/null"}`)); !got {
-		t.Fatal("expected /dev/null to be treated as local")
+	dev := "/dev/null"
+	if runtime.GOOS == "windows" {
+		dev = `C:\NUL`
 	}
-	// /dev/null alongside an in-workspace path — still local. Build the dest
-	// with forward slashes so the embedded JSON is valid on every host (a raw
-	// Windows temp dir contains backslashes that would otherwise produce
+	// Build the JSON inputs via json.Marshal so the Windows drive path's
+	// backslash is escaped correctly without hand-written escape sequences.
+	input := func(fields map[string]string) json.RawMessage {
+		b, err := json.Marshal(fields)
+		if err != nil {
+			t.Fatalf("marshal input: %v", err)
+		}
+		return json.RawMessage(b)
+	}
+
+	// The harmless device alone is auto-allowed.
+	if got := AllPathsInSessionRoots(ctx, input(map[string]string{"path": dev})); !got {
+		t.Fatalf("expected %s to be treated as local", dev)
+	}
+	// The harmless device alongside an in-workspace path — still local. Build
+	// the dest with forward slashes so the embedded JSON is valid on every host
+	// (a raw Windows temp dir contains backslashes that would otherwise produce
 	// illegal JSON escapes such as "\U" or "\T"). The containment check
 	// filepath.Cleans both sides, so separators do not affect the result.
 	dest := filepath.ToSlash(filepath.Join(ws, "out"))
-	if got := AllPathsInSessionRoots(ctx, json.RawMessage(`{"path":"/dev/null","dest":"`+dest+`"}`)); !got {
-		t.Fatal("expected /dev/null + in-root path to be treated as local")
+	if got := AllPathsInSessionRoots(ctx, input(map[string]string{"path": dev, "dest": dest})); !got {
+		t.Fatalf("expected %s + in-root path to be treated as local", dev)
 	}
-	// /dev/null alongside a genuine out-of-root path — must fail (not masked).
-	if got := AllPathsInSessionRoots(ctx, json.RawMessage(`{"path":"/dev/null","dest":"/etc/evil"}`)); got {
-		t.Fatal("expected out-of-root path to fail fast-path even with /dev/null present")
+	// The harmless device alongside a genuine out-of-root path — must fail
+	// (not masked).
+	if got := AllPathsInSessionRoots(ctx, input(map[string]string{"path": dev, "dest": "/etc/evil"})); got {
+		t.Fatalf("expected out-of-root path to fail fast-path even with %s present", dev)
 	}
 }
 
