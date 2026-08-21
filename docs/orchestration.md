@@ -472,7 +472,7 @@ All methods are safe for concurrent use. Read methods return defensive copies, s
 | `GetAllStepResults` | Defensive copy of all step results, keyed by step ID. |
 | `GetReflections` | Defensive copy of all reflections, in insertion order. |
 | `GetFinalResult` / `SetFinalResult` | The final result string. |
-| `SetStepResult` | Records a completed step. Auto-generates a summary from `output` (first paragraph, capped at the configured max length). |
+| `SetStepResult` | Records a completed step. Auto-generates a summary from `output` (skipping leading blank lines and markdown headings, then the first paragraph, capped at the configured max length). |
 | `AddReflection` | Appends a reflection. |
 | `Search` | Case-insensitive substring search across step summaries, full outputs, and reflection summaries. Returns `[]BlackboardEntry`. |
 | `StoreFact` / `SearchFacts` / `GetFacts` | Fact memory — see [Fact memory](#fact-memory). |
@@ -496,7 +496,7 @@ bb.SetOriginalRequest("Build a Go project that prints hello")
 func WithMaxSummaryLen(n int) MapBlackboardOption
 ```
 
-Sets a character-based cap on auto-generated step summaries. A value of `0` uses the default of `500` characters. The summary takes the first paragraph (text up to the first double-newline) or the first `n` characters, whichever is shorter, appending `...` when truncated.
+Sets a character-based cap on auto-generated step summaries. A value of `0` uses the default of `500` characters. The summary skips leading blank lines and leading markdown headings (ATX `# …` and setext `===`/`---` underlines), then takes the first paragraph (text up to the first double-newline) or the first `n` characters, whichever is shorter, appending `…` when truncated.
 
 ```go
 bb := orchestration.NewMapBlackboard(orchestration.WithMaxSummaryLen(800))

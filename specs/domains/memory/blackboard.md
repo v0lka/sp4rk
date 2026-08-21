@@ -40,7 +40,7 @@ type Blackboard interface {
 }
 ```
 
-All methods are safe for concurrent use. Read methods return defensive copies, so callers can mutate returned slices without racing the blackboard. `SetStepResult` auto-generates a summary from `output` (first paragraph, capped at the configured max length). `Search` is a case-insensitive substring search across step summaries, full outputs, and reflection summaries.
+All methods are safe for concurrent use. Read methods return defensive copies, so callers can mutate returned slices without racing the blackboard. `SetStepResult` auto-generates a summary from `output`: leading blank lines and leading markdown headings (ATX `# …` and setext `===`/`---` underlines) are skipped, then the first paragraph (up to the first double-newline) is taken and capped at the configured max length. `Search` is a case-insensitive substring search across step summaries, full outputs, and reflection summaries.
 
 ### Fact memory
 
@@ -82,7 +82,7 @@ type Attachment struct {
 
 ### MapBlackboard
 
-`NewMapBlackboard(opts ...MapBlackboardOption)` is the reference thread-safe, map-backed implementation — the default for in-memory tasks. `WithMaxSummaryLen(n)` caps auto-generated step summaries (default `500` characters; first paragraph up to `n` chars, `...` when truncated). It also exposes `SetStepResultRaw`, `SetFacts`, and `SetAttachments`, used by the persistence layer to hydrate state without regenerating summaries.
+`NewMapBlackboard(opts ...MapBlackboardOption)` is the reference thread-safe, map-backed implementation — the default for in-memory tasks. `WithMaxSummaryLen(n)` caps auto-generated step summaries (default `500` characters; after skipping leading blank lines and markdown headings, the first paragraph up to `n` chars, `…` when truncated). It also exposes `SetStepResultRaw`, `SetFacts`, and `SetAttachments`, used by the persistence layer to hydrate state without regenerating summaries.
 
 ### Adapters
 

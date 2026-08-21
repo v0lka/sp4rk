@@ -424,8 +424,11 @@ func (b *MapBlackboard) Search(query string) []BlackboardEntry {
 // Helpers
 // ---------------------------------------------------------------------------
 
-// GenerateSummary creates a summary from output: first paragraph (up to first
-// double-newline) or first maxLen chars, whichever is shorter. Appends "..." if truncated.
+// GenerateSummary creates a summary from output: the first meaningful paragraph
+// (up to the first double-newline) or the first maxLen chars, whichever is
+// shorter. Leading blank lines and leading markdown headings (ATX `# ...` and
+// setext `===`/`---` underlines) are skipped so the summary captures actual
+// content rather than a title. TruncateUTF8 appends "…" when truncated.
 // If maxLen is 0, uses default of 500.
 func GenerateSummary(output string, maxLen int) string {
 	if output == "" {
@@ -436,10 +439,12 @@ func GenerateSummary(output string, maxLen int) string {
 		maxLen = 500
 	}
 
+	body := skipLeadingHeadings(output)
+
 	// Find first double-newline (paragraph break).
-	paragraph := output
-	if idx := strings.Index(output, "\n\n"); idx >= 0 {
-		paragraph = output[:idx]
+	paragraph := body
+	if idx := strings.Index(body, "\n\n"); idx >= 0 {
+		paragraph = body[:idx]
 	}
 
 	// Take whichever is shorter: paragraph or maxLen chars.
@@ -451,6 +456,73 @@ func GenerateSummary(output string, maxLen int) string {
 	}
 
 	return result
+}
+
+// skipLeadingHeadings strips leading blank lines and leading markdown headings
+// (ATX `# ...` and setext `===`/`---` underlines) from s, returning the
+// remaining content starting at the first non-heading, non-blank line. When s
+// contains nothing but headings and blank lines, the original input is
+// returned unchanged so a summary is never empty for non-empty output.
+func skipLeadingHeadings(s string) string {
+	lines := strings.Split(s, "\n")
+	i := 0
+	for i < len(lines) {
+		line := strings.TrimSpace(lines[i])
+
+		// Blank line.
+		if line == "" {
+			i++
+			continue
+		}
+
+		// ATX heading: 1-6 '#' followed by whitespace or end of line.
+		if isATXHeading(line) {
+			i++
+			continue
+		}
+
+		// Setext heading: this line followed by an all-'=' or all-'-' underline.
+		if i+1 < len(lines) && isSetextUnderline(strings.TrimSpace(lines[i+1])) {
+			i += 2
+			continue
+		}
+
+		// First content line.
+		break
+	}
+
+	if i >= len(lines) {
+		return s
+	}
+	return strings.Join(lines[i:], "\n")
+}
+
+// isATXHeading reports whether s is a Markdown ATX heading: 1-6 leading '#'
+// characters followed by a space, a tab, or the end of the string.
+func isATXHeading(s string) bool {
+	n := 0
+	for n < len(s) && s[n] == '#' {
+		n++
+	}
+	if n == 0 || n > 6 {
+		return false
+	}
+	return n == len(s) || s[n] == ' ' || s[n] == '\t'
+}
+
+// isSetextUnderline reports whether s is a Markdown setext underline: a
+// non-empty line made entirely of '=' or entirely of '-'.
+func isSetextUnderline(s string) bool {
+	return s != "" && (allSameByte(s, '=') || allSameByte(s, '-'))
+}
+
+func allSameByte(s string, b byte) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] != b {
+			return false
+		}
+	}
+	return true
 }
 
 // copyPlan returns a deep copy of a Plan.

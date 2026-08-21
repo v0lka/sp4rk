@@ -106,6 +106,53 @@ func TestBlackboard_StepResult_WithError(t *testing.T) {
 	}
 }
 
+func TestGenerateSummary_SkipsLeadingHeadings(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		want   string
+	}{
+		{
+			name:   "atx heading then body",
+			output: "## Implement auth middleware\n\nAdded JWT validation and wired it into the router.",
+			want:   "Added JWT validation and wired it into the router.",
+		},
+		{
+			name:   "setext heading then body",
+			output: "Implementation\n==============\n\nRewrote the parser.",
+			want:   "Rewrote the parser.",
+		},
+		{
+			name:   "leading blank lines then atx heading then body",
+			output: "\n\n### Result\n\nExtracted the retry logic into a helper.",
+			want:   "Extracted the retry logic into a helper.",
+		},
+		{
+			name:   "multiple headings before body",
+			output: "# One\n\n## Two\n\nThe real summary.",
+			want:   "The real summary.",
+		},
+		{
+			name:   "no heading remains unchanged",
+			output: "Plain first paragraph.\n\nSecond paragraph.",
+			want:   "Plain first paragraph.",
+		},
+		{
+			name:   "heading only falls back to original",
+			output: "## Just a title",
+			want:   "## Just a title",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := GenerateSummary(tt.output, 500); got != tt.want {
+				t.Fatalf("GenerateSummary() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestBlackboard_GetStepSummary(t *testing.T) {
 	bb := NewMapBlackboard()
 
