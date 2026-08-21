@@ -321,6 +321,100 @@ func TestModelRegistry_FuzzyMatch_Table(t *testing.T) {
 	}
 }
 
+func TestNormalizeModelID_StripsPostfixes(t *testing.T) {
+	// Delivery/quantization postfixes must be stripped from the end — including
+	// chains of them — while parameter counts ("-8b") and canonical
+	// quantizations like "fp8" must survive untouched.
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"no postfix", "qwen3", "qwen3"},
+		{"gguf postfix", "qwen3-gguf", "qwen3"},
+		{"mlx postfix", "qwen3-mlx", "qwen3"},
+		{"safetensors postfix", "qwen3-safetensors", "qwen3"},
+		{"8bit postfix", "qwen3-8bit", "qwen3"},
+		{"8-bit postfix", "qwen3-8-bit", "qwen3"},
+		{"8_bit postfix", "qwen3-8_bit", "qwen3"},
+		{"16bit postfix (not reduced via 6bit)", "qwen3-16bit", "qwen3"},
+		{"32bit postfix (not reduced via 2bit)", "qwen3-32bit", "qwen3"},
+		{"postfix chain", "qwen3-8bit-gguf", "qwen3"},
+		{"postfix chain reversed", "qwen3-gguf-8bit", "qwen3"},
+		{"longer chain", "qwen3-8-bit-gguf-mlx", "qwen3"},
+		{"mixed case postfix", "QWEN3-8BIT-GGUF", "qwen3"},
+		{"vendor prefix still stripped", "qwen/qwen3-8bit", "qwen3"},
+		{"parameter count 8b not stripped", "qwen3-8b", "qwen38b"},
+		{"parameter count 4b not stripped", "qwen3-4b", "qwen34b"},
+		{"fp8 not stripped", "qwen3.6-35b-a3b-fp8", "qwen3635ba3bfp8"},
+		{"base suffix not stripped", "qwen3-base", "qwen3base"},
+		{"instruct 8b-it not stripped", "qwen3-8b-it", "qwen38bit"},
+		{"instruct 32b-it not stripped", "qwen3-32b-it", "qwen332bit"},
+		{"instruct gemma-2-2b-it not stripped", "gemma-2-2b-it", "gemma22bit"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := normalizeModelID(tt.in); got != tt.want {
+				t.Errorf("normalizeModelID(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestModelRegistry_FuzzyMatch_IgnoresPostfixes(t *testing.T) {
+	// A host that appends delivery/quantization postfixes to a base model name
+	// must resolve to the same metadata as the base. Chains of postfixes are
+	// stripped too.
+	registry := NewModelRegistry(map[string]ModelMetadata{
+		"my-model": {ContextWindow: 424242},
+	})
+
+	for _, model := range []string{
+		"my-model",
+		"my-model-gguf",
+		"my-model-mlx",
+		"my-model-8bit",
+		"my-model-8-bit",
+		"my-model-8bit-gguf",
+		"my-model-gguf-8bit-mlx",
+	} {
+		meta, ok := registry.ResolveLocal(model)
+		if !ok {
+			t.Errorf("ResolveLocal(%q): expected ok=true", model)
+			continue
+		}
+		if meta.ContextWindow != 424242 {
+			t.Errorf("ResolveLocal(%q): ContextWindow = %d, want 424242", model, meta.ContextWindow)
+		}
+	}
+
+	// A parameter-count suffix ("-8b") is not a quantization postfix and must
+	// NOT collapse onto the base model.
+	if _, ok := registry.ResolveLocal("my-model-8b"); ok {
+		t.Error("ResolveLocal(my-model-8b): expected ok=false (parameter count is not a postfix)")
+	}
+}
+
+func TestModelRegistry_FuzzyIndex_DeterministicWinner(t *testing.T) {
+	// When two override keys collapse to the same normalized form, the
+	// lexicographically smallest original key deterministically wins the fuzzy
+	// slot (see buildNormalizedIndex). A postfixed spelling sorts after its
+	// base, so the base is the survivor and a drifted query resolves to the
+	// base metadata, not the variant's.
+	registry := NewModelRegistry(map[string]ModelMetadata{
+		"qwen3-gguf": {ContextWindow: 200},
+		"qwen3":      {ContextWindow: 100},
+	})
+
+	meta, ok := registry.ResolveLocal("qwen3_gguf")
+	if !ok {
+		t.Fatal("ResolveLocal(qwen3_gguf): expected ok=true")
+	}
+	if meta.ContextWindow != 100 {
+		t.Errorf("ResolveLocal(qwen3_gguf): ContextWindow = %d, want 100 (base key wins)", meta.ContextWindow)
+	}
+}
+
 func TestModelRegistry_FuzzyMatch_CachesUnderQueryKey(t *testing.T) {
 	// A fuzzy hit must be cached under the (lowercased) query key so repeat
 	// resolves take the fast cache path and don't re-run the fuzzy scan.

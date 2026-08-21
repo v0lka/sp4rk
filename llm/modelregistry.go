@@ -636,23 +636,115 @@ func (r *ModelRegistry) resolveSpecOrCache(model, key string) ModelMetadata {
 // inconsistently between tokens of a model identifier.
 var modelIDSeparators = strings.NewReplacer(".", "", "-", "", "_", "")
 
+// modelIDPostfixes lists delivery/quantization decorations that hosts append to
+// a base model name but that are not part of the model's canonical identity.
+// They are stripped from the END of the identifier BEFORE its separators are
+// removed (see stripModelIDPostfixes), so a GGUF download or an 8-bit quant
+// serves the same model as its base: "qwen3-8bit", "qwen3-8-bit-gguf", and
+// "qwen3-gguf" all collapse to "qwen3".
+//
+// Each token carries its leading separator ("-"/"_"), which is what makes
+// stripping separator-aware: an instruct suffix is never misread as a
+// quantization because "qwen3-8b-it" ends in "-it", not in any postfix token,
+// while "qwen3-8bit"/"qwen3-8-bit"/"qwen3_8bit" are all stripped. Internal
+// separator spellings ("8-bit"/"8_bit") are expanded explicitly because the
+// separators are still present at strip time.
+//
+// Deliberately EXCLUDED are the fp*/int*/bf16 quantization tokens: "fp8" in
+// particular is part of canonical model names in the built-in catalog
+// ("glm-5.2-fp8" is a distinct model from "glm-5.2" with different metadata),
+// so stripping it would collapse distinct models onto one another.
+//
+// Order is not significant: stripModelIDPostfixes keeps the longest matching
+// suffix across the whole list, so a shorter postfix that is a suffix of a
+// longer one ("2bit" inside "32bit", "6bit" inside "16bit") can never win
+// first (the leading separator additionally prevents such partial overlaps).
+var modelIDPostfixes = buildModelIDPostfixes()
+
+// buildModelIDPostfixes expands the separator-free postfix cores into every
+// separator-aware suffix spelling, each prefixed by its leading separator.
+func buildModelIDPostfixes() []string {
+	cores := []string{
+		"safetensors",
+		"32bit",
+		"16bit",
+		"gguf",
+		"ggml",
+		"onnx",
+		"gptq",
+		"8bit",
+		"6bit",
+		"5bit",
+		"4bit",
+		"3bit",
+		"2bit",
+		"awq",
+		"nf4",
+		"mlx",
+	}
+	var postfixes []string
+	for _, core := range cores {
+		postfixes = append(postfixes, "-"+core, "_"+core)
+		if strings.HasSuffix(core, "bit") {
+			prefix := strings.TrimSuffix(core, "bit")
+			for _, lead := range []string{"-", "_"} {
+				for _, sep := range []string{"-", "_"} {
+					postfixes = append(postfixes, lead+prefix+sep+"bit")
+				}
+			}
+		}
+	}
+	return postfixes
+}
+
+// stripModelIDPostfixes removes recognized model postfixes from the end of a
+// lowercased, still-separated identifier, repeatedly, so chains of postfixes
+// collapse to the base name ("qwen3-8bit-gguf" -> "qwen3-8bit" -> "qwen3").
+// Each token includes its leading separator, so a suffix that is a parameter
+// count plus an instruct marker ("qwen3-8b-it") is left intact. At each pass it
+// strips the longest matching suffix, which keeps a shorter postfix that is a
+// suffix of a longer one ("2bit" inside "32bit") from winning first. Returns
+// the input unchanged when no postfix matches.
+func stripModelIDPostfixes(id string) string {
+	for {
+		var match string
+		for _, p := range modelIDPostfixes {
+			if len(p) > len(match) && strings.HasSuffix(id, p) {
+				match = p
+			}
+		}
+		if match == "" {
+			return id
+		}
+		id = strings.TrimSuffix(id, match)
+	}
+}
+
 // normalizeModelID normalizes a model identifier for the fuzzy lookup. It
 // strips the vendor/org prefix (everything up to and including the first "/"),
-// lowercases the result, then removes separator punctuation (".", "-", "_").
+// lowercases the result, strips recognized delivery/quantization postfixes
+// ("-gguf", "-mlx", "-8bit"/"-8-bit", and chains of them) from the end, then
+// removes separator punctuation (".", "-", "_").
+//
+// Postfixes are stripped BEFORE the separators are dropped so an instruct
+// suffix is never mistaken for a quantization: "qwen3-8b-it" ends in "-it" (not
+// a postfix) and survives intact, while "qwen3-8bit" and "qwen3-8-bit-gguf"
+// collapse to "qwen3".
 //
 // The vendor prefix is a routing decoration, not a property of the model: the
 // HuggingFace checkpoint "zai-org/glm-5.2-fp8" and the Z.ai API model
 // "GLM-5.2-FP8" share the same metadata. Discarding the prefix before
 // comparison lets a bare query match a prefixed registry key (and vice versa),
-// so vendor spelling never defeats the match.
+// so vendor spelling never defeats the match. Postfixes are likewise a
+// delivery/quantization decoration: "qwen3-8bit" and "qwen3-8-bit-gguf" are the
+// same model as "qwen3".
 //
-// Only the vendor prefix and punctuation are removed; alphanumerics are never
-// altered, so distinct model versions stay distinct: "qwen3.6" and "qwen3.7"
-// normalize to "qwen36" and "qwen37". This is the foundation of the fuzzy
-// lookup and is deliberately conservative — unlike edit distance it can never
-// silently remap one model version onto another.
+// Alphanumerics are otherwise never altered, so distinct model versions stay
+// distinct: "qwen3.6" and "qwen3.7" normalize to "qwen36" and "qwen37". This is
+// the foundation of the fuzzy lookup and is deliberately conservative — unlike
+// edit distance it can never silently remap one model version onto another.
 func normalizeModelID(id string) string {
-	return modelIDSeparators.Replace(strings.ToLower(BareModel(id)))
+	return modelIDSeparators.Replace(stripModelIDPostfixes(strings.ToLower(BareModel(id))))
 }
 
 // fuzzyLookup performs a vendor-prefix- and separator-insensitive search across
@@ -716,12 +808,16 @@ func (r *ModelRegistry) runtimeFuzzyLookup(want string) (ModelMetadata, bool) {
 
 // buildNormalizedIndex returns a lookup table mapping each entry's normalized
 // identifier (see normalizeModelID) to its metadata. When two keys collapse to
-// the same normalized form (rare: usually aliases of one model), the
-// lexicographically smallest original key wins, preserving the deterministic
-// tie-break previously implemented imperatively by the per-call scan. Building
-// the index once — at registry construction for overrides, lazily for the
-// shared built-in catalog — turns every fuzzy lookup from an O(n) scan with
-// per-key normalization into an O(1) map read.
+// the same normalized form — which postfix stripping now makes deliberate, e.g.
+// a quantized variant "qwen3-gguf" and its base "qwen3" both normalize to
+// "qwen3" — the lexicographically smallest original key wins, preserving the
+// deterministic tie-break previously implemented imperatively by the per-call
+// scan. Because the base name is a strict prefix of any postfixed spelling, it
+// sorts first and is the survivor: the variant's entry is dropped from the
+// fuzzy index (its exact-tier entry is unaffected). Building the index once —
+// at registry construction for overrides, lazily for the shared built-in
+// catalog — turns every fuzzy lookup from an O(n) scan with per-key
+// normalization into an O(1) map read.
 func buildNormalizedIndex(m map[string]ModelMetadata) map[string]ModelMetadata {
 	index := make(map[string]ModelMetadata, len(m))
 	winners := make(map[string]string, len(m))
