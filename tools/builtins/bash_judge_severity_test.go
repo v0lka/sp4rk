@@ -90,3 +90,59 @@ func TestBashExecTool_JudgeSeverity_BoundVarContainmentIsSoft(t *testing.T) {
 		t.Fatalf("bound-var containment severity = %v, want soft", outcome.Severity)
 	}
 }
+
+// TestBashExecTool_ReasonCodes pins the severity↔reason-code pairing for
+// every escalation branch of the bash judge. Reason codes are a
+// cross-repository contract (see tools.JudgeReasonCode): prose may be
+// reworded freely, these pairs may not drift.
+func TestBashExecTool_ReasonCodes(t *testing.T) {
+	ws := t.TempDir()
+	ctx := tools.WithWorkspacePath(context.Background(), ws)
+
+	tool, err := NewBashExecTool([]string{`rm\s+-rf`})
+	if err != nil {
+		t.Fatalf("failed to construct tool: %v", err)
+	}
+
+	tests := []struct {
+		name     string
+		command  string
+		wantSev  tools.JudgeSeverity
+		wantCode tools.JudgeReasonCode
+	}{
+		{
+			name:     "blacklist match is hard command_blacklist",
+			command:  "rm -rf /",
+			wantSev:  tools.JudgeSeverityHard,
+			wantCode: tools.ReasonCodeCommandBlacklist,
+		},
+		{
+			name:     "unresolvable path token is hard unresolvable_path_token",
+			command:  "cat ~root/secret",
+			wantSev:  tools.JudgeSeverityHard,
+			wantCode: tools.ReasonCodeUnresolvablePathToken,
+		},
+		{
+			name:     "existing out-of-root path is soft outside_session_roots",
+			command:  "cat /etc/hosts",
+			wantSev:  tools.JudgeSeveritySoft,
+			wantCode: tools.ReasonCodeOutsideSessionRoots,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			input, _ := json.Marshal(map[string]string{"command": tt.command})
+			outcome := tool.Judge(ctx, input)
+			if outcome.Allow {
+				t.Fatalf("expected escalation (allow=false), got %+v", outcome)
+			}
+			if outcome.Severity != tt.wantSev {
+				t.Errorf("severity = %v, want %v", outcome.Severity, tt.wantSev)
+			}
+			if outcome.ReasonCode != tt.wantCode {
+				t.Errorf("reason code = %q, want %q", outcome.ReasonCode, tt.wantCode)
+			}
+		})
+	}
+}

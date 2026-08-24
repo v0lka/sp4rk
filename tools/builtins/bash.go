@@ -87,8 +87,9 @@ func (t *BashExecTool) Judge(ctx context.Context, input json.RawMessage) tools.J
 	for i, re := range t.compiled {
 		if re.MatchString(params.Command) {
 			return tools.JudgeOutcome{
-				Reason:   "command matches blacklist pattern: " + t.blacklist[i],
-				Severity: tools.JudgeSeverityHard,
+				Reason:     "command matches blacklist pattern: " + t.blacklist[i],
+				Severity:   tools.JudgeSeverityHard,
+				ReasonCode: tools.ReasonCodeCommandBlacklist,
 			}
 		}
 	}
@@ -99,8 +100,9 @@ func (t *BashExecTool) Judge(ctx context.Context, input json.RawMessage) tools.J
 	// auto-approval (see JudgeSeverityHard).
 	if unresolved := tools.UnresolvablePathTokens(params.Command, tools.ShellBash); len(unresolved) > 0 {
 		return tools.JudgeOutcome{
-			Reason:   "command contains unresolvable path-like token(s): " + strings.Join(unresolved, ", "),
-			Severity: tools.JudgeSeverityHard,
+			Reason:     "command contains unresolvable path-like token(s): " + strings.Join(unresolved, ", "),
+			Severity:   tools.JudgeSeverityHard,
+			ReasonCode: tools.ReasonCodeUnresolvablePathToken,
 		}
 	}
 
@@ -118,8 +120,9 @@ func (t *BashExecTool) Judge(ctx context.Context, input json.RawMessage) tools.J
 	outside := tools.PathsOutsideRoots(ctx, params.Command, tools.ShellBash, params.WorkingDirectory)
 	if outside = tools.ExistingOrAnchoredPaths(outside); len(outside) > 0 {
 		return tools.JudgeOutcome{
-			Reason:   "command references existing path(s) outside session roots: " + strings.Join(outside, ", "),
-			Severity: tools.JudgeSeveritySoft,
+			Reason:     "command references existing path(s) outside session roots: " + strings.Join(outside, ", "),
+			Severity:   tools.JudgeSeveritySoft,
+			ReasonCode: tools.ReasonCodeOutsideSessionRoots,
 		}
 	}
 

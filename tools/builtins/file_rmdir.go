@@ -61,7 +61,7 @@ func (t *DeleteDirectoryTool) Judge(ctx context.Context, input json.RawMessage) 
 	}
 	params.Path = resolvePath(ctx, params.Path)
 	if err := validateResolvedPath(params.Path); err != nil {
-		return softOutcome(false, err.Error())
+		return softOutcome(false, err.Error(), tools.ReasonCodeOutsideSessionRoots)
 	}
 	return judgeWriteInSessionRoots(ctx, params.Path)
 }

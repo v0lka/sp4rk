@@ -24,7 +24,7 @@ The example ships in **two variants** plus a shared `tools.go`:
 
 - `security.WrapUntrustedContent` / `StripUntrustedTags` — how untrusted content is delimited
 - `tools.BaseTool.Untrusted` — opting a tool into the prompt-injection defense
-- `tools.ToolJudger` — per-tool safety heuristic (`Judge → JudgeOutcome{Allow, Reason, Severity}`)
+- `tools.ToolJudger` — per-tool safety heuristic (`Judge → JudgeOutcome{Allow, Reason, Severity, ReasonCode}`)
 - `tools.ToolGroupOf` — fail-closed capability metadata for custom tools
 - `tools.StrictJudgeRequest` / `ToolJudge.JudgeStrict` — conservative centralized gate evaluation
 - `ToolPolicy` + the fail-closed `ConfirmFunc` escalation path
@@ -69,12 +69,17 @@ func (t *appendLogTool) Judge(_ context.Context, input json.RawMessage) tools.Ju
     within, err := pathutil.IsWithinPath(t.ws, in.Path)
     if err != nil {
         // Unassessable input — fail closed, and never soft.
-        return tools.JudgeOutcome{Reason: "cannot determine target path", Severity: tools.JudgeSeverityHard}
+        return tools.JudgeOutcome{
+            Reason:     "cannot determine target path",
+            Severity:   tools.JudgeSeverityHard,
+            ReasonCode: tools.ReasonCodeUnassessablePath,
+        }
     }
     if !within {
         return tools.JudgeOutcome{
-            Reason:   "path outside workspace — potential sandbox escape",
-            Severity: tools.JudgeSeveritySoft, // scope question, not a fired control
+            Reason:     "path outside workspace — potential sandbox escape",
+            Severity:   tools.JudgeSeveritySoft, // scope question, not a fired control
+            ReasonCode: tools.ReasonCodeOutsideSessionRoots,
         }
     }
     return tools.JudgeOutcome{Allow: true}
@@ -90,7 +95,11 @@ the judge returns `Allow=false` with a reason, the call is **escalated** to the
 `ConfirmFunc` (and DENIED if none is configured). The outcome's `Severity`
 (`hard` for fired security controls, `soft` for scope questions) travels to the
 host via `ConfirmationRequest.JudgeSeverity`, which decides whether the
-escalation may be auto-resolved:
+escalation may be auto-resolved. The outcome's `ReasonCode` — the stable,
+machine-checkable classification (a published code is never renamed or reused;
+the empty value means unclassified) — travels alongside as
+`ConfirmationRequest.JudgeReasonCode`, so hosts key deterministic policy
+decisions off the code instead of matching the prose:
 
 ```
 out-of-workspace -> judge blocks -> [escalated to confirm] append_log … -> DENIED

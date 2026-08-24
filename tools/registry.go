@@ -256,7 +256,7 @@ func (r *ToolRegistry) Execute(ctx context.Context, name string, input json.RawM
 		}, nil
 
 	case PolicyUserConfirm:
-		return r.confirmAndExecute(ctx, tool, name, input, "", JudgeSeverityHard)
+		return r.confirmAndExecute(ctx, tool, name, input, JudgeOutcome{Severity: JudgeSeverityHard})
 
 	default: // PolicyAlwaysAllow
 		// Tool-specific safety judge: when an always-allowed tool implements
@@ -264,7 +264,7 @@ func (r *ToolRegistry) Execute(ctx context.Context, name string, input json.RawM
 		// (which fail-closes to deny if no ConfirmFunc is configured).
 		if judger, ok := tool.(ToolJudger); ok {
 			if outcome := judger.Judge(ctx, input); !outcome.Allow && outcome.Reason != "" {
-				return r.confirmAndExecute(ctx, tool, name, input, outcome.Reason, outcome.Severity)
+				return r.confirmAndExecute(ctx, tool, name, input, outcome)
 			}
 		}
 		return tool.Execute(ctx, input)
@@ -272,9 +272,12 @@ func (r *ToolRegistry) Execute(ctx context.Context, name string, input json.RawM
 }
 
 // confirmAndExecute requests user confirmation before executing a tool.
+// The judge outcome supplies the escalation's reason prose, severity, and
+// reason code threaded into the ConfirmationRequest; plain PolicyUserConfirm
+// gates pass a zero-reason hard outcome (no judge classified them).
 // FAIL-CLOSED: if no ConfirmFunc is configured, the call is denied with an
 // actionable error instead of executing silently.
-func (r *ToolRegistry) confirmAndExecute(ctx context.Context, tool Tool, name string, input json.RawMessage, reasoning string, severity JudgeSeverity) (ToolResult, error) {
+func (r *ToolRegistry) confirmAndExecute(ctx context.Context, tool Tool, name string, input json.RawMessage, outcome JudgeOutcome) (ToolResult, error) {
 	r.mu.RLock()
 	confirmFunc := r.confirmFunc
 	r.mu.RUnlock()
@@ -291,10 +294,11 @@ func (r *ToolRegistry) confirmAndExecute(ctx context.Context, tool Tool, name st
 	}
 
 	resp, err := confirmFunc(ctx, ConfirmationRequest{
-		ToolName:       name,
-		Input:          input,
-		JudgeReasoning: reasoning,
-		JudgeSeverity:  severity,
+		ToolName:        name,
+		Input:           input,
+		JudgeReasoning:  outcome.Reason,
+		JudgeSeverity:   outcome.Severity,
+		JudgeReasonCode: outcome.ReasonCode,
 	})
 	if err != nil {
 		return ToolResult{}, err
@@ -305,8 +309,8 @@ func (r *ToolRegistry) confirmAndExecute(ctx context.Context, tool Tool, name st
 		return tool.Execute(ctx, input)
 	case ConfirmDeny:
 		msg := "Tool execution denied by user."
-		if reasoning != "" {
-			msg += " Judge reasoning for flagging this call: " + reasoning
+		if outcome.Reason != "" {
+			msg += " Judge reasoning for flagging this call: " + outcome.Reason
 		}
 		return ToolResult{Content: msg, IsError: true}, nil
 	case ConfirmDenyAndStop:

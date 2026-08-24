@@ -58,10 +58,11 @@ File tools resolve paths via context helpers (`WorkspacePathFrom`/`TempDirFrom`)
 
 ### Shell tools (`bash_exec`, `posh_exec`)
 
-Both shell tools share one safety model, evaluated by their `ToolJudger.Judge` before execution:
+Both shell tools share one safety model, evaluated by their `ToolJudger.Judge` before execution. Every escalation carries a typed `tools.JudgeReasonCode` — the machine-checkable classification delivered to the host as `ConfirmationRequest.JudgeReasonCode` — alongside its prose reason and severity (see [Judge reason codes](#judge-reason-codes)):
 
-1. **Blacklist** — the raw command string is matched against the constructor-supplied regex list (an invalid pattern fails construction). A match returns `allow=false` with the blacklist reason, which **takes precedence** over the containment reason.
-2. **Path containment** — `tools.PathsOutsideRoots` extracts and resolves shell path tokens (bash and PowerShell grammars; `~`, `$VAR`/`$env:VAR`, and `..` idioms included) and reports those outside the session roots. `tools.ExistingOrAnchoredPaths` then keeps a path when it exists or its nearest existing ancestor directory does, so a write whose leaf does not yet exist but whose parent directory does (e.g. `echo x > /etc/cron.d/newjob`) still escalates with `"command references existing path(s) outside session roots: …"`. A wholly non-existent subtree is dropped, keeping the false-positive rate low.
+1. **Blacklist** — the raw command string is matched against the constructor-supplied regex list (an invalid pattern fails construction). A match returns `allow=false` with the blacklist reason (`command_blacklist`, hard), which **takes precedence** over the containment reason.
+2. **Unresolvable path tokens** (`bash_exec` only) — `tools.UnresolvablePathTokens` flags path-like tokens the resolver cannot assess (`~user`, `${VAR:-/etc/passwd}`), returning `unresolvable_path_token` (hard): input that cannot be assessed at all is never silently let through under auto-approval.
+3. **Path containment** — `tools.PathsOutsideRoots` extracts and resolves shell path tokens (bash and PowerShell grammars; `~`, `$VAR`/`$env:VAR`, and `..` idioms included) and reports those outside the session roots. `tools.ExistingOrAnchoredPaths` then keeps a path when it exists or its nearest existing ancestor directory does, so a write whose leaf does not yet exist but whose parent directory does (e.g. `echo x > /etc/cron.d/newjob`) still escalates with `"command references existing path(s) outside session roots: …"` (`outside_session_roots`, soft). A wholly non-existent subtree is dropped, keeping the false-positive rate low.
 
 **Separator-run tokens are skipped.** A token consisting entirely of separators — a POSIX run of two or more slashes (`//`, `///`) or a two-character drive prefix followed by only separators (`C:\\`) — is a shell-language artifact, not a path: the trailing `//` of a sed address (`sed 's/.*function //'`), a comment marker (`echo "// TODO fix" >> notes.md`), an integer-division operator (`$(( total // count ))`), or an escaped PowerShell drive root. It carries no path component and names no out-of-root location; resolving a bare `//` would clean it to the filesystem root `/` and force a false-positive confirmation of an entirely in-root command. The skip lives in `tools.isPureSeparatorRunToken`, applied in `ResolveShellPathTokens` and mirrored in the JSON-input extractor `tools.ExtractPaths` behind `AllPathsInSessionRoots` (where a phantom root previously defeated the fast-path's *all paths in-root* auto-allow).
 
@@ -72,6 +73,22 @@ Guarantees the skip preserves (regression-tested in `tools/shellpaths_test.go` a
 - `Get-Content C:\` (single separator — the drive root) and `Get-Content C:\\Windows\win.ini` are still extracted; only the pure `C:\\` run is skipped.
 - The blacklist fires on the raw command string **before** path analysis, so `rm -rf /` is still escalated by an `rm -rf` pattern regardless of the skip — and its separator-run spelling `rm -rf //` (whose `//` token the skip removes from path extraction, exactly as the bare `/` never matched) is covered by the same blacklist, which remains the authoritative backstop for bare-root deletions.
 - A separator-run artifact cannot mask a real escape (`sed 's/.*function //'` alongside `/etc/passwd` still fails containment — tokens are extracted independently), and alongside only in-root paths it no longer injects a phantom root, so judge fast-path auto-approval behaves correctly.
+
+### Judge reason codes
+
+Every built-in `ToolJudger` escalation classifies its reason with a typed `tools.JudgeReasonCode` — the stable, machine-checkable contract the host receives as `ConfirmationRequest.JudgeReasonCode` (see [../../contracts/tools.md](../../contracts/tools.md)); the prose `Reason` may be reworded freely while a published code is never renamed or reused. The built-in mapping:
+
+| Code | Severity | Emitted by |
+| ---- | -------- | ---------- |
+| `command_blacklist` | hard | `bash_exec`, `posh_exec` — the raw command string matched a blacklist pattern |
+| `unresolvable_path_token` | hard | `bash_exec` — path-like tokens the resolver cannot assess (`~user`, `${VAR:-/etc/passwd}`) |
+| `outside_session_roots` | soft | `bash_exec`, `posh_exec`, file tools — a fully assessed path resolved outside the session roots |
+| `unassessable_path` | hard | file tools — the target path could not be determined at all |
+| `unassessable_url` | hard | `web_fetch` — the target URL could not be determined at all |
+| `ssrf_private_address` | hard | `web_fetch` — the URL resolves to a private/reserved address |
+| `ssrf_protection_degraded` | hard | `web_fetch` — the SSRF CIDR check is unavailable (fail-closed) |
+
+Allowed outcomes carry an empty code (nothing to classify), as do plain `PolicyUserConfirm` escalations no judge classified. `symlink_escape` and `symlink_suspicious` exist in the taxonomy for hosts that run symlink detection over tool input; no SDK built-in emits them.
 
 ### Web search providers
 
@@ -107,6 +124,7 @@ Blackboard-backed tools (`read_step_output`, `list_step_outputs`, `read_final_re
 - Blackboard-backed tools read only error-free completed steps; outputs are listed in deterministic step-ID order.
 - `read_skill_resource` resolves paths via `skills.SafeResolvePath` (path-traversal safe).
 - Shell path extraction skips pure separator-run tokens (`//`, `C:\\`) as shell-language artifacts; tokens carrying real components (`/etc/passwd`, `//etc/passwd`, `C:\`, `C:\\Windows\win.ini`), anchored out-of-root writes, and the raw-command-string blacklist are unaffected.
+- Every built-in judge escalation carries a `JudgeReasonCode` matching its escalation branch; allowed outcomes and plain `PolicyUserConfirm` gates carry none.
 - Untrusted-output tools always set `Untrusted: true` and are wrapped when injection defense is enabled.
 - `glob` and `ripgrep` share a single ignore authority (`IgnoreChecker` from context); a `nil` checker means no filtering (the opt-in, no-regression default).
 - Tool-name constants live in `tools` (`names.go`) and mirror the registration names used by `tools/builtins`; `IsShellExecTool` classifies `bash_exec`/`posh_exec` as the highest-uncertainty, intentionally deprioritized tools in grouped tool lists.
@@ -119,7 +137,7 @@ To add a new built-in tool:
 2. In the constructor, set `ToolName`, `ToolDescription`, `Schema` (JSON Schema), and `Policy` (`PolicyAlwaysAllow` / `PolicyUserConfirm`).
 3. Implement `Execute(ctx, input)` — use `ParseInputError` for JSON parse failures and `ErrorResult` for logical errors.
 4. Set `Untrusted: true` if the tool returns external data (web, MCP, filesystem reads of external content).
-5. Optionally implement `ToolJudger` for tool-specific safety escalation on `PolicyAlwaysAllow` tools.
+5. Optionally implement `ToolJudger` for tool-specific safety escalation on `PolicyAlwaysAllow` tools; classify each denied branch with a `tools.JudgeReasonCode` (reuse a published code where the semantics match, add a new one otherwise).
 6. For a read tool that returns a transformed/decoded view of a file (not raw bytes), implement `tools.ContentBackedReader` (`IsContentBacked`) so the executor caches the result in memory while keeping file coherence metadata; leave it unimplemented to keep the default file-backed behavior.
 7. Register the tool in the `ToolRegistry` alongside the `finish` tool.
 

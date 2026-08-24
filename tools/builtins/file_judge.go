@@ -9,20 +9,22 @@ import (
 )
 
 // softOutcome wraps an (allowed, reason) pair from a containment check into a
-// JudgeOutcome with soft severity: path-locality escalations are advisory —
-// the operation may be legitimate, only its scope is in question.
-func softOutcome(allowed bool, reason string) tools.JudgeOutcome {
-	return tools.JudgeOutcome{Allow: allowed, Reason: reason, Severity: tools.JudgeSeveritySoft}
+// JudgeOutcome with soft severity and the passed reason code: path-locality
+// escalations are advisory — the operation may be legitimate, only its scope
+// is in question. Allowed outcomes pass an empty code (nothing to classify);
+// denied outcomes carry the code matching their escalation branch.
+func softOutcome(allowed bool, reason string, code tools.JudgeReasonCode) tools.JudgeOutcome {
+	return tools.JudgeOutcome{Allow: allowed, Reason: reason, Severity: tools.JudgeSeveritySoft, ReasonCode: code}
 }
 
 // hardOutcome wraps an (allowed, reason) pair into a JudgeOutcome with hard
-// severity. Used for unassessable inputs ("cannot determine target path") —
-// mirroring the web_fetch judge's "cannot determine target URL" — because an
-// input that cannot be assessed at all must never be auto-resolved by Smart
-// Approve or weakened by the advisory judge (JudgeSeverityHard contract in
-// tools/safety.go).
-func hardOutcome(allowed bool, reason string) tools.JudgeOutcome {
-	return tools.JudgeOutcome{Allow: allowed, Reason: reason, Severity: tools.JudgeSeverityHard}
+// severity and the passed reason code. Used for unassessable inputs ("cannot
+// determine target path") — mirroring the web_fetch judge's "cannot determine
+// target URL" — because an input that cannot be assessed at all must never be
+// auto-resolved by Smart Approve or weakened by the advisory judge
+// (JudgeSeverityHard contract in tools/safety.go).
+func hardOutcome(allowed bool, reason string, code tools.JudgeReasonCode) tools.JudgeOutcome {
+	return tools.JudgeOutcome{Allow: allowed, Reason: reason, Severity: tools.JudgeSeverityHard, ReasonCode: code}
 }
 
 // judgeWriteInSessionRoots checks whether a write operation targets a path
@@ -37,7 +39,7 @@ func judgeWriteInSessionRoots(ctx context.Context, path string) tools.JudgeOutco
 		// Cannot determine path — fail closed and escalate to confirmation
 		// (mirrors the read-side judge). Unassessable input is hard: it must
 		// not be auto-resolved by Smart Approve.
-		return hardOutcome(false, "cannot determine target path")
+		return hardOutcome(false, "cannot determine target path", tools.ReasonCodeUnassessablePath)
 	}
 	absPath = filepath.Clean(absPath)
 	if resolved, evalErr := filepath.EvalSymlinks(absPath); evalErr == nil {
@@ -50,9 +52,9 @@ func judgeWriteInSessionRoots(ctx context.Context, path string) tools.JudgeOutco
 	}
 
 	if isPathInSessionRoots(ctx, absPath) {
-		return softOutcome(true, "target is within session workspace or temp directory")
+		return softOutcome(true, "target is within session workspace or temp directory", "")
 	}
-	return softOutcome(false, formatOutsideRootsError(absPath).Error())
+	return softOutcome(false, formatOutsideRootsError(absPath).Error(), tools.ReasonCodeOutsideSessionRoots)
 }
 
 // judgeReadInSessionRootsForPath is the shared containment core for read-side
@@ -70,7 +72,7 @@ func judgeReadInSessionRootsForPath(ctx context.Context, resolvedPath string) to
 	if err != nil {
 		// Cannot determine path — fail closed and escalate to confirmation.
 		// Unassessable input is hard (see hardOutcome).
-		return hardOutcome(false, "cannot determine target path")
+		return hardOutcome(false, "cannot determine target path", tools.ReasonCodeUnassessablePath)
 	}
 	absPath = filepath.Clean(absPath)
 	if evaled, evalErr := filepath.EvalSymlinks(absPath); evalErr == nil {
@@ -83,10 +85,10 @@ func judgeReadInSessionRootsForPath(ctx context.Context, resolvedPath string) to
 	}
 
 	if isPathInSessionRoots(ctx, absPath) {
-		return softOutcome(true, "read-only file operation within session workspace or temp directory")
+		return softOutcome(true, "read-only file operation within session workspace or temp directory", "")
 	}
 
-	return softOutcome(false, formatOutsideRootsError(absPath).Error())
+	return softOutcome(false, formatOutsideRootsError(absPath).Error(), tools.ReasonCodeOutsideSessionRoots)
 }
 
 // judgeReadInSessionRoots checks whether a read operation targets a path inside
@@ -125,23 +127,23 @@ func judgeReadWithPathDefault(ctx context.Context, input json.RawMessage, pathOp
 	if err := json.Unmarshal(input, &params); err != nil {
 		// Cannot determine path — fail closed and escalate to confirmation.
 		// Unassessable input is hard (see hardOutcome).
-		return hardOutcome(false, "cannot determine target path")
+		return hardOutcome(false, "cannot determine target path", tools.ReasonCodeUnassessablePath)
 	}
 
 	if params.Path == "" {
 		if !pathOptional {
-			return hardOutcome(false, "cannot determine target path")
+			return hardOutcome(false, "cannot determine target path", tools.ReasonCodeUnassessablePath)
 		}
 		ws := tools.WorkspacePathFrom(ctx)
 		if ws == "" {
-			return hardOutcome(false, "cannot determine target path")
+			return hardOutcome(false, "cannot determine target path", tools.ReasonCodeUnassessablePath)
 		}
 		return judgeReadInSessionRootsForPath(ctx, ws)
 	}
 
 	resolved := resolvePath(ctx, params.Path)
 	if err := validateResolvedPath(resolved); err != nil {
-		return softOutcome(false, err.Error())
+		return softOutcome(false, err.Error(), tools.ReasonCodeOutsideSessionRoots)
 	}
 	return judgeReadInSessionRootsForPath(ctx, resolved)
 }

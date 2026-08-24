@@ -68,3 +68,55 @@ func TestPoshExecTool_JudgeSeverity_NoConcern(t *testing.T) {
 		t.Fatalf("expected zero (no-concern) outcome, got %+v", outcome)
 	}
 }
+
+// TestPoshExecTool_ReasonCodes pins the severity↔reason-code pairing for the
+// posh judge's escalation branches (the Windows counterpart of
+// TestBashExecTool_ReasonCodes; posh has no unresolvable-path-token branch —
+// PowerShell env syntax like "$env:VAR" resolves fine). Reason codes are a
+// cross-repository contract (see tools.JudgeReasonCode): prose may be
+// reworded freely, these pairs may not drift.
+func TestPoshExecTool_ReasonCodes(t *testing.T) {
+	ws := t.TempDir()
+	ctx := tools.WithWorkspacePath(context.Background(), ws)
+
+	tool, err := NewPoshExecTool([]string{`Remove-Item\s+-Recurse`})
+	if err != nil {
+		t.Fatalf("failed to construct tool: %v", err)
+	}
+
+	tests := []struct {
+		name     string
+		command  string
+		wantSev  tools.JudgeSeverity
+		wantCode tools.JudgeReasonCode
+	}{
+		{
+			name:     "blacklist match is hard command_blacklist",
+			command:  "Remove-Item -Recurse C:\\",
+			wantSev:  tools.JudgeSeverityHard,
+			wantCode: tools.ReasonCodeCommandBlacklist,
+		},
+		{
+			name:     "existing out-of-root path is soft outside_session_roots",
+			command:  "Get-Content C:\\Windows\\win.ini",
+			wantSev:  tools.JudgeSeveritySoft,
+			wantCode: tools.ReasonCodeOutsideSessionRoots,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			input, _ := json.Marshal(map[string]string{"command": tt.command})
+			outcome := tool.Judge(ctx, input)
+			if outcome.Allow {
+				t.Fatalf("expected escalation (allow=false), got %+v", outcome)
+			}
+			if outcome.Severity != tt.wantSev {
+				t.Errorf("severity = %v, want %v", outcome.Severity, tt.wantSev)
+			}
+			if outcome.ReasonCode != tt.wantCode {
+				t.Errorf("reason code = %q, want %q", outcome.ReasonCode, tt.wantCode)
+			}
+		})
+	}
+}

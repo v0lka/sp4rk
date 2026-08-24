@@ -74,6 +74,52 @@ func (s *JudgeSeverity) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// JudgeReasonCode is a stable, machine-checkable classification of the reason
+// behind a judge escalation. Unlike Reason — human-readable prose that may be
+// reworded freely — codes are a cross-repository contract: hosts downstream
+// (for example c0wrk's canonical hard-reason backstop) key deterministic
+// policy decisions off the code instead of matching prose. A published code
+// must never be renamed or reused; add new codes instead. The empty value
+// means "unclassified" — hosts decide unclassified outcomes by their own
+// fail-closed policy, never by matching the prose.
+type JudgeReasonCode string
+
+const (
+	// ReasonCodeCommandBlacklist marks a shell command that matched a
+	// configured blacklist pattern — a fired security control.
+	ReasonCodeCommandBlacklist JudgeReasonCode = "command_blacklist"
+	// ReasonCodeUnresolvablePathToken marks a command containing path-like
+	// tokens the resolver cannot assess ("~user", "${VAR:-/etc/passwd}").
+	// Hard but scope-shaped: a strict judge may positively clear it.
+	ReasonCodeUnresolvablePathToken JudgeReasonCode = "unresolvable_path_token"
+	// ReasonCodeOutsideSessionRoots marks a fully assessed path (or shell
+	// path reference) that resolved outside the session roots — an advisory
+	// scope question (soft).
+	ReasonCodeOutsideSessionRoots JudgeReasonCode = "outside_session_roots"
+	// ReasonCodeSSRFPrivateAddress marks a fetch target that resolves to a
+	// private/reserved address — an SSRF escape attempt (fired control).
+	ReasonCodeSSRFPrivateAddress JudgeReasonCode = "ssrf_private_address"
+	// ReasonCodeSSRFDegraded marks an unavailable SSRF check (the CIDR list
+	// failed to initialize): the posture is unassessable, fail-closed.
+	ReasonCodeSSRFDegraded JudgeReasonCode = "ssrf_protection_degraded"
+	// ReasonCodeUnassessableURL marks an input whose target URL could not be
+	// determined at all — unassessable, fail-closed.
+	ReasonCodeUnassessableURL JudgeReasonCode = "unassessable_url"
+	// ReasonCodeUnassessablePath marks an input whose target path could not
+	// be determined at all — unassessable, fail-closed.
+	ReasonCodeUnassessablePath JudgeReasonCode = "unassessable_path"
+	// ReasonCodeSymlinkEscape marks an input that traverses symlinks
+	// resolving outside the session roots. Set by hosts that run symlink
+	// detection over tool input (e.g. c0wrk's registry gate), since the
+	// sp4rk walker reports traversals rather than a JudgeOutcome.
+	ReasonCodeSymlinkEscape JudgeReasonCode = "symlink_escape"
+	// ReasonCodeSymlinkSuspicious marks symlink input that could not be
+	// fully resolved (target unknown) without a confirmed escape. Set by
+	// hosts alongside ReasonCodeSymlinkEscape; unassessable-shaped but
+	// without a fired control, so hosts may let a strict judge clear it.
+	ReasonCodeSymlinkSuspicious JudgeReasonCode = "symlink_suspicious"
+)
+
 // JudgeOutcome is the result of a tool-local safety judge: whether the call is
 // allowed, the reason when it is not, and how severe that reason is.
 // Allow=false with an empty Reason means "no tool-specific concern" — the
@@ -82,6 +128,10 @@ type JudgeOutcome struct {
 	Allow    bool
 	Reason   string
 	Severity JudgeSeverity
+	// ReasonCode is the typed classification of Reason (see JudgeReasonCode).
+	// It is the stable contract consumers key off; Reason remains the
+	// human-readable prose. The zero value means unclassified.
+	ReasonCode JudgeReasonCode
 }
 
 // ToolJudger is an optional interface that tools can implement to provide
@@ -104,6 +154,13 @@ type ConfirmationRequest struct {
 	// outcome's Severity; plain PolicyUserConfirm gates escalate as hard (no
 	// judge classified them). The zero value is hard — fail-closed.
 	JudgeSeverity JudgeSeverity `json:"judge_severity"`
+	// JudgeReasonCode is the typed classification of the escalation (see
+	// JudgeReasonCode): the machine-checkable contract paired with the
+	// JudgeReasoning prose. It is set for judge-escalated calls from the judge
+	// outcome's ReasonCode; plain PolicyUserConfirm gates escalate with no
+	// code (no judge classified them). The zero value means unclassified —
+	// hosts decide unclassified escalations by their own fail-closed policy.
+	JudgeReasonCode JudgeReasonCode `json:"judge_reason_code,omitempty"`
 	// DisableJudge prevents a confirmation surfaced by the strict automatic
 	// judge from being sent through the advisory on-demand judge a second time.
 	// The zero value preserves the existing Ask Agent flow for ordinary gates.

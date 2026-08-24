@@ -172,8 +172,9 @@ func (t *WebFetchTool) Judge(ctx context.Context, input json.RawMessage) tools.J
 		// Cannot determine URL — fail closed and escalate to confirmation.
 		// The SSRF posture of the call is unassessable, so treat as hard.
 		return tools.JudgeOutcome{
-			Reason:   "cannot determine target URL",
-			Severity: tools.JudgeSeverityHard,
+			Reason:     "cannot determine target URL",
+			Severity:   tools.JudgeSeverityHard,
+			ReasonCode: tools.ReasonCodeUnassessableURL,
 		}
 	}
 
@@ -182,14 +183,16 @@ func (t *WebFetchTool) Judge(ctx context.Context, input json.RawMessage) tools.J
 		// CIDR list failed to initialize — SSRF protection is unavailable.
 		// Fail-safe: require user confirmation for all web fetches.
 		return tools.JudgeOutcome{
-			Reason:   fmt.Sprintf("SSRF protection degraded: %v", initErr),
-			Severity: tools.JudgeSeverityHard,
+			Reason:     fmt.Sprintf("SSRF protection degraded: %v", initErr),
+			Severity:   tools.JudgeSeverityHard,
+			ReasonCode: tools.ReasonCodeSSRFDegraded,
 		}
 	}
 	if private {
 		return tools.JudgeOutcome{
-			Reason:   "URL resolves to private/reserved address " + addr,
-			Severity: tools.JudgeSeverityHard,
+			Reason:     "URL resolves to private/reserved address " + addr,
+			Severity:   tools.JudgeSeverityHard,
+			ReasonCode: tools.ReasonCodeSSRFPrivateAddress,
 		}
 	}
 

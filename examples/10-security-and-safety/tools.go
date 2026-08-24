@@ -83,23 +83,26 @@ func newAppendLogTool(workspace string) *appendLogTool {
 // "<ws>-evil" passes a "<ws>" prefix) and is exactly what the SDK's own
 // guidelines forbid for containment decisions.
 // Severity follows the taxonomy: unassessable input is hard, a
-// path-containment concern is soft.
+// path-containment concern is soft. ReasonCode carries the matching
+// machine-readable classification (tools.JudgeReasonCode) — the stable
+// contract hosts key policy off instead of matching prose.
 func (t *appendLogTool) Judge(_ context.Context, input json.RawMessage) tools.JudgeOutcome {
 	var in struct {
 		Path string `json:"path"`
 	}
 	if err := json.Unmarshal(input, &in); err != nil {
-		return tools.JudgeOutcome{Reason: "malformed input", Severity: tools.JudgeSeverityHard}
+		return tools.JudgeOutcome{Reason: "malformed input", Severity: tools.JudgeSeverityHard, ReasonCode: tools.ReasonCodeUnassessablePath}
 	}
 	within, err := pathutil.IsWithinPath(t.ws, in.Path)
 	if err != nil {
 		// Containment cannot be assessed — fail closed and escalate.
-		return tools.JudgeOutcome{Reason: "cannot determine target path", Severity: tools.JudgeSeverityHard}
+		return tools.JudgeOutcome{Reason: "cannot determine target path", Severity: tools.JudgeSeverityHard, ReasonCode: tools.ReasonCodeUnassessablePath}
 	}
 	if !within {
 		return tools.JudgeOutcome{
-			Reason:   "path outside workspace — potential sandbox escape",
-			Severity: tools.JudgeSeveritySoft,
+			Reason:     "path outside workspace — potential sandbox escape",
+			Severity:   tools.JudgeSeveritySoft,
+			ReasonCode: tools.ReasonCodeOutsideSessionRoots,
 		}
 	}
 	return tools.JudgeOutcome{Allow: true}
@@ -145,7 +148,7 @@ func runSecurityDemos() {
 	// The ConfirmFunc is consulted when a judge escalates a call. We DENY here
 	// to make the block visible; in a real app this would prompt the user.
 	registry.SetConfirmFunc(func(_ context.Context, req tools.ConfirmationRequest) (tools.ConfirmationResponse, error) {
-		fmt.Printf("  [escalated to confirm] %s — judge_reasoning=%q\n", req.ToolName, req.JudgeReasoning)
+		fmt.Printf("  [escalated to confirm] %s — judge_reasoning=%q judge_reason_code=%q\n", req.ToolName, req.JudgeReasoning, req.JudgeReasonCode)
 		return tools.ConfirmDeny, nil
 	})
 

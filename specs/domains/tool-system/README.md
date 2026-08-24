@@ -6,7 +6,7 @@ Provides the tool abstraction for the agent: a single `Tool` interface, a thread
 
 ## Key Files
 
-- `github.com/v0lka/sp4rk/tools` — `Tool` interface, `BaseTool`, `ToolResult`, `ToolPolicy`, `ToolJudger` (`JudgeOutcome` + `JudgeSeverity`), `ToolJudge` (`StrictJudgeRequest`, `Judge`/`JudgeStrict`), `ToolDescriptor` (carries `Group`), `ToolRegistry`, `StripParamsFromSchema`
+- `github.com/v0lka/sp4rk/tools` — `Tool` interface, `BaseTool`, `ToolResult`, `ToolPolicy`, `ToolJudger` (`JudgeOutcome` + `JudgeSeverity` + `JudgeReasonCode`), `ToolJudge` (`StrictJudgeRequest`, `Judge`/`JudgeStrict`), `ToolDescriptor` (carries `Group`), `ToolRegistry`, `StripParamsFromSchema`
 - `github.com/v0lka/sp4rk/tools/group.go` — `ToolGroup` and the 8 declared groups (`execute`, `local_read`, `local_write`, `remote_read`, `remote_write`, `system`, `local_mcp`, `remote_mcp`), `AllToolGroups()`, `IsValidToolGroup()`, `MCPToolGroup(transport)`
 - `github.com/v0lka/sp4rk/tools` (registry) — `Register`/`RegisterWithSource`/`RegisterWithSourceCategory`, `Execute` (fail-closed policy enforcement), `List`/`ListFiltered`, MCP shadowing protection
 - `github.com/v0lka/sp4rk/tools` (context helpers) — `WithWorkspacePath`, `WithTempDir`, `WithAllowedRoots`, `SessionRoots`, `WithTaskContext`. `SessionRoots` returns the deduplicated union of workspace + temp + additional allowed roots consulted by every path-containment check.
@@ -43,10 +43,12 @@ const (
     PolicyUserConfirm
 )
 
-// Optional per-tool safety heuristic. JudgeOutcome carries Allow, Reason, and
-// Severity: JudgeSeverityHard (the zero value — fail-closed) marks a fired
-// security control (blacklist pattern, SSRF); JudgeSeveritySoft marks a scope
-// question (path containment). Allow=false with an empty Reason means
+// Optional per-tool safety heuristic. JudgeOutcome carries Allow, Reason,
+// Severity, and ReasonCode: JudgeSeverityHard (the zero value — fail-closed)
+// marks a fired security control (blacklist pattern, SSRF); JudgeSeveritySoft
+// marks a scope question (path containment). ReasonCode is the typed, stable
+// classification of the reason delivered to the host as
+// ConfirmationRequest.JudgeReasonCode. Allow=false with an empty Reason means
 // "no tool-specific concern" and the tool proceeds.
 type ToolJudger interface {
     Judge(ctx context.Context, input json.RawMessage) JudgeOutcome

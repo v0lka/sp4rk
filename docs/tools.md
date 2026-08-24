@@ -95,10 +95,15 @@ A tool with `PolicyAlwaysAllow` may optionally implement `ToolJudger` to provide
 ```go
 type JudgeSeverity int // JudgeSeverityHard (zero value, fail-closed) | JudgeSeveritySoft
 
+// Stable, machine-checkable classification of the escalation reason — e.g.
+// "command_blacklist", "ssrf_private_address", "outside_session_roots".
+type JudgeReasonCode string
+
 type JudgeOutcome struct {
-    Allow    bool
-    Reason   string
-    Severity JudgeSeverity
+    Allow      bool
+    Reason     string
+    Severity   JudgeSeverity
+    ReasonCode JudgeReasonCode
 }
 
 type ToolJudger interface {
@@ -107,6 +112,8 @@ type ToolJudger interface {
 ```
 
 `Severity` classifies the escalation for the host: **hard** marks a fired security control (shell blacklist pattern, SSRF) that hosts must treat as never auto-resolvable; **soft** marks a scope question (path containment) that a strict judge may resolve. `Allow=false` with an empty `Reason` means "no tool-specific concern" and the tool proceeds. The severity reaches the host via `ConfirmationRequest.JudgeSeverity`; `JudgeSeverityHard` is the zero value, so an unclassified escalation is treated as hard.
+
+`ReasonCode` is the typed classification of the reason — the machine-checkable counterpart of the human-readable `Reason` prose, delivered to the host as `ConfirmationRequest.JudgeReasonCode`. It is a cross-repository contract: hosts key deterministic policy decisions off the code instead of matching prose, so a published code is never renamed or reused (new classifications add new codes), and the empty value means unclassified — hosts decide unclassified escalations by their own fail-closed policy. The built-in judges publish `command_blacklist`, `unresolvable_path_token`, `outside_session_roots`, `ssrf_private_address`, `ssrf_protection_degraded`, `unassessable_url`, and `unassessable_path`; `symlink_escape` and `symlink_suspicious` are set by hosts that run symlink detection over tool input.
 
 ### ContentBackedReader (optional)
 

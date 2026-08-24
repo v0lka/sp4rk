@@ -91,10 +91,13 @@ Tools may optionally implement `ToolJudger` to provide tool-specific safety heur
 ```go
 type JudgeSeverity int // zero value = hard (fail-closed); constants JudgeSeverityHard, JudgeSeveritySoft; String() → "hard"/"soft"
 
+type JudgeReasonCode string // stable, machine-checkable classification of the reason; e.g. "command_blacklist", "ssrf_private_address", "outside_session_roots", "unassessable_path"
+
 type JudgeOutcome struct {
-    Allow    bool
-    Reason   string
-    Severity JudgeSeverity
+    Allow      bool
+    Reason     string
+    Severity   JudgeSeverity
+    ReasonCode JudgeReasonCode
 }
 
 type ToolJudger interface {
@@ -105,6 +108,8 @@ type ToolJudger interface {
 For a tool whose effective policy is `PolicyAlwaysAllow`, the registry calls `Judge` **before** execution. If the judge returns `Allow=false` **with non-empty Reason**, the call is escalated to user confirmation via `ConfirmFunc`. An outcome of `Allow=false` with empty Reason is treated as "no concern to report" and the tool proceeds.
 
 The `Severity` classifies the reason so hosts can decide what an escalation means: **`hard`** marks a fired security control (shell blacklist pattern, SSRF) — hosts treat it as never auto-resolvable and do not pass it through an advisory auto-approval path; **`soft`** marks a scope question (path containment outside session roots — evaluated on the symlink-resolved path, so a symlink that escapes the roots is denied containment like any other out-of-roots target) that a strict judge may resolve. The engine escalates both severities identically (user confirmation) and delivers the severity to the host via `ConfirmationRequest.JudgeSeverity`. `JudgeSeverityHard` is the zero value — a judge outcome or escalation that arrives unclassified is treated as `hard` (fail-closed).
+
+`ReasonCode` is the typed classification of the reason — the machine-checkable counterpart of the human-readable `Reason` prose, delivered to the host as `ConfirmationRequest.JudgeReasonCode`. Codes are a cross-repository contract: hosts key deterministic policy decisions off the code instead of matching prose, so a published code is never renamed or reused (new classifications add new codes). The empty value means unclassified — hosts decide unclassified outcomes by their own fail-closed policy. The built-in judges publish `command_blacklist`, `unresolvable_path_token`, `outside_session_roots`, `ssrf_private_address`, `ssrf_protection_degraded`, `unassessable_url`, and `unassessable_path` (see [../domains/tool-system/builtins.md](../domains/tool-system/builtins.md)); `symlink_escape` and `symlink_suspicious` are host-set classifications.
 
 This is the SDK hook a host uses to implement its own safety checks (for example, a shell tool whose `Judge` matches a blacklist of dangerous commands, or a file tool whose `Judge` flags paths outside permitted roots). The engine provides the interface and the escalation wiring; the heuristics themselves are tool/host-specific.
 
@@ -128,11 +133,12 @@ Strict mode remains advisory to the host: it returns an allow/confirm recommenda
 
 ```go
 type ConfirmationRequest struct {
-    ToolName       string          `json:"tool_name"`
-    Input          json.RawMessage `json:"input"`
-    JudgeReasoning string          `json:"judge_reasoning,omitempty"`
-    JudgeSeverity  JudgeSeverity   `json:"judge_severity"` // hard (zero) | soft; plain PolicyUserConfirm gates escalate as hard
-    DisableJudge   bool            `json:"disable_judge,omitempty"`
+    ToolName        string          `json:"tool_name"`
+    Input           json.RawMessage `json:"input"`
+    JudgeReasoning  string          `json:"judge_reasoning,omitempty"`
+    JudgeSeverity   JudgeSeverity   `json:"judge_severity"` // hard (zero) | soft; plain PolicyUserConfirm gates escalate as hard
+    JudgeReasonCode JudgeReasonCode `json:"judge_reason_code,omitempty"` // typed classification; empty for plain gates and unclassified outcomes
+    DisableJudge    bool            `json:"disable_judge,omitempty"`
 }
 
 type ConfirmationResponse int
@@ -152,7 +158,7 @@ registry.Execute()
   │
   ├─ no ConfirmFunc configured? → FAIL-CLOSED: return error ToolResult
   │                                ("no ConfirmFunc is configured")
-  ├─ ConfirmFunc(ctx, ConfirmationRequest{ToolName, Input, JudgeReasoning, JudgeSeverity})
+  ├─ ConfirmFunc(ctx, ConfirmationRequest{ToolName, Input, JudgeReasoning, JudgeSeverity, JudgeReasonCode})
   │      │
   │      ▼
   │   host responds (Allow / Deny / Deny & Stop)
@@ -259,6 +265,7 @@ File-based defaults, session roots, and blacklist regexes are host-application c
 - A `PolicyUserConfirm` tool with no `ConfirmFunc` configured is **always denied** (fail-closed), never executed silently.
 - `PolicyAlwaysDeny` is never bypassed — not by a judge, not by a confirmation, not by an override that does not change the policy.
 - A `ToolJudger` escalation requires `allow=false` **with non-empty reasoning**; `allow=false` with empty reasoning proceeds.
+- A published `JudgeReasonCode` is a stable contract: it is never renamed or reused, and the empty value means unclassified (hosts decide unclassified escalations by their own fail-closed policy, never by matching the `Reason` prose).
 - Path extraction skips tokens that consist entirely of separators — a POSIX `//` run or a drive prefix followed by only separators (`C:\\`) — because they are shell-language artifacts (sed addresses, comment markers, integer division, escaped drive roots) that name no location. The skip never applies to a token carrying path components: `/etc/passwd`, `//etc/passwd`, `C:\`, and `C:\\Windows\win.ini` all remain reportable, anchored out-of-root writes still escalate, and command blacklists (matched on the raw command string, before path analysis) are unaffected.
 - Untrusted tool output is wrapped in `<untrusted-content>` before it reaches the model, unconditionally for any tool whose `IsUntrusted()` is true (or that is MCP-sourced).
 - The untrusted-content boundary survives compaction: `ContextWindow` re-wraps untrusted tool messages retained in the frozen compacted prefix, so untrusted content never re-enters LLM context raw after compaction.
