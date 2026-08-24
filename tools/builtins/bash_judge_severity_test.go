@@ -67,3 +67,26 @@ func TestBashExecTool_JudgeSeverity_NoConcern(t *testing.T) {
 		t.Fatalf("expected zero (no-concern) outcome, got %+v", outcome)
 	}
 }
+
+func TestBashExecTool_JudgeSeverity_BoundVarContainmentIsSoft(t *testing.T) {
+	tool, err := NewBashExecTool(nil)
+	if err != nil {
+		t.Fatalf("failed to construct tool: %v", err)
+	}
+	ws := t.TempDir()
+	ctx := tools.WithWorkspacePath(context.Background(), ws)
+	// D is bound in-command to /etc; "$D/hosts" resolves to /etc/hosts, which
+	// exists on Unix and lies outside the workspace root. The bound variable is
+	// not a hard (unresolvable) token — containment escalation is soft.
+	input, _ := json.Marshal(map[string]string{"command": `D=/etc; cat "$D/hosts"`})
+	outcome := tool.Judge(ctx, input)
+	if outcome.Allow {
+		t.Fatal("expected out-of-root reference (via bound var) to be denied")
+	}
+	if !strings.Contains(outcome.Reason, "outside session roots") {
+		t.Fatalf("unexpected reason: %q", outcome.Reason)
+	}
+	if outcome.Severity != tools.JudgeSeveritySoft {
+		t.Fatalf("bound-var containment severity = %v, want soft", outcome.Severity)
+	}
+}

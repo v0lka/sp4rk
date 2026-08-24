@@ -779,3 +779,36 @@ func TestHasRelativeEscape(t *testing.T) {
 		}
 	}
 }
+
+func TestResolveShellPathTokens_InCommandBindingUnionsEnv(t *testing.T) {
+	// A variable assigned a literal value in-command does NOT shadow the
+	// process env: when both a binding and a non-empty, differing env value
+	// exist, BOTH expansions are reported (fail-closed over-report). This test
+	// kept next to the resolver it exercises; broader coverage — including the
+	// prefix-assignment form and the parser-layer (extractBashPaths) union —
+	// lives in shellEnvBindings_test.go.
+	envVal := filepath.ToSlash(osAbsPath("from", "env"))
+	t.Setenv("D", envVal)
+	bind := filepath.ToSlash(osAbsPath("tmp", "build"))
+	got := ResolveShellPathTokens(`D=`+bind+`; cat "$D/a"`, ShellBash, osAbsPath("wd"))
+	want := []string{
+		filepath.Clean(osAbsPath("tmp", "build")),
+		filepath.Clean(osAbsPath("tmp", "build", "a")),
+		filepath.Clean(osAbsPath("from", "env", "a")),
+	}
+	if len(got) != len(want) {
+		t.Fatalf("union of binding and env expansions = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("union of binding and env expansions = %v, want %v", got, want)
+		}
+	}
+
+	// Unbound $D (no in-command assignment) falls back to the process env.
+	back := ResolveShellPathTokens(`cat "$D/a"`, ShellBash, osAbsPath("wd"))
+	wantBack := []string{filepath.Clean(osAbsPath("from", "env", "a"))}
+	if len(back) != len(wantBack) || back[0] != wantBack[0] {
+		t.Fatalf("env fallback = %v, want %v", back, wantBack)
+	}
+}

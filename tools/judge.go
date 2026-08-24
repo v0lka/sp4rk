@@ -70,21 +70,37 @@ type StrictJudgeRequest struct {
 	Input       json.RawMessage
 	TaskContext string
 	ToolSource  string
+	// JudgeReasoning is the host's deterministic reason for escalating the
+	// call, and JudgeSeverity classifies that escalation as hard (a fired
+	// security control) or soft (an advisory scope question). Both are
+	// forwarded to the LLM so it can apply the strict hard-severity policy.
+	// The reasoning may quote fragments of the untrusted command under
+	// evaluation, so before entering the prompt envelope it is line-sanitized
+	// (see [sanitizeEnvelopeLine]) and wrapped in a security untrusted-content
+	// boundary (see [security.WrapUntrustedContent]): the classification is
+	// trusted host policy, the quoted fragments are not. The zero severity is
+	// hard — fail-closed.
+	JudgeReasoning string
+	JudgeSeverity  JudgeSeverity
 }
 
 // strictJudgeEnvelope is serialized as JSON to keep untrusted data fields
-// structurally separated in the LLM request. The untrusted fields — the tool
-// Input and the host-provided SessionDirectories — are wrapped in
-// security.WrapUntrustedContent boundaries and the directories are
-// line-sanitized before serialization, mirroring the advisory judge path, so
-// hostile values cannot forge prompt structure or break out of the envelope.
+// structurally separated in the LLM request. The fields that can carry
+// untrusted-derived text — the tool Input, the host-provided
+// SessionDirectories, and the JudgeReasoning (host-generated, but it may
+// quote fragments of the command under evaluation) — are wrapped in
+// security.WrapUntrustedContent boundaries and line-sanitized before
+// serialization, mirroring the advisory judge path, so hostile values cannot
+// forge prompt structure or break out of the envelope.
 type strictJudgeEnvelope struct {
-	TaskContext        string `json:"task_context"`
-	ToolName           string `json:"tool_name"`
-	ToolSource         string `json:"tool_source"`
-	Input              string `json:"input"`
-	Environment        string `json:"environment,omitempty"`
-	SessionDirectories string `json:"session_directories,omitempty"`
+	TaskContext        string        `json:"task_context"`
+	ToolName           string        `json:"tool_name"`
+	ToolSource         string        `json:"tool_source"`
+	Input              string        `json:"input"`
+	Environment        string        `json:"environment,omitempty"`
+	SessionDirectories string        `json:"session_directories,omitempty"`
+	JudgeReasoning     string        `json:"judge_reasoning,omitempty"`
+	JudgeSeverity      JudgeSeverity `json:"judge_severity"`
 }
 
 // marshalStrictEnvelope serializes the strict judge envelope with HTML
@@ -176,20 +192,41 @@ func judgeCacheKey(toolName string, input json.RawMessage, roots []string) strin
 	return key
 }
 
-// sanitizeSessionRootLine collapses line-break characters — including the
+// sanitizeEnvelopeLine collapses line-break characters — including the
 // Unicode separators NEL, LS, and PS that LLMs read as newlines — in a
-// host-provided directory string, so a hostile or malformed value cannot
-// forge list entries or prompt headers via line injection (e.g.
-// "/evil\n## Response Format"). Tag-breakout sequences are handled
-// separately by security.WrapUntrustedContent around the whole list.
-func sanitizeSessionRootLine(root string) string {
+// host-provided single-line envelope value (a session-root directory, the
+// judge reasoning forwarded to strict evaluation), so a hostile or malformed
+// value cannot forge list entries or prompt headers via line injection (e.g.
+// "/evil\n## Response Format"). The judge reasoning is host-generated, but it
+// may quote fragments of untrusted tool input (e.g. an unresolvable path-like
+// token from the command under evaluation), so it gets the same treatment.
+// Tag-breakout sequences are handled separately by
+// security.WrapUntrustedContent around the values that carry them.
+func sanitizeEnvelopeLine(s string) string {
 	return strings.Map(func(r rune) rune {
 		switch r {
 		case '\n', '\r', '\v', '\f', '\u0085', '\u2028', '\u2029':
 			return ' '
 		}
 		return r
-	}, root)
+	}, s)
+}
+
+// wrapJudgeReasoning prepares the host's escalation reason for the strict
+// judge prompt envelope. The reason is host-generated, but it may quote
+// fragments of the untrusted command under evaluation (e.g. an unresolvable
+// path-like token), so it is line-sanitized (see [sanitizeEnvelopeLine]) and
+// wrapped in a security untrusted-content boundary (see
+// [security.WrapUntrustedContent]): sanitization stops the value from forging
+// prompt structure, and the boundary tells the LLM that instruction-like text
+// quoted inside the reason is data, not policy. An empty reason is returned
+// unchanged so the envelope's omitempty keeps the field absent.
+func wrapJudgeReasoning(reasoning string) string {
+	reasoning = sanitizeEnvelopeLine(reasoning)
+	if reasoning == "" {
+		return ""
+	}
+	return security.WrapUntrustedContent(reasoning, "judge_reasoning", nil)
 }
 
 // formatSessionRootsBlock renders the session's directory roots as a compact
@@ -210,13 +247,13 @@ func formatSessionRootsBlock(ctx context.Context, roots []string) string {
 	if len(roots) == 0 {
 		return ""
 	}
-	ws := sanitizeSessionRootLine(WorkspacePathFrom(ctx))
+	ws := sanitizeEnvelopeLine(WorkspacePathFrom(ctx))
 	var list strings.Builder
 	if ws != "" {
 		fmt.Fprintf(&list, "- Workspace: %s\n", ws)
 	}
 	for _, r := range roots {
-		r = sanitizeSessionRootLine(r)
+		r = sanitizeEnvelopeLine(r)
 		if r == ws {
 			continue
 		}
@@ -403,12 +440,21 @@ func (j *ToolJudge) JudgeStrict(ctx context.Context, request StrictJudgeRequest)
 
 	roots := SessionRoots(ctx)
 	envelope := strictJudgeEnvelope{
-		TaskContext:        request.TaskContext,
-		ToolName:           request.ToolName,
-		ToolSource:         request.ToolSource,
-		Input:              security.WrapUntrustedContent(string(request.Input), "tool_input", nil),
+		TaskContext: request.TaskContext,
+		ToolName:    request.ToolName,
+		ToolSource:  request.ToolSource,
+		Input:       security.WrapUntrustedContent(string(request.Input), "tool_input", nil),
+		// The judge reasoning is host-generated, but it may quote fragments of
+		// the untrusted command under evaluation (e.g. an unresolvable
+		// path-like token), so it gets the same two-layer treatment as the
+		// tool input: line-sanitized to close off forged prompt structure,
+		// then wrapped in an untrusted-content boundary so the LLM treats
+		// instruction-like text quoted inside the reason as data, not policy.
+		// An empty reason stays empty so the field remains omitted.
+		JudgeReasoning:     wrapJudgeReasoning(request.JudgeReasoning),
 		Environment:        FormatCompactEnvBlock(EnvInfoFrom(ctx)),
 		SessionDirectories: formatSessionRootsBlock(ctx, roots),
+		JudgeSeverity:      request.JudgeSeverity,
 	}
 	prompt, err := marshalStrictEnvelope(envelope)
 	if err != nil {

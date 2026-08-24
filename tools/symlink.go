@@ -417,6 +417,11 @@ func extractBashPaths(command, workingDirectory, workspace string) (paths []stri
 		return nil, true // unparseable — suspicious
 	}
 
+	// Pre-pass: collect literal in-command variable bindings ("VAR=value",
+	// "export VAR=value", "VAR=value cmd ...") so a bound "$VAR" can be resolved
+	// to its literal value instead of being flagged unexpandable.
+	bindings := collectShellEnvBindings(file)
+
 	seen := make(map[string]struct{})
 	syntax.Walk(file, func(node syntax.Node) bool {
 		switch n := node.(type) {
@@ -424,21 +429,31 @@ func extractBashPaths(command, workingDirectory, workspace string) (paths []stri
 			hasUnexpandable = true
 			return false // don't recurse into $(...) or `...`
 		case *syntax.ParamExp:
+			// Parameter expansions nested inside a Word never reach this case:
+			// the *syntax.Word case below expands them (via
+			// expandWordWithBindings, which also applies the union semantics —
+			// a binding resolves to its literal but a differing non-empty env
+			// value keeps the word suspicious) and then stops the walk. This
+			// case is only a fail-closed safety net for a ParamExp the walk
+			// reaches outside any Word: it cannot be statically resolved, so
+			// the command stays suspicious.
 			hasUnexpandable = true
 			return false
 		case *syntax.ProcSubst:
 			hasUnexpandable = true
 			return false
 		case *syntax.Word:
-			// Check for unexpandable shell constructs within the word
-			// (e.g., $HOME/file parses as one Word with Parts [ParamExp, Lit]).
-			for _, part := range n.Parts {
-				switch part.(type) {
-				case *syntax.ParamExp, *syntax.CmdSubst, *syntax.ProcSubst:
-					hasUnexpandable = true
-				}
+			// Expand the word substituting in-command variable bindings. Bound
+			// variables resolve to their literal value; unbound/dynamic
+			// constructs ("$UNSET", "$(cmd)", backticks, globs, process
+			// substitution) mark the word unexpandable, so the command stays
+			// suspicious. The remaining literal fragments are still extracted as
+			// path candidates (an unset "$VAR" concatenated with a suffix expands
+			// to the suffix alone), mirroring the historical wordLiteral path.
+			lit, unexp := expandWordWithBindings(n, bindings)
+			if unexp {
+				hasUnexpandable = true
 			}
-			lit := wordLiteral(n)
 			if lit == "" || !looksLikePath(lit) {
 				return false
 			}

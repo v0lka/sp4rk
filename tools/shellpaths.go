@@ -201,7 +201,10 @@ func UnresolvablePathTokens(command string, shell ShellKind) []string {
 //     home directory via [os.UserHomeDir] (falling back to $HOME then
 //     $USERPROFILE). "~user" is best-effort and skipped when unresolvable.
 //   - "$VAR"/"${VAR}" (bash) and "$env:VAR"/"${env:VAR}" (posh) expand via
-//     [os.Getenv]; tokens whose expansion is empty are SKIPPED.
+//     [os.Getenv] and, for bash, the command's own literal "VAR=value"
+//     bindings ([collectCommandEnvBindings]); when both exist, BOTH expansions
+//     are reported — a binding adds candidates, it never masks an environment
+//     value (fail-closed). Tokens whose every expansion is empty are SKIPPED.
 //   - Relative tokens containing ".." resolve against workDir; only tokens
 //     with ".." are analyzed (plain relative names already resolve inside the
 //     validated workDir and are ignored). Relative tokens are skipped when
@@ -218,6 +221,16 @@ func ResolveShellPathTokens(command string, shell ShellKind, workDir string) []s
 
 	seen := make(map[string]struct{})
 	var out []string
+	// Collect in-command literal variable bindings (bash only) so "$VAR" can
+	// resolve to the command's own assignment value ("VAR=value",
+	// "export VAR=value", "VAR=value cmd ...") in ADDITION to the process
+	// environment — a binding never masks an env value (see
+	// [resolveEnvToken]). PowerShell has no mvdan parser here, so it gets no
+	// bindings.
+	var bindings map[string]string
+	if shell == ShellBash {
+		bindings = collectCommandEnvBindings(command)
+	}
 	for _, m := range re.FindAllStringIndex(command, -1) {
 		start, end := m[0], m[1]
 		tok := command[start:end]
@@ -276,15 +289,16 @@ func ResolveShellPathTokens(command string, shell ShellKind, workDir string) []s
 				continue
 			}
 		}
-		resolved, ok := resolveShellToken(tok, shell, workDir)
-		if !ok || resolved == "" || !isAbsResolved(resolved) {
-			continue
+		for _, resolved := range resolveShellToken(tok, shell, workDir, bindings) {
+			if resolved == "" || !isAbsResolved(resolved) {
+				continue
+			}
+			if _, dup := seen[resolved]; dup {
+				continue
+			}
+			seen[resolved] = struct{}{}
+			out = append(out, resolved)
 		}
-		if _, dup := seen[resolved]; dup {
-			continue
-		}
-		seen[resolved] = struct{}{}
-		out = append(out, resolved)
 	}
 	return out
 }
@@ -517,25 +531,35 @@ func nearestExistingAncestorDir(p string) (string, bool) {
 }
 
 // resolveShellToken dispatches a single matched token to the appropriate
-// resolver based on its leading character(s). It returns (resolved, ok); ok is
-// false when the token cannot be resolved (the caller drops it).
-func resolveShellToken(token string, shell ShellKind, workDir string) (string, bool) {
+// resolver based on its leading character(s). It returns the resolved
+// absolute-path candidates; an empty slice means the token cannot be resolved
+// and the caller drops it. Env tokens may yield several candidates — see
+// [resolveEnvToken].
+func resolveShellToken(token string, shell ShellKind, workDir string, bindings map[string]string) []string {
 	switch {
 	case token == "":
-		return "", false
+		return nil
 	case isURLSchemeFragment(token):
 		// A single letter + "://" is the drive-letter tail of a URL scheme
 		// (e.g. the "s://" extracted from "https://") caught by pathRegex's
 		// [A-Za-z]:[\\/] alternative. It is not a filesystem path and must
 		// be skipped to avoid false positives — notably on Windows, where
 		// "s://host/path" looks like a drive path.
-		return "", false
+		return nil
 	case strings.HasPrefix(token, "~"):
-		return resolveTildeToken(token)
+		resolved, ok := resolveTildeToken(token)
+		if !ok {
+			return nil
+		}
+		return []string{resolved}
 	case strings.HasPrefix(token, "$"):
-		return resolveEnvToken(token, shell)
+		return resolveEnvToken(token, shell, bindings)
 	case strings.HasPrefix(token, ".."):
-		return resolveRelativeToken(token, workDir)
+		resolved, ok := resolveRelativeToken(token, workDir)
+		if !ok {
+			return nil
+		}
+		return []string{resolved}
 	default:
 		// Anything else matched by the combined regex is an absolute path
 		// coming from [pathRegex]: a POSIX root ("/...") or a Windows drive
@@ -545,9 +569,9 @@ func resolveShellToken(token string, shell ShellKind, workDir string) (string, b
 		// with the path package to keep it forward-slashed and POSIX-absolute
 		// regardless of host OS. Windows drive paths use filepath as usual.
 		if strings.HasPrefix(token, "/") {
-			return path.Clean(token), true
+			return []string{path.Clean(token)}
 		}
-		return filepath.Clean(token), true
+		return []string{filepath.Clean(token)}
 	}
 }
 
@@ -597,10 +621,17 @@ func resolveTildeToken(token string) (string, bool) {
 }
 
 // resolveEnvToken expands a "$VAR"/"${VAR}" (bash) or
-// "$env:VAR"/"${env:VAR}" (posh) reference plus an optional path remainder.
-// A bare empty/unset variable is skipped; with a path suffix it resolves to the
-// suffix alone, mirroring the shell's concatenation of an empty expansion with
-// the literal suffix.
+// "$env:VAR"/"${env:VAR}" (posh) reference plus an optional path remainder,
+// returning every absolute-path candidate. A bare empty/unset variable is
+// skipped; with a path suffix it resolves to the suffix alone, mirroring the
+// shell's concatenation of an empty expansion with the literal suffix.
+//
+// In-command literal bindings never shadow the process environment: the
+// binding pre-pass is position- and control-flow-unaware (an assignment inside
+// a branch not taken still lands in the map), so a name with BOTH a binding
+// and a non-empty env value is ambiguous and BOTH expansions are returned —
+// fail-closed over-report. A binding can add candidates; it can never mask an
+// environment value.
 //
 // Note: an env var that resolves to an absolute path outside the session roots
 // (e.g. "$HOME", "$USERPROFILE") is reported by PathsOutsideRoots. This is
@@ -608,7 +639,7 @@ func resolveTildeToken(token string) (string, bool) {
 // path — and the user-confirmation policy gates the command. The cost is a
 // false positive on benign commands like "echo $HOME"; the conservative
 // stance is preferable to silently allowing an out-of-root dereference.
-func resolveEnvToken(token string, shell ShellKind) (string, bool) {
+func resolveEnvToken(token string, shell ShellKind, bindings map[string]string) []string {
 	var name, rest string
 	switch {
 	case strings.HasPrefix(token, "${env:"):
@@ -620,17 +651,17 @@ func resolveEnvToken(token string, shell ShellKind) (string, bool) {
 	case strings.HasPrefix(token, "$"):
 		name, rest = splitEnvName(token[1:])
 	default:
-		return "", false
+		return nil
 	}
 	if name == "" {
-		return "", false
+		return nil
 	}
 	// The per-shell combined regex already guarantees that bash tokens are the
 	// "$VAR"/"${VAR}" forms and posh tokens are the "$env:"/"${env:" forms, so
 	// no cross-dialect mismatch can reach here.
-	val := os.Getenv(name)
 	rest = normalizeSeparators(rest)
-	if val == "" {
+	vals := envValueCandidates(name, bindings)
+	if len(vals) == 0 {
 		// An unset or empty variable concatenated with a literal suffix expands
 		// in the shell to just the suffix (e.g. "$UNSET/etc/passwd" →
 		// "/etc/passwd"). Resolve the suffix rather than dropping the token, so
@@ -638,14 +669,44 @@ func resolveEnvToken(token string, shell ShellKind) (string, bool) {
 		// env var still surfaces as an out-of-root reference. A bare empty var
 		// (no suffix) names no path and remains skipped.
 		if rest == "" {
-			return "", false
+			return nil
 		}
-		return cleanJoined(rest), true
+		return []string{cleanJoined(rest)}
 	}
-	if rest != "" {
-		return cleanJoined(val, rest), true
+	out := make([]string, 0, len(vals))
+	for _, val := range vals {
+		if rest != "" {
+			out = append(out, cleanJoined(val, rest))
+			continue
+		}
+		out = append(out, cleanJoined(val))
 	}
-	return cleanJoined(val), true
+	return out
+}
+
+// envValueCandidates returns the possible runtime values of a variable
+// reference in deterministic order: the in-command literal binding (if any)
+// followed by the process-environment value (if non-empty), deduplicated. A
+// binding collected from the command may not be in effect where the reference
+// executes, so when both exist both are candidates.
+func envValueCandidates(name string, bindings map[string]string) []string {
+	var vals []string
+	add := func(v string) {
+		if v == "" {
+			return
+		}
+		for _, existing := range vals {
+			if existing == v {
+				return
+			}
+		}
+		vals = append(vals, v)
+	}
+	if bindings != nil {
+		add(bindings[name])
+	}
+	add(os.Getenv(name))
+	return vals
 }
 
 // splitBrace extracts the variable name inside "${...}" / "${env:...}" and the

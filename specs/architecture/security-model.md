@@ -117,7 +117,7 @@ The separate `ToolJudge` (`github.com/v0lka/sp4rk/tools` `judge.go`) is an LLM-b
 Strict mode differs from advisory `Judge` in three security-relevant ways:
 
 1. It performs one LLM call for every invocation. Internal-tool and in-session path fast paths are disabled, and no verdict cache is read or written.
-2. It serializes a JSON envelope rather than interpolating the tool arguments into instructions. Raw input and host-supplied session-directory values are wrapped in `untrusted-content` boundaries, and directory lines are sanitized before serialization.
+2. It serializes a JSON envelope rather than interpolating the tool arguments into instructions. Raw input, host-supplied session-directory values, and the host's judge reasoning (host-generated, but it may quote fragments of the untrusted command, e.g. an unresolvable path-like token) are wrapped in `untrusted-content` boundaries and line-sanitized before serialization.
 3. It accepts only the strict `VERDICT`/`REASON` response contract. Missing provider, request construction failure, provider error, cancellation/timeout, nil response, and unparseable output all return `VerdictConfirm`. Provider error text is excluded from strict logs because it may echo sensitive tool input.
 
 Strict mode remains advisory to the host: it returns an allow/confirm recommendation and never bypasses `PolicyAlwaysDeny`, a hard `JudgeSeverity`, or registry confirmation policy by itself.

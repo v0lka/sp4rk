@@ -184,14 +184,18 @@ func TestExtractBashPaths_RelativeFallback(t *testing.T) {
 }
 
 func TestExtractBashPaths_VariableExpansion(t *testing.T) {
-	// ${HOME} (braced) delimits the variable from the following path and is
-	// detected as unexpandable; the trailing OS-absolute literal is extracted
-	// and the result is marked suspicious.
+	// ${HOME} (braced) delimits the variable from the following path. HOME is
+	// NOT assigned anywhere in the command, so the variable is *unbound* and the
+	// result stays suspicious; only the trailing OS-absolute literal is
+	// extracted. Under the binding semantics a $VAR bound to a literal value
+	// in-command resolves to that value — and stays non-suspicious only while
+	// no differing env value makes it ambiguous (union semantics) — see
+	// TestExtractBashPaths_VariableBinding.
 	suffix := osAbsPath("lit", ".config")
 	cmd := "cat ${HOME}" + filepath.ToSlash(suffix)
 	paths, suspicious := extractBashPaths(cmd, osAbsPath("wd"), osAbsPath("ws"))
 	if !suspicious {
-		t.Fatal("expected suspicious flag for $var")
+		t.Fatal("expected suspicious flag for unbound $var")
 	}
 	want := filepath.Clean(suffix)
 	if len(paths) != 1 || paths[0] != want {
@@ -200,17 +204,65 @@ func TestExtractBashPaths_VariableExpansion(t *testing.T) {
 }
 
 func TestExtractBashPaths_VariableExpansionInPath(t *testing.T) {
-	// ${HOME} delimits the variable; the trailing literal path is extracted
-	// and the result is marked suspicious.
+	// ${HOME} delimits the variable; the trailing literal path is extracted and
+	// the result is marked suspicious because the variable is unbound (not
+	// assigned in-command).
 	suffix := osAbsPath("path", "to", "file")
 	cmd := "cat ${HOME}" + filepath.ToSlash(suffix)
 	paths, suspicious := extractBashPaths(cmd, osAbsPath("wd"), osAbsPath("ws"))
 	if !suspicious {
-		t.Fatal("expected suspicious flag for $var")
+		t.Fatal("expected suspicious flag for unbound $var")
 	}
 	want := filepath.Clean(suffix)
 	if len(paths) != 1 || paths[0] != want {
 		t.Fatalf("expected [%s] from literal parts, got %v", want, paths)
+	}
+}
+
+func TestExtractBashPaths_VariableBinding(t *testing.T) {
+	// In-command variable binding (Task 1 semantics): a $VAR assigned a *literal*
+	// value within the same command is expanded to that value, so the resulting
+	// path is extracted and the command is NOT marked suspicious — as long as no
+	// differing env value makes the reference ambiguous (union semantics, see
+	// TestExtractBashPaths_BindingWithDifferingEnvStaysSuspicious). Dynamic RHS
+	// ($(…)), bare command-substitution and unbound variables remain suspicious
+	// / unexpandable. Fixtures are OS-absolute (osAbsPath) so the table behaves
+	// identically on POSIX and Windows.
+	t.Setenv("D", "")
+	bind := filepath.ToSlash(osAbsPath("tmp", "build"))
+	other := filepath.ToSlash(osAbsPath("etc"))
+	last := filepath.ToSlash(osAbsPath("tmp"))
+	dynSuffix := filepath.ToSlash(osAbsPath("a"))
+	clean := func(parts ...string) string { return filepath.Clean(osAbsPath(parts...)) }
+	wd, ws := osAbsPath("wd"), osAbsPath("ws")
+	cases := []struct {
+		name       string
+		cmd        string
+		suspicious bool
+		want       []string
+	}{
+		{"simple assignment binds", `D=` + bind + `; cat "$D/a"`, false, []string{clean("tmp", "build"), clean("tmp", "build", "a")}},
+		{"export binds like assignment", `export D=` + bind + `; cat "$D/a"`, false, []string{clean("tmp", "build"), clean("tmp", "build", "a")}},
+		{"command-prefix assignment binds", `D=` + bind + ` mkdir "$D/x"`, false, []string{clean("tmp", "build"), clean("tmp", "build", "x")}},
+		{"dynamic RHS stays unbound", `D=$(echo x); cat "${D}` + dynSuffix + `"`, true, []string{clean("a")}},
+		{"last assignment wins", `D=` + other + `; D=` + last + `; echo "$D"`, false, []string{clean("etc"), clean("tmp")}},
+		{"bare command substitution stays suspicious", `cat $(echo x)`, true, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			paths, suspicious := extractBashPaths(tc.cmd, wd, ws)
+			if suspicious != tc.suspicious {
+				t.Fatalf("suspicious = %v, want %v (paths=%v)", suspicious, tc.suspicious, paths)
+			}
+			if len(paths) != len(tc.want) {
+				t.Fatalf("paths = %v, want %v", paths, tc.want)
+			}
+			for i := range paths {
+				if paths[i] != tc.want[i] {
+					t.Fatalf("paths[%d] = %q, want %q (all=%v)", i, paths[i], tc.want[i], paths)
+				}
+			}
+		})
 	}
 }
 
