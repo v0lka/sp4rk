@@ -71,6 +71,29 @@ func TestPoshExecTool_EchoHello(t *testing.T) {
 	}
 }
 
+func TestPoshExecTool_UnicodeOutput(t *testing.T) {
+	tool := mustNewPoshExecTool(t, nil)
+	const want = "Привет 😀"
+
+	input, err := json.Marshal(map[string]string{
+		"command": "Write-Output '" + want + "'",
+	})
+	if err != nil {
+		t.Fatalf("marshal input: %v", err)
+	}
+
+	result, err := tool.Execute(context.Background(), input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("unexpected error result: %s", result.Content)
+	}
+	if got := strings.TrimSpace(result.Content); got != want {
+		t.Errorf("expected Unicode output %q, got %q", want, got)
+	}
+}
+
 func TestPoshExecTool_NonZeroExitCode(t *testing.T) {
 	tool := mustNewPoshExecTool(t, nil)
 

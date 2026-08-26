@@ -236,10 +236,10 @@ func (t *PoshExecTool) Execute(ctx context.Context, input json.RawMessage) (tool
 	defer jobCleanup()
 
 	err = cmd.Wait()
-	output := buf.Bytes()
+	output := decodePowerShellOutput(buf.Bytes())
 
 	if err != nil {
-		result := string(output) + "\n" + err.Error()
+		result := output + "\n" + err.Error()
 		if errors.Is(timeoutCtx.Err(), context.DeadlineExceeded) {
 			result += "\n[Process killed: timeout exceeded]"
 		}
@@ -250,7 +250,7 @@ func (t *PoshExecTool) Execute(ctx context.Context, input json.RawMessage) (tool
 	}
 
 	res := tools.ToolResult{
-		Content: string(output),
+		Content: output,
 		IsError: false,
 	}
 	// Surface a degraded-containment note rather than logging via a global

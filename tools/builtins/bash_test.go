@@ -71,6 +71,29 @@ func TestBashExecTool_EchoHello(t *testing.T) {
 	}
 }
 
+func TestBashExecTool_UnicodeOutput(t *testing.T) {
+	tool := mustNewBashExecTool(t, nil)
+	const want = "Привет 😀\n"
+
+	input, err := json.Marshal(map[string]string{
+		"command": "printf 'Привет 😀\\n'",
+	})
+	if err != nil {
+		t.Fatalf("marshal input: %v", err)
+	}
+
+	result, err := tool.Execute(context.Background(), input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("unexpected error result: %s", result.Content)
+	}
+	if result.Content != want {
+		t.Errorf("expected Unicode output %q, got %q", want, result.Content)
+	}
+}
+
 func TestBashExecTool_NonZeroExitCode(t *testing.T) {
 	tool := mustNewBashExecTool(t, nil)
 
