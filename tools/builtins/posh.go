@@ -156,8 +156,20 @@ func (t *PoshExecTool) Execute(ctx context.Context, input json.RawMessage) (tool
 	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	// Bootstrap the session with BOM-less UTF-8 before the user command.
+	// powershell.exe encodes redirected console output — and decodes native
+	// commands' output — with the legacy OEM code page of its hidden console,
+	// which cannot represent most non-ASCII text: Unicode degrades to '?'
+	// before it ever reaches decodePowerShellOutput. Assigning a BOM-less
+	// UTF8Encoding makes both PowerShell's own output and native tool output
+	// round-trip as UTF-8. Best-effort: with no console attached the
+	// assignment throws, which we swallow — decodePowerShellOutput still
+	// handles BOM'd UTF-16 and any UTF-8 BOM a different encoding object
+	// might emit.
+	const utf8Bootstrap = `try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false); $OutputEncoding = [Console]::OutputEncoding } catch { }`
+
 	// Create command: Windows PowerShell, no profile, non-interactive.
-	cmd := exec.CommandContext(timeoutCtx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command)
+	cmd := exec.CommandContext(timeoutCtx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", utf8Bootstrap+"; "+command)
 
 	// Place the command in a new process group so cmd.Cancel can target
 	// powershell.exe in isolation (CREATE_NEW_PROCESS_GROUP). The full process
