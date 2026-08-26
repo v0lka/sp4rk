@@ -81,7 +81,7 @@ func utf16ByteOrder(output []byte) (encodingunicode.Endianness, bool) {
 	return encodingunicode.LittleEndian, false
 }
 
-func validUTF16Text(output []byte, order encodingunicode.Endianness) (bool, int) {
+func validUTF16Text(output []byte, order encodingunicode.Endianness) (valid bool, textRunes int) {
 	units := make([]uint16, 0, len(output)/2)
 	for i := 0; i < len(output); i += 2 {
 		if order == encodingunicode.LittleEndian {
@@ -91,7 +91,6 @@ func validUTF16Text(output []byte, order encodingunicode.Endianness) (bool, int)
 		}
 	}
 
-	textRunes := 0
 	for i := 0; i < len(units); i++ {
 		r := rune(units[i])
 		switch {
