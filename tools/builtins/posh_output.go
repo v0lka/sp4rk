@@ -1,6 +1,7 @@
 package builtins
 
 import (
+	"bytes"
 	"unicode"
 	"unicode/utf16"
 	"unicode/utf8"
@@ -14,6 +15,10 @@ import (
 // one, UTF-8 is left unchanged and UTF-16 candidates are accepted only when
 // their code units form valid, text-like Unicode in one byte order.
 func decodePowerShellOutput(output []byte) string {
+	// Strip a UTF-8 BOM: a PowerShell session configured with the standard
+	// BOM-emitting UTF8 encoding ([Console]::OutputEncoding =
+	// [System.Text.Encoding]::UTF8) writes the StreamWriter preamble first.
+	output = bytes.TrimPrefix(output, []byte{0xef, 0xbb, 0xbf})
 	if len(output) == 0 {
 		return ""
 	}

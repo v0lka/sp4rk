@@ -41,6 +41,21 @@ func TestDecodePowerShellOutput(t *testing.T) {
 			want:   "Привет 😀\n",
 		},
 		{
+			name:   "utf8 BOM is stripped",
+			output: append([]byte{0xef, 0xbb, 0xbf}, []byte("Привет 😀\n")...),
+			want:   "Привет 😀\n",
+		},
+		{
+			name:   "utf8 BOM ascii",
+			output: []byte{0xef, 0xbb, 0xbf, 'h', 'e', 'l', 'l', 'o'},
+			want:   "hello",
+		},
+		{
+			name:   "utf8 BOM only",
+			output: []byte{0xef, 0xbb, 0xbf},
+			want:   "",
+		},
+		{
 			name:   "binary-like data is unchanged",
 			output: []byte{0x01, 0x00, 0x02, 0x00},
 			want:   "\x01\x00\x02\x00",

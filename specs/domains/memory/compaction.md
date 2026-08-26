@@ -7,6 +7,7 @@ Compress conversation history when the context window approaches capacity, prese
 ## Key Files
 
 - `github.com/v0lka/sp4rk/memory` — `SlidingWindowStrategy`, `SummarizationStrategy`, `HierarchicalStrategy`, `NewCompactionStrategy`, `CompactionConfig`, `CompactionDeps`
+- `github.com/v0lka/sp4rk/memory` — `CompactConversationHistory` (manual, message-level compaction), `compactConversationHistory` (legacy budget-fit helper for planner prompts)
 - `github.com/v0lka/sp4rk/memory` — `ContextWindow` (orchestrates pruning + strategy compaction), `CompactionThresholds`
 - `github.com/v0lka/sp4rk/memory` — `ToolOutputPruning`, `HistoryMutation`
 - `github.com/v0lka/sp4rk/agent` — `CompactionStrategy` interface, `Step`, `ToolResultCache`
@@ -48,6 +49,20 @@ func NewCompactionStrategy(name string, cfg CompactionConfig, deps CompactionDep
 ```
 
 Recognized names: `"sliding_window"`, `"summarization"`, `"hierarchical"`; any other name falls back to `SlidingWindowStrategy`. `CompactionConfig` holds fields for all three strategies (only the relevant ones are used); `CompactionDeps` carries the `TokenCounter`, the `Summarize` callback, and `MaxSummarizeTokens` (default `16000`) required by the LLM-based strategies. Zero fields are defaulted: `sliding_window` applies `KeepFirst`→`3` and `KeepLast`→`10` (the unrecognized-name fallback strategy inherits these same defaults, so a zero-valued config always preserves a head and a tail of the step history rather than erasing it); `BlockSize`→`10`, `KeepLast`→`5`, `ObservationTruncate`→`500` for the LLM-based strategies; hierarchical ratios→`0.4/0.3/0.3`.
+
+### CompactConversationHistory (manual, message-level)
+
+```go
+func CompactConversationHistory(ctx context.Context, msgs []llm.Message, budgetTokens int, strategy string, cfg CompactionConfig, deps CompactionDeps) ([]llm.Message, error)
+```
+
+Message-level counterpart to the step strategies for callers that hold raw conversation histories (user/assistant exchanges) rather than a `ContextWindow` — e.g. a session orchestrator compacting cross-task dialogue context on demand. Strategies reuse the same names, config fields, defaults, and zone semantics as `NewCompactionStrategy`:
+
+- `sliding_window` — keep first `KeepFirst` + last `KeepLast` messages verbatim, one system note marks the omitted middle; no LLM call; short histories (`len <= KeepFirst+KeepLast`) are returned unchanged.
+- `summarization` — keep last `KeepLast` messages verbatim; older messages grouped into `BlockSize` blocks, each summarized via `deps.Summarize` into a system message.
+- `hierarchical` — distant zone (one aggressive summary block over the whole zone), middle zone (per-`BlockSize` summaries), recent zone verbatim.
+
+Differences from the step-based path: unknown strategy names fail closed with an error (no silent fallback); LLM strategies require a non-nil `deps.Summarize` and propagate its error (no fallback indicator); the input slice is never mutated; user messages with content blocks are flattened (`userMessageText`) before summarization. `budgetTokens > 0` is honored as a hard ceiling — the result is trimmed oldest-first until it fits (a nil `TokenCounter` skips trimming) — and the very last message is always preserved.
 
 ### Tool-output pruning (separate mechanism)
 
