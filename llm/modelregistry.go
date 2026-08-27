@@ -1356,6 +1356,19 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			Family:        "deepseek",
 			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
+		// deepseek-v4-flash-vision-exp — experimental V4 Flash variant that
+		// additionally accepts image input (JPEG/PNG/GIF/WebP) alongside the
+		// same 1M context / 384K max output as V4 Flash. Images are billed
+		// as input tokens, capped at 384 tokens per image after an automatic
+		// downscale to roughly 800×800.
+		// Source: https://api-docs.deepseek.com/guides/vision/
+		"deepseek-v4-flash-vision-exp": {
+			ContextWindow: 1000000,
+			OutputLimit:   384000,
+			TokenizerType: "approximate",
+			Family:        "deepseek",
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
 
 		// ── Kimi models (Moonshot AI) ───────────────────────────────────
 		// Source: https://platform.kimi.ai/docs/models.md
@@ -1832,6 +1845,22 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			Family:        "qwen",
 			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
+		// Qwen3.8-Flash-Next (HuggingFace): experimental preview of the
+		// Qwen4 architecture — Gated DeltaNet + Qwen Sparse Attention,
+		// Gated Residual, and N-gram embedding (125B total / 6B active,
+		// plus 51B n-gram embedding params). Multimodal (text+image/video
+		// via the vision encoder), thinking on by default, 256K native
+		// context extensible to 1M; the Qwen Cloud "Qwen3.8-Flash" API
+		// serves this model with 1M context by default.
+		//   config: max_position_embeddings=262144 (Qwen4ExpForConditionalGeneration)
+		//   source: https://huggingface.co/Qwen/Qwen3.8-Flash-Next
+		"qwen/qwen3.8-flash-next": {
+			ContextWindow: 262144,
+			OutputLimit:   65536,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
 		// Qwen3-Coder: non-thinking coding MoE, 256K context.
 		"qwen/qwen3-coder-30b": {
 			ContextWindow: 262144,
@@ -1997,6 +2026,21 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			TokenizerType: "approximate",
 			Family:        "glm",
 			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		// GLM-5.3-Flash (HuggingFace): first natively multimodal GLM-5
+		// model — 320B total / 18B active hybrid sparse+linear attention
+		// MoE with an always-on thinking mode (cannot be disabled). Text
+		// parameters are consistent with GLM-5.3 (1M context, 128K max
+		// output per https://docs.z.ai/guides/llm/glm-5.3-flash); native
+		// image/video input; function calling.
+		//   config: max_position_embeddings=1048576 (Glm5NextForConditionalGeneration)
+		//   source: https://huggingface.co/zai-org/GLM-5.3-Flash
+		"zai-org/glm-5.3-flash": {
+			ContextWindow: 1048576,
+			OutputLimit:   128000,
+			TokenizerType: "approximate",
+			Family:        "glm",
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 
 		// ── Google Gemma (open-weights) ────────────────────────────────

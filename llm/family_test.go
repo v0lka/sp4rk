@@ -56,18 +56,21 @@ func TestDetectFamily(t *testing.T) {
 		// DeepSeek
 		{"deepseek-v4-pro", FamilyDeepSeek},
 		{"deepseek-v4-flash", FamilyDeepSeek},
+		{"deepseek-v4-flash-vision-exp", FamilyDeepSeek},
 		{"deepseek-chat", FamilyDeepSeek},
 
 		// Qwen / QwQ (Alibaba)
 		{"qwen-plus", FamilyQwen},
 		{"qwen-max", FamilyQwen},
 		{"qwen-2.5-72b", FamilyQwen},
+		{"qwen3.8-flash-next", FamilyQwen},
 		{"qwq-plus", FamilyQwen},
 		{"qwq-32b", FamilyQwen},
 
 		// GLM (Zhipu AI)
 		{"glm-5.1", FamilyGLM},
 		{"glm-4.7", FamilyGLM},
+		{"glm-5.3-flash", FamilyGLM},
 		{"glm-z1-32b", FamilyGLM},
 		{"chatglm-4", FamilyGLM},
 

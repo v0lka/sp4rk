@@ -68,6 +68,7 @@ func TestModelRegistry_BuiltInResolution(t *testing.T) {
 		// DeepSeek V4 models
 		{"deepseek-v4-pro", 1000000, 384000, "approximate"},
 		{"deepseek-v4-flash", 1000000, 384000, "approximate"},
+		{"deepseek-v4-flash-vision-exp", 1000000, 384000, "approximate"},
 
 		// Grok models — verified from docs.x.ai
 		{"grok-4.20", 1000000, 32768, "approximate"},
@@ -1132,6 +1133,7 @@ func TestResolveFamily_BuiltinModels(t *testing.T) {
 		// DeepSeek V4 models
 		{"deepseek-v4-pro", "deepseek"},
 		{"deepseek-v4-flash", "deepseek"},
+		{"deepseek-v4-flash-vision-exp", "deepseek"},
 
 		// Kimi models — the Kimi Code endpoint's short IDs ("k3", "k3-256k")
 		// contain no "kimi" substring, so these pin the explicit built-in
