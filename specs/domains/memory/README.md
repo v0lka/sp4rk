@@ -115,6 +115,6 @@ When `InjectionDefenseEnabled` is `true`, tool outputs from untrusted sources (f
 
 - [compaction.md](compaction.md) — strategy details, pruning, history mutation
 - [blackboard.md](blackboard.md) — inter-step shared state
-- [../orchestration/executor.md](../orchestration/executor.md) — the executor drives compaction
-- [../orchestration/conductor.md](../orchestration/conductor.md) — wires the ContextManager per run
+- [../orchestration/executor.md](../orchestration/executor.md) — the executor drives threshold-gated compaction each iteration
+- [../orchestration/conductor.md](../orchestration/conductor.md) — wires the ContextManager per run; `CompactOnStart` forces one compaction pass before the first LLM call
 - [../prompt-building.md](../prompt-building.md) — `CacheBreakMarker` and provider-level prompt caching

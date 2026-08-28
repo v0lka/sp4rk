@@ -103,6 +103,7 @@ type ConductorConfig struct {
     PendingUserInterjection string
     PauseChecker func(context.Context) bool
     UserMessageSource func(context.Context) string
+    CompactOnStart bool
 }
 ```
 
@@ -133,6 +134,7 @@ type ConductorConfig struct {
 | `PendingUserInterjection` | One-shot resume nudge appended after seeded history as the final user message. Requires `InterjectionAware`; an `InterjectionConsumer` retires it only after a successful LLM response. Empty disables it. |
 | `PauseChecker` | Cooperative step-boundary pause callback. A true return becomes `ExecutionStatusPaused` with an empty output and preserved trajectory. Nil disables pause. |
 | `UserMessageSource` | Host-owned live-message source polled after pause at each boundary. One non-empty message is delivered in the next LLM request. Nil disables live steering. |
+| `CompactOnStart` | Forces one compaction pass right after resume/nudge seeding — before the first LLM call — regardless of fill thresholds. Intended for manual compaction of a paused task: relaunch with `ResumeSteps` + `CompactOnStart` and the seeded trajectory is compressed up front. Emits a `ContextCompaction` event (empty step ID) only when `Compact` reports a result; a nil result (nothing to compact) emits nothing. The Executor's threshold-driven reactive compaction may still fire later. `false` (default) keeps compaction purely threshold-driven. |
 
 ### NewConductor
 

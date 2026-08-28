@@ -74,7 +74,7 @@ type Events interface {
 | Method | Description |
 |--------|-------------|
 | `ContextFill(fillPercent, usedTokens, maxTokens, status, stepID)` | Fired to report context-window fill. `status` is one of `ok`, `compact`, `warning`, `emergency`, `reject` (see `FillCheck`). `stepID` is empty for non-plan executions. |
-| `ContextCompaction(beforePercent, afterPercent, stepID)` | Fired after a compaction runs, reporting the fill percentage before and after. |
+| `ContextCompaction(beforePercent, afterPercent, stepID)` | Fired after a compaction runs, reporting the fill percentage before and after. `stepID` names the plan step whose executor iteration compacted; it is empty for a run-level pass such as the Conductor's compact-on-start (`CompactOnStart`). |
 
 #### Completion
 

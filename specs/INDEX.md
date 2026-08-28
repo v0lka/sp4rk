@@ -18,6 +18,7 @@
 | Failure analysis, retry/replan/abort                          | [domains/orchestration/reflector.md](domains/orchestration/reflector.md)        |
 | Subagent delegation, parallel steps                           | [domains/orchestration/subagents.md](domains/orchestration/subagents.md)        |
 | Resuming execution from a checkpoint (ResumeSteps, SeedSteps) | [domains/orchestration/conductor.md](domains/orchestration/conductor.md), [domains/orchestration/executor.md](domains/orchestration/executor.md), [domains/memory/README.md](domains/memory/README.md) |
+| Manual compaction of a resumed task (CompactOnStart)         | [domains/orchestration/conductor.md](domains/orchestration/conductor.md)                                        |
 | Cooperative pause, live user messages, resume interjections    | [architecture/data-flow.md](architecture/data-flow.md), [domains/orchestration/conductor.md](domains/orchestration/conductor.md), [domains/orchestration/executor.md](domains/orchestration/executor.md), [domains/memory/README.md](domains/memory/README.md) |
 | Post-edit verification after write_file/edit_file              | [contracts/agent-execution.md](contracts/agent-execution.md), [domains/orchestration/executor.md](domains/orchestration/executor.md), [domains/orchestration/conductor.md](domains/orchestration/conductor.md) |
 | Tool registry, execution pipeline                             | [domains/tool-system/README.md](domains/tool-system/README.md)                  |

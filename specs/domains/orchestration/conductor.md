@@ -42,9 +42,11 @@ conductor.Run(ctx, message, bb, availableTools, events, compactionStrategy)
 ├─ 4. When ResumeSteps is set, seed the ContextManager (via StepSeedable) and the
 │      Executor (via WithResumeSteps) with the prior steps so the loop continues
 │      from len(steps)+1. When PendingUserInterjection is set, install the one-shot
-│      nudge through InterjectionAware. Install PauseChecker, UserMessageSource,
-│      and VerifyOnEdit on the Executor when configured; then launch one
-│      Executor.Run with the finish-join guard.
+│      nudge through InterjectionAware. When CompactOnStart is set, run one forced
+│      compaction pass on the ContextManager before the executor launches (see
+│      [Compact on start](#compact-on-start)). Install PauseChecker,
+│      UserMessageSource, and VerifyOnEdit on the Executor when configured; then
+│      launch one Executor.Run with the finish-join guard.
 │
 ├─ 5. Map the ExecutorResult onto ExecutionStatus:
 │      ├─ Finished == true                          → ExecutionStatusSuccess
@@ -109,6 +111,14 @@ Budget: the resumed steps count against the shared `MaxSteps` budget, not in add
 
 `ConductorConfig.PendingUserInterjection` carries a one-shot message for a resumed run. When non-empty and the context manager implements `InterjectionAware`, `Run` calls `SetPendingUserInterjection` after seeding steps. The context window renders it as the final user message after the pending tool result on every prompt build until the executor receives a successful LLM response and calls `InterjectionConsumer.ConsumePendingUserInterjection`. This preserves the nudge across a context-window failure, compaction, and retry without duplicating it after success. Empty is the backward-compatible default.
 
+### Compact on start
+
+`ConductorConfig.CompactOnStart` forces one compaction pass on the `ContextManager` immediately after the resume/nudge seeding and before the executor launches — hence before the first LLM call — regardless of the fill thresholds that gate the Executor's reactive compaction. Its purpose is manual compaction of a paused task: the host re-launches the Conductor with `ResumeSteps` + `CompactOnStart` so the seeded trajectory is compressed up front rather than waiting for a threshold to trip mid-run.
+
+When `Compact` reports a result, `Run` emits a `ContextCompaction` event carrying the result's before/after fill percentages with an empty step ID — the pass belongs to the run, not to an executor step. A nil result (nothing to compact: empty steps or a nil strategy) emits no event.
+
+The pass covers only the start of the run: the Executor's threshold-driven reactive compaction inside the loop is unchanged and still fires when fill warrants it. `false` (the default) keeps compaction purely threshold-driven and is backward-compatible.
+
 ### Post-edit verification
 
 `ConductorConfig.VerifyOnEdit` and `VerifyOnEditMaxOutputChars` are forwarded to `Executor.SetVerifyOnEdit`. The runner executes a command selected by user configuration, not model output, once after each response group containing a successful `write_file`/`edit_file`; its capped result becomes a `[verify_on_edit]` observation. Nil disables the hook, and a non-positive cap selects `agent.DefaultVerifyOnEditCap`.
@@ -132,6 +142,7 @@ Budget: the resumed steps count against the shared `MaxSteps` budget, not in add
 - When a `PendingDelegations` registry is in `ctx`, `finish` is rejected while it reports pending async work.
 - When `ResumeSteps` is set, `Run` fails fast unless the `ContextManager` implements `StepSeedable`; on success it seeds both the `ContextManager` and the `Executor` with the same defensive copy of the steps.
 - A configured `PendingUserInterjection` is appended after seeded history and remains pending through reactive-compaction retries until one LLM response succeeds.
+- When `CompactOnStart` is set, `Run` performs one start-of-run compaction pass after seeding and before the executor launches; the Executor's threshold-driven reactive compaction inside the loop is unchanged.
 - Pause is checked before the live-message source at every boundary, so a paused run returns a checkpoint without consuming the next queued message.
 - A pending verify-on-edit run is flushed before a paused or finished result is returned.
 - A Conductor instance is reusable across steps; per-run state lives on the `ContextManager`, not on the Conductor.

@@ -50,6 +50,7 @@ type ConductorConfig struct {
     PendingUserInterjection   string
     PauseChecker              func(context.Context) bool
     UserMessageSource         func(context.Context) string
+    CompactOnStart            bool
     VerifyOnEdit              agent.EditVerifyRunner
     VerifyOnEditMaxOutputChars int
 }
@@ -155,6 +156,7 @@ The Conductor is the only top-level execution entry point this domain exposes. D
 | `ResumeSteps` | `nil` | Prior ReAct steps to resume from a checkpoint. When non-empty, `Run` seeds the `ContextManager` (via `StepSeedable`) and the `Executor` (via `WithResumeSteps`); the steps count against `MaxSteps`. Requires a `StepSeedable` `ContextManager` (see [conductor.md](conductor.md)). |
 | `PendingUserInterjection` | `""` | One-shot resume nudge appended after seeded history; retained through reactive-compaction retries and consumed after the first successful LLM response. |
 | `PauseChecker` / `UserMessageSource` | `nil` | Optional step-boundary callbacks. Pause is checked first; one live message is polled only when the run continues. |
+| `CompactOnStart` | `false` | Forces one compaction pass on the `ContextManager` right after resume/nudge seeding, before the first LLM call, regardless of fill thresholds — manual compaction of a paused task (see [conductor.md](conductor.md#compact-on-start)). Emits `ContextCompaction` only when the pass reports a result; reactive executor compaction is unaffected. |
 | `VerifyOnEdit` | `nil` | User-configured verifier run once per response group containing a successful `write_file`/`edit_file`; nil disables it. |
 | `VerifyOnEditMaxOutputChars` | `<= 0` → `4000` | Unicode-safe cap for the injected verification output. |
 | `ConversationHistory` | `nil` | Prior conversation messages (previous exchanges) rendered before the current task via the `ConversationAware` capability. |

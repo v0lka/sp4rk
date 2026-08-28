@@ -117,6 +117,20 @@ type ConductorConfig struct {
 	// step boundary — without pausing or restarting the run. A nil source
 	// disables live injection (the default, backward-compatible behavior).
 	UserMessageSource func(context.Context) string
+
+	// CompactOnStart forces one compaction pass immediately after the
+	// resume/nudge seeding — before the first LLM call — regardless of the
+	// context fill thresholds that normally gate reactive compaction. It
+	// exists for manual compaction of a paused task: the host application
+	// re-launches the Conductor with ResumeSteps + CompactOnStart so the
+	// seeded trajectory is compressed up front. The count applies to the
+	// start-of-run pass only: the Executor's threshold-driven reactive
+	// compaction may still fire later in the run as usual. Compact is a safe
+	// no-op (returns nil) when there is nothing to compact — empty steps or
+	// a nil strategy — so no ContextCompaction event fires in that case.
+	// false (default) preserves the previous behavior: compaction remains
+	// purely threshold-driven inside the Executor loop.
+	CompactOnStart bool
 }
 
 // Conductor runs a single Executor.Run that owns a task end-to-end.
@@ -251,6 +265,18 @@ func (c *Conductor) Run(
 	if c.cfg.PendingUserInterjection != "" {
 		if icm, ok := cm.(InterjectionAware); ok {
 			icm.SetPendingUserInterjection(c.cfg.PendingUserInterjection)
+		}
+	}
+
+	// Compact-on-start: force one compaction pass right after the
+	// resume/nudge seeding and before the first LLM call, regardless of fill
+	// thresholds (manual compaction of a paused task resumed via
+	// ResumeSteps). Compact is a safe no-op returning nil when there is
+	// nothing to compact — empty steps or a nil strategy — so the event only
+	// fires when compaction actually occurred.
+	if c.cfg.CompactOnStart {
+		if result := cm.Compact(ctx); result != nil {
+			events.ContextCompaction(result.BeforePercent, result.AfterPercent, "")
 		}
 	}
 
