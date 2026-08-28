@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -332,5 +333,254 @@ func TestCompactConversationHistory_UserContentBlocksFlattened(t *testing.T) {
 	}
 	if !strings.Contains(seenFirst, "[image attached]") {
 		t.Errorf("block text should flatten image blocks, got %q", seenFirst)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// token-budget mode (budgetTokens > 0 AND deps.TokenCounter != nil)
+// ---------------------------------------------------------------------------
+
+// uniformMsgs builds n user messages whose Content is exactly charsPerMsg
+// bytes long, so under mockTokenCounter{countPerChar: 1} each message costs
+// exactly charsPerMsg tokens (CountMessages counts Content only).
+func uniformMsgs(n, charsPerMsg int) []llm.Message {
+	msgs := make([]llm.Message, 0, n)
+	for i := 0; i < n; i++ {
+		marker := fmt.Sprintf("m%02d ", i)
+		msgs = append(msgs, llm.Message{
+			Role:    "user",
+			Content: marker + strings.Repeat("x", charsPerMsg-len(marker)),
+		})
+	}
+	return msgs
+}
+
+func tokenModeDeps(counter llm.TokenCounter) CompactionDeps {
+	calls := 0
+	return CompactionDeps{Summarize: countingSummarizer(&calls), TokenCounter: counter}
+}
+
+// A short 6-message dialog that exceeds the budget must be compacted by
+// sliding_window even though the count-based defaults (keepFirst=3 +
+// keepLast=10 ≥ 6) would no-op: in token mode the no-op decision is made on
+// tokens alone.
+func TestCompactConversationHistory_TokenModeShortDialogCompacted(t *testing.T) {
+	msgs := uniformMsgs(6, 100) // 6 × 100 tokens = 600 total
+	counter := &mockTokenCounter{countPerChar: 1}
+	deps := CompactionDeps{TokenCounter: counter}
+
+	out, err := CompactConversationHistory(context.Background(), msgs, 300, "sliding_window", CompactionConfig{}, deps)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// head share 45 → no message fits (100 > 45) → empty head;
+	// tail share 240 → 2 messages; 4 omitted.
+	if len(out) != 3 {
+		t.Fatalf("expected [note + 2-message tail], got %d messages: %+v", len(out), out)
+	}
+	if out[0].Role != "system" || !strings.Contains(out[0].Content, "omitted") {
+		t.Errorf("expected omission note first, got %s:%q", out[0].Role, out[0].Content)
+	}
+	if out[1].Content != msgs[4].Content || out[2].Content != msgs[5].Content {
+		t.Errorf("expected verbatim tail msgs[4:6], got %q / %q", out[1].Content, out[2].Content)
+	}
+	if got := counter.CountMessages(out); got > 300 {
+		t.Errorf("result exceeds budget: %d > 300", got)
+	}
+}
+
+// A generous budget keeps both the head and a sizeable tail: head share 105 →
+// 1 message, tail share 560 → 5 messages, 4 omitted, total 678 ≤ 700.
+func TestCompactConversationHistory_TokenModeSlidingHeadAndTail(t *testing.T) {
+	msgs := uniformMsgs(10, 100) // 1000 total
+	counter := &mockTokenCounter{countPerChar: 1}
+	cfg := CompactionConfig{}
+	cfg.SlidingWindow.KeepFirst = 3
+	cfg.SlidingWindow.KeepLast = 10
+	deps := CompactionDeps{TokenCounter: counter}
+
+	out, err := CompactConversationHistory(context.Background(), msgs, 700, "sliding_window", cfg, deps)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(out) != 7 {
+		t.Fatalf("expected [1 head + note + 5 tail], got %d messages: %+v", len(out), out)
+	}
+	if out[0].Content != msgs[0].Content {
+		t.Errorf("head[0] should be message 0, got %q", out[0].Content)
+	}
+	if out[1].Role != "system" || !strings.Contains(out[1].Content, "omitted") {
+		t.Errorf("expected omission note at index 1, got %s:%q", out[1].Role, out[1].Content)
+	}
+	if out[2].Content != msgs[5].Content {
+		t.Errorf("tail should start at message 5, got %q", out[2].Content)
+	}
+	if out[len(out)-1].Content != msgs[9].Content {
+		t.Errorf("last message must be preserved, got %q", out[len(out)-1].Content)
+	}
+	if got := counter.CountMessages(out); got > 700 {
+		t.Errorf("result exceeds budget: %d > 700", got)
+	}
+}
+
+// 50 light messages that fit the budget are returned unchanged for every
+// strategy — even though the count-based windows (3+10, keepLast=5, ratios)
+// would compact them — and no LLM summarization happens.
+func TestCompactConversationHistory_TokenModeFittingHistoryUnchanged(t *testing.T) {
+	msgs := convHistory(25) // 50 messages
+	counter := &mockTokenCounter{countPerChar: 1}
+	budget := counter.CountMessages(msgs) // exactly at budget — fits (≤)
+	if budget <= 0 {
+		t.Fatalf("sanity: budget must be positive, got %d", budget)
+	}
+	for _, strategy := range []string{"sliding_window", "summarization", "hierarchical"} {
+		calls := 0
+		deps := CompactionDeps{Summarize: countingSummarizer(&calls), TokenCounter: counter}
+		out, err := CompactConversationHistory(context.Background(), msgs, budget, strategy, CompactionConfig{}, deps)
+		if err != nil {
+			t.Fatalf("strategy %s: unexpected error: %v", strategy, err)
+		}
+		if len(out) != len(msgs) {
+			t.Fatalf("strategy %s: fitting history must be unchanged, got %d of %d messages", strategy, len(out), len(msgs))
+		}
+		for i := range msgs {
+			if out[i].Content != msgs[i].Content {
+				t.Errorf("strategy %s: message %d changed: %q != %q", strategy, i, out[i].Content, msgs[i].Content)
+			}
+		}
+		if calls != 0 {
+			t.Errorf("strategy %s: fitting history must not call Summarize, got %d calls", strategy, calls)
+		}
+	}
+}
+
+// A history that already fits the budget returns before the Summarize
+// requirement — no summarization happens, so LLM-backed strategies do not
+// need the dependency.
+func TestCompactConversationHistory_TokenModeFittingSkipsSummarizerRequirement(t *testing.T) {
+	msgs := convHistory(3) // 6 light messages
+	deps := CompactionDeps{TokenCounter: &mockTokenCounter{countPerChar: 1}}
+
+	out, err := CompactConversationHistory(context.Background(), msgs, 1_000_000, "summarization", CompactionConfig{}, deps)
+	if err != nil {
+		t.Fatalf("fitting history must not require Summarize: %v", err)
+	}
+	if len(out) != len(msgs) {
+		t.Errorf("fitting history must be unchanged, got %d of %d messages", len(out), len(msgs))
+	}
+}
+
+// Every strategy's token-mode result stays within the budget while keeping
+// the last message.
+func TestCompactConversationHistory_TokenModeResultWithinBudget(t *testing.T) {
+	msgs := uniformMsgs(12, 100) // 1200 total
+	const budget = 400
+	for _, strategy := range []string{"sliding_window", "summarization", "hierarchical"} {
+		counter := &mockTokenCounter{countPerChar: 1}
+		deps := tokenModeDeps(counter)
+		out, err := CompactConversationHistory(context.Background(), msgs, budget, strategy, CompactionConfig{}, deps)
+		if err != nil {
+			t.Fatalf("strategy %s: unexpected error: %v", strategy, err)
+		}
+		if len(out) == 0 {
+			t.Fatalf("strategy %s: empty result", strategy)
+		}
+		if last := out[len(out)-1]; last.Content != msgs[len(msgs)-1].Content {
+			t.Errorf("strategy %s: last message must survive, got %q", strategy, last.Content)
+		}
+		if got := counter.CountMessages(out); got > budget {
+			t.Errorf("strategy %s: result exceeds budget: %d > %d", strategy, got, budget)
+		}
+	}
+}
+
+// The single documented exception: when the last message alone exceeds the
+// budget it is still returned (never removed), even though the result stays
+// over budget.
+func TestCompactConversationHistory_TokenModeOversizedLastMessageException(t *testing.T) {
+	msgs := []llm.Message{
+		{Role: "user", Content: strings.Repeat("a", 100)},
+		{Role: "user", Content: strings.Repeat("b", 100)},
+		{Role: "user", Content: strings.Repeat("c", 1000)}, // alone over budget
+	}
+	counter := &mockTokenCounter{countPerChar: 1}
+	deps := CompactionDeps{TokenCounter: counter}
+
+	out, err := CompactConversationHistory(context.Background(), msgs, 200, "sliding_window", CompactionConfig{}, deps)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("expected only the oversized last message to remain, got %d messages", len(out))
+	}
+	if out[0].Content != msgs[2].Content {
+		t.Errorf("last message must be preserved verbatim, got %q", out[0].Content)
+	}
+	if got := counter.CountMessages(out); got <= 200 {
+		t.Errorf("sanity: expected the documented over-budget exception, got %d ≤ 200", got)
+	}
+}
+
+// budget=0 keeps the count-based mode byte-for-byte: a short 6-message dialog
+// stays unchanged despite being over any small token budget, and a 40-message
+// history is windowed by message counts (3 + note + 10 = 14) without token
+// trimming.
+func TestCompactConversationHistory_ZeroBudgetKeepsCountMode(t *testing.T) {
+	deps := CompactionDeps{TokenCounter: &mockTokenCounter{countPerChar: 1}}
+
+	short := uniformMsgs(6, 100)
+	out, err := CompactConversationHistory(context.Background(), short, 0, "sliding_window", CompactionConfig{}, deps)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(out) != len(short) {
+		t.Errorf("budget=0: short dialog must stay unchanged, got %d of %d messages", len(out), len(short))
+	}
+
+	long := uniformMsgs(40, 100)
+	out, err = CompactConversationHistory(context.Background(), long, 0, "sliding_window", CompactionConfig{}, deps)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(out) != 14 {
+		t.Fatalf("budget=0: expected count-based window of 14 messages, got %d", len(out))
+	}
+	if out[0].Content != long[0].Content || out[len(out)-1].Content != long[39].Content {
+		t.Errorf("budget=0: window endpoints wrong: first %q, last %q", out[0].Content, out[len(out)-1].Content)
+	}
+}
+
+// A positive budget without a TokenCounter cannot enter token mode: the
+// count-based fallback applies (short dialog unchanged, 40-message history
+// windowed to 14, no token trimming) — the same behavior as budget=0.
+func TestCompactConversationHistory_NilCounterFallsBackToCountMode(t *testing.T) {
+	deps := CompactionDeps{} // no TokenCounter
+
+	short := uniformMsgs(6, 100)
+	out, err := CompactConversationHistory(context.Background(), short, 300, "sliding_window", CompactionConfig{}, deps)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(out) != len(short) {
+		t.Errorf("nil counter: short dialog must stay unchanged (count mode), got %d of %d messages", len(out), len(short))
+	}
+
+	long := uniformMsgs(40, 100)
+	out, err = CompactConversationHistory(context.Background(), long, 300, "sliding_window", CompactionConfig{}, deps)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(out) != 14 {
+		t.Fatalf("nil counter: expected count-based window of 14 messages, got %d", len(out))
+	}
+
+	calls := 0
+	sumDeps := CompactionDeps{Summarize: countingSummarizer(&calls)}
+	out, err = CompactConversationHistory(context.Background(), long, 300, "summarization", CompactionConfig{}, sumDeps)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if calls != 4 || len(out) != 9 { // 35 msgs / blocks of 10 → 4 summaries + 5 tail
+		t.Errorf("nil counter: expected count-based summarization (4 calls, 9 messages), got %d calls, %d messages", calls, len(out))
 	}
 }

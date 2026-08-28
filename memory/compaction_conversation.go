@@ -121,6 +121,22 @@ func compactConversationHistory(messages []llm.Message, budgetTokens int, tokenC
 // Exported manual conversation-history compaction
 // ---------------------------------------------------------------------------
 
+// Token-budget shares: fractions of budgetTokens each strategy may spend on
+// its verbatim zone in token-budget mode. The shares deliberately leave
+// headroom below 1.0 for the summary/omission-note messages the strategies
+// add, before trimConversationToBudget enforces the hard ceiling.
+const (
+	slidingWindowTailShare  = 0.8  // sliding_window: verbatim tail budget share
+	slidingWindowHeadShare  = 0.15 // sliding_window: verbatim head budget share
+	summarizationTailShare  = 0.7  // summarization: verbatim tail budget share
+	hierarchicalRecentShare = 0.5  // hierarchical: verbatim recent-zone budget share
+)
+
+// unknownConversationStrategyFmt is the single source of the unknown-strategy
+// error text: the upfront validation and the switch's default arm both format
+// it with the offending strategy name, so the two can never drift apart.
+const unknownConversationStrategyFmt = "memory: unknown conversation compaction strategy %q"
+
 // CompactConversationHistory compacts a plain conversation history ([]llm.Message
 // of user/assistant exchanges) using the named strategy, returning the compacted
 // messages. Unlike the step-based strategies (which operate on []agent.Step inside
@@ -141,19 +157,58 @@ func compactConversationHistory(messages []llm.Message, budgetTokens int, tokenC
 //
 // Invariants:
 //   - The very last message is NEVER removed (it anchors the ongoing exchange).
-//   - budgetTokens (> 0) is a hard ceiling: the result is trimmed oldest-first
-//     until it fits (a nil deps.TokenCounter skips trimming). budgetTokens <= 0
-//     means no budget.
+//   - Token-budget mode (budgetTokens > 0 AND deps.TokenCounter != nil): the
+//     no-op decision is made on tokens alone — a history that fits the budget
+//     is returned verbatim, regardless of message counts. When it does not
+//     fit, every strategy sizes its verbatim zones as a share of the budget so
+//     the result keeps as much recent context as the budget allows:
+//     sliding_window keeps a verbatim tail of at most ~80% of the budget
+//     (capped at KeepLast messages) plus a head of at most ~15% (capped at
+//     KeepFirst); summarization keeps a verbatim tail of at most ~70% (capped
+//     at KeepLast); hierarchical keeps a verbatim recent zone of at most ~50%
+//     of the budget (capped at the ratio-derived zone; the overflow folds into
+//     the summarized middle zone instead of being dropped). Each share cap
+//     yields to the never-remove-last invariant: the final message is kept
+//     verbatim even when it alone exceeds its zone's share (up to the full
+//     budget; a final message beyond the budget is the documented exception
+//     below).
+//   - budgetTokens is a hard ceiling in token-budget mode: after the strategy
+//     runs, trimConversationToBudget drops the oldest messages until the
+//     result fits. The single documented exception: a last message that alone
+//     exceeds the budget is still returned (the never-remove-last invariant
+//     outranks the ceiling).
+//   - Fallback mode (budgetTokens <= 0 OR a nil deps.TokenCounter): the
+//     historical message-count-based behavior applies unchanged — windows are
+//     sized in messages, token trimming is skipped, and no-op decisions are
+//     made on message counts alone.
 //   - Unknown strategies fail closed with an error.
 //   - LLM-backed strategies require a non-nil deps.Summarize and propagate its
 //     error (the original messages are the caller's to keep — this function
-//     never mutates msgs).
+//     never mutates msgs). A history that already fits the budget returns
+//     before this check: no summarization happens, so no LLM dependency is
+//     needed.
 //
 // Zero-valued cfg fields fall back to the same defaults as NewCompactionStrategy.
 func CompactConversationHistory(ctx context.Context, msgs []llm.Message, budgetTokens int, strategy string, cfg CompactionConfig, deps CompactionDeps) ([]llm.Message, error) {
 	if len(msgs) == 0 {
 		return msgs, nil
 	}
+	if strategy != "sliding_window" && strategy != "summarization" && strategy != "hierarchical" {
+		return nil, fmt.Errorf(unknownConversationStrategyFmt, strategy)
+	}
+
+	// Token-budget mode gate (budgetTokens > 0 AND a non-nil deps.TokenCounter):
+	// the no-op decision is made on tokens alone. A history whose total token
+	// count already fits the budget is returned verbatim — even when its
+	// message count exceeds the strategy's count-based window, and even for
+	// LLM-backed strategies whose Summarize dependency is nil (nothing to
+	// summarize, so no LLM is needed). Without a budget or a counter the
+	// count-based mode below applies unchanged.
+	if budgetTokens > 0 && deps.TokenCounter != nil &&
+		deps.TokenCounter.CountMessages(msgs) <= budgetTokens {
+		return msgs, nil
+	}
+
 	switch strategy {
 	case "sliding_window":
 		return compactConversationSliding(msgs, budgetTokens, cfg, deps), nil
@@ -162,8 +217,61 @@ func CompactConversationHistory(ctx context.Context, msgs []llm.Message, budgetT
 	case "hierarchical":
 		return compactConversationHierarchical(ctx, msgs, budgetTokens, cfg, deps)
 	default:
-		return nil, fmt.Errorf("memory: unknown conversation compaction strategy %q", strategy)
+		// Unreachable (validation above fails closed on unknown strategies);
+		// kept so the switch stays exhaustive against future case additions.
+		return nil, fmt.Errorf(unknownConversationStrategyFmt, strategy)
 	}
+}
+
+// fitRecentMessages returns the longest suffix of msgs, taken greedily from
+// the end, whose total token count fits within budgetTokens; it never returns
+// more than capMessages. The very last message is always kept even when it
+// alone exceeds budgetTokens — this preserves the "never remove the last
+// message" invariant, making an over-budget single-message suffix the
+// contract's documented exception. Callers must supply a non-nil counter and a
+// positive budget (token-budget mode only); capMessages < 1 is clamped to 1.
+func fitRecentMessages(msgs []llm.Message, budgetTokens int, counter llm.TokenCounter, capMessages int) []llm.Message {
+	if len(msgs) == 0 {
+		return nil
+	}
+	if capMessages < 1 {
+		capMessages = 1
+	}
+	kept := 0
+	total := 0
+	for i := len(msgs) - 1; i >= 0 && kept < capMessages; i-- {
+		msgTokens := counter.CountMessages([]llm.Message{msgs[i]})
+		if kept > 0 && total+msgTokens > budgetTokens {
+			break
+		}
+		total += msgTokens
+		kept++
+	}
+	return msgs[len(msgs)-kept:]
+}
+
+// fitLeadingMessages returns the longest prefix of msgs, taken greedily from
+// the start, whose total token count fits within budgetTokens; it never
+// returns more than capMessages. Unlike the suffix fit there is no
+// "always keep one" rule: when not even the first message fits the share, the
+// head is empty — the recent tail anchors the result and the omission note
+// explains the gap.
+func fitLeadingMessages(msgs []llm.Message, budgetTokens int, counter llm.TokenCounter, capMessages int) []llm.Message {
+	limit := min(capMessages, len(msgs))
+	if limit <= 0 {
+		return nil
+	}
+	total := 0
+	fitted := 0
+	for i := 0; i < limit; i++ {
+		msgTokens := counter.CountMessages([]llm.Message{msgs[i]})
+		if total+msgTokens > budgetTokens {
+			break
+		}
+		total += msgTokens
+		fitted++
+	}
+	return msgs[:fitted]
 }
 
 // compactConversationSliding implements the sliding-window strategy for message
@@ -176,6 +284,34 @@ func compactConversationSliding(msgs []llm.Message, budgetTokens int, cfg Compac
 	keepLast := cfg.SlidingWindow.KeepLast
 	if keepLast <= 0 {
 		keepLast = 10
+	}
+	// Token-budget mode: size the verbatim zones as budget shares; the final
+	// trim enforces the hard ceiling. There is no message-count short-circuit
+	// here — the dispatcher gate has already established that the history
+	// exceeds the budget, so even a short 6-message dialog gets windowed.
+	if budgetTokens > 0 && deps.TokenCounter != nil {
+		head := fitLeadingMessages(msgs, int(float64(budgetTokens)*slidingWindowHeadShare), deps.TokenCounter, keepFirst)
+		tail := fitRecentMessages(msgs, int(float64(budgetTokens)*slidingWindowTailShare), deps.TokenCounter, keepLast)
+		omitted := len(msgs) - len(head) - len(tail)
+		if omitted <= 0 {
+			// Defensive, but reachable: the always-keep-last rule lets the
+			// tail exceed its ~80% share (a last message that fits the budget
+			// but not the share), and when the head share covers the leading
+			// messages, head+tail span the whole history with nothing to omit
+			// — e.g. budget 100 with messages of 15 and 90 tokens. An
+			// "[... 0 ... messages omitted ...]" note would be pure noise, so
+			// fall through to the ceiling trim alone.
+			return trimConversationToBudget(msgs, budgetTokens, deps.TokenCounter)
+		}
+		result := make([]llm.Message, 0, len(head)+1+len(tail))
+		result = append(result, head...)
+		result = append(result, llm.Message{
+			Role: "system",
+			Content: fmt.Sprintf("[... %d earlier conversation messages omitted by sliding-window compaction ...]",
+				omitted),
+		})
+		result = append(result, tail...)
+		return trimConversationToBudget(result, budgetTokens, deps.TokenCounter)
 	}
 	if len(msgs) <= keepFirst+keepLast {
 		return msgs
@@ -205,6 +341,31 @@ func compactConversationSummarizing(ctx context.Context, msgs []llm.Message, bud
 	}
 	if deps.Summarize == nil {
 		return nil, errors.New("memory: conversation summarization requires a non-nil Summarize dependency")
+	}
+	// Token-budget mode: the verbatim tail is the longest suffix capped at
+	// keepLast messages that fits within ~70% of the budget; everything older
+	// is summarized. No message-count short-circuit — the dispatcher gate has
+	// already established that the history exceeds the budget.
+	if budgetTokens > 0 && deps.TokenCounter != nil {
+		tail := fitRecentMessages(msgs, int(float64(budgetTokens)*summarizationTailShare), deps.TokenCounter, keepLast)
+		if len(tail) >= len(msgs) {
+			// Defensive, but reachable: a single-message history whose lone
+			// message exceeds the budget — always-keep-last makes the tail
+			// cover it entirely, so there is nothing to summarize (a covering
+			// tail of two or more messages is impossible: it would fit the
+			// ~70% share and the dispatcher gate would have returned no-op).
+			// The ceiling then leaves the over-budget final message verbatim
+			// (the documented never-remove-last exception).
+			return trimConversationToBudget(msgs, budgetTokens, deps.TokenCounter), nil
+		}
+		blocks, err := summarizeConversationBlocks(ctx, msgs[:len(msgs)-len(tail)], blockSize, cfg, deps)
+		if err != nil {
+			return nil, err
+		}
+		result := make([]llm.Message, 0, len(blocks)+len(tail))
+		result = append(result, blocks...)
+		result = append(result, tail...)
+		return trimConversationToBudget(result, budgetTokens, deps.TokenCounter), nil
 	}
 	if len(msgs) <= keepLast {
 		return msgs, nil
@@ -247,8 +408,24 @@ func compactConversationHierarchical(ctx context.Context, msgs []llm.Message, bu
 	if distant+middle >= n {
 		distant = max(n-1-middle, 0)
 	}
+	// Token-budget mode: cap the verbatim recent zone at ~50% of the budget.
+	// The overflow — the older part of the ratio-derived recent zone — folds
+	// into the middle zone so it is summarized per block rather than silently
+	// dropped; the recent zone keeps at least the final message.
+	if budgetTokens > 0 && deps.TokenCounter != nil {
+		zone := msgs[distant+middle:]
+		recent := fitRecentMessages(zone, int(float64(budgetTokens)*hierarchicalRecentShare), deps.TokenCounter, len(zone))
+		middle += len(zone) - len(recent)
+	}
 	if distant+middle <= 0 {
-		return msgs, nil
+		// Nothing to summarize. Reachable in count mode whenever the
+		// ratio-derived zones shrink to zero (n <= 2 under the default
+		// 0.4/0.3 ratios; the trim below is a no-op there), and in
+		// token-budget mode only for a single-message history whose lone
+		// message exceeds the budget — both zones truncate to 0 at n=1 and
+		// the always-kept recent zone is that (possibly over-budget) final
+		// message, which is never removed.
+		return trimConversationToBudget(msgs, budgetTokens, deps.TokenCounter), nil
 	}
 
 	var result []llm.Message
@@ -330,14 +507,26 @@ func conversationBlockText(msgs []llm.Message, truncateChars int) string {
 }
 
 // trimConversationToBudget enforces the token ceiling by dropping the oldest
-// messages first. It always keeps at least the final message. A nil counter or
-// a non-positive budget disables trimming.
+// messages first. It always keeps at least the final message — so the only
+// result that may exceed budgetTokens is a single last message that alone is
+// over budget (the contract's documented exception). In token-budget mode this
+// is the final hard ceiling applied after every strategy, including the
+// defensive paths. A nil counter or a non-positive budget disables trimming
+// (fallback mode is left untouched).
 func trimConversationToBudget(result []llm.Message, budgetTokens int, counter llm.TokenCounter) []llm.Message {
 	if budgetTokens <= 0 || counter == nil || len(result) <= 1 {
 		return result
 	}
-	for counter.CountMessages(result) > budgetTokens && len(result) > 1 {
+	// CountMessages is additive over messages ("total token count across all
+	// messages"), so maintain the running total incrementally — dropping the
+	// oldest message subtracts exactly its own count — instead of recounting
+	// the whole slice per drop. This loop runs on every token-mode compaction,
+	// and the counter may be a real tokenizer.
+	total := counter.CountMessages(result)
+	for total > budgetTokens && len(result) > 1 {
+		dropped := counter.CountMessages([]llm.Message{result[0]})
 		result = result[1:]
+		total -= dropped
 	}
 	return result
 }
