@@ -65,6 +65,10 @@ func closeSessionOnly(e *Embedder) {
 		e.sess.destroy()
 		e.sess = nil
 	}
+	if e.batchSess != nil {
+		e.batchSess.destroy()
+		e.batchSess = nil
+	}
 	if e.sessOpts != nil {
 		_ = e.sessOpts.Destroy()
 		e.sessOpts = nil

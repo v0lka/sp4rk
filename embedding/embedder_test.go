@@ -2,6 +2,7 @@ package embedding
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"os"
 	"testing"
@@ -500,5 +501,285 @@ func TestMeanPoolAndNormalize_BatchSizeTwo(t *testing.T) {
 	}
 	if diff := math.Abs(float64(result[1][1] - expected11)); diff > eps {
 		t.Errorf("result[1][1] = %f, want %f", result[1][1], expected11)
+	}
+}
+
+// --- Persistent batch session (multi-text EmbedDocuments) ---
+
+// cosineSimilarity returns the cosine similarity between two equal-length
+// vectors. Both inputs are assumed non-zero.
+func cosineSimilarity(a, b []float32) float64 {
+	if len(a) != len(b) {
+		panic("cosineSimilarity: length mismatch")
+	}
+	var dot, na, nb float64
+	for i := range a {
+		dot += float64(a[i]) * float64(b[i])
+		na += float64(a[i]) * float64(a[i])
+		nb += float64(b[i]) * float64(b[i])
+	}
+	if na == 0 || nb == 0 {
+		return 0
+	}
+	return dot / (math.Sqrt(na) * math.Sqrt(nb))
+}
+
+// batchTestTexts returns n pairwise-distinct texts for batch embedding tests.
+func batchTestTexts(n int) []string {
+	base := []string{
+		"The quick brown fox jumps over the lazy dog",
+		"Machine learning models transform tokens into vectors",
+		"Persistent sessions avoid repeated model loading",
+		"Zero-padded rows must never leak into results",
+		"Chunked inference processes batches in fixed-capacity slices",
+		"Jina embeddings are normalized to unit length",
+		"Attention masks exclude padding from mean pooling",
+		"The cosine similarity between equivalent vectors is one",
+	}
+	if n <= len(base) {
+		return base[:n]
+	}
+	texts := make([]string, n)
+	for i := range texts {
+		texts[i] = base[i%len(base)] + fmt.Sprintf(" (variant %d)", i/len(base))
+	}
+	return texts
+}
+
+// embedBatchRefs embeds each text individually via EmbedQuery (the
+// batchSize=1 fast path) and returns the per-item reference embeddings.
+func embedBatchRefs(t *testing.T, e *Embedder, texts []string) [][]float32 {
+	t.Helper()
+	refs := make([][]float32, len(texts))
+	for i, text := range texts {
+		ref, err := e.EmbedQuery(context.Background(), text)
+		if err != nil {
+			t.Fatalf("EmbedQuery(%d) error = %v", i, err)
+		}
+		refs[i] = ref
+	}
+	return refs
+}
+
+// TestEmbedder_BatchEmbedDocuments_LazyInitAndDefaultBatchSize verifies that
+// the batch session is created lazily and exactly once, that single-text
+// calls never create it, and that BatchSize normalization falls back to
+// DefaultBatchSize for zero and negative values.
+func TestEmbedder_BatchEmbedDocuments_LazyInitAndDefaultBatchSize(t *testing.T) {
+	libPath := testLibraryPath(t)
+	tokPath := testTokenizerPath(t)
+	modelPath := testModelPath(t)
+
+	emb, err := NewEmbedder(EmbedderConfig{
+		ModelPath:     modelPath,
+		TokenizerPath: tokPath,
+		LibraryPath:   libPath,
+	})
+	if err != nil {
+		t.Fatalf("NewEmbedder() error = %v", err)
+	}
+	// See TestEmbedder_EmbeddingFunc: close sessions without destroying the
+	// shared ONNX environment owned by TestMain.
+	defer closeSessionOnly(emb)
+
+	if emb.batchSize != DefaultBatchSize {
+		t.Errorf("batchSize = %d, want DefaultBatchSize (%d) for zero config", emb.batchSize, DefaultBatchSize)
+	}
+	if emb.batchSess != nil {
+		t.Fatal("batchSess must be nil right after NewEmbedder (lazy init)")
+	}
+
+	// Single-text calls must not create the batch session.
+	before := onnxSessionsCreated.Load()
+	if _, err := emb.EmbedQuery(context.Background(), "single text keeps the fast path"); err != nil {
+		t.Fatalf("EmbedQuery() error = %v", err)
+	}
+	if onnxSessionsCreated.Load() != before {
+		t.Error("single-text embedding must not create a session")
+	}
+	if emb.batchSess != nil {
+		t.Error("single-text embedding must not create the batch session")
+	}
+
+	// First multi-text call creates exactly one batch session.
+	before = onnxSessionsCreated.Load()
+	if _, err := emb.EmbedDocuments(context.Background(), []string{"first", "second"}); err != nil {
+		t.Fatalf("EmbedDocuments() error = %v", err)
+	}
+	if got := onnxSessionsCreated.Load() - before; got != 1 {
+		t.Errorf("first multi-text call created %d sessions, want 1", got)
+	}
+	first := emb.batchSess
+	if first == nil {
+		t.Fatal("batchSess must be non-nil after the first multi-text call")
+	}
+
+	// Subsequent multi-text calls create zero sessions and reuse the same one.
+	before = onnxSessionsCreated.Load()
+	if _, err := emb.EmbedDocuments(context.Background(), []string{"third", "fourth", "fifth"}); err != nil {
+		t.Fatalf("EmbedDocuments() error = %v", err)
+	}
+	if onnxSessionsCreated.Load() != before {
+		t.Error("second multi-text call must not create a session")
+	}
+	if emb.batchSess != first {
+		t.Error("second multi-text call must reuse the same batch session")
+	}
+
+	// Negative BatchSize falls back to the default.
+	neg, err := NewEmbedder(EmbedderConfig{
+		ModelPath:     modelPath,
+		TokenizerPath: tokPath,
+		LibraryPath:   libPath,
+		BatchSize:     -3,
+	})
+	if err != nil {
+		t.Fatalf("NewEmbedder(BatchSize=-3) error = %v", err)
+	}
+	defer closeSessionOnly(neg)
+	if neg.batchSize != DefaultBatchSize {
+		t.Errorf("batchSize = %d for negative config, want DefaultBatchSize (%d)", neg.batchSize, DefaultBatchSize)
+	}
+}
+
+// TestEmbedder_BatchEmbedDocuments_PaddedChunk verifies that a batch smaller
+// than the session capacity performs exactly one inference, returns exactly n
+// results, and matches per-item embeddings — proving zero-padded rows never
+// leak into results.
+func TestEmbedder_BatchEmbedDocuments_PaddedChunk(t *testing.T) {
+	libPath := testLibraryPath(t)
+	tokPath := testTokenizerPath(t)
+	modelPath := testModelPath(t)
+
+	const capacity = 4
+	emb, err := NewEmbedder(EmbedderConfig{
+		ModelPath:     modelPath,
+		TokenizerPath: tokPath,
+		LibraryPath:   libPath,
+		BatchSize:     capacity,
+	})
+	if err != nil {
+		t.Fatalf("NewEmbedder() error = %v", err)
+	}
+	defer closeSessionOnly(emb)
+
+	texts := batchTestTexts(2) // n=2 < capacity=4 → rows 2..3 zero-padded
+	ctx := context.Background()
+
+	refs := embedBatchRefs(t, emb, texts)
+
+	beforeRuns := onnxInferenceRuns.Load()
+	beforeSessions := onnxSessionsCreated.Load()
+	got, err := emb.EmbedDocuments(ctx, texts)
+	if err != nil {
+		t.Fatalf("EmbedDocuments() error = %v", err)
+	}
+
+	// n <= capacity → exactly one inference and one lazy session creation.
+	if d := onnxInferenceRuns.Load() - beforeRuns; d != 1 {
+		t.Errorf("n<=capacity performed %d inferences, want 1", d)
+	}
+	if d := onnxSessionsCreated.Load() - beforeSessions; d != 1 {
+		t.Errorf("first batch call created %d sessions, want 1 (lazy init)", d)
+	}
+
+	// Padded rows never leak: exactly n unit-norm results, each matching its
+	// per-item reference. A leaked padded row would be an all-zero vector or
+	// change the result count.
+	if len(got) != len(texts) {
+		t.Fatalf("len(got) = %d, want %d (padded rows must not leak)", len(got), len(texts))
+	}
+	for i := range texts {
+		if len(got[i]) != DefaultHiddenDim {
+			t.Errorf("got[%d] dim = %d, want %d", i, len(got[i]), DefaultHiddenDim)
+		}
+		if c := cosineSimilarity(got[i], refs[i]); c < 0.999 {
+			t.Errorf("cosine(got[%d], ref[%d]) = %f, want >= 0.999", i, i, c)
+		}
+		var sqNorm float64
+		for _, v := range got[i] {
+			sqNorm += float64(v) * float64(v)
+		}
+		if diff := math.Abs(math.Sqrt(sqNorm) - 1.0); diff > 1e-5 {
+			t.Errorf("got[%d] norm = %f, want 1.0", i, math.Sqrt(sqNorm))
+		}
+	}
+}
+
+// TestEmbedder_BatchEmbedDocuments_Chunking verifies that n > capacity is
+// processed in ceil(n/capacity) inferences, returns exactly n vectors, and
+// every vector matches its per-item embedding (order preserved across chunks).
+func TestEmbedder_BatchEmbedDocuments_Chunking(t *testing.T) {
+	libPath := testLibraryPath(t)
+	tokPath := testTokenizerPath(t)
+	modelPath := testModelPath(t)
+
+	const capacity = 3
+	emb, err := NewEmbedder(EmbedderConfig{
+		ModelPath:     modelPath,
+		TokenizerPath: tokPath,
+		LibraryPath:   libPath,
+		BatchSize:     capacity,
+	})
+	if err != nil {
+		t.Fatalf("NewEmbedder() error = %v", err)
+	}
+	defer closeSessionOnly(emb)
+
+	texts := batchTestTexts(7) // chunks: 3 + 3 + 1
+	ctx := context.Background()
+
+	refs := embedBatchRefs(t, emb, texts)
+
+	beforeRuns := onnxInferenceRuns.Load()
+	beforeSessions := onnxSessionsCreated.Load()
+	got, err := emb.EmbedDocuments(ctx, texts)
+	if err != nil {
+		t.Fatalf("EmbedDocuments() error = %v", err)
+	}
+
+	if d := onnxSessionsCreated.Load() - beforeSessions; d != 1 {
+		t.Errorf("first batch call created %d sessions, want 1 (lazy init)", d)
+	}
+	if d := onnxInferenceRuns.Load() - beforeRuns; d != 3 {
+		t.Errorf("chunked batch performed %d inferences, want 3 (ceil(7/3))", d)
+	}
+	if len(got) != len(texts) {
+		t.Fatalf("len(got) = %d, want %d", len(got), len(texts))
+	}
+	for i := range texts {
+		if c := cosineSimilarity(got[i], refs[i]); c < 0.999 {
+			t.Errorf("cosine(got[%d], ref[%d]) = %f, want >= 0.999", i, i, c)
+		}
+	}
+}
+
+// --- runBatch / newONNXSession validation guards (no ONNX runtime needed) ---
+
+func TestNewONNXSession_ZeroBatchSize(t *testing.T) {
+	// The batchSize guard rejects the request before any ONNX call.
+	_, err := newONNXSession("model.onnx", 0, 8, 2, nil)
+	if err == nil {
+		t.Error("newONNXSession(batchSize=0) expected error, got nil")
+	}
+}
+
+func TestOnnxSession_RunBatch_Validation(t *testing.T) {
+	s := &onnxSession{batchSize: 4, seqLen: 8, hiddenDim: 2}
+
+	ids := make([]int64, 2*8) // correct length for n=2, seqLen=8
+
+	// n out of range.
+	if _, err := s.runBatch(0, ids, ids, ids); err == nil {
+		t.Error("runBatch(n=0) expected error, got nil")
+	}
+	if _, err := s.runBatch(5, ids, ids, ids); err == nil {
+		t.Error("runBatch(n>capacity) expected error, got nil")
+	}
+
+	// Length mismatch (want n*seqLen = 16).
+	short := make([]int64, 8)
+	if _, err := s.runBatch(2, short, ids, ids); err == nil {
+		t.Error("runBatch(length mismatch) expected error, got nil")
 	}
 }

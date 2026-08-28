@@ -4,9 +4,21 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"sync/atomic"
 
 	ort "github.com/yalue/onnxruntime_go"
 )
+
+// onnxSessionsCreated counts ONNX sessions successfully created via
+// newONNXSession. Production code never reads it; it exists so tests can
+// assert that steady-state inference performs zero session creations
+// (session creation costs ~2s, inference ~50ms).
+var onnxSessionsCreated atomic.Int64
+
+// onnxInferenceRuns counts session.Run invocations across all sessions.
+// Production code never reads it; it exists so tests can assert that a batch
+// of n <= capacity texts performs exactly one inference per call.
+var onnxInferenceRuns atomic.Int64
 
 // onnxInitOnce ensures initONNXRuntime performs its work at most once per process.
 // onnxInitErr caches the outcome of that single initialization attempt.
@@ -70,41 +82,51 @@ func buildSessionOptions(intraOpThreads int) (*ort.SessionOptions, error) {
 }
 
 // onnxSession holds a reusable ONNX Runtime session with pre-allocated tensors
-// for batchSize=1 inference. Creating an ONNX session is expensive (~2s for model
-// loading + graph optimization), while inference is fast (~50ms). Reusing the
-// session eliminates per-call overhead when embedding one text at a time.
+// for fixed-capacity batch inference. Creating an ONNX session is expensive
+// (~2s for model loading + graph optimization), while inference is fast
+// (~50ms). Reusing the session eliminates per-call overhead: one session with
+// capacity 1 serves the single-text fast path, and one session with the
+// configured batch capacity serves all multi-text EmbedDocuments calls
+// (smaller batches are zero-padded up to the capacity).
 type onnxSession struct {
 	session    *ort.AdvancedSession
 	inputIDs   *ort.Tensor[int64]
 	attMask    *ort.Tensor[int64]
 	tokenTypes *ort.Tensor[int64]
 	output     *ort.Tensor[float32]
+	batchSize  int // fixed row capacity of the input/output tensors
 	seqLen     int
 	hiddenDim  int
 }
 
-// newONNXSession creates a persistent ONNX session for batchSize=1 inference.
-// The session and its tensors are kept alive for reuse across multiple calls.
+// newONNXSession creates a persistent ONNX session whose input tensors are
+// shaped [batchSize, seqLen] and output tensor [batchSize, seqLen, hiddenDim].
+// batchSize is the fixed capacity of the session; individual runs may feed
+// fewer rows (see runBatch). The session and its tensors are kept alive for
+// reuse across multiple calls.
 // opts may be nil (legacy behavior) or a *SessionOptions produced by
 // buildSessionOptions to limit intra-op parallelism. opts ownership is NOT
 // transferred: the caller keeps the handle and must destroy it separately.
-func newONNXSession(modelPath string, seqLen, hiddenDim int, opts *ort.SessionOptions) (*onnxSession, error) {
-	inputShape := ort.NewShape(1, int64(seqLen))
+func newONNXSession(modelPath string, batchSize, seqLen, hiddenDim int, opts *ort.SessionOptions) (*onnxSession, error) {
+	if batchSize < 1 {
+		return nil, fmt.Errorf("batchSize must be >= 1, got %d", batchSize)
+	}
+	inputShape := ort.NewShape(int64(batchSize), int64(seqLen))
 
-	inputIDsData := make([]int64, seqLen)
+	inputIDsData := make([]int64, batchSize*seqLen)
 	inputIDsTensor, err := ort.NewTensor(inputShape, inputIDsData)
 	if err != nil {
 		return nil, fmt.Errorf("creating input_ids tensor: %w", err)
 	}
 
-	attMaskData := make([]int64, seqLen)
+	attMaskData := make([]int64, batchSize*seqLen)
 	attMaskTensor, err := ort.NewTensor(inputShape, attMaskData)
 	if err != nil {
 		_ = inputIDsTensor.Destroy()
 		return nil, fmt.Errorf("creating attention_mask tensor: %w", err)
 	}
 
-	tokenTypesData := make([]int64, seqLen)
+	tokenTypesData := make([]int64, batchSize*seqLen)
 	tokenTypesTensor, err := ort.NewTensor(inputShape, tokenTypesData)
 	if err != nil {
 		_ = inputIDsTensor.Destroy()
@@ -112,7 +134,7 @@ func newONNXSession(modelPath string, seqLen, hiddenDim int, opts *ort.SessionOp
 		return nil, fmt.Errorf("creating token_type_ids tensor: %w", err)
 	}
 
-	outputShape := ort.NewShape(1, int64(seqLen), int64(hiddenDim))
+	outputShape := ort.NewShape(int64(batchSize), int64(seqLen), int64(hiddenDim))
 	outputTensor, err := ort.NewEmptyTensor[float32](outputShape)
 	if err != nil {
 		_ = inputIDsTensor.Destroy()
@@ -137,12 +159,15 @@ func newONNXSession(modelPath string, seqLen, hiddenDim int, opts *ort.SessionOp
 		return nil, fmt.Errorf("creating ONNX session: %w", err)
 	}
 
+	onnxSessionsCreated.Add(1)
+
 	return &onnxSession{
 		session:    session,
 		inputIDs:   inputIDsTensor,
 		attMask:    attMaskTensor,
 		tokenTypes: tokenTypesTensor,
 		output:     outputTensor,
+		batchSize:  batchSize,
 		seqLen:     seqLen,
 		hiddenDim:  hiddenDim,
 	}, nil
@@ -164,9 +189,50 @@ func (s *onnxSession) run(inputIDs, attMask, tokenTypes []int64) ([]float32, err
 	if err := s.session.Run(); err != nil {
 		return nil, fmt.Errorf("running ONNX inference: %w", err)
 	}
+	onnxInferenceRuns.Add(1)
 
 	results := meanPoolAndNormalize(s.output.GetData(), attMask, 1, s.seqLen, s.hiddenDim)
 	return results[0], nil
+}
+
+// runBatch executes ONE inference on the persistent batch session for the
+// first n rows of the flattened inputs. Each input slice must hold exactly
+// n*seqLen elements in row-major order ([n, seqLen]). Rows n..batchSize-1 of
+// the session tensors are zero-padded so they cannot influence the returned
+// embeddings; pooling covers only the first n rows, and padded rows are
+// never pooled.
+func (s *onnxSession) runBatch(n int, inputIDs, attMask, tokenTypes []int64) ([][]float32, error) {
+	if n < 1 || n > s.batchSize {
+		return nil, fmt.Errorf("batch rows out of range: got %d, capacity %d", n, s.batchSize)
+	}
+	want := n * s.seqLen
+	if len(inputIDs) != want || len(attMask) != want || len(tokenTypes) != want {
+		return nil, fmt.Errorf("input length mismatch: got (%d,%d,%d), want n*seqLen=%d",
+			len(inputIDs), len(attMask), len(tokenTypes), want)
+	}
+
+	// Zero the full tensors first so any rows beyond n are zero-padded, then
+	// copy the n real rows over the front. This also clears stale data from
+	// prior inferences for rows the current call no longer fills.
+	idsData := s.inputIDs.GetData()
+	maskData := s.attMask.GetData()
+	typesData := s.tokenTypes.GetData()
+	clear(idsData)
+	clear(maskData)
+	clear(typesData)
+	copy(idsData, inputIDs)
+	copy(maskData, attMask)
+	copy(typesData, tokenTypes)
+
+	if err := s.session.Run(); err != nil {
+		return nil, fmt.Errorf("running ONNX inference: %w", err)
+	}
+	onnxInferenceRuns.Add(1)
+
+	// Rows are independent, so pool over the n real rows only; padded rows
+	// are never touched.
+	pooled := meanPoolAndNormalize(s.output.GetData(), maskData, n, s.seqLen, s.hiddenDim)
+	return pooled, nil
 }
 
 // destroy releases the session and all associated tensors.
@@ -186,66 +252,6 @@ func (s *onnxSession) destroy() {
 	if s.output != nil {
 		_ = s.output.Destroy()
 	}
-}
-
-// runInferenceBatch runs the ONNX model on a batch of tokenized inputs and returns
-// pooled, normalized embeddings. Creates a temporary session for the batch.
-// The inputs are flat int64 slices of shape [batchSize, seqLen].
-//
-// For jina-embeddings-v2-small-en:
-//   - Inputs: input_ids, attention_mask, token_type_ids (all int64, shape [batch, seq])
-//   - Output: last_hidden_state (float32, shape [batch, seq, hiddenDim])
-//   - Post-processing: mean pooling + L2 normalization
-func runInferenceBatch(modelPath string, batchSize, seqLen, hiddenDim int, inputIDs, attentionMask, tokenTypeIDs []int64, opts *ort.SessionOptions) ([][]float32, error) {
-	inputShape := ort.NewShape(int64(batchSize), int64(seqLen))
-
-	inputIDsTensor, err := ort.NewTensor(inputShape, inputIDs)
-	if err != nil {
-		return nil, fmt.Errorf("creating input_ids tensor: %w", err)
-	}
-	defer func() { _ = inputIDsTensor.Destroy() }()
-
-	attMaskTensor, err := ort.NewTensor(inputShape, attentionMask)
-	if err != nil {
-		return nil, fmt.Errorf("creating attention_mask tensor: %w", err)
-	}
-	defer func() { _ = attMaskTensor.Destroy() }()
-
-	tokenTypeTensor, err := ort.NewTensor(inputShape, tokenTypeIDs)
-	if err != nil {
-		return nil, fmt.Errorf("creating token_type_ids tensor: %w", err)
-	}
-	defer func() { _ = tokenTypeTensor.Destroy() }()
-
-	outputShape := ort.NewShape(int64(batchSize), int64(seqLen), int64(hiddenDim))
-	outputTensor, err := ort.NewEmptyTensor[float32](outputShape)
-	if err != nil {
-		return nil, fmt.Errorf("creating output tensor: %w", err)
-	}
-	defer func() { _ = outputTensor.Destroy() }()
-
-	session, err := ort.NewAdvancedSession(
-		modelPath,
-		[]string{"input_ids", "attention_mask", "token_type_ids"},
-		[]string{"last_hidden_state"},
-		[]ort.Value{inputIDsTensor, attMaskTensor, tokenTypeTensor},
-		[]ort.Value{outputTensor},
-		opts,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("creating ONNX session: %w", err)
-	}
-	defer func() { _ = session.Destroy() }()
-
-	if err := session.Run(); err != nil {
-		return nil, fmt.Errorf("running ONNX inference: %w", err)
-	}
-
-	rawOutput := outputTensor.GetData()
-
-	// Mean pooling with attention mask, then L2 normalization.
-	embeddings := meanPoolAndNormalize(rawOutput, attentionMask, batchSize, seqLen, hiddenDim)
-	return embeddings, nil
 }
 
 // meanPoolAndNormalize performs masked mean pooling across the sequence dimension
