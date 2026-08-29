@@ -86,10 +86,15 @@ func TestDefaultSampling(t *testing.T) {
 			wantTopP: nil,
 		},
 		{
-			// qwen.readthedocs.io quickstart, thinking-mode default.
-			name:     "qwen returns thinking default 0.6/0.95/20",
+			// HF Qwen/Qwen3.8-27B model card, thinking-mode default; instruct
+			// mode is 0.7/0.80/20 + presence_penalty=1.5, but the preset is
+			// family-keyed with no mode signal, so it carries the thinking
+			// values. Supersedes the Qwen3-2507 value 0.6 from the
+			// qwen.readthedocs.io quickstart.
+			// See also unsloth.ai/docs/models/qwen3.8.
+			name:     "qwen returns thinking default 1.0/0.95/20",
 			family:   "qwen",
-			wantTemp: fp(0.6),
+			wantTemp: fp(1.0),
 			wantTopP: fp(0.95),
 			wantTopK: ip(20),
 		},

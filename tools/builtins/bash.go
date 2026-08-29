@@ -94,10 +94,13 @@ func (t *BashExecTool) Judge(ctx context.Context, input json.RawMessage) tools.J
 		}
 	}
 
-	// Unresolvable path-like tokens ("~user", "${VAR:-/etc/passwd}") reference
-	// locations the resolver cannot assess. Escalate as HARD: an input that
-	// cannot be assessed at all must never be silently let through under
-	// auto-approval (see JudgeSeverityHard).
+	// Unresolvable path-like tokens ("~user", "${VAR:-/etc/passwd}", and
+	// "$NAME" references to names rebound by constructs the static walker
+	// cannot see through — "read D", "source cfg", "eval", "printf -v D",
+	// "mapfile D", "unset D", for/select loop iteration, …) reference
+	// locations or values the resolver cannot assess. Escalate as HARD: an
+	// input that cannot be assessed at all must never be silently let through
+	// under auto-approval (see JudgeSeverityHard).
 	if unresolved := tools.UnresolvablePathTokens(params.Command, tools.ShellBash); len(unresolved) > 0 {
 		return tools.JudgeOutcome{
 			Reason:     "command contains unresolvable path-like token(s): " + strings.Join(unresolved, ", "),

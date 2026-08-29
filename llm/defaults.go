@@ -30,8 +30,18 @@ func DefaultRouterConfig() RouterConfig {
 //
 //   - google: Gemini degrades into repetition loops at low temperature; the
 //     vendor default of 1.0 is the documented safe point.
-//   - qwen: Qwen3 thinking mode misbehaves below 0.6; the quickstart pins
-//     0.6 as the recommended minimum for both modes.
+//   - kimi: the Kimi Code subscription endpoint (api.kimi.com/coding) rejects
+//     any temperature other than 1 (HTTP 400 "invalid temperature: only 1 is
+//     allowed for this model"), and Kimi thinking modes document 1.0 as the
+//     only stable value. The coding-endpoint models are capability-gated out
+//     of sampling injection entirely (registry Temperature=false); 1.0 keeps
+//     deterministic calls accepted for kimi-family entries that still declare
+//     Temperature (platform kimi-k3 / k2.5 / k2.6 / k2).
+//   - qwen: Qwen3 thinking mode is documented to misbehave at low
+//     temperature (the superseded Qwen3 quickstart recommended a 0.6 minimum;
+//     the Qwen3.8 card now recommends 1.0 for thinking). 0.6 is retained as
+//     a conservative family-safe floor for deterministic (routing/compaction)
+//     calls, which the Qwen3.8 guidance does not contradict as a minimum.
 //
 // Reasoning models that reject the temperature parameter entirely never reach
 // this function — applyDefaultSampling gates on Capabilities.Temperature
@@ -39,7 +49,7 @@ func DefaultRouterConfig() RouterConfig {
 func DeterministicTemperature(family string) *float64 {
 	var t float64
 	switch family {
-	case "google":
+	case "google", "kimi":
 		t = 1.0
 	case "qwen":
 		t = 0.6

@@ -206,7 +206,7 @@ Pointer fields indicate "set" vs "unset": `nil` means no override.
 cfg := prompt.DefaultSampling("anthropic") // all nil — let the model self-select
 cfg = prompt.DefaultSampling("google")      // Temperature: 1.0
 cfg = prompt.DefaultSampling("deepseek")    // Temperature: 0.0 (coding/math)
-cfg = prompt.DefaultSampling("qwen")        // Temperature: 0.6, TopP: 0.95, TopK: 20
+cfg = prompt.DefaultSampling("qwen")        // Temperature: 1.0, TopP: 0.95, TopK: 20
 ```
 
 | Family | Default |
@@ -217,7 +217,7 @@ cfg = prompt.DefaultSampling("qwen")        // Temperature: 0.6, TopP: 0.95, Top
 | `google` | Temperature 1.0 (low values cause looping) |
 | `mistral` | all nil (use server default 0.7) |
 | `deepseek` | Temperature 0.0 (coding/math; ignored when thinking enabled) |
-| `qwen` | Temperature 0.6, TopP 0.95, TopK 20 |
+| `qwen` | Temperature 1.0, TopP 0.95, TopK 20 (Qwen3.8 thinking-mode default; instruct-mode guidance is 0.7 / 0.80 / 20 + presence_penalty 1.5) |
 | `glm` | Temperature 1.0, TopP 0.95, TopK 40 |
 | `kimi` | all nil (server enforces per model) |
 | default | Temperature 0.5, TopP 0.95 |

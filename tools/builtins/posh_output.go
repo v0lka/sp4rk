@@ -14,6 +14,15 @@ import (
 // Core and normal command output use UTF-8. A BOM is authoritative. Without
 // one, UTF-8 is left unchanged and UTF-16 candidates are accepted only when
 // their code units form valid, text-like Unicode in one byte order.
+//
+// NUL-separated ASCII (find -print0 style output) is valid UTF-8 whose NULs
+// often sit on one byte parity — statistically indistinguishable, at the
+// code-unit level, from BOM-less UTF-16. When the raw bytes are valid UTF-8,
+// a BOM-less UTF-16 reading is accepted only for the classic pure-ASCII
+// signature (every decoded rune ASCII, i.e. every NUL consumed as a
+// code-unit high byte); anything else keeps the bytes verbatim so NUL
+// separators survive instead of turning into CJK mojibake ("abc\0def\0"
+// decoded as UTF-16LE would become "扡愀d"-style garbage).
 func decodePowerShellOutput(output []byte) string {
 	// Strip a UTF-8 BOM: a PowerShell session configured with the standard
 	// BOM-emitting UTF8 encoding ([Console]::OutputEncoding =
@@ -36,11 +45,23 @@ func decodePowerShellOutput(output []byte) string {
 
 	if order, ok := utf16ByteOrder(output); ok {
 		if decoded, err := encodingunicode.UTF16(order, encodingunicode.IgnoreBOM).NewDecoder().Bytes(output); err == nil {
-			return string(decoded)
+			if !utf8.Valid(output) || isAllASCII(decoded) {
+				return string(decoded)
+			}
 		}
 	}
 
 	return string(output)
+}
+
+// isAllASCII reports whether every byte of s is an ASCII byte (< 0x80).
+func isAllASCII(s []byte) bool {
+	for _, b := range s {
+		if b >= utf8.RuneSelf {
+			return false
+		}
+	}
+	return true
 }
 
 func hasUTF16BOM(output []byte) bool {

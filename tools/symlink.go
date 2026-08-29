@@ -417,9 +417,11 @@ func extractBashPaths(command, workingDirectory, workspace string) (paths []stri
 		return nil, true // unparseable — suspicious
 	}
 
-	// Pre-pass: collect literal in-command variable bindings ("VAR=value",
-	// "export VAR=value", "VAR=value cmd ...") so a bound "$VAR" can be resolved
-	// to its literal value instead of being flagged unexpandable.
+	// Pre-pass: summarize literal in-command variable bindings ("VAR=value",
+	// "export VAR=value", "VAR=value cmd ...") so a "$VAR" assigned exactly
+	// once with a literal value can be resolved to that literal instead of
+	// being flagged unexpandable; any re-bound or dynamically assigned name
+	// stays ambiguous (fail-closed — see [envBindings]).
 	bindings := collectShellEnvBindings(file)
 
 	seen := make(map[string]struct{})

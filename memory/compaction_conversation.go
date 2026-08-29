@@ -22,8 +22,8 @@ import (
 //     (75% of the total budget), and summarise the older messages into a condensed
 //     system message that captures the key conversation flow.
 //
-// The returned messages are intended for planner prompts; the original history
-// remains unmodified.
+// The returned messages are a compacted copy for prompt assembly; the
+// original history remains unmodified.
 //
 // keepRecentRatio must be strictly between 0 and 1 (exclusive). Values outside
 // this range return an error.

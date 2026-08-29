@@ -812,3 +812,64 @@ func TestResolveShellPathTokens_InCommandBindingUnionsEnv(t *testing.T) {
 		t.Fatalf("env fallback = %v, want %v", back, wantBack)
 	}
 }
+
+func TestResolveShellPathTokens_LeadingSlashEnvTokenResolvesAbsolute(t *testing.T) {
+	// A word-initial "/" before an env token — "/$D/passwd" — makes the
+	// runtime expansion absolute, but the token itself starts at "$D" and
+	// resolves to the relative join "etc/passwd", which the absolute-only
+	// filter drops: without the reconstruction the out-of-root reference
+	// would go unreported while the binding cleared the parser layer's
+	// suspicious flag. The absolutized variant "/etc/passwd" must be
+	// reported (and escalate via PathsOutsideRoots). With the env pinned
+	// empty the EMPTY expansion is also a possible runtime value (the
+	// binding may never execute), so the suffix-alone "/passwd" is reported
+	// as an equal-standing candidate.
+	t.Setenv("D", "")
+	got := ResolveShellPathTokens(`D=etc; cat "/$D/passwd"`, ShellBash, osAbsPath("wd"))
+	if !sliceContains(got, "/etc/passwd") || !sliceContains(got, "/passwd") {
+		t.Fatalf("leading-slash env token = %v, want [/etc/passwd /passwd]", got)
+	}
+
+	ws := t.TempDir()
+	ctx := WithWorkspacePath(context.Background(), ws)
+	if out := PathsOutsideRoots(ctx, `D=etc; cat "/$D/passwd"`, ShellBash, ws); !sliceContains(out, "/etc/passwd") {
+		t.Fatalf("expected /etc/passwd reported outside roots, got %v", out)
+	}
+
+	// The unbound variant keeps surfacing through the suffix-alone fallback.
+	if got := ResolveShellPathTokens(`cat "/$UNSET/passwd"`, ShellBash, osAbsPath("wd")); !sliceContains(got, "/passwd") {
+		t.Fatalf("unbound leading-slash env token = %v, want /passwd included", got)
+	}
+
+	// A "/" that continues a relative word ("a/$D/passwd" → runtime
+	// "a/etc/passwd", relative) must NOT be absolutized: the runtime path
+	// stays under the working directory.
+	got = ResolveShellPathTokens(`D=etc; cat a/$D/passwd`, ShellBash, osAbsPath("wd"))
+	for _, p := range got {
+		if p == "/etc/passwd" {
+			t.Fatalf("mid-word relative env reference absolutized: %v", got)
+		}
+	}
+}
+
+func TestResolveShellPathTokens_RebindingReportsAllValues(t *testing.T) {
+	// A name assigned more than once in the command is position-ambiguous
+	// (the pre-pass cannot tell which value a reference sees — a decoy
+	// re-binding after the reference must not mask the earlier out-of-root
+	// binding), so EVERY distinct literal value is reported as a candidate
+	// (fail-closed union), never just the last one.
+	t.Setenv("D", "")
+	first := filepath.ToSlash(osAbsPath("etc", "passwd"))
+	decoy := filepath.ToSlash(osAbsPath("ws", "safe"))
+	got := ResolveShellPathTokens(`D=`+first+`; cat "/$D/x"; D=`+decoy, ShellBash, osAbsPath("wd"))
+	for _, want := range []string{
+		filepath.Clean(osAbsPath("etc", "passwd")),
+		filepath.Clean(osAbsPath("ws", "safe")),
+		filepath.Clean(osAbsPath("etc", "passwd", "x")),
+		filepath.Clean(osAbsPath("ws", "safe", "x")),
+	} {
+		if !sliceContains(got, want) {
+			t.Fatalf("re-bound var candidates = %v, want %q included", got, want)
+		}
+	}
+}

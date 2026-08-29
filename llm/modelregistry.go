@@ -810,14 +810,19 @@ func (r *ModelRegistry) runtimeFuzzyLookup(want string) (ModelMetadata, bool) {
 // identifier (see normalizeModelID) to its metadata. When two keys collapse to
 // the same normalized form — which postfix stripping now makes deliberate, e.g.
 // a quantized variant "qwen3-gguf" and its base "qwen3" both normalize to
-// "qwen3" — the lexicographically smallest original key wins, preserving the
-// deterministic tie-break previously implemented imperatively by the per-call
-// scan. Because the base name is a strict prefix of any postfixed spelling, it
-// sorts first and is the survivor: the variant's entry is dropped from the
-// fuzzy index (its exact-tier entry is unaffected). Building the index once —
-// at registry construction for overrides, lazily for the shared built-in
-// catalog — turns every fuzzy lookup from an O(n) scan with per-key
-// normalization into an O(1) map read.
+// "qwen3" — the key with the lexicographically smallest LOWERCASED spelling
+// wins, preserving the deterministic tie-break previously implemented
+// imperatively by the per-call scan. The comparison is case-insensitive so the
+// documented survivor invariant holds across casings: a host's "Qwen3-GGUF"
+// override must not beat its base "qwen3" merely because uppercase sorts
+// before lowercase. Because the base name is a strict prefix of any postfixed
+// spelling, it sorts first and is the survivor: the variant's entry is dropped
+// from the fuzzy index (its exact-tier entry is unaffected). Two spellings
+// that differ only in case tie on their lowercased form; the raw key then
+// breaks the tie so the winner stays deterministic regardless of map
+// iteration order. Building the index once — at registry construction for
+// overrides, lazily for the shared built-in catalog — turns every fuzzy lookup
+// from an O(n) scan with per-key normalization into an O(1) map read.
 func buildNormalizedIndex(m map[string]ModelMetadata) map[string]ModelMetadata {
 	index := make(map[string]ModelMetadata, len(m))
 	winners := make(map[string]string, len(m))
@@ -826,9 +831,15 @@ func buildNormalizedIndex(m map[string]ModelMetadata) map[string]ModelMetadata {
 		if norm == "" {
 			continue
 		}
-		if winner, ok := winners[norm]; !ok || k < winner {
+		if winner, ok := winners[norm]; !ok {
 			winners[norm] = k
 			index[norm] = v
+		} else {
+			lk, lw := strings.ToLower(k), strings.ToLower(winner)
+			if lk < lw || (lk == lw && k < winner) {
+				winners[norm] = k
+				index[norm] = v
+			}
 		}
 	}
 	return index
@@ -1384,17 +1395,34 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 		// https://www.kimi.com/code/docs/en/kimi-code/models
 		// These short IDs contain no "kimi" substring, so DetectFamily would
 		// miss them — the explicit Family here is load-bearing.
+		//
+		// Sampling: K3 always has thinking mode enabled — both the platform
+		// "kimi-k3" and the endpoint's "k3"/"k3-256k" (source:
+		// https://platform.kimi.ai/docs/guide/kimi-k3-quickstart) — and is
+		// tuned via the reasoning_effort field (low/high/max) instead of
+		// sampling knobs; K2.7 Code likewise runs with thinking always on
+		// (disabling thinking routes the request to K2.6). The Kimi Code
+		// endpoint additionally enforces temperature=1, rejecting any other
+		// value with HTTP 400 "invalid temperature: only 1 is allowed for
+		// this model". The K3 and K2.7-code entries therefore carry no
+		// Temperature capability (same shape as kimi-k2-thinking and the
+		// o-series): no sampling fields are injected for any purpose, and the
+		// omitted parameter resolves to the server-managed value — the only
+		// one these thinking-locked models accept.
 		// Note: OutputLimit is a context-window reserve (subtracted from the
 		// window), so we store a practical reserve, not the absolute ceiling.
 		// kimi-k3: 131K default (configurable up to 1M).
 		// kimi-k2.7-code / kimi-k2.6 / kimi-k2.5: 256K max output; reserve 65K
 		// (the 256K ceiling would zero the input budget under EffectiveMax).
+		// kimi-k3 is the platform-style ID of the same always-thinking K3
+		// served as "k3"/"k3-256k" on the Kimi Code endpoint — see the
+		// sampling note in the section comment above.
 		"kimi-k3": {
 			ContextWindow: 1000000,
 			OutputLimit:   131072,
 			TokenizerType: "approximate",
 			Family:        "kimi",
-			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
 		},
 		// Kimi Code endpoint aliases (see the section comment above).
 		"k3": {
@@ -1402,42 +1430,42 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			OutputLimit:   131072,
 			TokenizerType: "approximate",
 			Family:        "kimi",
-			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
 		},
 		"k3-256k": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "kimi",
-			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
 		},
 		"kimi-k2.7-code": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "kimi",
-			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
 		},
 		"kimi-k2.7-code-highspeed": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "kimi",
-			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
 		},
 		"kimi-for-coding": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "kimi",
-			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
 		},
 		"kimi-for-coding-highspeed": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "kimi",
-			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
 		},
 		"kimi-k2.6": {
 			ContextWindow: 262144,
@@ -1856,6 +1884,18 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 		//   source: https://huggingface.co/Qwen/Qwen3.8-Flash-Next
 		"qwen/qwen3.8-flash-next": {
 			ContextWindow: 262144,
+			OutputLimit:   65536,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		// Qwen3.8-Flash: the Qwen Cloud serving name of the Flash-Next
+		// preview checkpoint above. The API exposes it with a 1M context
+		// window by default (see the Flash-Next entry), so resolving the
+		// documented serving name must land here instead of falling back
+		// to the generic 128K/32K fallback defaults.
+		"qwen/qwen3.8-flash": {
+			ContextWindow: 1048576,
 			OutputLimit:   65536,
 			TokenizerType: "approximate",
 			Family:        "qwen",

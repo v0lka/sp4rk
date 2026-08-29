@@ -187,10 +187,15 @@ func (b *MapBlackboard) MaxSummaryLen() int {
 
 // SetStepResultRaw stores a pre-built StepResult without regenerating the summary.
 // Used by persistence restoration to hydrate the blackboard with stored data.
+// Like SetStepResult, it defensively copies the Steps trajectory (see
+// copyStepResult): later caller-side mutation of the source Steps slice can
+// never alias stored blackboard state. The copy is one level deep — nested
+// slice fields inside a Step (e.g. ReasoningItems, tool-call Input payloads)
+// remain shared, so callers must treat stored step contents as immutable.
 func (b *MapBlackboard) SetStepResultRaw(stepID string, sr StepResult) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.stepResults[stepID] = sr
+	b.stepResults[stepID] = copyStepResult(sr)
 }
 
 // ---------------------------------------------------------------------------

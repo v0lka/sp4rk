@@ -215,6 +215,16 @@ func (e *Embedder) EmbedDocuments(ctx context.Context, texts []string) ([][]floa
 		return nil, errors.New("embedder is closed")
 	}
 
+	// Honor cancellation that arrived while waiting for the lock BEFORE the
+	// unbounded preparatory work: EncodeBatch tokenizes every text, and the
+	// batch path's lazy session creation loads the model (~2s), all under
+	// e.mu — a cancelled caller must bail out instead of stalling concurrent
+	// EmbedQuery calls first. The per-chunk re-checks below additionally
+	// bound wasted inference on long batches.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	numTexts := len(texts)
 	inputIDs, attentionMask, tokenTypeIDs, err := e.tokenizer.EncodeBatch(texts, e.maxSeqLen)
 	if err != nil {
@@ -224,10 +234,6 @@ func (e *Embedder) EmbedDocuments(ctx context.Context, texts []string) ([][]floa
 	// Fast path: use the persistent session for single-text embedding.
 	// This is the common case when chromem-go calls EmbeddingFunc one text at a time.
 	if numTexts == 1 && e.sess != nil {
-		// Honor cancellation that arrived while waiting for the lock.
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
 		e.logger.Debug("running inference (persistent session)", "seqLen", e.maxSeqLen)
 		vec, err := e.sess.run(inputIDs, attentionMask, tokenTypeIDs)
 		if err != nil {
@@ -251,9 +257,10 @@ func (e *Embedder) EmbedDocuments(ctx context.Context, texts []string) ([][]floa
 
 	results := make([][]float32, 0, numTexts)
 	for start := 0; start < numTexts; start += e.batchSize {
-		// Re-check the context before every chunk: ONNX inference blocks, so
-		// a long batch must remain cancellable. This also covers cancellation
-		// that arrived while waiting for the lock.
+		// Re-check the context before every chunk: ONNX inference blocks and
+		// is uninterruptible, so a long multi-chunk batch must remain
+		// cancellable between chunks (cancellation that arrived while waiting
+		// for the lock is already honored above, before any preparatory work).
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()

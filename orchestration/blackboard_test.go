@@ -6,6 +6,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/v0lka/sp4rk/agent"
 )
 
 func TestBlackboard_OriginalRequest(t *testing.T) {
@@ -591,5 +593,43 @@ func TestBlackboard_GetAttachment_DefensiveCopy(t *testing.T) {
 	}
 	if att2.MarkdownContent != "original" {
 		t.Fatalf("defensive copy broken: internal state mutated to %q", att2.MarkdownContent)
+	}
+}
+
+// TestBlackboard_SetStepResultRaw_DefensiveCopy pins the blackboard.md
+// invariant that StepResult writes defensively copy the Steps trajectory on
+// BOTH write paths: a caller mutating the slice handed to SetStepResultRaw
+// (persistence hydration is the intended caller) must not be able to mutate
+// stored blackboard state through the retained backing array.
+func TestBlackboard_SetStepResultRaw_DefensiveCopy(t *testing.T) {
+	bb := NewMapBlackboard()
+
+	steps := []agent.Step{{Thought: "original"}}
+	bb.SetStepResultRaw("step_1", StepResult{
+		StepID:  "step_1",
+		Summary: "hydrated",
+		Steps:   steps,
+	})
+
+	// Mutate the caller-side slice after the write.
+	steps[0].Thought = "mutated"
+
+	got, ok := bb.GetStepResult("step_1")
+	if !ok {
+		t.Fatal("expected step result retrievable")
+	}
+	if got.Steps[0].Thought != "original" {
+		t.Fatalf("defensive copy broken: stored trajectory mutated to %q", got.Steps[0].Thought)
+	}
+
+	// The documented write path shares the same guarantee.
+	bb.SetStepResult("step_2", "out", nil, steps)
+	steps[0].Thought = "mutated-again"
+	got2, ok := bb.GetStepResult("step_2")
+	if !ok {
+		t.Fatal("expected step result retrievable")
+	}
+	if got2.Steps[0].Thought != "mutated" {
+		t.Fatalf("defensive copy broken: stored trajectory mutated to %q", got2.Steps[0].Thought)
 	}
 }

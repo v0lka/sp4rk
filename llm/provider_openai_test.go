@@ -1390,6 +1390,28 @@ func TestOpenAIProvider_BuildChatParams_GLMReasoning(t *testing.T) {
 		}
 	})
 
+	t.Run("glm-5.2 off (the c0wrk spelling) disables thinking, not the vendor default", func(t *testing.T) {
+		// c0wrk stores "off" in its small-LLM config; without the
+		// case-insensitive sentinel it fell through the switch, set no
+		// fields, and GLM 5.2's thinking-enabled default silently won.
+		out := build(t, "glm-5.2", "off")
+		thinking, _ := out["thinking"].(map[string]any)
+		if thinking["type"] != "disabled" {
+			t.Errorf("thinking.type = %v, want disabled", thinking["type"])
+		}
+		if _, ok := out["reasoning_effort"]; ok {
+			t.Errorf("reasoning_effort must be absent for off, got %v", out["reasoning_effort"])
+		}
+	})
+
+	t.Run("glm-5.2 OFF (uppercase) also disables thinking", func(t *testing.T) {
+		out := build(t, "glm-5.2", "OFF")
+		thinking, _ := out["thinking"].(map[string]any)
+		if thinking["type"] != "disabled" {
+			t.Errorf("thinking.type = %v, want disabled", thinking["type"])
+		}
+	})
+
 	t.Run("glm-5.2 max enables thinking and sets reasoning_effort=max", func(t *testing.T) {
 		out := build(t, "glm-5.2", "max")
 		thinking, _ := out["thinking"].(map[string]any)
@@ -1422,14 +1444,256 @@ func TestOpenAIProvider_BuildChatParams_GLMReasoning(t *testing.T) {
 		}
 	})
 
-	t.Run("glm-5.1 keeps legacy On/Off thinking", func(t *testing.T) {
+	t.Run("glm-5.1 keeps legacy binary thinking, normalized to wire values", func(t *testing.T) {
+		// The family options spell the control "On"/"Off" (and c0wrk stores
+		// "off"), but the wire values are "enabled"/"disabled" — passing the
+		// option spelling through verbatim sends an invalid thinking.type.
 		out := build(t, "glm-5.1", "Off")
 		thinking, _ := out["thinking"].(map[string]any)
-		if thinking["type"] != "Off" {
-			t.Errorf("thinking.type = %v, want Off (legacy)", thinking["type"])
+		if thinking["type"] != "disabled" {
+			t.Errorf("thinking.type = %v, want disabled (normalized wire value)", thinking["type"])
 		}
 		if _, ok := out["reasoning_effort"]; ok {
 			t.Errorf("reasoning_effort must be absent for legacy GLM, got %v", out["reasoning_effort"])
+		}
+		out = build(t, "glm-5.1", "On")
+		thinking, _ = out["thinking"].(map[string]any)
+		if thinking["type"] != "enabled" {
+			t.Errorf("thinking.type = %v, want enabled (normalized wire value)", thinking["type"])
+		}
+	})
+
+	t.Run("glm-5.1 non-canonical effort fails closed to disabled", func(t *testing.T) {
+		out := build(t, "glm-5.1", "none")
+		thinking, _ := out["thinking"].(map[string]any)
+		if thinking["type"] != "disabled" {
+			t.Errorf("thinking.type = %v, want disabled", thinking["type"])
+		}
+	})
+
+	t.Run("glm-5.2 non-canonical effort fails closed to disabled", func(t *testing.T) {
+		// A value outside the documented option set must not fall through to
+		// GLM 5.2's thinking-enabled default.
+		out := build(t, "glm-5.2", "medium")
+		thinking, _ := out["thinking"].(map[string]any)
+		if thinking["type"] != "disabled" {
+			t.Errorf("thinking.type = %v, want disabled (fail closed)", thinking["type"])
+		}
+		if _, ok := out["reasoning_effort"]; ok {
+			t.Errorf("reasoning_effort must be absent, got %v", out["reasoning_effort"])
+		}
+	})
+}
+
+func TestOpenAIProvider_BuildChatParams_DeepSeekReasoning(t *testing.T) {
+	p, _ := NewOpenAIProvider(OpenAIProviderConfig{Name: "deepseek", APIKey: "k"})
+
+	// build marshals the generated params to JSON and returns the decoded
+	// top-level map so individual reasoning fields can be asserted.
+	build := func(t *testing.T, model, effort string) map[string]any {
+		req := ChatRequest{
+			Model:           model,
+			Messages:        []Message{{Role: "user", Content: "Hi"}},
+			ReasoningEffort: effort,
+		}
+		raw, err := json.Marshal(p.buildChatParams(req))
+		if err != nil {
+			t.Fatalf("marshal params: %v", err)
+		}
+		var out map[string]any
+		if err := json.Unmarshal(raw, &out); err != nil {
+			t.Fatalf("unmarshal params: %v", err)
+		}
+		return out
+	}
+
+	thinkingType := func(t *testing.T, effort string) string {
+		t.Helper()
+		out := build(t, "deepseek-v4-pro", effort)
+		thinking, _ := out["thinking"].(map[string]any)
+		typ, _ := thinking["type"].(string)
+		return typ
+	}
+
+	t.Run("canonical Off disables thinking verbatim", func(t *testing.T) {
+		if got := thinkingType(t, "Off"); got != "Off" {
+			t.Errorf("thinking.type = %v, want Off", got)
+		}
+	})
+
+	t.Run("lowercase off (the c0wrk spelling) normalizes to canonical Off", func(t *testing.T) {
+		if got := thinkingType(t, "off"); got != "Off" {
+			t.Errorf("thinking.type = %v, want Off (normalized)", got)
+		}
+	})
+
+	t.Run("uppercase OFF also normalizes to Off", func(t *testing.T) {
+		if got := thinkingType(t, "OFF"); got != "Off" {
+			t.Errorf("thinking.type = %v, want Off (normalized)", got)
+		}
+	})
+
+	t.Run("canonical High and Max pass through verbatim", func(t *testing.T) {
+		if got := thinkingType(t, "High"); got != "High" {
+			t.Errorf("thinking.type = %v, want High", got)
+		}
+		if got := thinkingType(t, "Max"); got != "Max" {
+			t.Errorf("thinking.type = %v, want Max", got)
+		}
+	})
+
+	t.Run("non-canonical effort fails closed to Off", func(t *testing.T) {
+		for _, effort := range []string{"low", "medium", "On", "xhigh"} {
+			if got := thinkingType(t, effort); got != "Off" {
+				t.Errorf("thinking.type for effort %q = %v, want Off (fail-closed)", effort, got)
+			}
+		}
+	})
+}
+
+func TestOpenAIProvider_BuildChatParams_QwenReasoning(t *testing.T) {
+	p, _ := NewOpenAIProvider(OpenAIProviderConfig{Name: "qwen", APIKey: "k"})
+
+	// build marshals the generated params to JSON and returns the decoded
+	// top-level map so individual reasoning fields can be asserted.
+	build := func(t *testing.T, model, effort string) map[string]any {
+		req := ChatRequest{
+			Model:           model,
+			Messages:        []Message{{Role: "user", Content: "Hi"}},
+			ReasoningEffort: effort,
+		}
+		raw, err := json.Marshal(p.buildChatParams(req))
+		if err != nil {
+			t.Fatalf("marshal params: %v", err)
+		}
+		var out map[string]any
+		if err := json.Unmarshal(raw, &out); err != nil {
+			t.Fatalf("unmarshal params: %v", err)
+		}
+		return out
+	}
+
+	t.Run("legacy On enables thinking without reasoning_effort", func(t *testing.T) {
+		out := build(t, "qwen3.8-27b", "On")
+		if out["enable_thinking"] != true {
+			t.Errorf("enable_thinking = %v, want true", out["enable_thinking"])
+		}
+		if _, ok := out["reasoning_effort"]; ok {
+			t.Errorf("reasoning_effort must be absent for On, got %v", out["reasoning_effort"])
+		}
+	})
+
+	t.Run("xhigh enables thinking at the native default", func(t *testing.T) {
+		out := build(t, "qwen3.8-27b", "xhigh")
+		if out["enable_thinking"] != true {
+			t.Errorf("enable_thinking = %v, want true", out["enable_thinking"])
+		}
+		if _, ok := out["reasoning_effort"]; ok {
+			t.Errorf("reasoning_effort must be absent for xhigh (native default), got %v", out["reasoning_effort"])
+		}
+	})
+
+	t.Run("medium sets reasoning_effort and never disables thinking", func(t *testing.T) {
+		out := build(t, "qwen3.8-27b", "medium")
+		if out["reasoning_effort"] != "medium" {
+			t.Errorf("reasoning_effort = %v, want medium", out["reasoning_effort"])
+		}
+		if out["enable_thinking"] == false {
+			t.Errorf("enable_thinking must not be false when reasoning_effort is set, got %v", out["enable_thinking"])
+		}
+	})
+
+	t.Run("low sets reasoning_effort and never disables thinking", func(t *testing.T) {
+		out := build(t, "qwen3.8-27b", "low")
+		if out["reasoning_effort"] != "low" {
+			t.Errorf("reasoning_effort = %v, want low", out["reasoning_effort"])
+		}
+		if out["enable_thinking"] == false {
+			t.Errorf("enable_thinking must not be false when reasoning_effort is set, got %v", out["enable_thinking"])
+		}
+	})
+
+	t.Run("Off disables thinking", func(t *testing.T) {
+		out := build(t, "qwen3.8-27b", "Off")
+		if out["enable_thinking"] != false {
+			t.Errorf("enable_thinking = %v, want false", out["enable_thinking"])
+		}
+		if _, ok := out["reasoning_effort"]; ok {
+			t.Errorf("reasoning_effort must be absent for Off, got %v", out["reasoning_effort"])
+		}
+	})
+
+	t.Run("lower-case off (c0wrk stored value) disables thinking", func(t *testing.T) {
+		out := build(t, "qwen3.8-27b", "off")
+		if out["enable_thinking"] != false {
+			t.Errorf("enable_thinking = %v, want false", out["enable_thinking"])
+		}
+		if _, ok := out["reasoning_effort"]; ok {
+			t.Errorf("reasoning_effort must be absent for off, got %v", out["reasoning_effort"])
+		}
+	})
+
+	t.Run("any-case OFF disables thinking (case-insensitive sentinel)", func(t *testing.T) {
+		out := build(t, "qwen3.8-27b", "OFF")
+		if out["enable_thinking"] != false {
+			t.Errorf("enable_thinking = %v, want false", out["enable_thinking"])
+		}
+		if _, ok := out["reasoning_effort"]; ok {
+			t.Errorf("reasoning_effort must be absent for OFF, got %v", out["reasoning_effort"])
+		}
+	})
+
+	t.Run("empty (Auto) sends no reasoning fields", func(t *testing.T) {
+		out := build(t, "qwen3.8-27b", "")
+		if _, ok := out["enable_thinking"]; ok {
+			t.Errorf("enable_thinking must be absent for Auto, got %v", out["enable_thinking"])
+		}
+		if _, ok := out["reasoning_effort"]; ok {
+			t.Errorf("reasoning_effort must be absent for Auto, got %v", out["reasoning_effort"])
+		}
+	})
+
+	// Pre-3.8 Qwen models keep the legacy binary control: no
+	// reasoning_effort is ever sent (at best silently ignored, at worst a
+	// 400 from a strict gateway), and a known effort value maps to thinking
+	// enabled while anything else fails closed to disabled.
+	t.Run("pre-3.8 On enables thinking without reasoning_effort", func(t *testing.T) {
+		out := build(t, "qwen3-235b-a22b-instruct", "On")
+		if out["enable_thinking"] != true {
+			t.Errorf("enable_thinking = %v, want true", out["enable_thinking"])
+		}
+		if _, ok := out["reasoning_effort"]; ok {
+			t.Errorf("reasoning_effort must never be sent to a pre-3.8 model, got %v", out["reasoning_effort"])
+		}
+	})
+
+	t.Run("pre-3.8 medium maps to binary thinking, not reasoning_effort", func(t *testing.T) {
+		out := build(t, "qwen3-235b-a22b-instruct", "medium")
+		if out["enable_thinking"] != true {
+			t.Errorf("enable_thinking = %v, want true (legacy binary control)", out["enable_thinking"])
+		}
+		if _, ok := out["reasoning_effort"]; ok {
+			t.Errorf("reasoning_effort must never be sent to a pre-3.8 model, got %v", out["reasoning_effort"])
+		}
+	})
+
+	t.Run("pre-3.8 Off disables thinking", func(t *testing.T) {
+		out := build(t, "qwq-32b", "off")
+		if out["enable_thinking"] != false {
+			t.Errorf("enable_thinking = %v, want false", out["enable_thinking"])
+		}
+		if _, ok := out["reasoning_effort"]; ok {
+			t.Errorf("reasoning_effort must never be sent to a pre-3.8 model, got %v", out["reasoning_effort"])
+		}
+	})
+
+	t.Run("pre-3.8 unknown value fails closed", func(t *testing.T) {
+		out := build(t, "qwen2.5-72b-instruct", "bogus")
+		if out["enable_thinking"] != false {
+			t.Errorf("enable_thinking = %v, want false (fail-closed default)", out["enable_thinking"])
+		}
+		if _, ok := out["reasoning_effort"]; ok {
+			t.Errorf("reasoning_effort must never be sent to a pre-3.8 model, got %v", out["reasoning_effort"])
 		}
 	})
 }
@@ -1788,6 +2052,54 @@ func TestRouter_RegistryProtocolOverrideRoutesGemmaToChatCompletions(t *testing.
 			}
 			if tc.notSub != "" && strings.Contains(path, tc.notSub) {
 				t.Errorf("expected path NOT to contain %q, got %q", tc.notSub, path)
+			}
+		})
+	}
+}
+
+// TestApplyGLMReasoning pins the GLM thinking-control mapping, in particular
+// the fail-closed contract: every value outside the documented option set
+// disables thinking instead of silently falling through to the model's
+// always-on default, and the disable sentinels match case-insensitively so
+// a host-stored "off"/"NONE" spelling cannot re-enable thinking either.
+func TestApplyGLMReasoning(t *testing.T) {
+	tests := []struct {
+		name             string
+		model            string
+		effort           string
+		wantThinking     string
+		wantReasoningEff string
+	}{
+		{"glm 5.2 max enables thinking at max", "glm-5.2", "max", "enabled", "max"},
+		{"glm 5.2 high enables thinking at high", "glm-5.2", "high", "enabled", "high"},
+		{"glm 5.2 none disables thinking", "glm-5.2", "none", "disabled", ""},
+		{"glm 5.2 NONE disables thinking case-insensitively", "glm-5.2", "NONE", "disabled", ""},
+		{"glm 5.2 None disables thinking case-insensitively", "glm-5.2", "None", "disabled", ""},
+		{"glm 5.2 off disables thinking", "glm-5.2", "off", "disabled", ""},
+		{"glm 5.2 OFF disables thinking case-insensitively", "glm-5.2", "OFF", "disabled", ""},
+		{"glm 5.2 On aliases the enabled default", "glm-5.2", "On", "enabled", "max"},
+		{"glm 5.2 ON aliases the enabled default case-insensitively", "glm-5.2", "ON", "enabled", "max"},
+		{"glm 5.2 non-canonical effort fails closed to disabled", "glm-5.2", "medium", "disabled", ""},
+		{"glm 5.2 unknown effort fails closed to disabled", "glm-5.2", "turbo", "disabled", ""},
+		{"glm 5.3 flash max enables thinking", "glm-5.3-flash", "max", "enabled", "max"},
+		{"glm 4.7 On maps to the enabled wire value", "glm-4.7", "On", "enabled", ""},
+		{"glm 4.7 ON maps to the enabled wire value", "glm-4.7", "ON", "enabled", ""},
+		{"glm 4.7 off maps to the disabled wire value", "glm-4.7", "off", "disabled", ""},
+		{"glm 4.7 Off maps to the disabled wire value", "glm-4.7", "Off", "disabled", ""},
+		{"glm 4.7 none maps to the disabled wire value", "glm-4.7", "none", "disabled", ""},
+		{"glm 4.7 max fails closed to the disabled wire value", "glm-4.7", "max", "disabled", ""},
+		{"glm 4.7 non-canonical effort fails closed to disabled", "glm-4.7", "medium", "disabled", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			params := &oai.ChatCompletionNewParams{}
+			applyGLMReasoning(params, tt.model, tt.effort)
+			thinking, _ := params.ExtraFields()["thinking"].(map[string]string)
+			if thinking == nil || thinking["type"] != tt.wantThinking {
+				t.Errorf("thinking = %v, want type %q", params.ExtraFields()["thinking"], tt.wantThinking)
+			}
+			if got, _ := params.ExtraFields()["reasoning_effort"].(string); got != tt.wantReasoningEff {
+				t.Errorf("reasoning_effort = %q, want %q", got, tt.wantReasoningEff)
 			}
 		})
 	}

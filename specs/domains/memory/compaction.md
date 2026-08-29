@@ -7,7 +7,7 @@ Compress conversation history when the context window approaches capacity, prese
 ## Key Files
 
 - `github.com/v0lka/sp4rk/memory` — `SlidingWindowStrategy`, `SummarizationStrategy`, `HierarchicalStrategy`, `NewCompactionStrategy`, `CompactionConfig`, `CompactionDeps`
-- `github.com/v0lka/sp4rk/memory` — `CompactConversationHistory` (manual, message-level compaction), `compactConversationHistory` (legacy budget-fit helper for planner prompts)
+- `github.com/v0lka/sp4rk/memory` — `CompactConversationHistory` (manual, message-level compaction)
 - `github.com/v0lka/sp4rk/memory` — `ContextWindow` (orchestrates pruning + strategy compaction), `CompactionThresholds`
 - `github.com/v0lka/sp4rk/memory` — `ToolOutputPruning`, `HistoryMutation`
 - `github.com/v0lka/sp4rk/agent` — `CompactionStrategy` interface, `Step`, `ToolResultCache`
@@ -58,11 +58,13 @@ func CompactConversationHistory(ctx context.Context, msgs []llm.Message, budgetT
 
 Message-level counterpart to the step strategies for callers that hold raw conversation histories (user/assistant exchanges) rather than a `ContextWindow` — e.g. a session orchestrator compacting cross-task dialogue context on demand. Strategies reuse the same names, config fields, defaults, and zone semantics as `NewCompactionStrategy`:
 
-- `sliding_window` — keep first `KeepFirst` + last `KeepLast` messages verbatim, one system note marks the omitted middle; no LLM call; short histories (`len <= KeepFirst+KeepLast`) are returned unchanged.
+- `sliding_window` — keep first `KeepFirst` + last `KeepLast` messages verbatim, one system note marks the omitted middle; no LLM call; short histories (`len <= KeepFirst+KeepLast`) are returned unchanged in count-based mode — in token-budget mode the no-op decision is made on tokens alone, so an over-budget short history is still windowed (and then trimmed to the ceiling).
 - `summarization` — keep last `KeepLast` messages verbatim; older messages grouped into `BlockSize` blocks, each summarized via `deps.Summarize` into a system message.
 - `hierarchical` — distant zone (one aggressive summary block over the whole zone), middle zone (per-`BlockSize` summaries), recent zone verbatim.
 
 Differences from the step-based path: unknown strategy names fail closed with an error (no silent fallback); LLM strategies require a non-nil `deps.Summarize` and propagate its error (no fallback indicator); the input slice is never mutated; user messages with content blocks are flattened (`userMessageText`) before summarization. `budgetTokens > 0` is honored as a hard ceiling — the result is trimmed oldest-first until it fits (a nil `TokenCounter` skips trimming) — and the very last message is always preserved.
+
+In token-budget mode (`budgetTokens > 0` and a non-nil `deps.TokenCounter`), each strategy sizes its verbatim zones as a **share of the budget** so the result keeps as much recent context as the budget allows: `sliding_window` keeps a verbatim tail of at most ~80% of the budget (capped at `KeepLast` messages) plus a head of at most ~15% (capped at `KeepFirst`); `summarization` keeps a verbatim tail of at most ~70% (capped at `KeepLast`); `hierarchical` keeps a verbatim recent zone of at most ~50% (capped at the ratio-derived zone; zone overflow folds into the summarized middle zone instead of being dropped). Each share cap yields to the never-remove-last invariant: the final message is kept verbatim even when it alone exceeds its zone's share (up to the full budget; a last message beyond the budget is the documented exception). The shares deliberately leave headroom below 1.0 for the summary/omission-note messages the strategies add, before the oldest-first trim enforces the hard ceiling.
 
 ### Tool-output pruning (separate mechanism)
 

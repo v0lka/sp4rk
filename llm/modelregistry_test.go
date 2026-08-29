@@ -70,6 +70,12 @@ func TestModelRegistry_BuiltInResolution(t *testing.T) {
 		{"deepseek-v4-flash", 1000000, 384000, "approximate"},
 		{"deepseek-v4-flash-vision-exp", 1000000, 384000, "approximate"},
 
+		// New multimodal entries from the qwen/glm/deepseek wave — the
+		// prefixed spellings are the exact catalog keys; pin their windows
+		// and output limits so a silent catalog edit cannot pass tests.
+		{"qwen/qwen3.8-flash-next", 262144, 65536, "approximate"},
+		{"zai-org/glm-5.3-flash", 1048576, 128000, "approximate"},
+
 		// Grok models — verified from docs.x.ai
 		{"grok-4.20", 1000000, 32768, "approximate"},
 		{"grok-3-mini", 131072, 32768, "approximate"},
@@ -102,6 +108,45 @@ func TestModelRegistry_BuiltInResolution(t *testing.T) {
 			}
 			if meta.TokenizerType != tt.expectedTokenizer {
 				t.Errorf("expected TokenizerType %s, got %s", tt.expectedTokenizer, meta.TokenizerType)
+			}
+		})
+	}
+}
+
+// The K3 and K2.7-code models are thinking-locked: K3 always has thinking
+// mode enabled (platform "kimi-k3" and the Kimi Code endpoint's "k3"/
+// "k3-256k" alike) and is tuned via reasoning_effort instead of sampling
+// knobs; K2.7 Code runs with thinking always on. The Kimi Code endpoint
+// additionally enforces temperature=1, rejecting any other value with
+// HTTP 400 "invalid temperature: only 1 is allowed for this model". Their
+// built-in capabilities must therefore leave Temperature unset so
+// applyDefaultSampling injects no sampling fields for any call purpose —
+// the same shape as kimi-k2-thinking and the o-series. Regression guard for
+// routing calls failing with HTTP 400 against api.kimi.com/coding.
+func TestModelRegistry_KimiThinkingLockedModelsRejectSampling(t *testing.T) {
+	registry := NewModelRegistry(nil)
+	models := []string{
+		"kimi-k3", "k3", "k3-256k",
+		"kimi-for-coding", "kimi-for-coding-highspeed",
+		"kimi-k2.7-code", "kimi-k2.7-code-highspeed",
+	}
+	for _, model := range models {
+		t.Run(model, func(t *testing.T) {
+			meta, ok := registry.Resolve(context.Background(), model)
+			if !ok {
+				t.Fatalf("expected built-in catalog hit for %q", model)
+			}
+			if meta.Family != "kimi" {
+				t.Errorf("Family = %q, want kimi", meta.Family)
+			}
+			if meta.Capabilities == nil {
+				t.Fatal("Capabilities = nil, want non-nil")
+			}
+			if meta.Capabilities.Temperature {
+				t.Errorf("Capabilities.Temperature = true, want false: the endpoint enforces temperature=1, so any injected sampling field is a guaranteed HTTP 400")
+			}
+			if !meta.Capabilities.Attachment || !meta.Capabilities.Reasoning || !meta.Capabilities.ToolCall {
+				t.Errorf("Capabilities = %+v, want Attachment, Reasoning and ToolCall preserved", meta.Capabilities)
 			}
 		})
 	}
@@ -413,6 +458,43 @@ func TestModelRegistry_FuzzyIndex_DeterministicWinner(t *testing.T) {
 	}
 	if meta.ContextWindow != 100 {
 		t.Errorf("ResolveLocal(qwen3_gguf): ContextWindow = %d, want 100 (base key wins)", meta.ContextWindow)
+	}
+}
+
+func TestBuildNormalizedIndex_CaseInsensitiveBaseSurvives(t *testing.T) {
+	// buildNormalizedIndex's tie-break compares lowercased keys, so an
+	// UPPERCASED postfixed variant ("Qwen3-GGUF", 'Q' < 'q' in raw byte order)
+	// must not beat its lowercase base even when case-mixed keys reach the
+	// index directly: the documented survivor invariant ("the base name is a
+	// strict prefix of any postfixed spelling, so it sorts first") holds
+	// across casings. The registry's own input paths pre-lowercase their keys
+	// (NewModelRegistry, SetRuntimeMetadata), so today this is a robustness
+	// pin on the internal contract rather than a reachable registry behavior.
+	index := buildNormalizedIndex(map[string]ModelMetadata{
+		"Qwen3-GGUF": {ContextWindow: 200},
+		"qwen3":      {ContextWindow: 100},
+	})
+	meta, ok := index["qwen3"]
+	if !ok {
+		t.Fatal("normalized index missing the qwen3 entry")
+	}
+	if meta.ContextWindow != 100 {
+		t.Errorf("fuzzy slot for qwen3 = ContextWindow %d, want 100 (base survives the case-mixed variant)", meta.ContextWindow)
+	}
+
+	// Keys differing only in case tie on their lowercased form; the raw key
+	// then breaks the tie deterministically (uppercase first), never map
+	// iteration order.
+	index = buildNormalizedIndex(map[string]ModelMetadata{
+		"Qwen3": {ContextWindow: 300},
+		"qwen3": {ContextWindow: 100},
+	})
+	meta, ok = index["qwen3"]
+	if !ok {
+		t.Fatal("normalized index missing the case-tied qwen3 entry")
+	}
+	if meta.ContextWindow != 300 {
+		t.Errorf("case-only tie resolved to ContextWindow %d, want 300 (raw-key tie-break, deterministic)", meta.ContextWindow)
 	}
 }
 
@@ -2687,6 +2769,26 @@ func TestResolveBuiltInModel_UnknownModel(t *testing.T) {
 	}
 	if !meta.Capabilities.Attachment {
 		t.Error("expected optimistic attachment capability in fallback")
+	}
+}
+
+// TestModelRegistry_Qwen38FlashServingNameResolves pins that the serving
+// name the Qwen3.8-Flash-Next catalog entry documents ("Qwen3.8-Flash",
+// exposed by the Qwen Cloud API with a 1M context window by default) is
+// resolvable in the built-in catalog — both bare and prefixed spellings —
+// instead of falling through to the generic fallback defaults.
+func TestModelRegistry_Qwen38FlashServingNameResolves(t *testing.T) {
+	for _, id := range []string{"qwen3.8-flash", "qwen/qwen3.8-flash", "Qwen/Qwen3.8-Flash"} {
+		meta, ok := ResolveBuiltInModel(id)
+		if !ok {
+			t.Fatalf("ResolveBuiltInModel(%q): expected ok=true", id)
+		}
+		if meta.ContextWindow != 1048576 {
+			t.Errorf("ResolveBuiltInModel(%q).ContextWindow = %d, want 1048576", id, meta.ContextWindow)
+		}
+		if meta.Family != "qwen" {
+			t.Errorf("ResolveBuiltInModel(%q).Family = %q, want qwen", id, meta.Family)
+		}
 	}
 }
 

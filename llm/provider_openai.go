@@ -275,13 +275,9 @@ func (p *OpenAIProvider) buildChatParams(req ChatRequest) oai.ChatCompletionNewP
 		case "openai_flagship", "openai_standard", "openai_codex":
 			params.ReasoningEffort = oai.ReasoningEffort(req.ReasoningEffort)
 		case "deepseek":
-			params.SetExtraFields(map[string]any{
-				"thinking": map[string]string{"type": req.ReasoningEffort},
-			})
+			applyDeepSeekReasoning(&params, req.ReasoningEffort)
 		case "qwen":
-			params.SetExtraFields(map[string]any{
-				"enable_thinking": req.ReasoningEffort == "On",
-			})
+			applyQwenReasoning(&params, req.Model, req.ReasoningEffort)
 		case "glm":
 			applyGLMReasoning(&params, req.Model, req.ReasoningEffort)
 		}
@@ -340,42 +336,146 @@ func mergeExtraFields(params *oai.ChatCompletionNewParams, extra map[string]any)
 	params.SetExtraFields(merged)
 }
 
+// applyQwenReasoning sets the reasoning-related extra fields for Qwen models.
+//
+// Qwen 3.8+ supports the per-request reasoning_effort parameter (values
+// "xhigh"/"medium"/"low") with thinking enabled by default at the native xhigh
+// effort:
+//
+//   - "off"/"Off":    thinking disabled (enable_thinking=false), no reasoning_effort
+//   - "On"/"xhigh":   thinking enabled (enable_thinking=true) at the native
+//     default effort xhigh, so reasoning_effort is left unset
+//   - "medium"/"low": adaptive thinking at the requested effort, expressed via
+//     reasoning_effort alone (the control implies thinking enabled)
+//
+// Pre-3.8 Qwen models (qwen3-*, qwen2.5-*, qwq-*, …) do not know
+// reasoning_effort — sending it is at best silently ignored and at worst
+// rejected by a strict OpenAI-compatible gateway — so they keep the legacy
+// binary control: a known effort value maps to enable_thinking=true, every
+// other value fails closed to false (the pre-reasoning_effort behavior of
+// enable_thinking = (effort == "On")).
+//
+// "On" is kept as a legacy alias of "xhigh" for configurations stored with the
+// binary value. The disable sentinel is matched case-insensitively (EqualFold)
+// ahead of the switch, so the fail-closed default branch cannot silently
+// evolve into a vendor-default pass-through that re-enables thinking for the
+// sentinel. Any other value fails closed to thinking disabled, preserving
+// the pre-reasoning_effort behavior of enable_thinking = (effort == "On").
+func applyQwenReasoning(params *oai.ChatCompletionNewParams, model, effort string) {
+	// "off" is the value c0wrk stores in its small-LLM config; "Off" is the
+	// canonical spelling. Both disable thinking; the guard runs before the
+	// switch so the semantics of the documented sentinel are pinned
+	// independently of the default branch below.
+	if strings.EqualFold(effort, "off") {
+		params.SetExtraFields(map[string]any{
+			"enable_thinking": false,
+		})
+		return
+	}
+	if !IsQwen38OrLater(model) {
+		// Legacy binary control: any known effort value ("On" and its native
+		// aliases) requests thinking; anything else keeps the fail-closed
+		// disabled default of the historical enable_thinking=(effort=="On").
+		on := effort == "On" || effort == "xhigh" || effort == "medium" || effort == "low"
+		params.SetExtraFields(map[string]any{
+			"enable_thinking": on,
+		})
+		return
+	}
+	switch effort {
+	case "On", "xhigh":
+		params.SetExtraFields(map[string]any{
+			"enable_thinking": true,
+		})
+	case "medium", "low":
+		params.SetExtraFields(map[string]any{
+			"reasoning_effort": effort,
+		})
+	default:
+		params.SetExtraFields(map[string]any{
+			"enable_thinking": false,
+		})
+	}
+}
+
+// applyDeepSeekReasoning sets the thinking control for DeepSeek models. The
+// wire contract takes the canonical options "Off"/"High"/"Max" (see
+// FamilyReasoningOptions) verbatim as thinking.type. The disable sentinel is
+// matched case-insensitively — "off" is the value c0wrk stores in its
+// small-LLM config, and sending it verbatim case-mismatches the canonical
+// spelling — and every value outside the canonical set ("low"/"medium" from
+// a host's generic value set, unknown spellings) fails closed to disabled:
+// a strict gateway rejects unknown thinking.type values outright, and
+// silently enabling thinking is the opposite of the configured intent.
+func applyDeepSeekReasoning(params *oai.ChatCompletionNewParams, effort string) {
+	switch effort {
+	case "High", "Max":
+		params.SetExtraFields(map[string]any{
+			"thinking": map[string]string{"type": effort},
+		})
+	default:
+		params.SetExtraFields(map[string]any{
+			"thinking": map[string]string{"type": "Off"},
+		})
+	}
+}
+
 // applyGLMReasoning sets the reasoning-related extra fields for GLM models.
 //
 // GLM 5.2+ supports the reasoning_effort parameter (values "max"/"high") which
 // is honored when thinking is enabled:
 //
-//   - "none": thinking disabled, no reasoning_effort
+//   - "none"/"off": thinking disabled, no reasoning_effort ("off" is the
+//     value c0wrk stores in its small-LLM config; BOTH sentinels are
+//     matched case-insensitively ahead of the switch, like in
+//     applyQwenReasoning, so the fail-closed default branch below can never
+//     re-enable thinking for a differently-cased sentinel)
 //   - "max":  thinking enabled,  reasoning_effort=max
 //   - "high": thinking enabled,  reasoning_effort=high
+//   - "On":   thinking enabled at the GLM default (max) — the family-level
+//     spelling a host config stored before the model-level option set
 //
-// An empty effort (the UI "Auto"/Default selection) is left unset: GLM 5.2
-// enables thinking by default with reasoning_effort=max, so Auto == "max".
+// The call site guarantees a non-empty effort. Every OTHER value fails
+// closed to thinking disabled: a strict gateway rejects unknown
+// thinking.type values outright, and silently enabling thinking is the
+// opposite of the configured intent (mirroring applyDeepSeekReasoning).
 //
-// Older GLM models (< 5.2) keep the legacy thinking on/off control, passing the
-// native effort value ("On"/"Off") directly as thinking.type.
+// Older GLM models (< 5.2) keep the legacy binary thinking.type control,
+// whose wire values are "enabled"/"disabled". The family options spell them
+// "On"/"Off" and c0wrk stores "off", so both spellings of both sentinels
+// are normalized to their wire values instead of being passed through
+// verbatim — and any non-canonical value ("none", "max", an unknown
+// spelling) fails closed to "disabled" for the same reason as above.
 func applyGLMReasoning(params *oai.ChatCompletionNewParams, model, effort string) {
 	if IsGLM52OrLater(model) {
-		switch effort {
-		case "none":
+		switch {
+		case strings.EqualFold(effort, "none"), strings.EqualFold(effort, "off"):
 			params.SetExtraFields(map[string]any{
 				"thinking": map[string]string{"type": "disabled"},
 			})
-		case "max":
+		case effort == "max", strings.EqualFold(effort, "on"):
 			params.SetExtraFields(map[string]any{
 				"thinking":         map[string]string{"type": "enabled"},
 				"reasoning_effort": "max",
 			})
-		case "high":
+		case effort == "high":
 			params.SetExtraFields(map[string]any{
 				"thinking":         map[string]string{"type": "enabled"},
 				"reasoning_effort": "high",
 			})
+		default:
+			params.SetExtraFields(map[string]any{
+				"thinking": map[string]string{"type": "disabled"},
+			})
 		}
 		return
 	}
+	wireType := "disabled"
+	if strings.EqualFold(effort, "on") {
+		wireType = "enabled"
+	}
 	params.SetExtraFields(map[string]any{
-		"thinking": map[string]string{"type": effort},
+		"thinking": map[string]string{"type": wireType},
 	})
 }
 

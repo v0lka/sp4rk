@@ -272,6 +272,94 @@ func TestExecute_JudgerEscalation_SeveritySurfaced(t *testing.T) {
 	}
 }
 
+// TestExecute_JudgerEscalation_ReasonCodeSurfaced verifies the machine-
+// checkable half of the escalation contract: the judge outcome's ReasonCode
+// must reach the host through ConfirmationRequest.JudgeReasonCode verbatim —
+// downstream hosts key deterministic policy decisions off the code instead of
+// matching prose (see JudgeReasonCode), so a dropped or mangled code silently
+// degrades their fail-closed posture to prose-matching. An unclassified
+// escalation (zero code) must surface as the zero code, never a fabricated
+// one.
+func TestExecute_JudgerEscalation_ReasonCodeSurfaced(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		outcome  JudgeOutcome
+		wantCode JudgeReasonCode
+	}{
+		{name: "soft containment code surfaces", outcome: JudgeOutcome{Reason: "path outside session roots", Severity: JudgeSeveritySoft, ReasonCode: ReasonCodeOutsideSessionRoots}, wantCode: ReasonCodeOutsideSessionRoots},
+		{name: "hard control code surfaces", outcome: JudgeOutcome{Reason: "command matches blacklist pattern: rm", Severity: JudgeSeverityHard, ReasonCode: ReasonCodeCommandBlacklist}, wantCode: ReasonCodeCommandBlacklist},
+		{name: "unclassified stays unclassified", outcome: JudgeOutcome{Reason: "dangerous"}, wantCode: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			reg := NewToolRegistry()
+			base := newMockToolWithPolicy("risky", "always-allow with judge", PolicyAlwaysAllow)
+			tool := &judgerMockTool{mockTool: base, judgeFn: func(_ context.Context, _ json.RawMessage) JudgeOutcome {
+				return tt.outcome
+			}}
+			reg.Register(tool)
+
+			var gotReq ConfirmationRequest
+			reg.SetConfirmFunc(func(_ context.Context, req ConfirmationRequest) (ConfirmationResponse, error) {
+				gotReq = req
+				return ConfirmDeny, nil
+			})
+
+			res, err := reg.Execute(context.Background(), "risky", nil)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !res.IsError {
+				t.Fatal("expected denied result")
+			}
+			if gotReq.JudgeReasonCode != tt.wantCode {
+				t.Errorf("ConfirmationRequest.JudgeReasonCode = %q, want %q", gotReq.JudgeReasonCode, tt.wantCode)
+			}
+			if gotReq.JudgeReasoning != tt.outcome.Reason {
+				t.Errorf("ConfirmationRequest.JudgeReasoning = %q, want the outcome reason %q", gotReq.JudgeReasoning, tt.outcome.Reason)
+			}
+		})
+	}
+}
+
+// TestExecute_PlainConfirmGate_ZeroReasonCode pins the plain
+// PolicyUserConfirm half of the contract: a gate with no judge classifier
+// must surface an EMPTY JudgeReasonCode (never a fabricated one) so hosts can
+// apply their documented fail-closed default for unclassified escalations.
+func TestExecute_PlainConfirmGate_ZeroReasonCode(t *testing.T) {
+	t.Parallel()
+
+	reg := NewToolRegistry()
+	reg.Register(newMockToolWithPolicy("mutating", "user-confirm gate", PolicyUserConfirm))
+
+	var gotReq ConfirmationRequest
+	reg.SetConfirmFunc(func(_ context.Context, req ConfirmationRequest) (ConfirmationResponse, error) {
+		gotReq = req
+		return ConfirmDeny, nil
+	})
+
+	res, err := reg.Execute(context.Background(), "mutating", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("expected denied result")
+	}
+	if gotReq.JudgeReasonCode != "" {
+		t.Errorf("plain gate JudgeReasonCode = %q, want empty (unclassified)", gotReq.JudgeReasonCode)
+	}
+	if gotReq.JudgeSeverity != JudgeSeverityHard {
+		t.Errorf("plain gate JudgeSeverity = %v, want hard", gotReq.JudgeSeverity)
+	}
+	if gotReq.JudgeReasoning != "" {
+		t.Errorf("plain gate JudgeReasoning = %q, want empty (no judge classified it)", gotReq.JudgeReasoning)
+	}
+}
+
 // --- Task 2: explicit MCP source categorization ---
 
 func TestRegisterWithSourceCategory_ExplicitMCP(t *testing.T) {

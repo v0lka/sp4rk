@@ -146,3 +146,98 @@ func TestBashExecTool_ReasonCodes(t *testing.T) {
 		})
 	}
 }
+
+// TestBashExecTool_Judge_ReboundVarIsHard closes the invisible-rebinding
+// hole at the Judge layer: a variable rebound by a construct the static
+// walker cannot see through ("read D < cfg" — attacker-controlled file
+// content) must keep every "$D" reference UNASSESSABLE, escalating hard, so
+// a decoy literal binding can never auto-approve the command.
+func TestBashExecTool_Judge_ReboundVarIsHard(t *testing.T) {
+	t.Setenv("D", "")
+	tool, err := NewBashExecTool(nil)
+	if err != nil {
+		t.Fatalf("failed to construct tool: %v", err)
+	}
+	ws := t.TempDir()
+	ctx := tools.WithWorkspacePath(context.Background(), ws)
+	input, _ := json.Marshal(map[string]string{"command": `D=safe; read -r D < cfg; cat "$D/x"`})
+	outcome := tool.Judge(ctx, input)
+	if outcome.Allow {
+		t.Fatal("expected rebound-var reference to be denied")
+	}
+	if !strings.Contains(outcome.Reason, "$D") {
+		t.Fatalf("expected reason to name the unassessable token, got %q", outcome.Reason)
+	}
+	if outcome.Severity != tools.JudgeSeverityHard {
+		t.Fatalf("rebound-var severity = %v, want hard", outcome.Severity)
+	}
+	if outcome.ReasonCode != tools.ReasonCodeUnresolvablePathToken {
+		t.Fatalf("rebound-var reason code = %q, want %q", outcome.ReasonCode, tools.ReasonCodeUnresolvablePathToken)
+	}
+}
+
+// TestBashExecTool_Judge_DeadBranchDecoyStillContained closes the
+// empty-expansion masking hole at the Judge layer: a decoy binding in a
+// branch that never executes ("if false; then D=safe; fi") must not mask the
+// EMPTY expansion of the unset variable — "$D/etc/passwd" runtime-reads
+// /etc/passwd, so the suffix-alone candidate must escalate containment.
+func TestBashExecTool_Judge_DeadBranchDecoyStillContained(t *testing.T) {
+	t.Setenv("D", "")
+	tool, err := NewBashExecTool(nil)
+	if err != nil {
+		t.Fatalf("failed to construct tool: %v", err)
+	}
+	ws := t.TempDir()
+	ctx := tools.WithWorkspacePath(context.Background(), ws)
+	input, _ := json.Marshal(map[string]string{"command": `if false; then D=safe; fi; cat "$D/etc/passwd"`})
+	outcome := tool.Judge(ctx, input)
+	if outcome.Allow {
+		t.Fatal("expected dead-branch decoy with absolute suffix to be denied")
+	}
+	if !strings.Contains(outcome.Reason, "outside session roots") {
+		t.Fatalf("unexpected reason: %q", outcome.Reason)
+	}
+	if outcome.Severity != tools.JudgeSeveritySoft {
+		t.Fatalf("dead-branch containment severity = %v, want soft", outcome.Severity)
+	}
+}
+
+// TestBashExecTool_Judge_EnvClearingStaysContained closes the
+// environment-clearing hole at the Judge layer: "env -i" and "exec -c" run
+// the child with an environment the judge's process cannot observe, so a
+// variable that holds an in-root value HERE expands to NOTHING there —
+// "$WS/etc/passwd" runtime-reads /etc/passwd. sudo(8)'s default env_reset
+// has the same shape. The whole command must go opaque and escalate hard
+// instead of auto-approving on the in-root candidate.
+func TestBashExecTool_Judge_EnvClearingStaysContained(t *testing.T) {
+	tool, err := NewBashExecTool(nil)
+	if err != nil {
+		t.Fatalf("failed to construct tool: %v", err)
+	}
+	ws := t.TempDir()
+	t.Setenv("WS", ws)
+	ctx := tools.WithWorkspacePath(context.Background(), ws)
+	for name, command := range map[string]string{
+		"env -i":                   `env -i bash -c 'cat "$WS/etc/passwd"'`,
+		"env --ignore-environment": `env --ignore-environment bash -c 'cat "$WS/etc/passwd"'`,
+		"exec -c":                  `exec -c bash -c 'cat "$WS/etc/passwd"'`,
+		"sudo":                     `sudo cat "$WS/etc/passwd"`,
+		"su -l":                    `su -l root -c 'cat "$WS/etc/passwd"'`,
+		"doas":                     `doas cat "$WS/etc/passwd"`,
+		"ssh":                      `ssh host 'cat "$WS/etc/passwd"'`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			input, _ := json.Marshal(map[string]string{"command": command})
+			outcome := tool.Judge(ctx, input)
+			if outcome.Allow {
+				t.Fatalf("expected %s command to be denied", name)
+			}
+			if outcome.Severity != tools.JudgeSeverityHard {
+				t.Fatalf("%s severity = %v, want hard", name, outcome.Severity)
+			}
+			if outcome.ReasonCode != tools.ReasonCodeUnresolvablePathToken {
+				t.Fatalf("%s reason code = %q, want %q", name, outcome.ReasonCode, tools.ReasonCodeUnresolvablePathToken)
+			}
+		})
+	}
+}

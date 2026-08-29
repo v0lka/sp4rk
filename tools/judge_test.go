@@ -2254,3 +2254,94 @@ func TestConfirmationRequest_SeverityOnTheWire(t *testing.T) {
 		t.Errorf("round-trip JudgeSeverity = %v, want %v", back.JudgeSeverity, JudgeSeverityHard)
 	}
 }
+
+// TestConfirmationRequest_ReasonCodeOnTheWire verifies the reason code
+// travels under the "judge_reason_code" tag inside a serialized
+// ConfirmationRequest. The tag is a cross-repository contract (hosts key
+// deterministic policy decisions off the code — see JudgeReasonCode), so its
+// name and the round-tripped value must not drift. An unclassified request
+// omits the field entirely (omitempty), never serializing a placeholder.
+func TestConfirmationRequest_ReasonCodeOnTheWire(t *testing.T) {
+	data, err := json.Marshal(ConfirmationRequest{
+		ToolName:        "bash_exec",
+		Input:           json.RawMessage(`{"command":"cat /etc/passwd"}`),
+		JudgeReasoning:  "command references existing path(s) outside session roots",
+		JudgeSeverity:   JudgeSeveritySoft,
+		JudgeReasonCode: ReasonCodeOutsideSessionRoots,
+	})
+	if err != nil {
+		t.Fatalf("Marshal: unexpected error: %v", err)
+	}
+	if !strings.Contains(string(data), `"judge_reason_code":"outside_session_roots"`) {
+		t.Errorf("marshaled request = %s, want judge_reason_code as the name \"outside_session_roots\"", data)
+	}
+
+	var back ConfirmationRequest
+	if err := json.Unmarshal(data, &back); err != nil {
+		t.Fatalf("Unmarshal: unexpected error: %v", err)
+	}
+	if back.JudgeReasonCode != ReasonCodeOutsideSessionRoots {
+		t.Errorf("round-trip JudgeReasonCode = %q, want %q", back.JudgeReasonCode, ReasonCodeOutsideSessionRoots)
+	}
+
+	// A second, distinct code round-trips identically — pinning that the
+	// wire path is code-agnostic rather than special-cased.
+	hard, err := json.Marshal(ConfirmationRequest{
+		ToolName:        "bash_exec",
+		Input:           json.RawMessage(`{"command":"curl http://169.254.169.254/"}`),
+		JudgeSeverity:   JudgeSeverityHard,
+		JudgeReasonCode: ReasonCodeCommandBlacklist,
+	})
+	if err != nil {
+		t.Fatalf("Marshal: unexpected error: %v", err)
+	}
+	if !strings.Contains(string(hard), `"judge_reason_code":"command_blacklist"`) {
+		t.Errorf("marshaled request = %s, want judge_reason_code as the name \"command_blacklist\"", hard)
+	}
+	var hardBack ConfirmationRequest
+	if err := json.Unmarshal(hard, &hardBack); err != nil {
+		t.Fatalf("Unmarshal: unexpected error: %v", err)
+	}
+	if hardBack.JudgeReasonCode != ReasonCodeCommandBlacklist {
+		t.Errorf("round-trip JudgeReasonCode = %q, want %q", hardBack.JudgeReasonCode, ReasonCodeCommandBlacklist)
+	}
+
+	// Unclassified: the field is omitted rather than serialized empty.
+	plain, err := json.Marshal(ConfirmationRequest{ToolName: "mutating"})
+	if err != nil {
+		t.Fatalf("Marshal: unexpected error: %v", err)
+	}
+	if strings.Contains(string(plain), "judge_reason_code") {
+		t.Errorf("unclassified request = %s, want judge_reason_code omitted", plain)
+	}
+}
+
+// TestJudgeReasonCode_Vocabulary pins every published JudgeReasonCode to its
+// exact literal wire value. The codes are a cross-repository contract: a
+// published code is never renamed or reused (see JudgeReasonCode), yet every
+// other test in the suite compares against the constants themselves — which
+// would follow any rename silently. This table fails on any change to the
+// published vocabulary, catching a rename before it drifts into serialized
+// confirmations, logs, and non-Go hosts.
+func TestJudgeReasonCode_Vocabulary(t *testing.T) {
+	published := map[JudgeReasonCode]string{
+		ReasonCodeCommandBlacklist:      "command_blacklist",
+		ReasonCodeUnresolvablePathToken: "unresolvable_path_token",
+		ReasonCodeOutsideSessionRoots:   "outside_session_roots",
+		ReasonCodeSSRFPrivateAddress:    "ssrf_private_address",
+		ReasonCodeSSRFDegraded:          "ssrf_protection_degraded",
+		ReasonCodeUnassessableURL:       "unassessable_url",
+		ReasonCodeUnassessablePath:      "unassessable_path",
+		ReasonCodeSymlinkEscape:         "symlink_escape",
+		ReasonCodeSymlinkSuspicious:     "symlink_suspicious",
+	}
+	const wantPublished = 9
+	if len(published) != wantPublished {
+		t.Fatalf("vocabulary size = %d, want %d — update this pin when publishing or retiring a code", len(published), wantPublished)
+	}
+	for code, want := range published {
+		if string(code) != want {
+			t.Errorf("JudgeReasonCode literal = %q, want %q — published codes are never renamed", string(code), want)
+		}
+	}
+}

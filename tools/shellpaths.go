@@ -98,6 +98,116 @@ var unresolvableTokenRe = map[ShellKind]*regexp.Regexp{
 	ShellBash: regexp.MustCompile(`(?:` + tildeUserRe + `|` + bashParamExpansionRe + `)`),
 }
 
+// bashPlainVarRe matches a plain "$NAME" or "${NAME}" reference — no operator
+// forms, which [bashParamExpansionRe] covers separately. A leading "=" or
+// "~" sigil is tolerated so zsh word-splitting/pattern spellings ("$=D")
+// are still found. It feeds the dynamically-rebound-variable pass of
+// [UnresolvablePathTokens].
+var bashPlainVarRe = regexp.MustCompile(`\$[=~]?[A-Za-z_][A-Za-z0-9_]*|\$\{[=~]?[A-Za-z_][A-Za-z0-9_]*\}`)
+
+// bashBracedVarRe is the compiled form of [bashParamExpansionRe], matching
+// any "${...}" braced parameter form (plain or operator). It feeds the
+// dynamically-rebound-variable pass of [UnresolvablePathTokens].
+var bashBracedVarRe = regexp.MustCompile(bashParamExpansionRe)
+
+// bashPositionalVarRe matches a positional parameter reference ("$1",
+// "${12}", "$@", "$*") plus an optional path suffix. Positional values come
+// from the invocation context or a "set --" rebind, never from this
+// command's static bindings.
+var bashPositionalVarRe = regexp.MustCompile(`\$\{?[0-9@*]+\}?(?:/[a-zA-Z0-9/_.\-~]+)?`)
+
+// bashArithExpRe matches a word-level arithmetic expansion — "$((…))", with
+// one level of nested parentheses so subshell and command-substitution
+// operands stay whole — plus bash's legacy "$[…]" spelling. A bare "((…))"
+// command is an assignment or condition, not a value producer, and is
+// folded by the binding walker's arithmetic handling instead.
+var bashArithExpRe = regexp.MustCompile(`\$\(\((?:[^()]|\([^()]*\))*\)\)|\$[[][^[\]]*[\]]`)
+
+// arithExpNameRe extracts the bare identifier references an arithmetic
+// expression evaluates — inside arithmetic a variable needs no "$" sigil,
+// which is exactly why the plain/braced variable passes cannot see them.
+var arithExpNameRe = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*`)
+
+// arithExpReferencesUnassessable reports whether the arithmetic expansion
+// tok evaluates any variable the binding walker marks unassessable (dynamic
+// or whole-command opaque): the expansion's runtime value is then unknown —
+// often attacker-controlled file content — exactly like a plain "$D" to a
+// rebound name. Assignment targets ("D=5") are skipped: the binding walker's
+// arithmetic handling already marks the assigned name, while the target
+// itself is not a reference whose unknown value flows out.
+func arithExpReferencesUnassessable(tok string, bindings *envBindings) bool {
+	for _, m := range arithExpNameRe.FindAllStringIndex(tok, -1) {
+		if arithNameIsAssignmentTarget(tok, m[1]) {
+			continue
+		}
+		if bindings.unassessable(tok[m[0]:m[1]]) {
+			return true
+		}
+	}
+	return false
+}
+
+// arithNameIsAssignmentTarget reports whether the identifier ending at index
+// end inside an arithmetic expression is the TARGET of a plain assignment
+// ("D=5", "D = 5"). A comparison ("D==5") is not an assignment, and a
+// compound operator ("D+=1", "D<<=2") reads the name as well as writing it,
+// so those occurrences still count as references.
+func arithNameIsAssignmentTarget(tok string, end int) bool {
+	i := end
+	for i < len(tok) && (tok[i] == ' ' || tok[i] == '\t') {
+		i++
+	}
+	if i >= len(tok) || tok[i] != '=' {
+		return false
+	}
+	if i+1 < len(tok) && tok[i+1] == '=' {
+		return false // "==": comparison, not assignment
+	}
+	return true
+}
+
+// bracedOperatorCarriesPath reports whether a braced "${...}" OPERATOR form
+// (non-plain, non-indirect, non-length) is used where an absolute path can be
+// assembled: the enclosing word is absolute-shaped (a "/" precedes the token
+// within it, as in "/e${X:1}") or continues with a path suffix after the
+// token ("${HOME:-safe}/.ssh/id_rsa"). Such a reference routes the base
+// name's value through an operator the resolver cannot compose, so it must
+// fail closed instead of resolving to a benign candidate.
+func bracedOperatorCarriesPath(tok, command string, start, end int) bool {
+	inner := tok[2 : len(tok)-1]
+	if strings.HasPrefix(inner, "!") || strings.HasPrefix(inner, "#") {
+		return false // indirect and length forms have their own rules
+	}
+	name, rest := splitEnvName(inner)
+	if name == "" || rest == "" {
+		return false // plain "${NAME}" — resolved through valueCandidates
+	}
+	wordStart, wordEnd := shellWordBounds(command, start, end)
+	if wordStart < start && wordStartsAbsolute(command[wordStart:]) {
+		return true
+	}
+	tail := strings.Map(func(r rune) rune {
+		if r == '"' || r == '\'' {
+			return -1
+		}
+		return r
+	}, command[end:wordEnd])
+	return strings.Contains(tail, "/")
+}
+
+// isIndirectParamExpansion reports whether a "${...}" token is an indirect
+// expansion "${!name}" — excluding the "${!prefix@}"/"${!prefix*}" name
+// listings, whose values are identifier lists and cannot carry a path. The
+// indirect form resolves the referenced variable's NAME from the base
+// name's runtime VALUE, so no static candidate list can assess it.
+func isIndirectParamExpansion(tok string) bool {
+	inner := tok[2 : len(tok)-1]
+	if !strings.HasPrefix(inner, "!") {
+		return false
+	}
+	return !strings.HasSuffix(inner, "@") && !strings.HasSuffix(inner, "*")
+}
+
 // isPathBearingParamExpansion reports whether a "${...}" token is a parameter
 // expansion whose operand references a path — i.e. the part after the variable
 // name contains "/", "~", or "$". Plain "${VAR}" and benign defaults such as
@@ -132,7 +242,7 @@ func isPathBearingParamExpansion(tok string) bool {
 // fabricated paths. For a security containment check the dangerous direction is
 // a false negative, so the skipped tokens are recovered here.
 //
-// Two bash forms are detected:
+// Three bash forms are detected:
 //
 //   - "~user": a "~" at a word boundary followed by username characters. The
 //     word-boundary check skips "~" that continues a path-component word (e.g.
@@ -143,6 +253,20 @@ func isPathBearingParamExpansion(tok string) bool {
 //     form (its "~" and "$env:"/"${env:}" idioms are all resolved by
 //     [resolveEnvToken] and [resolveTildeToken]), so the PowerShell dialect
 //     reports nothing.
+//   - a plain "$NAME"/"${NAME}" reference — or a braced form derived from it
+//     ("${A[0]}", "${D:0}", "${D@Q}", "${D^}", or an indirect "${!…}") — to
+//     a name the binding walker cannot assess: rebound by a construct that
+//     never produces a plain assignment node ("read D", "printf -v D",
+//     "mapfile D", "unset D", "getopts", for/select loop iteration, an
+//     arithmetic assignment "((D=5))", an attribute-changing
+//     "declare -a/-n/…", a dynamic right-hand side), or to ANY name at all
+//     once the command contains an opaque "source"/"."/"eval"/"let"
+//     (however spelled), a dynamically-built command word, or a non-literal
+//     "bash -c" script. The runtime value of such a reference is unknown —
+//     often attacker-controlled file content — so no candidate list can
+//     assess it. A reference to a name with only plain literal bindings is
+//     NOT reported: [resolveEnvToken] assesses it (unioning the empty
+//     expansion).
 func UnresolvablePathTokens(command string, shell ShellKind) []string {
 	re := unresolvableTokenRe[shell]
 	if re == nil {
@@ -162,8 +286,15 @@ func UnresolvablePathTokens(command string, shell ShellKind) []string {
 			}
 		case '$':
 			// Only flag parameter expansions whose operand could hide a path,
-			// so benign "${VAR:-hello}" defaults are not escalated.
-			if !isPathBearingParamExpansion(tok) {
+			// so benign "${VAR:-hello}" defaults are not escalated; every
+			// indirect "${!name}" form (except the name listings); and braced
+			// OPERATOR forms used where a path is assembled — a "/" before
+			// the token in the same word ("/e${X:1}") or a path suffix after
+			// it ("${HOME:-safe}/.ssh/id_rsa"): the operator routes the
+			// variable's value through a transformation no candidate list can
+			// compose while the runtime word still lands on an absolute path.
+			if !isPathBearingParamExpansion(tok) && !isIndirectParamExpansion(tok) &&
+				!bracedOperatorCarriesPath(tok, command, start, end) {
 				continue
 			}
 		}
@@ -173,8 +304,181 @@ func UnresolvablePathTokens(command string, shell ShellKind) []string {
 		seen[tok] = struct{}{}
 		out = append(out, tok)
 	}
+	if shell == ShellBash {
+		out = appendUnassessableVarTokens(command, seen, out)
+	}
 	return out
 }
+
+// appendUnassessableVarTokens appends the variable references whose name the
+// bash binding walker marks unassessable (see [envBindings.unassessable]):
+// the name is rebound in-command by a construct whose runtime value is
+// statically unknown, or the whole command is opaque ("source"/"."/"eval"/
+// "let", a dynamically-built command word, or a non-literal "bash -c"
+// script). Both plain "$NAME"/"${NAME}" references and braced operator forms
+// derived from a name ("${A[0]}", "${D:0}", "${D@Q}", "${D^}") fail closed
+// at the same HARD escalation as "~user" and path-bearing parameter
+// expansions, as does every indirect "${!…}" form once any rebinding is
+// present — the referenced variable's NAME is itself runtime data.
+// Positional references ("$1", "$@") escalate when they carry a path suffix
+// or when the command rebinds them ("set -- …", "shift"). When the command
+// contains no dynamic or opaque rebinding at all, nothing else is appended
+// — plain literal bindings and environment-only names stay assessable
+// through [resolveEnvToken].
+func appendUnassessableVarTokens(command string, seen map[string]struct{}, out []string) []string {
+	bindings := collectCommandEnvBindings(command)
+	// Positional parameters are never statically assessable: their values
+	// come from the invocation context or an in-command "set --"/"shift"
+	// rebind. A reference carrying a PATH SUFFIX ("cat \"$1/etc/passwd\"")
+	// always escalates — the empty/unknown expansion concatenated with an
+	// absolute suffix is exactly the hidden out-of-root shape; so does a
+	// positional COMPOSED with more word content ("$1$2", "$1frag"), which
+	// no candidate list can express — while a bare positional
+	// ("awk '{print $1}'") escalates only once the command rebinds the
+	// positionals, keeping ordinary awk/sed one-liners quiet.
+	positionalRebound := bindings != nil && bindings.positionalRebound
+	for _, m := range bashPositionalVarRe.FindAllStringIndex(command, -1) {
+		tok := command[m[0]:m[1]]
+		// Single-quoted content is literal (awk/sed scripts) — unless the
+		// command rebinds positionals, in which case even a nested -c
+		// script's "$1" references hold unknown values.
+		if inSingleQuotes(command, m[0]) && !positionalRebound {
+			continue
+		}
+		ws, we := shellWordBounds(command, m[0], m[1])
+		composed := (ws < m[0] || we > m[1]) && (!inSingleQuotes(command, ws) || positionalRebound)
+		if !positionalRebound && !strings.Contains(tok, "/") && !composed {
+			continue
+		}
+		if _, dup := seen[tok]; dup {
+			continue
+		}
+		seen[tok] = struct{}{}
+		out = append(out, tok)
+	}
+	// Words whose candidate product cannot be composed — an operator form,
+	// a positional, or an over-cap product — are unassessable as a whole:
+	// the true runtime combination may be any of the dropped ones, so the
+	// word itself escalates. The word qualifies when it starts with "/"
+	// ("/$P$Q/x") or when any referenced variable holds an absolute-valued
+	// candidate ("$P$Q/passwd" with P="/e" — the composition lands outside
+	// the roots).
+	for _, m := range bashPlainVarRe.FindAllStringIndex(command, -1) {
+		if inSingleQuotes(command, m[0]) {
+			continue // literal text — no composed runtime value
+		}
+		ws, we := shellWordBounds(command, m[0], m[1])
+		if ws >= m[0] && we <= m[1] {
+			continue // single-token word — per-token rules apply
+		}
+		word := command[ws:we]
+		if _, dup := seen[word]; dup {
+			continue
+		}
+		if !wordStartsAbsolute(word) && !wordHasAbsoluteCandidate(word, bindings) {
+			continue // a purely relative composition stays in-root
+		}
+		if _, ok := absoluteWordExpansions(word, bindings); ok {
+			continue
+		}
+		seen[word] = struct{}{}
+		out = append(out, word)
+	}
+	if bindings == nil || (!bindings.opaque && len(bindings.dynamic) == 0) {
+		return out
+	}
+	sawVarToken := false
+	seenName := make(map[string]struct{})
+	for _, m := range bashPlainVarRe.FindAllStringIndex(command, -1) {
+		tok := command[m[0]:m[1]]
+		body := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(tok, "$"), "{"), "}")
+		// A leading "="/"~" is a zsh word-splitting/pattern sigil ("$=D"),
+		// not part of the name.
+		name := strings.TrimLeft(body, "=~")
+		if _, dup := seenName[name]; dup {
+			continue
+		}
+		if !bindings.unassessable(name) {
+			continue
+		}
+		seenName[name] = struct{}{}
+		sawVarToken = true
+		if _, dup := seen[tok]; dup {
+			continue
+		}
+		seen[tok] = struct{}{}
+		out = append(out, tok)
+	}
+	// Braced operator forms: bashPlainVarRe skips them, and the main
+	// operator pass (isPathBearingParamExpansion) escalates only operands
+	// carrying a literal path marker — a reference whose VALUE is the
+	// variable's runtime content carries none. Escalate any braced form
+	// whose BASE name is unassessable, and every indirect ("${!…}") form.
+	for _, m := range bashBracedVarRe.FindAllStringIndex(command, -1) {
+		tok := command[m[0]:m[1]]
+		if _, dup := seen[tok]; dup {
+			continue
+		}
+		inner := tok[2 : len(tok)-1]
+		indirect := strings.HasPrefix(inner, "!")
+		base := strings.TrimPrefix(inner, "!")
+		// A zsh parenthesized expansion-flag group ("${(z)D}") prefixes the
+		// name.
+		if strings.HasPrefix(base, "(") {
+			if end := strings.IndexByte(base, ')'); end >= 0 {
+				base = base[end+1:]
+			}
+		}
+		name, _ := splitEnvName(base)
+		if name == "" || (name[0] >= '0' && name[0] <= '9') {
+			continue // positional parameter or malformed — no base name
+		}
+		if !indirect && !bindings.unassessable(name) {
+			continue
+		}
+		sawVarToken = true
+		seen[tok] = struct{}{}
+		out = append(out, tok)
+	}
+	// Arithmetic expansions: inside "$((…))" (and the legacy "$[…]"
+	// spelling) a variable is referenced WITHOUT the "$" sigil, so neither
+	// the plain nor the braced pass can see it — a reference to an
+	// unassessable name evaluated in arithmetic would otherwise escape
+	// every pass while its runtime value flows into the word exactly like
+	// "$D" would. Escalate the whole expansion when any name it evaluates
+	// is unassessable; a single-quoted occurrence is literal text.
+	for _, m := range bashArithExpRe.FindAllStringIndex(command, -1) {
+		if inSingleQuotes(command, m[0]) {
+			continue // literal text — no runtime reference
+		}
+		tok := command[m[0]:m[1]]
+		if _, dup := seen[tok]; dup {
+			continue
+		}
+		if !arithExpReferencesUnassessable(tok, bindings) {
+			continue
+		}
+		sawVarToken = true
+		seen[tok] = struct{}{}
+		out = append(out, tok)
+	}
+	// An OPAQUE construct (source/eval/let, a dynamically-built command
+	// word, a pipe- or stdin-fed interpreter, a non-POSIX dialect script)
+	// executes hidden shell text even when the command carries NO variable
+	// reference — without this sentinel such commands would slip both
+	// passes silently. It is appended only when no variable reference was
+	// found to carry the escalation (a reference-bearing command already
+	// escalates through its tokens).
+	if bindings.opaque && !sawVarToken {
+		out = append(out, opaqueConstructToken)
+	}
+	return out
+}
+
+// opaqueConstructToken is the synthetic token reported for a command whose
+// opaque constructs (source/eval-style hidden shell text) carry no variable
+// reference of their own to escalate.
+const opaqueConstructToken = "<opaque-rebinding-construct>"
 
 // ResolveShellPathTokens extracts path-like tokens from a shell command string
 // and resolves shell idioms to absolute paths:
@@ -202,9 +506,18 @@ func UnresolvablePathTokens(command string, shell ShellKind) []string {
 //     $USERPROFILE). "~user" is best-effort and skipped when unresolvable.
 //   - "$VAR"/"${VAR}" (bash) and "$env:VAR"/"${env:VAR}" (posh) expand via
 //     [os.Getenv] and, for bash, the command's own literal "VAR=value"
-//     bindings ([collectCommandEnvBindings]); when both exist, BOTH expansions
-//     are reported — a binding adds candidates, it never masks an environment
-//     value (fail-closed). Tokens whose every expansion is empty are SKIPPED.
+//     bindings ([collectCommandEnvBindings]); when several expansions are
+//     possible — a binding alongside a non-empty env value, a name assigned
+//     more than once / dynamically, or the EMPTY expansion of a possibly
+//     unset or cleared variable (see [envBindings.emptyExpansionPossible]) —
+//     ALL of them are reported: a binding adds candidates, it never masks an
+//     environment value, an earlier binding, or the empty expansion
+//     (fail-closed). Tokens whose every expansion is empty AND carry no path
+//     suffix are SKIPPED (a bare empty expansion names no path). A
+//     word-initial "/" before the env token ("/$D/passwd") additionally
+//     resolves the absolutized variants, because the runtime expansion of
+//     such a word is an absolute path even though the token itself resolves
+//     to a relative join.
 //   - Relative tokens containing ".." resolve against workDir; only tokens
 //     with ".." are analyzed (plain relative names already resolve inside the
 //     validated workDir and are ignored). Relative tokens are skipped when
@@ -224,10 +537,11 @@ func ResolveShellPathTokens(command string, shell ShellKind, workDir string) []s
 	// Collect in-command literal variable bindings (bash only) so "$VAR" can
 	// resolve to the command's own assignment value ("VAR=value",
 	// "export VAR=value", "VAR=value cmd ...") in ADDITION to the process
-	// environment — a binding never masks an env value (see
-	// [resolveEnvToken]). PowerShell has no mvdan parser here, so it gets no
-	// bindings.
-	var bindings map[string]string
+	// environment — a binding never masks an env value, and a re-bound or
+	// dynamically assigned name contributes ALL of its distinct literal
+	// values as candidates (see [envBindings]). PowerShell has no mvdan
+	// parser here, so it gets no bindings.
+	var bindings *envBindings
 	if shell == ShellBash {
 		bindings = collectCommandEnvBindings(command)
 	}
@@ -246,7 +560,8 @@ func ResolveShellPathTokens(command string, shell ShellKind, workDir string) []s
 		// Boundary checks for tokens whose leading character could continue a
 		// preceding relative-path word (".." parent-refs and POSIX "/abs"
 		// paths). Env ("$VAR") and tilde ("~") tokens start with non-path
-		// characters and are inherently bounded, so they are exempt.
+		// characters and are inherently bounded, so they are exempt — the
+		// '$' case below handles absolute-shaped assembled words.
 		switch tok[0] {
 		case '.':
 			// A ".." glued to a preceding path-component char — e.g. the ".." in
@@ -287,6 +602,37 @@ func ResolveShellPathTokens(command string, shell ShellKind, workDir string) []s
 				seen[resolved] = struct{}{}
 				out = append(out, resolved)
 				continue
+			}
+		case '$':
+			// An env token inside a word whose runtime expansion may be
+			// ABSOLUTE — the word starts with "/" ("/$D/passwd",
+			// "/et$B/passwd") or one of its referenced variables holds an
+			// absolute-valued candidate ("$P$Q/passwd" with P="/e") —
+			// assembles at runtime from the literal fragments and every
+			// referenced variable's candidates. Resolving the token alone
+			// cannot see the literal prefix or the sibling tokens, so the
+			// whole word is expanded across the candidate product (see
+			// absoluteWordExpansions). Words that cannot be composed
+			// (operator forms, over-cap products) are left to the
+			// unresolvable pass, which escalates them hard.
+			if shell == ShellBash && bindings != nil && !inSingleQuotes(command, start) {
+				if ws, we := shellWordBounds(command, start, end); (ws < start || we > end) &&
+					(wordStartsAbsolute(command[ws:]) || wordHasAbsoluteCandidate(command[ws:we], bindings)) {
+					word := command[ws:we]
+					if cands, ok := absoluteWordExpansions(word, bindings); ok {
+						for _, c := range cands {
+							if c == "" || !isAbsResolved(c) {
+								continue
+							}
+							if _, dup := seen[c]; dup {
+								continue
+							}
+							seen[c] = struct{}{}
+							out = append(out, c)
+						}
+						continue
+					}
+				}
 			}
 		}
 		for _, resolved := range resolveShellToken(tok, shell, workDir, bindings) {
@@ -535,7 +881,7 @@ func nearestExistingAncestorDir(p string) (string, bool) {
 // absolute-path candidates; an empty slice means the token cannot be resolved
 // and the caller drops it. Env tokens may yield several candidates — see
 // [resolveEnvToken].
-func resolveShellToken(token string, shell ShellKind, workDir string, bindings map[string]string) []string {
+func resolveShellToken(token string, shell ShellKind, workDir string, bindings *envBindings) []string {
 	switch {
 	case token == "":
 		return nil
@@ -620,18 +966,183 @@ func resolveTildeToken(token string) (string, bool) {
 	return "", false
 }
 
+// inSingleQuotes reports whether position pos in command sits inside a
+// single-quoted span, tracking quoting as the shell lexes it: a single
+// quote toggles the span only OUTSIDE double quotes (inside double quotes
+// an apostrophe is a literal character), a double quote toggles its context
+// only outside single quotes, and a backslash escapes the next character
+// only outside single quotes (inside '...' backslashes are literal).
+// Single-quoted content is literal — no expansion, no composition — so
+// positional and word-assembly rules must not fire inside it (awk/sed
+// scripts: "awk '{print $1}'"), while an apostrophe inside double quotes
+// ("it's") must not flip that decision.
+func inSingleQuotes(command string, pos int) bool {
+	single, double := false, false
+	for i := 0; i < pos; i++ {
+		switch command[i] {
+		case '\\':
+			if !single {
+				i++ // skip the escaped character (literal inside '...')
+			}
+		case '\'':
+			if !double {
+				single = !single
+			}
+		case '"':
+			if !single {
+				double = !double
+			}
+		}
+	}
+	return single
+}
+
+// wordStartsAbsolute reports whether a word's first non-quoting character is
+// the POSIX root separator ('"/et$B/passwd"' is an absolute-shaped word).
+func wordStartsAbsolute(word string) bool {
+	return strings.HasPrefix(strings.TrimLeft(word, `"'`), "/")
+}
+
+// shellWordBounds returns the [start, end) bounds of the shell word
+// enclosing the token at command[tokStart:tokEnd]: the run of word-ish
+// characters around it — path components, separators, quotes, and
+// reference sigils — bounded by whitespace or any other shell
+// metacharacter. A shell word continues through embedded quotes
+// ("$D"c/passwd) and adjacent references ("$P$Q", "${D}${E}").
+func shellWordBounds(command string, tokStart, tokEnd int) (wordStart, wordEnd int) {
+	isWordChar := func(c byte) bool {
+		return isPathComponentChar(c) || c == '/' || c == '"' || c == '\'' ||
+			c == '$' || c == '{' || c == '}'
+	}
+	start := tokStart
+	for start > 0 && isWordChar(command[start-1]) {
+		start--
+	}
+	end := tokEnd
+	for end < len(command) && isWordChar(command[end]) {
+		end++
+	}
+	return start, end
+}
+
+// bashPlainWordVarRe matches a plain "$NAME"/"${NAME}"/"$=NAME" reference
+// with NO suffix, for splitting a word into literal and variable segments.
+var bashPlainWordVarRe = regexp.MustCompile(`\$[=~]?\{?[A-Za-z_][A-Za-z0-9_]*\}?`)
+
+// absoluteWordExpansions expands an absolute-shaped shell word (one starting
+// with "/") across the candidate product of its plain variable references:
+// every literal fragment concatenates with every candidate value of every
+// referenced name, so "/et$B/passwd" with B="c" surfaces "/etc/passwd" and
+// "/$P$Q/passwd" surfaces the pairwise joins. assessable reports whether
+// the word could be composed at all: an operator-form braced reference
+// ("${X:1}") or a positional ("$1") derives a value no candidate list can
+// express, so the caller must escalate the word instead of resolving it.
+// The product is capped; an over-cap word is UNASSESSABLE (assessable=false)
+// so the caller escalates it hard — a truncated emission could silently
+// omit the one true runtime combination (fail-open).
+// quoteSep temporarily replaces embedded quoting inside an assembled word
+// ("$D"c/passwd): the quote is a zero-width word separator at expansion
+// time — segments around it join without it, but a reference name must not
+// bleed across it.
+const quoteSep = "\x00"
+
+var wordQuoteReplacer = strings.NewReplacer(`"`, quoteSep, "'", quoteSep)
+
+func absoluteWordExpansions(word string, bindings *envBindings) (cands []string, assessable bool) {
+	// Embedded quotes are word separators, not content.
+	word = wordQuoteReplacer.Replace(word)
+	for _, m := range bashBracedVarRe.FindAllString(word, -1) {
+		inner := m[2 : len(m)-1]
+		if strings.HasPrefix(inner, "!") {
+			continue // indirect forms are escalated by their own pass
+		}
+		name, rest := splitEnvName(inner)
+		if name == "" || rest != "" {
+			return nil, false // an operator form — cannot be composed
+		}
+	}
+	if bashPositionalVarRe.MatchString(word) {
+		return nil, false // positional references — never statically assessable
+	}
+	parts := bashPlainWordVarRe.Split(word, -1)
+	matches := bashPlainWordVarRe.FindAllString(word, -1)
+	// parts[0] is the literal prefix before the first reference ("/et" in
+	// "/et$B/passwd") — the word is absolute-shaped, so it starts with "/".
+	products := []string{parts[0]}
+	const maxProducts = 32
+	for i, name := range matches {
+		body := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(name, "$"), "{"), "}")
+		varName := strings.TrimLeft(body, "=~")
+		vals := bindings.valueCandidates(varName)
+		if len(vals) == 0 {
+			vals = []string{""}
+		}
+		var next []string
+		for _, p := range products {
+			for _, v := range vals {
+				if len(next) >= maxProducts {
+					// The full product does not fit: the true runtime
+					// combination may be the one dropped — fail closed.
+					return nil, false
+				}
+				next = append(next, p+v)
+			}
+		}
+		products = next
+		if i+1 < len(parts) {
+			var withSuffix []string
+			for _, p := range products {
+				if len(withSuffix) >= maxProducts {
+					return nil, false
+				}
+				withSuffix = append(withSuffix, p+parts[i+1])
+			}
+			products = withSuffix
+		}
+	}
+	out := make([]string, 0, len(products))
+	for _, p := range products {
+		out = append(out, cleanJoined(strings.ReplaceAll(p, quoteSep, "")))
+	}
+	return out, true
+}
+
+// wordHasAbsoluteCandidate reports whether any plain variable reference in
+// the word has a "/"-prefixed resolution candidate — the word's runtime
+// composition can therefore land on an absolute path even though the word
+// itself does not start with "/" ("$P$Q/passwd" with P="/e").
+func wordHasAbsoluteCandidate(word string, bindings *envBindings) bool {
+	for _, name := range bashPlainWordVarRe.FindAllString(word, -1) {
+		body := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(name, "$"), "{"), "}")
+		varName := strings.TrimLeft(body, "=~")
+		for _, v := range bindings.valueCandidates(varName) {
+			if strings.HasPrefix(v, "/") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // resolveEnvToken expands a "$VAR"/"${VAR}" (bash) or
 // "$env:VAR"/"${env:VAR}" (posh) reference plus an optional path remainder,
-// returning every absolute-path candidate. A bare empty/unset variable is
-// skipped; with a path suffix it resolves to the suffix alone, mirroring the
-// shell's concatenation of an empty expansion with the literal suffix.
+// returning every absolute-path candidate.
 //
 // In-command literal bindings never shadow the process environment: the
 // binding pre-pass is position- and control-flow-unaware (an assignment inside
-// a branch not taken still lands in the map), so a name with BOTH a binding
-// and a non-empty env value is ambiguous and BOTH expansions are returned —
-// fail-closed over-report. A binding can add candidates; it can never mask an
-// environment value.
+// a branch not taken still lands in the summary), so a name with BOTH a
+// binding and a non-empty env value is ambiguous and BOTH expansions are
+// returned — fail-closed over-report. A name assigned more than once (or
+// dynamically) likewise contributes ALL of its distinct literal values as
+// candidates (see [envBindings.valueCandidates]); a binding can add
+// candidates, it can never mask an environment value or an earlier binding.
+// The EMPTY expansion is a candidate of equal standing: whenever the variable
+// may be unset, empty or cleared at the reference (see
+// [envBindings.emptyExpansionPossible]), the token also resolves its path
+// suffix alone — "$D/etc/passwd" with a possibly-unset D (a decoy in-command
+// binding included) surfaces "/etc/passwd" exactly like the historical
+// unbound-variable fallback. A candidate whose expansion is bare and empty
+// names no path and is skipped.
 //
 // Note: an env var that resolves to an absolute path outside the session roots
 // (e.g. "$HOME", "$USERPROFILE") is reported by PathsOutsideRoots. This is
@@ -639,7 +1150,7 @@ func resolveTildeToken(token string) (string, bool) {
 // path — and the user-confirmation policy gates the command. The cost is a
 // false positive on benign commands like "echo $HOME"; the conservative
 // stance is preferable to silently allowing an out-of-root dereference.
-func resolveEnvToken(token string, shell ShellKind, bindings map[string]string) []string {
+func resolveEnvToken(token string, shell ShellKind, bindings *envBindings) []string {
 	var name, rest string
 	switch {
 	case strings.HasPrefix(token, "${env:"):
@@ -660,21 +1171,21 @@ func resolveEnvToken(token string, shell ShellKind, bindings map[string]string) 
 	// "$VAR"/"${VAR}" forms and posh tokens are the "$env:"/"${env:" forms, so
 	// no cross-dialect mismatch can reach here.
 	rest = normalizeSeparators(rest)
-	vals := envValueCandidates(name, bindings)
-	if len(vals) == 0 {
-		// An unset or empty variable concatenated with a literal suffix expands
-		// in the shell to just the suffix (e.g. "$UNSET/etc/passwd" →
-		// "/etc/passwd"). Resolve the suffix rather than dropping the token, so
-		// a prompt-injection command that hides an absolute path behind an empty
-		// env var still surfaces as an out-of-root reference. A bare empty var
-		// (no suffix) names no path and remains skipped.
-		if rest == "" {
-			return nil
-		}
-		return []string{cleanJoined(rest)}
-	}
+	vals := bindings.valueCandidates(name)
 	out := make([]string, 0, len(vals))
 	for _, val := range vals {
+		// The empty expansion concatenated with a literal suffix resolves in
+		// the shell to just the suffix (e.g. "$UNSET/etc/passwd" →
+		// "/etc/passwd"), so a prompt-injection command that hides an absolute
+		// path behind a possibly-unset env var still surfaces as an
+		// out-of-root reference. A bare empty expansion (no suffix) names no
+		// path and remains skipped.
+		if val == "" {
+			if rest != "" {
+				out = append(out, cleanJoined(rest))
+			}
+			continue
+		}
 		if rest != "" {
 			out = append(out, cleanJoined(val, rest))
 			continue
@@ -682,31 +1193,6 @@ func resolveEnvToken(token string, shell ShellKind, bindings map[string]string) 
 		out = append(out, cleanJoined(val))
 	}
 	return out
-}
-
-// envValueCandidates returns the possible runtime values of a variable
-// reference in deterministic order: the in-command literal binding (if any)
-// followed by the process-environment value (if non-empty), deduplicated. A
-// binding collected from the command may not be in effect where the reference
-// executes, so when both exist both are candidates.
-func envValueCandidates(name string, bindings map[string]string) []string {
-	var vals []string
-	add := func(v string) {
-		if v == "" {
-			return
-		}
-		for _, existing := range vals {
-			if existing == v {
-				return
-			}
-		}
-		vals = append(vals, v)
-	}
-	if bindings != nil {
-		add(bindings[name])
-	}
-	add(os.Getenv(name))
-	return vals
 }
 
 // splitBrace extracts the variable name inside "${...}" / "${env:...}" and the

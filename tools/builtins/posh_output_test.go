@@ -26,6 +26,21 @@ func TestDecodePowerShellOutput(t *testing.T) {
 			want:   "hello\n",
 		},
 		{
+			name:   "strictly alternating NUL ASCII still decodes as UTF-16LE",
+			output: []byte{'a', 0, 'b', 0, 'c', 0},
+			want:   "abc",
+		},
+		{
+			name:   "NUL-separated ASCII is not reinterpreted as UTF-16",
+			output: []byte("abc\x00def\x00"),
+			want:   "abc\x00def\x00",
+		},
+		{
+			name:   "NUL-separated ASCII filenames stay raw",
+			output: []byte("file1.txt\x00file2.txt\x00"),
+			want:   "file1.txt\x00file2.txt\x00",
+		},
+		{
 			name:   "utf16 little endian no BOM non ASCII",
 			output: []byte{0x1f, 0x04, 0x40, 0x04, 0x38, 0x04, 0x32, 0x04, 0x35, 0x04, 0x42, 0x04, 0x20, 0x00, 0x71, 0x67, 0xac, 0x4e, 0x20, 0x00, 0x3d, 0xd8, 0x00, 0xde, 0x0a, 0x00},
 			want:   "Привет 東京 😀\n",

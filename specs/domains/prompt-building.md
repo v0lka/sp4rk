@@ -74,11 +74,11 @@ When a system prompt contains a `CacheBreakMarker`, downstream consumers split i
 | `openai_flagship`, `openai_standard` | Temperature 0.3 (reasoning members are filtered by model capabilities) |
 | `google` | Temperature 1.0 (low values cause looping) |
 | `deepseek` | Temperature 0.0 (coding/math; ignored when thinking enabled) |
-| `qwen` | Temperature 0.6, TopP 0.95, TopK 20 |
+| `qwen` | Temperature 1.0, TopP 0.95, TopK 20 (Qwen3.8 thinking-mode default; instruct-mode guidance is 0.7 / 0.80 / 20 + presence_penalty 1.5) |
 | `glm` | Temperature 1.0, TopP 0.95, TopK 40 |
 | default | Temperature 0.5, TopP 0.95 |
 
-`DefaultSampling` is the vendor preset for executor/default calls. The root wiring converts its five generation knobs (`Temperature`, `TopP`, `TopK`, `RepetitionPenalty`, `PresencePenalty`) into `llm.SamplingDefaults`; `MaxTokens` remains a prompt-level advisory field rather than part of `llm.SamplingDefaults`. The LLM Router applies that preset only for `CallPurposeExecutor` and the backward-compatible zero purpose. Routing, compaction, and summarization calls bypass it and use `llm.DeterministicTemperature` with family-safe floors (Google 1.0, Qwen 0.6, otherwise 0.0).
+`DefaultSampling` is the vendor preset for executor/default calls. The root wiring converts its five generation knobs (`Temperature`, `TopP`, `TopK`, `RepetitionPenalty`, `PresencePenalty`) into `llm.SamplingDefaults`; `MaxTokens` remains a prompt-level advisory field rather than part of `llm.SamplingDefaults`. The LLM Router applies that preset only for `CallPurposeExecutor` and the backward-compatible zero purpose. Routing, compaction, and summarization calls bypass it and use `llm.DeterministicTemperature` with family-safe floors (Google 1.0, Kimi 1.0, Qwen 0.6, otherwise 0.0).
 
 ## Invariants
 

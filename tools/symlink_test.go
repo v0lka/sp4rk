@@ -222,9 +222,14 @@ func TestExtractBashPaths_VariableExpansionInPath(t *testing.T) {
 func TestExtractBashPaths_VariableBinding(t *testing.T) {
 	// In-command variable binding (Task 1 semantics): a $VAR assigned a *literal*
 	// value within the same command is expanded to that value, so the resulting
-	// path is extracted and the command is NOT marked suspicious — as long as no
-	// differing env value makes the reference ambiguous (union semantics, see
-	// TestExtractBashPaths_BindingWithDifferingEnvStaysSuspicious). Dynamic RHS
+	// path is still extracted as a candidate. The command is marked suspicious
+	// whenever the reference is statically ambiguous: a differing env value
+	// (union semantics, see TestExtractBashPaths_BindingWithDifferingEnvStaysSuspicious),
+	// or an EMPTY env value — the walk cannot prove the binding is live at the
+	// reference (it may sit in a branch not taken or after the reference), so
+	// the empty expansion stays possible and the word stays unexpandable. The
+	// non-suspicious case (env set and equal to the binding) is pinned by
+	// TestExtractBashPaths_BindingMatchingEnvNotSuspicious. Dynamic RHS
 	// ($(…)), bare command-substitution and unbound variables remain suspicious
 	// / unexpandable. Fixtures are OS-absolute (osAbsPath) so the table behaves
 	// identically on POSIX and Windows.
@@ -241,11 +246,11 @@ func TestExtractBashPaths_VariableBinding(t *testing.T) {
 		suspicious bool
 		want       []string
 	}{
-		{"simple assignment binds", `D=` + bind + `; cat "$D/a"`, false, []string{clean("tmp", "build"), clean("tmp", "build", "a")}},
-		{"export binds like assignment", `export D=` + bind + `; cat "$D/a"`, false, []string{clean("tmp", "build"), clean("tmp", "build", "a")}},
-		{"command-prefix assignment binds", `D=` + bind + ` mkdir "$D/x"`, false, []string{clean("tmp", "build"), clean("tmp", "build", "x")}},
+		{"simple assignment binds (empty env keeps empty expansion possible)", `D=` + bind + `; cat "$D/a"`, true, []string{clean("tmp", "build"), clean("tmp", "build", "a")}},
+		{"export binds like assignment (empty env keeps empty expansion possible)", `export D=` + bind + `; cat "$D/a"`, true, []string{clean("tmp", "build"), clean("tmp", "build", "a")}},
+		{"command-prefix assignment binds (arguments expand before the prefix takes effect)", `D=` + bind + ` mkdir "$D/x"`, true, []string{clean("tmp", "build"), clean("tmp", "build", "x")}},
 		{"dynamic RHS stays unbound", `D=$(echo x); cat "${D}` + dynSuffix + `"`, true, []string{clean("a")}},
-		{"last assignment wins", `D=` + other + `; D=` + last + `; echo "$D"`, false, []string{clean("etc"), clean("tmp")}},
+		{"re-bound var stays suspicious (final literal still a candidate)", `D=` + other + `; D=` + last + `; echo "$D"`, true, []string{clean("etc"), clean("tmp")}},
 		{"bare command substitution stays suspicious", `cat $(echo x)`, true, nil},
 	}
 	for _, tc := range cases {

@@ -15,7 +15,7 @@ func TestFamilyReasoningOptions(t *testing.T) {
 		{"openai_codex", []string{"minimal", "low", "medium", "high", "max"}, "max", true},
 		{"google", []string{"MINIMAL", "LOW", "MEDIUM", "HIGH"}, "HIGH", true},
 		{"deepseek", []string{"Off", "High", "Max"}, "Max", true},
-		{"qwen", []string{"On", "Off"}, "On", true},
+		{"qwen", []string{"xhigh", "medium", "low", "Off"}, "xhigh", true},
 		{"glm", []string{"On", "Off"}, "On", true},
 		// Unsupported families
 		{"mistral", nil, "", false},
@@ -74,6 +74,34 @@ func TestIsGLM52OrLater(t *testing.T) {
 	}
 }
 
+func TestIsQwen38OrLater(t *testing.T) {
+	tests := []struct {
+		model string
+		want  bool
+	}{
+		{"qwen3.8-27b", true},
+		{"Qwen3.8", true},   // case-insensitive
+		{"qwen4-72b", true}, // future major
+		{"qwen/qwen3.8-flash-next", true},
+		{"qwen3.9-plus", true},
+		{"qwen3-235b-a22b-instruct", false}, // version 3 without a minor
+		{"qwen3-coder-480b-a35b", false},
+		{"qwen2.5-72b-instruct", false},
+		{"qwq-32b", false},    // unversioned Qwen-family reasoning model
+		{"qvq-72b", false},    // unversioned non-reasoning variant
+		{"qwen-turbo", false}, // unversioned legacy commercial name
+		{"", false},
+		{"claude-sonnet-4", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.model, func(t *testing.T) {
+			if got := IsQwen38OrLater(tt.model); got != tt.want {
+				t.Errorf("IsQwen38OrLater(%q) = %v, want %v", tt.model, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestModelReasoningOptions(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -113,6 +141,62 @@ func TestModelReasoningOptions(t *testing.T) {
 			model:       "Zen/glm-5.2",
 			wantOptions: []string{"none", "max", "high"},
 			wantDefault: "max",
+			wantOK:      true,
+		},
+		{
+			name:        "glm 5.3 flash is always thinking",
+			family:      "glm",
+			model:       "zai-org/glm-5.3-flash",
+			wantOptions: []string{"max", "high"},
+			wantDefault: "max",
+			wantOK:      true,
+		},
+		{
+			name:        "glm 5.3 non-flash offers disable",
+			family:      "glm",
+			model:       "glm-5.3",
+			wantOptions: []string{"none", "max", "high"},
+			wantDefault: "max",
+			wantOK:      true,
+		},
+		{
+			name:        "qwen 3.8 native reasoning_effort",
+			family:      "qwen",
+			model:       "qwen3.8-27b",
+			wantOptions: []string{"xhigh", "medium", "low", "Off"},
+			wantDefault: "xhigh",
+			wantOK:      true,
+		},
+		{
+			name:        "qwen 3.8 composite id",
+			family:      "qwen",
+			model:       "qwen/qwen3.8-flash-next",
+			wantOptions: []string{"xhigh", "medium", "low", "Off"},
+			wantDefault: "xhigh",
+			wantOK:      true,
+		},
+		{
+			name:        "qwen 3 legacy on/off",
+			family:      "qwen",
+			model:       "qwen3-235b-a22b-instruct",
+			wantOptions: []string{"On", "Off"},
+			wantDefault: "On",
+			wantOK:      true,
+		},
+		{
+			name:        "qwen 2.5 legacy on/off",
+			family:      "qwen",
+			model:       "qwen2.5-72b-instruct",
+			wantOptions: []string{"On", "Off"},
+			wantDefault: "On",
+			wantOK:      true,
+		},
+		{
+			name:        "qwq unversioned legacy on/off",
+			family:      "qwen",
+			model:       "qwq-32b",
+			wantOptions: []string{"On", "Off"},
+			wantDefault: "On",
 			wantOK:      true,
 		},
 		// Non-GLM families delegate to FamilyReasoningOptions unchanged.

@@ -51,11 +51,18 @@ func DefaultSampling(family string) SamplingConfig {
 		// (unchanged in this update; ignored when thinking mode is enabled).
 		return SamplingConfig{Temperature: fp(0.0)}
 	case "qwen":
-		// Qwen3 general / thinking-mode default.
-		// Source: qwen.readthedocs.io quickstart — "We recommend
-		// temperature=0.6, top_p=0.95, top_k=20, and min_p=0".
+		// Qwen3.8 thinking-mode default. Supersedes the Qwen3-2507-era
+		// guidance (qwen.readthedocs.io quickstart: "We recommend
+		// temperature=0.6, top_p=0.95, top_k=20, and min_p=0").
+		// Source: HF Qwen/Qwen3.8-27B model card — thinking mode:
+		// temperature=1.0, top_p=0.95, top_k=20; instruct mode:
+		// temperature=0.7, top_p=0.80, top_k=20, presence_penalty=1.5
+		// (see also unsloth.ai/docs/models/qwen3.8). DefaultSampling keys on
+		// family only — there is no mode signal to branch on — so the preset
+		// carries the thinking values; top_p=0.95 and top_k=20 are shared by
+		// both generations.
 		return SamplingConfig{
-			Temperature: fp(0.6),
+			Temperature: fp(1.0),
 			TopP:        fp(0.95),
 			TopK:        ip(20),
 		}

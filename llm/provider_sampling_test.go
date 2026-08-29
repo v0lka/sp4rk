@@ -179,6 +179,36 @@ func TestOpenAIChatSampling_MergesWithReasoningExtras(t *testing.T) {
 	wantNum(t, payload, "top_k", 20)
 }
 
+// Same regression guard as above, for the native qwen reasoning_effort levels:
+// the effort extra must survive the top_k merge, and must never arrive
+// alongside enable_thinking:false (which would silently disable thinking
+// server-side). The request pins a Qwen 3.8+ model because reasoning_effort
+// is version-gated (see IsQwen38OrLater): pre-3.8 models map every effort to
+// the binary enable_thinking switch and never receive reasoning_effort.
+func TestOpenAIChatSampling_MergesWithReasoningEffortExtras(t *testing.T) {
+	body, srv := chatBodyRecorder(t)
+	p := openAIProvider(t, srv.URL)
+
+	req := fullSamplingRequest()
+	req.Model = "qwen3.8-coder"
+	req.ReasoningEffort = "medium"
+	if _, err := p.ChatCompletion(context.Background(), req); err != nil {
+		t.Fatalf("ChatCompletion: %v", err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(*body, &payload); err != nil {
+		t.Fatalf("unmarshal request body: %v", err)
+	}
+	if payload["reasoning_effort"] != "medium" {
+		t.Errorf("expected reasoning extra \"reasoning_effort\"=medium in payload, got keys of %v", payload)
+	}
+	if payload["enable_thinking"] == false {
+		t.Errorf("enable_thinking must not be false alongside reasoning_effort, got %v", payload["enable_thinking"])
+	}
+	wantNum(t, payload, "top_k", 20)
+}
+
 // --- OpenAI Responses API ---
 
 // The Responses API supports temperature and top_p only; penalties and top_k
@@ -479,6 +509,7 @@ func TestRouterApplyDefaultSampling_FamilySafeFloor(t *testing.T) {
 		{"openai", 0.0},
 		{"anthropic", 0.0},
 		{"google", 1.0}, // Gemini loops at low temperature
+		{"kimi", 1.0},   // Kimi Code endpoint rejects any temperature but 1
 		{"qwen", 0.6},   // Qwen3 thinking floor
 	}
 	for _, tc := range cases {

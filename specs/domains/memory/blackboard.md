@@ -129,7 +129,7 @@ type Checkpointer interface {
 - `AddAttachment` replaces an existing attachment with the same ID; no two stored attachments ever share an ID.
 - Attachment reads return defensive copies; `GetAttachments` returns `nil` when no attachments are stored.
 - `RemoveAttachment` zeroes the removed slot so a removed attachment's `MarkdownContent` is eligible for garbage collection.
-- `StepResult` writes defensively copy the `Steps` trajectory on both write and read (no aliasing with caller slices); writing a step ID that already has a result replaces the previous result — pause/resume and re-execution paths rely on the latest execution's result winning
+- `StepResult` writes defensively copy the `Steps` trajectory on both write and read (no aliasing with the caller's `Steps` slice — one level deep; nested slice fields inside a `Step` remain shared, so step contents must be treated as immutable); writing a step ID that already has a result replaces the previous result — pause/resume and re-execution paths rely on the latest execution's result winning
 - `CheckpointedBlackboard` persistence is best-effort and never blocks the agent on a slow backend.
 - `Shutdown()` is idempotent and always closes the persistence worker.
 
