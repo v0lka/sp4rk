@@ -4,10 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 
 	mcpclient "github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/mcp"
+	mcpserver "github.com/mark3labs/mcp-go/server"
 	sdktools "github.com/v0lka/sp4rk/tools"
 )
 
@@ -1082,6 +1086,159 @@ func TestGateway_Status_DisconnectedServer(t *testing.T) {
 	}
 	if status[0].Error != "connection refused" {
 		t.Errorf("expected error 'connection refused', got %q", status[0].Error)
+	}
+}
+
+func TestGateway_Status_IncludesFailedServers(t *testing.T) {
+	gateway := newGateway()
+
+	// One connected server plus one failed entry, as recorded by
+	// Start/Reconfigure when a connection or discovery fails.
+	server := newServer("alpha")
+	server.client = &mcpclient.Client{}
+	server.transportType = "stdio"
+	gateway.servers["alpha"] = server
+	gateway.failedServers["zulu"] = ServerStatus{
+		Name:      "zulu",
+		Transport: "stdio",
+		Connected: false,
+		Tools:     []string{},
+		Error:     "connection refused",
+	}
+
+	status := gateway.Status()
+	if len(status) != 2 {
+		t.Fatalf("expected 2 status items, got %d", len(status))
+	}
+	if status[0].Name != "alpha" || !status[0].Connected {
+		t.Errorf("expected connected 'alpha' first, got %+v", status[0])
+	}
+	if status[1].Name != "zulu" || status[1].Connected || status[1].Error != "connection refused" {
+		t.Errorf("expected disconnected 'zulu' with error, got %+v", status[1])
+	}
+}
+
+func TestGateway_Start_RecordsFailedServer(t *testing.T) {
+	gateway := newGateway()
+
+	err := gateway.Start(context.Background(), map[string]ServerConfig{
+		"broken": {Transport: "stdio", Command: "/nonexistent/mcp-server"},
+	})
+	if err == nil {
+		t.Fatal("expected error for nonexistent command")
+	}
+
+	status := gateway.Status()
+	if len(status) != 1 {
+		t.Fatalf("expected 1 status item, got %d", len(status))
+	}
+	s := status[0]
+	if s.Name != "broken" {
+		t.Errorf("expected name 'broken', got %q", s.Name)
+	}
+	if s.Connected {
+		t.Error("expected connected=false for failed server")
+	}
+	if s.Transport != "stdio" {
+		t.Errorf("expected transport 'stdio', got %q", s.Transport)
+	}
+	if s.Error == "" {
+		t.Error("expected non-empty error for failed server")
+	}
+}
+
+func TestGateway_Reconfigure_FailedServerReportedAndCleared(t *testing.T) {
+	gateway := newGateway()
+	registry := sdktools.NewToolRegistry()
+	expand := func(s string) string { return s }
+
+	// A Reconfigure with a nonexistent command must leave the server visible
+	// in Status() as disconnected with its error.
+	err := gateway.Reconfigure(context.Background(), GatewayConfig{
+		Servers: map[string]ServerEntry{
+			"broken": {Command: "/nonexistent/mcp-server"},
+		},
+	}, registry, expand)
+	if err == nil {
+		t.Fatal("expected error for nonexistent command")
+	}
+	status := gateway.Status()
+	if len(status) != 1 || status[0].Name != "broken" || status[0].Connected {
+		t.Fatalf("expected a single disconnected 'broken' entry, got %+v", status)
+	}
+
+	// Removing the server from the config must clear the failed entry.
+	err = gateway.Reconfigure(context.Background(), GatewayConfig{
+		Servers: map[string]ServerEntry{},
+	}, registry, expand)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := gateway.Status(); len(got) != 0 {
+		t.Errorf("expected no status entries after removal, got %+v", got)
+	}
+}
+
+// TestGateway_Reconfigure_FailedServerClearedOnRecovery verifies the success
+// path of the add/change loop: a server that failed to connect and later
+// succeeds must have its failure record cleared. A stale record would shadow
+// the live server in failedServers (invisible in Status(), which skips
+// entries whose name is in the connection map), so the test asserts on the
+// map directly.
+func TestGateway_Reconfigure_FailedServerClearedOnRecovery(t *testing.T) {
+	gateway := newGateway()
+	registry := sdktools.NewToolRegistry()
+	expand := func(s string) string { return s }
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Phase 1: the endpoint is down, so the failure is recorded.
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "server unavailable", http.StatusInternalServerError)
+	}))
+	defer dead.Close()
+
+	err := gateway.Reconfigure(ctx, GatewayConfig{
+		Servers: map[string]ServerEntry{
+			"flaky": {Transport: "http", URL: dead.URL},
+		},
+	}, registry, expand)
+	if err == nil {
+		t.Fatal("expected error while endpoint is down")
+	}
+	status := gateway.Status()
+	if len(status) != 1 || status[0].Name != "flaky" || status[0].Connected || status[0].Error == "" {
+		t.Fatalf("expected a single disconnected 'flaky' entry with an error, got %+v", status)
+	}
+
+	// Phase 2: the server comes back up. Reconfigure must connect it and
+	// clear the failure record from phase 1.
+	mcpServer := mcpserver.NewMCPServer("test-mcp-server", "1.0.0")
+	mcpServer.AddTool(mcp.NewTool("echo", mcp.WithDescription("echo tool")),
+		func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultText("ok"), nil
+		})
+	live := httptest.NewServer(mcpserver.NewStreamableHTTPServer(mcpServer))
+	defer live.Close()
+
+	err = gateway.Reconfigure(ctx, GatewayConfig{
+		Servers: map[string]ServerEntry{
+			"flaky": {Transport: "http", URL: live.URL},
+		},
+	}, registry, expand)
+	if err != nil {
+		t.Fatalf("unexpected error after recovery: %v", err)
+	}
+
+	if len(gateway.failedServers) != 0 {
+		t.Errorf("expected failedServers to be cleared after successful reconnect, got %+v", gateway.failedServers)
+	}
+	status = gateway.Status()
+	if len(status) != 1 || status[0].Name != "flaky" || !status[0].Connected || status[0].Error != "" {
+		t.Errorf("expected a single connected 'flaky' entry without error, got %+v", status)
+	}
+	if gateway.GetServer("flaky") == nil {
+		t.Error("expected 'flaky' to be a live server after recovery")
 	}
 }
 

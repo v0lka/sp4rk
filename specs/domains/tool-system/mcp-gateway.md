@@ -85,6 +85,8 @@ After connecting, each server is queried with `tools/list`. Returned tools becom
 
 `Status()` returns per-server `ServerStatus` (name, transport, connected, starting, tool count, tools, error), sorted by name for deterministic output. `starting` is a transient state distinct from `Connected`/`Error`, marking an entry still being initialized; it is non-omitempty (always serialized) so a frontend can treat it as a first-class state. `ServerNames()`, `ToolCount()`, and `GetServer(name)` provide further introspection.
 
+`Status()` also includes configured servers whose `Connect` or `DiscoverTools` failed: their last failure is kept in a separate `failedServers` map (`Connected: false`, last error set, transport defaulted) and merged into the result, so callers can render every configured server. Failed entries are cleared when the server connects successfully, is removed from the config, or the gateway stops. Failed servers never enter the live connection map (`servers`/`expandedConfigs`) — the clean-state invariant for reconnection diffing is unchanged — and `Reconfigure` always retries a configured server that is only in `failedServers`.
+
 ## Error Handling
 
 MCP failures are **non-fatal** — a single broken server never prevents the agent from running with the remaining tools.

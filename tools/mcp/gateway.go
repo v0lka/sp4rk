@@ -20,6 +20,14 @@ type Gateway struct {
 	// false positives when raw ${VAR} placeholders in the GatewayConfig
 	// entries were already substituted before connection.
 	expandedConfigs map[string]ServerConfig
+	// failedServers holds the last known failure for each CONFIGURED server
+	// that is not in servers (its Connect or DiscoverTools failed). Status()
+	// merges these entries so callers always see every configured server,
+	// disconnected ones included. An entry is cleared as soon as the server
+	// connects successfully or is removed from the configuration. Guarded by
+	// mu; deliberately separate from servers to preserve the clean-state
+	// invariant (a failed server never enters the connection map).
+	failedServers   map[string]ServerStatus
 	defaultWorkDir  string
 	schemaSanitizer SchemaSanitizer
 	logger          *slog.Logger
@@ -31,6 +39,7 @@ func newGateway() *Gateway {
 	return &Gateway{
 		servers:         make(map[string]*Server),
 		expandedConfigs: make(map[string]ServerConfig),
+		failedServers:   make(map[string]ServerStatus),
 	}
 }
 
@@ -74,6 +83,7 @@ func (g *Gateway) Start(ctx context.Context, configs map[string]ServerConfig) er
 
 		if err := server.Connect(ctx, cfg); err != nil {
 			errs = append(errs, fmt.Errorf("server %s: %w", name, err))
+			g.recordFailureLocked(name, cfg.Transport, err)
 			continue
 		}
 
@@ -82,11 +92,13 @@ func (g *Gateway) Start(ctx context.Context, configs map[string]ServerConfig) er
 				errs = append(errs, fmt.Errorf("server %s: close after discovery failure: %w", name, closeErr))
 			}
 			errs = append(errs, fmt.Errorf("server %s: failed to discover tools: %w", name, err))
+			g.recordFailureLocked(name, cfg.Transport, err)
 			continue
 		}
 
 		g.servers[name] = server
 		g.expandedConfigs[name] = cfg // store the expanded config used to connect
+		delete(g.failedServers, name)
 		g.log().Debug("MCP server started", "server", name, "tools", len(server.Tools()))
 	}
 
@@ -137,6 +149,7 @@ func (g *Gateway) Stop() error {
 
 	g.servers = make(map[string]*Server)
 	g.expandedConfigs = make(map[string]ServerConfig)
+	g.failedServers = make(map[string]ServerStatus)
 
 	if len(errs) > 0 {
 		return &StopError{Errors: errs}
@@ -184,6 +197,19 @@ func (g *Gateway) Reconfigure(ctx context.Context, newConfig GatewayConfig,
 		delete(g.servers, name)
 		delete(g.expandedConfigs, name)
 		g.log().Debug("MCP server removed", "server", name)
+	}
+
+	// Failed servers are not in g.servers, so the removal pass above never
+	// visits them. This pass is the sole owner of failedServers cleanup in
+	// Reconfigure: it drops every failure record whose name left the config
+	// so Status() stops reporting them. (A failed server that STAYS in the
+	// config is retried below: it is absent from currentNames, so the
+	// add/change loop always reconnects it.)
+	for name := range g.failedServers {
+		if newNames[name] {
+			continue
+		}
+		delete(g.failedServers, name)
 	}
 
 	// Apply the new default work directory before the add/change loop so that
@@ -238,6 +264,7 @@ func (g *Gateway) Reconfigure(ctx context.Context, newConfig GatewayConfig,
 		server.logger = g.logger
 		if err := server.Connect(ctx, newCfg); err != nil {
 			errs = append(errs, fmt.Errorf("server %s: connect: %w", name, err))
+			g.recordFailureLocked(name, newCfg.Transport, err)
 			continue
 		}
 
@@ -246,6 +273,7 @@ func (g *Gateway) Reconfigure(ctx context.Context, newConfig GatewayConfig,
 				errs = append(errs, fmt.Errorf("server %s: close after discovery failure: %w", name, closeErr))
 			}
 			errs = append(errs, fmt.Errorf("server %s: discover tools: %w", name, err))
+			g.recordFailureLocked(name, newCfg.Transport, err)
 			continue
 		}
 
@@ -253,6 +281,7 @@ func (g *Gateway) Reconfigure(ctx context.Context, newConfig GatewayConfig,
 		// Track the expanded config so the next Reconfigure compares against
 		// post-expansion values (W-7).
 		g.expandedConfigs[name] = newCfg
+		delete(g.failedServers, name)
 
 		// Register new tools
 		for _, toolInfo := range server.Tools() {
@@ -376,14 +405,27 @@ func (g *Gateway) ToolCount() int {
 }
 
 // Status returns the current status of all MCP server connections.
-// The result is sorted by server name for deterministic output.
+// Configured servers whose connection failed are included as disconnected
+// entries (Connected=false, Error set) so callers can render every configured
+// server. The result is sorted by server name for deterministic output.
 func (g *Gateway) Status() []ServerStatus {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
-	statuses := make([]ServerStatus, 0, len(g.servers))
+	statuses := make([]ServerStatus, 0, len(g.servers)+len(g.failedServers))
 	for _, server := range g.servers {
 		statuses = append(statuses, server.Status())
+	}
+
+	// Surface configured servers that failed to connect. They are kept out of
+	// g.servers (clean-state invariant), so their status lives in
+	// failedServers. Success clears the entry, so a name present in both maps
+	// would indicate drift; the lookup skip guards against that.
+	for name, failed := range g.failedServers {
+		if _, ok := g.servers[name]; ok {
+			continue
+		}
+		statuses = append(statuses, failed)
 	}
 
 	// Sort by name for deterministic output
@@ -392,6 +434,27 @@ func (g *Gateway) Status() []ServerStatus {
 	})
 
 	return statuses
+}
+
+// recordFailureLocked stores the last failure for a configured server that is
+// not in servers, so Status() can report it as disconnected. transport is
+// normalized with the same default Server.Connect applies ("" → "stdio").
+// Caller must hold g.mu.
+func (g *Gateway) recordFailureLocked(name, transport string, err error) {
+	if transport == "" {
+		transport = "stdio"
+	}
+	msg := ""
+	if err != nil {
+		msg = err.Error()
+	}
+	g.failedServers[name] = ServerStatus{
+		Name:      name,
+		Transport: transport,
+		Connected: false,
+		Tools:     []string{},
+		Error:     msg,
+	}
 }
 
 // StartError represents errors that occurred during gateway startup.
