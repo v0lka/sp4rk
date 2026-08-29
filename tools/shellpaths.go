@@ -25,6 +25,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 )
 
@@ -1102,9 +1103,52 @@ func absoluteWordExpansions(word string, bindings *envBindings) (cands []string,
 	}
 	out := make([]string, 0, len(products))
 	for _, p := range products {
-		out = append(out, cleanJoined(strings.ReplaceAll(p, quoteSep, "")))
+		assembled := strings.ReplaceAll(p, quoteSep, "")
+		out = append(out, cleanJoined(stripPosixRootOverDrive(assembled, runtime.GOOS)))
 	}
 	return out, true
+}
+
+// stripPosixRootOverDrive removes the POSIX root separator that an
+// absolute-shaped word's leading "/" contributes when the assembled expansion
+// is a Windows drive-letter path: "/$D/x" with a candidate D="C:/Users/u"
+// assembles to "/C:/Users/u/x", which is not a path a Windows host can
+// address — the runtime target is the drive path itself ("C:/Users/u/x"). On
+// POSIX hosts the "/" + absolute-value concatenation collapses through
+// [path.Clean]; no drive-aware analogue exists, so the redundant root
+// separator is stripped here. Reporting the over-rooted form would emit a
+// candidate that no native-spelling root-containment comparison can match.
+//
+// The drive interpretation requires a single drive letter whose colon is
+// followed by a separator ("C:/x", "C:\x"): a bare "/C:" or "/C:temp" is a
+// POSIX-rooted path under a drive-lookalike directory and stays untouched,
+// and so does an assembly whose drive-like run is not at the root
+// ("/xC:/y"). POSIX-rooted values ("//etc/passwd/x" from "/" + "/etc/passwd"
+// + "/x") never carry a colon at [1] and pass through unchanged.
+//
+// Non-Windows hosts keep the assembled form: there "/C:/..." is a genuine
+// absolute path under a root directory named "C:", while the stripped
+// "C:/..." would not be absolute at all and would be dropped by the caller —
+// a fail-open regression. goos is a parameter (the ...ForOS convention) so
+// the Windows branch is exercised on every host by
+// TestStripPosixRootOverDrive_ForOS.
+func stripPosixRootOverDrive(p, goos string) string {
+	if goos != "windows" || len(p) < 4 || p[0] != '/' || p[2] != ':' {
+		return p
+	}
+	if !isASCIILetter(p[1]) {
+		return p
+	}
+	if sep := p[3]; sep != '/' && sep != '\\' {
+		return p
+	}
+	return p[1:]
+}
+
+// isASCIILetter reports whether b is an ASCII letter: the drive run of a
+// Windows drive-letter path is a single letter, case-insensitively.
+func isASCIILetter(b byte) bool {
+	return 'a' <= b && b <= 'z' || 'A' <= b && b <= 'Z'
 }
 
 // wordHasAbsoluteCandidate reports whether any plain variable reference in

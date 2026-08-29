@@ -873,3 +873,40 @@ func TestResolveShellPathTokens_RebindingReportsAllValues(t *testing.T) {
 		}
 	}
 }
+
+func TestStripPosixRootOverDrive_ForOS(t *testing.T) {
+	// Exercises the Windows drive-path branch on every host: the resolver can
+	// only reach it on a Windows runner, so the OS-parameterized core is
+	// pinned directly (the isNullDeviceForOS convention). The leading "/" an
+	// absolute-shaped word contributes over a drive-letter candidate must
+	// yield the native drive path on Windows, while POSIX hosts — and every
+	// assembly that is not exactly root + drive letter + separator — keep the
+	// assembled form.
+	tests := []struct {
+		name string
+		p    string
+		goos string
+		want string
+	}{
+		{"windows drive path", "/C:/Users/u/etc/passwd/x", "windows", "C:/Users/u/etc/passwd/x"},
+		{"windows backslash value", `/C:\Users\u/x`, "windows", `C:\Users\u/x`},
+		{"lowercase drive", "/c:/tmp/x", "windows", "c:/tmp/x"},
+		{"posix absolute untouched", "/etc/passwd/x", "windows", "/etc/passwd/x"},
+		{"double root from posix-absolute value untouched", "//etc/passwd/x", "windows", "//etc/passwd/x"},
+		{"bare drive colon untouched", "/C:", "windows", "/C:"},
+		{"colon without trailing separator untouched", "/C:temp/x", "windows", "/C:temp/x"},
+		{"multi-letter name untouched", "/CD:/x", "windows", "/CD:/x"},
+		{"drive not at root untouched", "/xC:/y", "windows", "/xC:/y"},
+		{"linux keeps assembled drive form", "/C:/Users/u/x", "linux", "/C:/Users/u/x"},
+		{"darwin keeps backslash form", `/C:\Users\u/x`, "darwin", `/C:\Users\u/x`},
+		{"empty", "", "windows", ""},
+		{"too short", "/C", "windows", "/C"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := stripPosixRootOverDrive(tt.p, tt.goos); got != tt.want {
+				t.Errorf("stripPosixRootOverDrive(%q, %q) = %q, want %q", tt.p, tt.goos, got, tt.want)
+			}
+		})
+	}
+}
