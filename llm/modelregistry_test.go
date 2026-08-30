@@ -313,7 +313,10 @@ func TestModelRegistry_CaseInsensitiveSetCachedInvalidate(t *testing.T) {
 func TestModelRegistry_FuzzyMatch_BuiltInDottedToNoDot(t *testing.T) {
 	// Real-world scenario: a host serves "Qwen/Qwen36-35B-A3B-FP8" for the
 	// registry key "qwen/qwen3.6-35b-a3b-fp8" (dot dropped). Case is already
-	// handled; this exercises separator-insensitive matching.
+	// handled; this exercises separator-insensitive matching. The "-fp8"
+	// variant postfix is stripped on the fuzzy path, so the query lands on
+	// the base "qwen/qwen3.6-35b-a3b" entry — which declares the same
+	// metadata as its FP8 sibling.
 	registry := NewModelRegistry(nil)
 
 	meta, ok := registry.Resolve(context.Background(), "Qwen/Qwen36-35B-A3B-FP8")
@@ -343,7 +346,11 @@ func TestModelRegistry_FuzzyMatch_Table(t *testing.T) {
 		{"dotted key, no-dot query", "qwen/qwen36-35b-a3b-fp8", true, 262144},
 		{"underscores instead of dots/dashes", "qwen/qwen3_6_35b_a3b_fp8", true, 262144},
 		{"plain qwen3.6 built-in via dashes", "qwen/qwen36-35b-a3b", true, 262144},
-		{"slashes kept, dots/dashes removed", "qwen/qwen3635ba3bfp8", true, 262144},
+		{"slashes kept, dots/dashes removed", "qwen/qwen3635ba3b", true, 262144},
+		// Negative: a jammed fp8 spelling has no separator before the postfix,
+		// so variant stripping does not apply and the drifted form matches
+		// nothing (postfix stripping is separator-aware by design).
+		{"jammed fp8 without separator does not match", "qwen/qwen3635ba3bfp8", false, 0},
 		// Negative: the query has no "/", so its "qwen" org fragment is NOT
 		// stripped and becomes part of the bare name — it must NOT match a
 		// prefixed key whose org prefix WAS stripped.
@@ -369,8 +376,10 @@ func TestModelRegistry_FuzzyMatch_Table(t *testing.T) {
 
 func TestNormalizeModelID_StripsPostfixes(t *testing.T) {
 	// Delivery/quantization postfixes must be stripped from the end — including
-	// chains of them — while parameter counts ("-8b") and canonical
-	// quantizations like "fp8" must survive untouched.
+	// chains of them, the numeric-parameterized variant families ("-mtp",
+	// "-oq4e", "-fp8", "-q4", "-bf16"), and "@"-tagged qualifiers — while
+	// parameter counts ("-8b") and instruct markers ("-it") must survive
+	// untouched.
 	tests := []struct {
 		name string
 		in   string
@@ -390,9 +399,32 @@ func TestNormalizeModelID_StripsPostfixes(t *testing.T) {
 		{"longer chain", "qwen3-8-bit-gguf-mlx", "qwen3"},
 		{"mixed case postfix", "QWEN3-8BIT-GGUF", "qwen3"},
 		{"vendor prefix still stripped", "qwen/qwen3-8bit", "qwen3"},
+		{"mtp postfix", "qwen3-mtp", "qwen3"},
+		{"oq4e postfix", "qwen3-oq4e", "qwen3"},
+		{"oq8e postfix (different width)", "qwen3-oq8e", "qwen3"},
+		{"fp8 postfix", "qwen3-fp8", "qwen3"},
+		{"fp8 postfix in canonical-style key", "qwen3.6-35b-a3b-fp8", "qwen3635ba3b"},
+		{"fp16 postfix", "qwen3-fp16", "qwen3"},
+		{"fp8b postfix", "qwen3-fp8b", "qwen3"},
+		{"fp8bit postfix", "qwen3-fp8bit", "qwen3"},
+		{"q4 postfix", "qwen3-q4", "qwen3"},
+		{"q4b postfix", "qwen3-q4b", "qwen3"},
+		{"q4bit postfix", "qwen3-q4bit", "qwen3"},
+		{"bf16 postfix", "qwen3-bf16", "qwen3"},
+		{"bf16b postfix", "qwen3-bf16b", "qwen3"},
+		{"bf16bit postfix", "qwen3-bf16bit", "qwen3"},
+		{"oq4e-mtp chain", "qwen3.8-27b-oq4e-mtp", "qwen3827b"},
+		{"mixed case oq4e-mtp chain", "Qwen3.8-27B-oQ4e-mtp", "qwen3827b"},
+		{"underscore variant chain", "qwen3.8-27b_oq4e_mtp", "qwen3827b"},
+		{"underscore fp8 postfix", "qwen3_fp8", "qwen3"},
+		{"variant chain with literal postfix", "qwen3-oq4e-mtp-gguf", "qwen3"},
+		{"@ tag drops remainder", "qwen3@q4_k_m", "qwen3"},
+		{"@ tag after variant postfix", "qwen3-fp8@2.0", "qwen3"},
+		{"@ tag with vendor prefix", "qwen/qwen3@iq4", "qwen3"},
 		{"parameter count 8b not stripped", "qwen3-8b", "qwen38b"},
 		{"parameter count 4b not stripped", "qwen3-4b", "qwen34b"},
-		{"fp8 not stripped", "qwen3.6-35b-a3b-fp8", "qwen3635ba3bfp8"},
+		{"jammed fp8 without separator not stripped", "qwen3fp8", "qwen3fp8"},
+		{"fp8 with trailing garbage not stripped", "qwen3-fp8x", "qwen3fp8x"},
 		{"base suffix not stripped", "qwen3-base", "qwen3base"},
 		{"instruct 8b-it not stripped", "qwen3-8b-it", "qwen38bit"},
 		{"instruct 32b-it not stripped", "qwen3-32b-it", "qwen332bit"},
@@ -423,6 +455,22 @@ func TestModelRegistry_FuzzyMatch_IgnoresPostfixes(t *testing.T) {
 		"my-model-8-bit",
 		"my-model-8bit-gguf",
 		"my-model-gguf-8bit-mlx",
+		"my-model-mtp",
+		"my-model-oq4e",
+		"my-model-oq8e",
+		"my-model-fp8",
+		"my-model-fp8b",
+		"my-model-fp8bit",
+		"my-model-fp16",
+		"my-model-q4",
+		"my-model-q4b",
+		"my-model-q4bit",
+		"my-model-bf16",
+		"my-model-bf16bit",
+		"my-model-oq4e-mtp",
+		"my-model_oq4e_mtp",
+		"my-model_fp8",
+		"my-model@q4_k_m",
 	} {
 		meta, ok := registry.ResolveLocal(model)
 		if !ok {
@@ -438,6 +486,36 @@ func TestModelRegistry_FuzzyMatch_IgnoresPostfixes(t *testing.T) {
 	// NOT collapse onto the base model.
 	if _, ok := registry.ResolveLocal("my-model-8b"); ok {
 		t.Error("ResolveLocal(my-model-8b): expected ok=false (parameter count is not a postfix)")
+	}
+
+	// A variant token jammed onto the base with no separator is not a postfix
+	// either and must NOT collapse onto the base model.
+	if _, ok := registry.ResolveLocal("my-modelfp8"); ok {
+		t.Error("ResolveLocal(my-modelfp8): expected ok=false (no separator before the variant token)")
+	}
+}
+
+func TestModelRegistry_FuzzyMatch_ModificationPostfixes(t *testing.T) {
+	// The originally reported scenario: a locally served spelling that appends
+	// modification postfixes to a built-in base model must resolve to the base
+	// entry, not to fallback metadata. "Qwen3.8-27B-oQ4e-mtp" is the built-in
+	// "qwen/qwen3.8-27b" (256K context) carrying an ordinal-quantization
+	// ("oQ4e") and a multi-token-prediction ("mtp") postfix; fallback would
+	// report ContextWindow=128000 with Attachment-only capabilities.
+	registry := NewModelRegistry(nil)
+
+	meta, ok := registry.ResolveLocal("Qwen3.8-27B-oQ4e-mtp")
+	if !ok {
+		t.Fatal("ResolveLocal(Qwen3.8-27B-oQ4e-mtp): expected ok=true (fuzzy match on qwen/qwen3.8-27b)")
+	}
+	if meta.ContextWindow != 262144 {
+		t.Errorf("ContextWindow = %d, want 262144 (fallback would report 128000)", meta.ContextWindow)
+	}
+	if meta.OutputLimit != 65536 {
+		t.Errorf("OutputLimit = %d, want 65536", meta.OutputLimit)
+	}
+	if meta.Capabilities == nil || !meta.Capabilities.Attachment || !meta.Capabilities.ToolCall {
+		t.Errorf("expected built-in capabilities (Attachment, ToolCall), got %+v", meta.Capabilities)
 	}
 }
 
@@ -556,35 +634,45 @@ func TestModelRegistry_FuzzyMatch_DoesNotCollideVersions(t *testing.T) {
 
 func TestModelRegistry_FuzzyMatch_IgnoresVendorPrefix(t *testing.T) {
 	// The vendor/org prefix is a routing decoration, not a property of the
-	// model. A prefixed built-in key ("zai-org/glm-5.2-fp8", the HuggingFace
-	// checkpoint) and a bare query ("GLM-5.2-FP8", the Z.ai API name) must
-	// resolve to the same metadata. Both directions of the asymmetry are
-	// exercised: prefixed-key-exact/bare-query-fuzzy and bare-exact-does-not-
-	// exist/prefixed-key-fuzzy.
+	// model: a bare query ("Qwen3.8-27B") fuzzy-matches the prefixed built-in
+	// key ("qwen/qwen3.8-27b") because the prefix is discarded. Variant
+	// postfixes are likewise discarded on the fuzzy path: a bare
+	// "GLM-5.2-FP8" strips "-fp8" and lands on the base "glm-5.2" entry,
+	// while the exact prefixed key still reaches the FP8-specific entry via
+	// the exact tier.
 	registry := NewModelRegistry(nil)
 
 	// zai-org/glm-5.2-fp8 is an exact built-in key (the HuggingFace FP8
-	// checkpoint, 1 MiB context). GLM-5.2-FP8 is NOT a built-in key — only the
-	// fuzzy lookup, which now discards the vendor prefix, can match it.
+	// checkpoint, 1 MiB context) — the exact tier keeps it reachable
+	// verbatim even though the fuzzy index now collapses the fp8 spelling
+	// onto the base.
 	prefixed, okP := registry.Resolve(context.Background(), "zai-org/glm-5.2-fp8")
-	bare, okB := registry.Resolve(context.Background(), "GLM-5.2-FP8")
+	if !okP {
+		t.Fatal("expected ok=true for the exact prefixed FP8 key")
+	}
+	if prefixed.ContextWindow != 1048576 {
+		t.Errorf("exact prefixed FP8 ContextWindow = %d, want 1048576", prefixed.ContextWindow)
+	}
 
-	if !okP || !okB {
-		t.Fatalf("both should resolve; got okP=%v okB=%v", okP, okB)
+	// GLM-5.2-FP8 is NOT a built-in key. The fuzzy lookup discards the "-fp8"
+	// variant postfix, so the query resolves to the base "glm-5.2" built-in
+	// (1000000), not to the FP8 sibling (1048576).
+	bare, okB := registry.Resolve(context.Background(), "GLM-5.2-FP8")
+	if !okB {
+		t.Fatal("expected ok=true for the bare FP8-spelled query")
 	}
-	// 1048576 is unique to the zai-org/glm-5.2-fp8 entry; the bare "glm-5.2"
-	// built-in has a 1000000 context window, so this also guards against the
-	// bare query accidentally matching the shorter-context sibling.
-	const wantCtx = 1048576
-	if prefixed.ContextWindow != wantCtx {
-		t.Errorf("prefixed ContextWindow = %d, want %d", prefixed.ContextWindow, wantCtx)
+	if bare.ContextWindow != 1000000 {
+		t.Errorf("bare GLM-5.2-FP8 ContextWindow = %d, want 1000000 (fp8 postfix stripped, base glm-5.2 wins)", bare.ContextWindow)
 	}
-	if bare.ContextWindow != wantCtx {
-		t.Errorf("bare ContextWindow = %d, want %d", bare.ContextWindow, wantCtx)
+
+	// Vendor prefix discarded: "Qwen3.8-27B" is not a built-in key, only the
+	// fuzzy lookup can match it to "qwen/qwen3.8-27b".
+	vendorless, okV := registry.Resolve(context.Background(), "Qwen3.8-27B")
+	if !okV {
+		t.Fatal("expected ok=true for the bare vendorless query")
 	}
-	if prefixed.ContextWindow != bare.ContextWindow {
-		t.Errorf("prefixed (%d) and bare (%d) resolved to different metadata",
-			prefixed.ContextWindow, bare.ContextWindow)
+	if vendorless.ContextWindow != 262144 {
+		t.Errorf("bare Qwen3.8-27B ContextWindow = %d, want 262144 (vendor prefix discarded)", vendorless.ContextWindow)
 	}
 }
 

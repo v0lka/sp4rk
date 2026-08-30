@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -650,10 +651,11 @@ var modelIDSeparators = strings.NewReplacer(".", "", "-", "", "_", "")
 // separator spellings ("8-bit"/"8_bit") are expanded explicitly because the
 // separators are still present at strip time.
 //
-// Deliberately EXCLUDED are the fp*/int*/bf16 quantization tokens: "fp8" in
-// particular is part of canonical model names in the built-in catalog
-// ("glm-5.2-fp8" is a distinct model from "glm-5.2" with different metadata),
-// so stripping it would collapse distinct models onto one another.
+// Numeric-parameterized variant families ("mtp", "oq4e", "fp8", "q4", "bf16")
+// are NOT in this literal list — their bit-width digits vary, so they are
+// matched by modelIDVariantPostfixPattern (see below). int* tokens remain
+// deliberately excluded everywhere: they are not an established serving-name
+// postfix family.
 //
 // Order is not significant: stripModelIDPostfixes keeps the longest matching
 // suffix across the whole list, so a shorter postfix that is a suffix of a
@@ -697,13 +699,37 @@ func buildModelIDPostfixes() []string {
 	return postfixes
 }
 
+// modelIDVariantPostfixPattern matches the numeric-parameterized variant
+// families a host may append as a trailing "-"/"_"-separated token:
+//
+//	mtp          — multi-token-prediction head variant of the base weights
+//	oq<N>e       — ordinal quantization encodings ("oq4e", "oq8e")
+//	fp<N>[b|bit] — floating-point widths ("fp8", "fp16", "fp8b", "fp8bit")
+//	q<N>[b|bit]  — integer quantization widths ("q4", "q8", "q4b", "q4bit")
+//	bf<N>[b|bit] — bfloat widths ("bf16", "bf16b", "bf16bit")
+//
+// These families ARE stripped even though some also appear inside canonical
+// catalog keys ("zai-org/glm-5.2-fp8"): exact-tier lookups still reach those
+// entries verbatim, while the fuzzy index deliberately collapses a postfixed
+// spelling onto its base (see buildNormalizedIndex) — which is what lets a
+// host's "Qwen3.8-27B-oQ4e-mtp" resolve to the catalog's "qwen/qwen3.8-27b".
+//
+// The input token is already lowercased, so the pattern is lowercase-only.
+// Anchored: the WHOLE trailing token must be the variant, so "fp8x"/"q4k"
+// never match, and a parameter count ("8b", "27b") has no family prefix.
+var modelIDVariantPostfixPattern = regexp.MustCompile(`^(?:mtp|oq\d+e|(?:fp|q|bf)\d+(?:bit|b)?)$`)
+
 // stripModelIDPostfixes removes recognized model postfixes from the end of a
 // lowercased, still-separated identifier, repeatedly, so chains of postfixes
-// collapse to the base name ("qwen3-8bit-gguf" -> "qwen3-8bit" -> "qwen3").
-// Each token includes its leading separator, so a suffix that is a parameter
-// count plus an instruct marker ("qwen3-8b-it") is left intact. At each pass it
-// strips the longest matching suffix, which keeps a shorter postfix that is a
-// suffix of a longer one ("2bit" inside "32bit") from winning first. Returns
+// collapse to the base name ("qwen3-8bit-gguf" -> "qwen3-8bit" -> "qwen3",
+// "qwen3.8-27b-oq4e-mtp" -> "qwen3.8-27b-oq4e" -> "qwen3.8-27b"). Each literal
+// token includes its leading separator, so a suffix that is a parameter count
+// plus an instruct marker ("qwen3-8b-it") is left intact. At each pass it
+// strips the longest matching literal suffix, which keeps a shorter postfix
+// that is a suffix of a longer one ("2bit" inside "32bit") from winning
+// first; when no literal matches, the trailing "-"/"_"-delimited token is
+// tested against the variant pattern (modelIDVariantPostfixPattern).
+// Requiring the separator keeps jammed spellings ("qwen3fp8") intact. Returns
 // the input unchanged when no postfix matches.
 func stripModelIDPostfixes(id string) string {
 	for {
@@ -713,23 +739,30 @@ func stripModelIDPostfixes(id string) string {
 				match = p
 			}
 		}
-		if match == "" {
-			return id
+		if match != "" {
+			id = strings.TrimSuffix(id, match)
+			continue
 		}
-		id = strings.TrimSuffix(id, match)
+		if i := strings.LastIndexAny(id, "-_"); i >= 0 && modelIDVariantPostfixPattern.MatchString(id[i+1:]) {
+			id = id[:i]
+			continue
+		}
+		return id
 	}
 }
 
 // normalizeModelID normalizes a model identifier for the fuzzy lookup. It
 // strips the vendor/org prefix (everything up to and including the first "/"),
-// lowercases the result, strips recognized delivery/quantization postfixes
-// ("-gguf", "-mlx", "-8bit"/"-8-bit", and chains of them) from the end, then
-// removes separator punctuation (".", "-", "_").
+// lowercases the result, drops an opaque "@"-tagged qualifier together with
+// the whole remainder of the name, strips recognized delivery/quantization
+// postfixes ("-gguf", "-mlx", "-8bit"/"-8-bit", the variant families "-mtp"/
+// "-oq4e"/"-fp8"/"-q4"/"-bf16", and chains of them) from the end, then removes
+// separator punctuation (".", "-", "_").
 //
 // Postfixes are stripped BEFORE the separators are dropped so an instruct
 // suffix is never mistaken for a quantization: "qwen3-8b-it" ends in "-it" (not
-// a postfix) and survives intact, while "qwen3-8bit" and "qwen3-8-bit-gguf"
-// collapse to "qwen3".
+// a postfix) and survives intact, while "qwen3-8bit", "qwen3-8-bit-gguf", and
+// "qwen3.8-27b-oq4e-mtp" collapse to "qwen3" and "qwen3827b" respectively.
 //
 // The vendor prefix is a routing decoration, not a property of the model: the
 // HuggingFace checkpoint "zai-org/glm-5.2-fp8" and the Z.ai API model
@@ -737,14 +770,20 @@ func stripModelIDPostfixes(id string) string {
 // comparison lets a bare query match a prefixed registry key (and vice versa),
 // so vendor spelling never defeats the match. Postfixes are likewise a
 // delivery/quantization decoration: "qwen3-8bit" and "qwen3-8-bit-gguf" are the
-// same model as "qwen3".
+// same model as "qwen3". An "@" tag is an opaque variant/digest qualifier
+// ("qwen3@q4_k_m", "qwen3@sha256:..."): everything from "@" onward is a
+// delivery detail, never part of the model identity.
 //
 // Alphanumerics are otherwise never altered, so distinct model versions stay
 // distinct: "qwen3.6" and "qwen3.7" normalize to "qwen36" and "qwen37". This is
 // the foundation of the fuzzy lookup and is deliberately conservative — unlike
 // edit distance it can never silently remap one model version onto another.
 func normalizeModelID(id string) string {
-	return modelIDSeparators.Replace(stripModelIDPostfixes(strings.ToLower(BareModel(id))))
+	s := strings.ToLower(BareModel(id))
+	if i := strings.IndexByte(s, '@'); i >= 0 {
+		s = s[:i]
+	}
+	return modelIDSeparators.Replace(stripModelIDPostfixes(s))
 }
 
 // fuzzyLookup performs a vendor-prefix- and separator-insensitive search across
