@@ -2,6 +2,8 @@ package embedding
 
 import (
 	"fmt"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/sugarme/tokenizer"
 	"github.com/sugarme/tokenizer/pretrained"
@@ -33,11 +35,38 @@ func NewTokenizer(path string) (*Tokenizer, error) {
 // ready for ONNX inference. maxLen controls the maximum sequence length
 // (including [CLS] and [SEP] special tokens).
 // Returns an error when encoding fails, e.g. due to a corrupted tokenizer.
+//
+// Robustness: sugarme/tokenizer v0.3.0 panics on input that is not valid
+// UTF-8 — its NormalizedString alignment bookkeeping breaks on undecodable
+// byte sequences (slice-bounds and nil-pointer panics inside
+// AddedVocabulary.splitWithIndices). Such input occurs in practice when
+// indexing files in legacy single-byte encodings (Windows-1251, Latin-1)
+// or corrupted files that slip past NUL-based binary sniffing. Encode
+// replaces invalid sequences with U+FFFD up front (the same lossy
+// conversion the Rust HF tokenizers library applies at its input
+// boundary), and additionally converts any residual library panic into an
+// ordinary error so a tokenizer bug can never crash the host process.
 func (t *Tokenizer) Encode(text string, maxLen int) (inputIDs, attentionMask, tokenTypeIDs []int64, err error) {
 	// Guard against zero or too-small maxLen which would cause index-out-of-range.
 	if maxLen < 2 {
 		return nil, nil, nil, fmt.Errorf("maxLen must be >= 2, got %d", maxLen)
 	}
+
+	if !utf8.ValidString(text) {
+		text = strings.ToValidUTF8(text, "�")
+	}
+
+	// Second line of defense: turn any library panic into an error.
+	defer func() {
+		if r := recover(); r != nil {
+			inputIDs, attentionMask, tokenTypeIDs = nil, nil, nil
+			if rErr, ok := r.(error); ok {
+				err = fmt.Errorf("tokenizer encode panic: %w", rErr)
+			} else {
+				err = fmt.Errorf("tokenizer encode panic: %v", r)
+			}
+		}
+	}()
 
 	en, err := t.inner.EncodeSingle(text, true)
 	if err != nil {
