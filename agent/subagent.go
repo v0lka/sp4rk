@@ -65,8 +65,15 @@ func RunSubAgent(ctx context.Context, stepID string, executor *Executor, cm Cont
 			}
 		}
 
-		// Emit subagent complete
-		emitter.SubAgentComplete(stepID, success, duration)
+		// Emit subagent completion. A cooperative pause (PauseChecker tripped at
+		// a step boundary, surfaced as ErrPaused) is a recoverable checkpoint,
+		// not a failure — emit a distinct SubAgentPaused event instead of
+		// SubAgentComplete(success=false) so hosts can tell the two apart.
+		if isPaused(err) {
+			emitter.SubAgentPaused(stepID, duration)
+		} else {
+			emitter.SubAgentComplete(stepID, success, duration)
+		}
 
 		if err != nil {
 			var steps []Step
@@ -122,3 +129,10 @@ func RunSubAgentsParallel(ctx context.Context, agents []SubAgentTask) (results [
 
 	return results
 }
+
+// isPaused reports whether err is the cooperative pause sentinel (ErrPaused)
+// returned by Executor.Run when a PauseChecker trips at a step boundary. A
+// paused sub-agent is a recoverable checkpoint, not a failure: hosts receive
+// the SubAgentPaused event (instead of SubAgentComplete(success=false)) and
+// the preserved trajectory in SubAgentResult for a later resume.
+func isPaused(err error) bool { return errors.Is(err, ErrPaused) }

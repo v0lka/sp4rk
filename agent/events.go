@@ -9,9 +9,10 @@ import "time"
 // sub-agent goroutine invokes emitter methods concurrently. Implementations
 // MUST be safe for concurrent use (e.g. guard shared state with a mutex).
 //
-// BREAKING CHANGE (v0.x): Finishing(stepNum int, summary string) was added.
+// BREAKING CHANGE (v0.x): Finishing(stepNum int, summary string) was added,
+// as was SubAgentPaused(stepID string, duration time.Duration).
 // All implementations of Events (and orchestration.Events, which embeds it)
-// MUST implement this method or fail to compile. A no-op stub is provided by
+// MUST implement these methods or fail to compile. A no-op stub is provided by
 // NoopEvents for struct embedding convenience.
 type Events interface {
 	StepStart(stepNum int)
@@ -21,6 +22,12 @@ type Events interface {
 	StepComplete(stepNum int, duration time.Duration)
 	SubAgentLaunch(stepID, description string)
 	SubAgentComplete(stepID string, success bool, duration time.Duration)
+	// SubAgentPaused is emitted instead of SubAgentComplete when the sub-agent
+	// stopped via a cooperative pause checkpoint (executor.ErrPaused) rather
+	// than finishing or failing. A pause is a recoverable checkpoint, not a
+	// failure: the trajectory so far is preserved in the SubAgentResult and the
+	// host may resume it later.
+	SubAgentPaused(stepID string, duration time.Duration)
 	AssistantChunk(content string)
 	AssistantDone(content string, inputTokens, outputTokens int)
 	ContextFill(fillPercent float64, usedTokens, maxTokens int, status string, stepID string)
@@ -59,6 +66,9 @@ func (n *NoopEvents) SubAgentLaunch(_, _ string) {}
 
 // SubAgentComplete is a no-op.
 func (n *NoopEvents) SubAgentComplete(_ string, _ bool, _ time.Duration) {}
+
+// SubAgentPaused is a no-op.
+func (n *NoopEvents) SubAgentPaused(_ string, _ time.Duration) {}
 
 // AssistantChunk is a no-op.
 func (n *NoopEvents) AssistantChunk(_ string) {}

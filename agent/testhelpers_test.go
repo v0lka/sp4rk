@@ -230,6 +230,10 @@ func (r *recordingEvents) SubAgentComplete(stepID string, success bool, _ time.D
 	r.record(fmt.Sprintf("SubAgentComplete:%s:%v", stepID, success))
 }
 
+func (r *recordingEvents) SubAgentPaused(stepID string, _ time.Duration) {
+	r.record("SubAgentPaused:" + stepID)
+}
+
 func (r *recordingEvents) AssistantChunk(content string) {
 	r.record("AssistantChunk")
 }

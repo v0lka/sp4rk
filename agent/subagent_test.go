@@ -67,6 +67,44 @@ func TestRunSubAgent_WithEmitter(t *testing.T) {
 	}
 }
 
+func TestRunSubAgent_Paused(t *testing.T) {
+	// A cooperative pause (PauseChecker trips at the first step boundary) is a
+	// recoverable checkpoint, not a failure: the emitter must observe the
+	// distinct SubAgentPaused event instead of SubAgentComplete(success=false),
+	// while the result channel still carries ErrPaused so the host can resume.
+	mockLLM := &mockLLMCaller{
+		responses: []*llm.ChatResponse{
+			llmResponseFinish("done", "should not reach"),
+		},
+	}
+	cm := newMockContextManager()
+	events := &recordingEvents{}
+	exec := newExecutorDefaultHITL(mockLLM, newMockToolExecutor(), &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+	exec.SetPauseChecker(func(context.Context) bool { return true })
+
+	ch := RunSubAgent(context.Background(), "step_1", exec, cm, nil, "pausable task", events, nil)
+	result := <-ch
+
+	if !errors.Is(result.Error, ErrPaused) {
+		t.Fatalf("expected ErrPaused, got %v", result.Error)
+	}
+	var foundPaused, foundComplete bool
+	for _, e := range events.events {
+		switch e {
+		case "SubAgentPaused:step_1":
+			foundPaused = true
+		case "SubAgentComplete:step_1:false":
+			foundComplete = true
+		}
+	}
+	if !foundPaused {
+		t.Error("expected SubAgentPaused event for step_1")
+	}
+	if foundComplete {
+		t.Error("SubAgentComplete must NOT be emitted for a paused sub-agent")
+	}
+}
+
 func TestRunSubAgent_LLMError(t *testing.T) {
 	mockLLM := &mockLLMCaller{
 		errors: []error{errors.New("llm failed")},

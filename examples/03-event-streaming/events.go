@@ -100,6 +100,10 @@ func (e *PrintingEvents) SubAgentComplete(stepID string, success bool, duration 
 	fmt.Printf("│ 📥 SubAgent %s %s (%v)\n", stepID, status, duration)
 }
 
+func (e *PrintingEvents) SubAgentPaused(stepID string, duration time.Duration) {
+	fmt.Printf("│ ⏸️  SubAgent paused at checkpoint: %s (%v)\n", stepID, duration)
+}
+
 // truncate shortens a string to maxLen bytes, flattening newlines.
 // The cut is UTF-8-safe (delegates to strutil.TruncateUTF8, which
 // appends "…" when truncated).
