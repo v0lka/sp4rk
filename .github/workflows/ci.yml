@@ -26,6 +26,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config ripgrep
 
+      # govulncheck is OS/arch-independent: scan on the linux leg only.
+      - name: Install govulncheck
+        # Version pinned so the gate is reproducible; upgrade deliberately.
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+
+      - name: Vulnerability scan (Go)
+        run: govulncheck ./...
+
       - name: Install golangci-lint
         run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
 
