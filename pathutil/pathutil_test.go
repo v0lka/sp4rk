@@ -395,6 +395,38 @@ func TestDetectCaseInsensitive_NoExistingAncestorFailsClosed(t *testing.T) {
 	_ = DetectCaseInsensitive("/nonexistent-root-probe/a/b/c")
 }
 
+// TestDetectCaseInsensitive_MemoizedPerDir verifies the process-lifetime
+// memoization: a second call for the same directory must reuse the cached
+// result instead of re-probing the filesystem (each probe creates and deletes
+// a temporary CaseSense-*.probe file, so hosts that call this per request
+// would otherwise churn the directory). The cache is white-box seeded with the
+// OPPOSITE of the freshly probed value — if the function consulted the
+// filesystem again it would return the real value and fail the assertion.
+// A second, distinct directory proves one directory's entry does not leak
+// into another's answer.
+func TestDetectCaseInsensitive_MemoizedPerDir(t *testing.T) {
+	dir := t.TempDir()
+	probed := DetectCaseInsensitive(dir) // first call probes for real
+
+	key, ok := existingAncestorDir(filepath.Clean(dir))
+	if !ok {
+		t.Fatalf("existingAncestorDir(%q) found no existing ancestor", dir)
+	}
+	seeded := !probed
+	caseInsensitiveMu.Lock()
+	caseInsensitiveKnown[key] = seeded
+	caseInsensitiveMu.Unlock()
+
+	if got := DetectCaseInsensitive(dir); got != seeded {
+		t.Errorf("DetectCaseInsensitive(%q) = %v after seeding cache with %v; the second call re-probed instead of reusing the memoized result", dir, got, seeded)
+	}
+
+	other := t.TempDir()
+	if got := DetectCaseInsensitive(other); got != probed {
+		t.Errorf("DetectCaseInsensitive(%q) = %v, want independently probed %v (per-directory cache isolation)", other, got, probed)
+	}
+}
+
 func TestSplitPathComponents_Root(t *testing.T) {
 	result := SplitPathComponents(string(filepath.Separator))
 	if len(result) != 0 {

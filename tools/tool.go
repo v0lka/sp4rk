@@ -160,10 +160,12 @@ type workspacePathKey struct{}
 //
 // The probe climbs to the nearest existing ancestor when the workspace does
 // not exist yet, and fails safe to case-sensitive when detection is impossible.
+// Its result is memoized per directory for the process lifetime, so repeated
+// calls never re-create the temporary probe file — but hosts that attach a
+// workspace on every request should still prefer resolving the flag once and
+// using [WithWorkspacePathNoProbe] plus [WithCaseInsensitivePaths].
 // Hosts may override the auto-detected value with [WithCaseInsensitivePaths]
-// after this call (last-writer-wins). To attach a workspace without the probe
-// (e.g. when the caller has already determined case-sensitivity), use
-// [WithWorkspacePathNoProbe].
+// after this call (last-writer-wins).
 func WithWorkspacePath(ctx context.Context, path string) context.Context {
 	ctx = context.WithValue(ctx, workspacePathKey{}, path)
 	if path != "" {

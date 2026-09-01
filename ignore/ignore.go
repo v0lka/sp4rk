@@ -55,10 +55,13 @@ type pattern struct {
 // anchored relative to the root.
 //
 // caseInsensitive records whether the root's filesystem folds letter case
-// (macOS APFS / Windows NTFS). It is probed once at construction via
-// [pathutil.DetectCaseInsensitive] and selects the containment variant used by
-// RootFor / RootFor in Multi, so containment matches the filesystem's actual
-// case-sensitivity rather than a hardcoded assumption.
+// (macOS APFS / Windows NTFS). It is obtained via
+// [pathutil.DetectCaseInsensitive], which memoizes its result per directory
+// for the process lifetime, so constructing Resolvers repeatedly (e.g. one
+// per listing request) never re-creates the temporary probe file. It selects
+// the containment variant used by RootFor / RootFor in Multi, so containment
+// matches the filesystem's actual case-sensitivity rather than a hardcoded
+// assumption.
 type Resolver struct {
 	root            string
 	patterns        []pattern

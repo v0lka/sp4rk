@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 // IsWithinPath returns true if child is equal to or a descendant of parent.
@@ -139,6 +140,15 @@ func SplitPathComponents(absPath string) []string {
 // behaviour of macOS APFS and Windows NTFS (case-insensitive) versus Linux
 // ext4/tmpfs/btrfs (case-sensitive).
 //
+// Results are memoized per probed directory for the lifetime of the process:
+// case-sensitivity is a property of the filesystem mount and cannot change
+// while the process runs, so the probe file is created and deleted at most
+// ONCE per directory no matter how often the function is called. This keeps
+// incidental re-invocations (e.g. hosts that rebuild ignore resolvers or
+// workspace contexts per request) from churning probe files in the workspace
+// root. A failed probe (unwritable directory → false, the fail-safe default)
+// is cached too, so a permanently read-only root is not re-probed forever.
+//
 // When dir does not exist (e.g. a brand-new session workspace) or is not
 // writable, the probe climbs to the nearest existing ancestor directory:
 // case-sensitivity is a filesystem property shared by the whole mount, so an
@@ -148,15 +158,34 @@ func SplitPathComponents(absPath string) []string {
 // turn a non-local path into a "local" one (an authorization-bypass risk for
 // path-locality checks such as [IsWithinPathFold]).
 //
-// Detect once per session root (at session-root resolution time) and pass the
-// result down to containment checks rather than calling per query.
+// Hosts that already resolve the flag once at session-root resolution time
+// and pass it down explicitly (via [tools.WithCaseInsensitivePaths]) keep
+// working unchanged; the memoization is transparent to them.
 func DetectCaseInsensitive(dir string) bool {
 	probeDir, ok := existingAncestorDir(filepath.Clean(dir))
 	if !ok {
 		return false
 	}
-	return probeCaseInsensitive(probeDir)
+	caseInsensitiveMu.Lock()
+	defer caseInsensitiveMu.Unlock()
+	if ci, known := caseInsensitiveKnown[probeDir]; known {
+		return ci
+	}
+	ci := probeCaseInsensitive(probeDir)
+	caseInsensitiveKnown[probeDir] = ci
+	return ci
 }
+
+// caseInsensitiveKnown memoizes probeCaseInsensitive results, keyed by the
+// existing-ancestor directory the probe ran in. caseInsensitiveMu guards both
+// the map and the probe itself, so concurrent first-time callers of the same
+// directory perform exactly one probe between them (losers block briefly on
+// the mutex and then read the stored result) rather than racing to create
+// duplicate probe files.
+var (
+	caseInsensitiveMu    sync.Mutex
+	caseInsensitiveKnown = make(map[string]bool)
+)
 
 // existingAncestorDir returns the deepest existing directory at or above dir,
 // climbing toward the filesystem root. It returns ("", false) when no existing
