@@ -1,6 +1,6 @@
 module github.com/v0lka/sp4rk
 
-go 1.26.3
+go 1.27.0
 
 require (
 	codeberg.org/readeck/go-readability/v2 v2.1.2

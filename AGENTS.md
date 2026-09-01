@@ -15,7 +15,7 @@ Formal design specifications live in [`specs/`](specs/) (architecture, domains, 
 
 ## Project shape
 
-- Single Go module: `github.com/v0lka/sp4rk` (this directory). Go `1.26.3` (see `go.mod`).
+- Single Go module: `github.com/v0lka/sp4rk` (this directory). Go `1.27.0` (see `go.mod`). The `go` directive in `go.mod` and the `go-version` pins in `.github/workflows/ci.yml` must stay in lockstep: CI builds with exactly this toolchain, and `govulncheck` scans its stdlib — bump both together whenever Go ships a security patch, or local and CI results drift apart.
 - The root `sp4rk` package is the public entry point. There is no internal/host-application layer here — every package is a reusable engine primitive.
 - **This is an SDK, not an application.** Every exported method, struct, interface, constant, and function is part of the public API consumed by downstream host applications — *even when it is only referenced from tests within this repo*. An exported symbol with no non-test call site inside sp4rk is **not** dead code: tests here stand in for real consumers, and the absence of a production call site is expected and normal. When reviewing, do **not** flag "exported X is only used in tests" as unreachable/dead code, and do not suggest un-exporting or removing such symbols on that basis alone. (Genuinely unused symbols are still caught by `go vet` / `unused`, which exclude test references appropriately.)
 
@@ -58,6 +58,7 @@ The root `Makefile` provides `build`, `test`, and `lint` targets; otherwise run 
 - `go test ./agent -run TestExecutor -v` — single test. Tests are in-package (`package agent`, not `agent_test`); many packages ship a `testhelpers_test.go`.
 - `go vet ./…` — vet.
 - `golangci-lint run` (or `make lint`) — lint. The config is `.golangci.yml` (v2 schema).
+- `make vulncheck` — Go dependency vulnerability gate (`govulncheck`, version pinned in the Makefile). Fails when a vulnerability from the official Go vulnerability database is reachable from this module's code. The CI linux job runs the exact same command. **Mandatory before every PR** — a stale Go toolchain (go.mod below the latest security patch) fails this gate even when lint and test are clean. On Windows (no make): `go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...`
 - `go run ./examples/01-minimal-agent` — **wrong**: `examples/` is a *separate* Go module (`sp4rk-examples`) that imports sp4rk as an external dependency. Run examples from inside it instead:
   - `cd examples && go run ./01-minimal-agent`
   - The eleven examples progress from a minimal agent through focused subsystem deep-dives to a full-stack system; see [`examples/README.md`](examples/README.md).
@@ -90,4 +91,4 @@ The root `Makefile` provides `build`, `test`, and `lint` targets; otherwise run 
 
 ## Pre-PR checklist
 
-`go vet ./… && golangci-lint run && go test ./…`. All three must be clean.
+`go vet ./… && golangci-lint run && go test ./… && make vulncheck`. All four must be clean. If `make vulncheck` passes locally but fails in CI (or vice versa), the Go toolchain pins in `go.mod` and `.github/workflows/ci.yml` have drifted and must be realigned first.
