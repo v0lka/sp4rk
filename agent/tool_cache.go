@@ -22,6 +22,13 @@ const (
 	fullHashLen = sha256.Size * 2
 )
 
+// maxCacheInputBytes caps the original tool-call input retained on a cache
+// entry for display (ToolResultCacheEntry.Input). Inputs above the cap are not
+// retained: card-title extraction only needs small scalar fields (path / url /
+// command / pattern), while e.g. a write_file payload would duplicate
+// multi-kilobyte content per entry.
+const maxCacheInputBytes = 4 * 1024
+
 // ToolResultCache caches raw tool outputs keyed by a git-style SHORT hash.
 //
 // Each entry's key is the shortest prefix (starting at minAbbrevLen hex chars)
@@ -59,6 +66,14 @@ type ToolResultCacheEntry struct {
 	ToolName  string    // e.g. "read_file", "ripgrep"
 	CreatedAt time.Time // when the entry was cached
 
+	// Input is the ORIGINAL tool-call input JSON (size-capped by
+	// maxCacheInputBytes; empty when the input exceeded the cap). It is
+	// display-only metadata: when a later tool_result_read resolves this entry,
+	// the executor rewrites the emitted tool_call to the original tool's name
+	// and these merged args so the chat UI can render the real file path /
+	// URL / command in the card title instead of the bare tool name.
+	Input string
+
 	// File-tool coherence metadata (zero-value if not a file tool).
 	FilePath  string // absolute path to the file (only for file-based tools)
 	FileMtime int64  // mod time at cache time (nanoseconds since epoch)
@@ -80,6 +95,11 @@ type ToolCacheMeta struct {
 	FileMtime int64
 	FileSize  int64
 	IsMCP     bool
+
+	// Input is the original tool-call input JSON, retained (up to
+	// maxCacheInputBytes) so a later tool_result_read of this entry can be
+	// displayed with the original call's arguments. Store enforces the cap.
+	Input string
 
 	// FileBacked indicates that the tool's backing store is the file on disk.
 	// When true, Store does not retain Content in memory; the cache entry
@@ -147,10 +167,21 @@ func (c *ToolResultCache) Store(toolName, content string, meta ToolCacheMeta) st
 
 	short := c.abbreviateLocked(full)
 
+	// Retain the original tool input for display purposes only (see
+	// ToolResultCacheEntry.Input). Oversized inputs (e.g. a write_file payload)
+	// are dropped rather than cached: the chat title extraction only needs the
+	// small scalar fields (path / url / command / pattern), and duplicating
+	// multi-kilobyte payloads per entry would defeat the cache's memory budget.
+	input := meta.Input
+	if len(input) > maxCacheInputBytes {
+		input = ""
+	}
+
 	entry := &ToolResultCacheEntry{
 		Hash:       full,
 		ToolName:   toolName,
 		CreatedAt:  time.Now(),
+		Input:      input,
 		FilePath:   meta.FilePath,
 		FileMtime:  meta.FileMtime,
 		FileSize:   meta.FileSize,

@@ -841,19 +841,14 @@ func (e *Executor) processSingleToolCall(
 	}
 
 	// Emit tool call (AFTER batch/finish checks — meta-tools handle their own events).
-	toolDisplayName := action.Name
-	// For tool_result_read: display as "original_tool (cached)" in chat UI
-	if action.Name == "tool_result_read" && e.toolCache != nil {
-		var trParams struct {
-			Hash string `json:"hash"`
-		}
-		if json.Unmarshal(action.Input, &trParams) == nil && trParams.Hash != "" {
-			if entry, ok := e.toolCache.Get(trParams.Hash); ok {
-				toolDisplayName = entry.ToolName + " (cached)"
-			}
-		}
+	// For tool_result_read: display as "original_tool (cached)" in chat UI, and
+	// carry the original call's args (fragment window overlaid) so the card
+	// title shows the real file path / URL instead of the bare tool name.
+	toolDisplayName, toolDisplayInput := action.Name, string(action.Input)
+	if base, in, ok := e.resolveToolResultReadDisplay(action.Name, action.Input); ok {
+		toolDisplayName, toolDisplayInput = base+" (cached)", in
 	}
-	e.emitter.ToolCall(state.stepNum, callIdx, toolDisplayName, string(action.Input), e.tools.GetToolSource(action.Name))
+	e.emitter.ToolCall(state.stepNum, callIdx, toolDisplayName, toolDisplayInput, e.tools.GetToolSource(action.Name))
 
 	// --- Circuit breaker: detect repeated identical tool calls ---
 	// Placed AFTER batch/finish checks so meta-tools aren't subject to
@@ -1118,9 +1113,15 @@ func (e *Executor) processBatchTool(
 			continue
 		}
 
-		// Emit tool call with "(batched)" suffix.
-		batchedName := sub.Tool + " (batched)"
-		e.emitter.ToolCall(state.stepNum, effectiveIdx, batchedName, string(sub.Input), e.tools.GetToolSource(sub.Tool))
+		// Emit tool call with "(batched)" suffix. A tool_result_read sub-call is
+		// resolved against the cache the same way standalone calls are, so the
+		// card reads "original_tool (batched)" with the original args rather
+		// than "tool_result_read (batched)" with hash-only args.
+		batchedName, batchedInput := sub.Tool+" (batched)", string(sub.Input)
+		if base, in, ok := e.resolveToolResultReadDisplay(sub.Tool, sub.Input); ok {
+			batchedName, batchedInput = base+" (batched)", in
+		}
+		e.emitter.ToolCall(state.stepNum, effectiveIdx, batchedName, batchedInput, e.tools.GetToolSource(sub.Tool))
 
 		// Circuit breaker: repeat identical tool call.
 		if loopAct, execResult, err := e.checkRepeatIdenticalTool(ctx, subCall, effectiveIdx, thought, resp, state, cw); loopAct != actionNone || execResult != nil {

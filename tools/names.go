@@ -14,6 +14,10 @@ const (
 	ToolBashExec  = "bash_exec"
 	ToolPoshExec  = "posh_exec"
 	ToolBatch     = "batch"
+	// ToolResultRead reads fragments of cached tool results by hash. The
+	// executor rewrites its display name to "<original_tool> (cached)" when the
+	// hash resolves, so the chat UI renders the original tool's card.
+	ToolResultRead = "tool_result_read"
 )
 
 // shellExecTools are the built-in tools that execute a shell command string

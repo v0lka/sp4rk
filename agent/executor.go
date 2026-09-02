@@ -847,6 +847,86 @@ func formatFileBackedNudge(hash string) string {
 	)
 }
 
+// resolveToolResultReadDisplay resolves a tool_result_read call against the
+// tool result cache for DISPLAY purposes: the emitted tool_call event should
+// carry the ORIGINAL tool's base name (callers append " (cached)" or
+// " (batched)") and the original call's args — with the requested fragment
+// window overlaid by mergeFragmentWindow — so the chat UI can render the real
+// file path / URL / command in the card title instead of the bare tool name.
+//
+// resolved is false for every other tool and for hashes that do not resolve
+// (unknown, evicted); in that case name/input are returned unchanged and the
+// caller emits the call as-is.
+func (e *Executor) resolveToolResultReadDisplay(name string, input json.RawMessage) (baseName, displayInput string, resolved bool) {
+	if name != tools.ToolResultRead || e.toolCache == nil {
+		return name, string(input), false
+	}
+	var trParams struct {
+		Hash string `json:"hash"`
+	}
+	if json.Unmarshal(input, &trParams) != nil || trParams.Hash == "" {
+		return name, string(input), false
+	}
+	entry, ok := e.toolCache.Get(trParams.Hash)
+	if !ok {
+		return name, string(input), false
+	}
+	displayInput = string(input)
+	if entry.Input != "" {
+		displayInput = mergeFragmentWindow(entry.Input, displayInput)
+	}
+	return entry.ToolName, displayInput, true
+}
+
+// mergeFragmentWindow overlays the tool_result_read fragment window params
+// (hash / start_line / num_lines / line) from frag onto the original tool's
+// args so a cached card describes the fragment it actually returns: the card
+// title, the file link's target line, and the body's line badge all reflect
+// the requested window rather than the original call's. The original args'
+// end_line is dropped only when frag supplies a real window (start_line,
+// num_lines, or line), because end_line describes the ORIGINAL window, not
+// this fragment; a hash-only call keeps the original end_line so the cached
+// card still points at the original target line. When frag requests a single
+// line (the `line` escape hatch), the stale start_line and num_lines are
+// dropped too. Returns orig unchanged when either side is not a JSON object
+// (the caller then displays the fragment args as-is).
+func mergeFragmentWindow(orig, frag string) string {
+	var base, f map[string]any
+	if err := json.Unmarshal([]byte(orig), &base); err != nil || base == nil {
+		return orig
+	}
+	if err := json.Unmarshal([]byte(frag), &f); err != nil || f == nil {
+		return orig
+	}
+	if _, singleLine := f["line"]; singleLine {
+		// `line` takes precedence over both start_line and num_lines (see
+		// toolResultReadInput / tool_result_read schema): a single-line read
+		// makes a stale original start_line AND num_lines misleading.
+		delete(base, "start_line")
+		delete(base, "num_lines")
+	}
+	hasWindow := false
+	for _, k := range []string{"start_line", "num_lines", "line"} {
+		if _, ok := f[k]; ok {
+			hasWindow = true
+			break
+		}
+	}
+	for _, k := range []string{"hash", "start_line", "num_lines", "line"} {
+		if v, ok := f[k]; ok {
+			base[k] = v
+		}
+	}
+	if hasWindow {
+		delete(base, "end_line")
+	}
+	merged, err := json.Marshal(base)
+	if err != nil {
+		return orig
+	}
+	return string(merged)
+}
+
 // buildCacheMeta extracts file metadata from tool input for file-based tools.
 // Returns ToolCacheMeta with FilePath/FileMtime/FileSize set for file tools,
 // and IsMCP set for MCP-sourced tools. For read_file, FileBacked is set to
@@ -857,6 +937,13 @@ func formatFileBackedNudge(hash string) string {
 // coherence metadata is still attached.
 func (e *Executor) buildCacheMeta(ctx context.Context, toolName string, input json.RawMessage) ToolCacheMeta {
 	var meta ToolCacheMeta
+
+	// Retain the original input (Store caps its size) so a later
+	// tool_result_read of this entry can be displayed with the original call's
+	// arguments — the chat UI then shows the real path / URL / command instead
+	// of the bare tool name. Set before the MCP early-return: MCP entries
+	// benefit from it just the same.
+	meta.Input = string(input)
 
 	// Detect MCP tools via source.
 	if source := e.tools.GetToolSource(toolName); source != "" && source != "core" {
