@@ -107,6 +107,12 @@ func (e *Executor) handleStepLimitBoundary(ctx context.Context, state *runState,
 	return actionNone
 }
 
+// contextServerLimitWarnFraction is the fraction of the model's advertised
+// context window at which the executor warns that the real request size is
+// approaching the server's KV-cache limit. Fires before the engine rejects the
+// request with a context-exceeded error, giving the host a chance to compact.
+const contextServerLimitWarnFraction = 0.9
+
 // callLLMWithReactiveCompaction calls the LLM and handles reactive compaction on context-exceeded errors.
 func (e *Executor) callLLMWithReactiveCompaction(ctx context.Context, state *runState, cw ContextManager, toolDefs []llm.ToolDefinition) (*llm.ChatResponse, loopAction, error) {
 	// Build messages from context window
@@ -139,6 +145,27 @@ func (e *Executor) callLLMWithReactiveCompaction(ctx context.Context, state *run
 
 	if resp == nil {
 		return nil, actionNone, fmt.Errorf("llm returned empty response at step %d", state.stepNum)
+	}
+
+	// Signal proximity to the server's KV-cache limit based on the real
+	// API-reported input tokens (which include tool schemas, system prompt,
+	// and full message history). This is independent of the budget-based fill
+	// percentage — a soft estimate that excludes tool schemas and framing —
+	// and fires when the true request size approaches the advertised context
+	// window, giving the host a chance to compact before the engine rejects
+	// the request with a context-exceeded error.
+	if sp, ok := cw.(ContextWindowSizeProvider); ok {
+		if window := sp.ContextWindowSize(); window > 0 && resp.Usage.InputTokens > 0 {
+			estimated := resp.Usage.InputTokens + cw.OutputLimit()
+			if float64(estimated) >= float64(window)*contextServerLimitWarnFraction {
+				e.emitter.ExecutorDiagnostic(state.stepNum, "context_near_server_limit", map[string]any{
+					"input_tokens":   resp.Usage.InputTokens,
+					"output_limit":   cw.OutputLimit(),
+					"context_window": window,
+					"estimated":      estimated,
+				})
+			}
+		}
 	}
 
 	// The pending user interjection (resume-with-nudge) was delivered to the

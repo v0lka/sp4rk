@@ -83,6 +83,14 @@ type ContextWindow struct {
 	mutation          HistoryMutation
 	safetyMargin      int // percentage of context window reserved as safety margin (default: 5)
 
+	// toolOverhead is a fixed token allowance reserved out of the context
+	// budget for the per-request tool schemas the executor attaches to every
+	// LLM call. Tool schemas are not counted by the conversation tracker
+	// (which only estimates message history), so without this reserve the
+	// fill estimate under-counts against local/self-hosted engines whose KV
+	// cache overflows on the true wire size. Set via SetToolOverhead.
+	toolOverhead int
+
 	// priorConversation holds messages from previous exchanges (prior
 	// user/assistant turns) that should appear in the prompt before the
 	// current task content. This lets a top-level agent (e.g. the Conductor)
@@ -233,7 +241,39 @@ func (cw *ContextWindow) SetHistoryMutation(m HistoryMutation) {
 // integer vs float rounding is intentional and acceptable.
 func (cw *ContextWindow) EffectiveMax() int {
 	safetyMargin := cw.modelMeta.ContextWindow * cw.safetyMargin / 100
-	return cw.modelMeta.ContextWindow - cw.modelMeta.OutputLimit - safetyMargin
+	return cw.modelMeta.ContextWindow - cw.modelMeta.OutputLimit - safetyMargin - cw.toolOverhead
+}
+
+// SetToolOverhead reserves a fixed token allowance out of the context budget
+// for the per-request tool schemas the executor attaches to every LLM call.
+// Implements agent.ToolOverheadAware so the executor can report the size of
+// the tool definitions it builds; the reserve is then subtracted from
+// EffectiveMax so fill/compaction thresholds reflect the true wire usage
+// (which includes tool schemas) instead of under-estimating it.
+func (cw *ContextWindow) SetToolOverhead(tokens int) {
+	if tokens < 0 {
+		tokens = 0
+	}
+	// Clamp the reserve so EffectiveMax never goes negative: the tool-schema
+	// reserve must not consume the output-limit and safety-margin allowances,
+	// otherwise CheckFill reports the window as permanently "reject" and leaks
+	// a negative Max into diagnostics even when the real request still fits.
+	maxReserve := cw.modelMeta.ContextWindow - cw.modelMeta.OutputLimit - cw.modelMeta.ContextWindow*cw.safetyMargin/100
+	if maxReserve < 0 {
+		maxReserve = 0
+	}
+	if tokens > maxReserve {
+		tokens = maxReserve
+	}
+	cw.toolOverhead = tokens
+}
+
+// ContextWindowSize returns the model's advertised context-window size.
+// Implements agent.ContextWindowSizeProvider so the executor can warn when the
+// real API-reported input tokens approach the server's KV-cache limit,
+// independent of the budget-based fill percentage (which is a soft estimate).
+func (cw *ContextWindow) ContextWindowSize() int {
+	return cw.modelMeta.ContextWindow
 }
 
 // FillPercent returns the current fill percentage of the context window.

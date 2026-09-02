@@ -563,6 +563,47 @@ func TestEffectiveMax(t *testing.T) {
 	}
 }
 
+// TestEffectiveMaxToolOverhead verifies that SetToolOverhead reserves a fixed
+// allowance out of EffectiveMax so tool schemas (which are attached to every
+// request but not counted by the conversation tracker) are reflected in the
+// budget.
+func TestEffectiveMaxToolOverhead(t *testing.T) {
+	counter := llm.NewSimpleTokenCounter()
+	tracker := llm.NewContextTokenTracker(counter)
+	strategy := NewSlidingWindowStrategy(3, 5)
+
+	modelMeta := llm.ModelMetadata{
+		ContextWindow: 100000,
+		OutputLimit:   8192,
+		TokenizerType: "approximate",
+	}
+	cw := NewContextWindow(ContextWindowConfig{SystemPrompt: "System", ModelMeta: modelMeta, Tracker: tracker, Thresholds: testThresholds(), Strategy: strategy})
+
+	baseMax := cw.EffectiveMax()
+	cw.SetToolOverhead(2000)
+	if got := cw.EffectiveMax(); got != baseMax-2000 {
+		t.Errorf("EffectiveMax with overhead = %d, want %d", got, baseMax-2000)
+	}
+
+	// Negative overhead is clamped to zero (clears any previous reserve).
+	cw.SetToolOverhead(-100)
+	if got := cw.EffectiveMax(); got != baseMax {
+		t.Errorf("EffectiveMax after negative overhead = %d, want %d (reset to base)", got, baseMax)
+	}
+
+	// An oversized reserve is clamped so EffectiveMax bottoms out at zero
+	// rather than leaking a negative Max into diagnostics.
+	cw.SetToolOverhead(baseMax + 5000)
+	if got := cw.EffectiveMax(); got != 0 {
+		t.Errorf("EffectiveMax after oversized overhead = %d, want 0 (clamped)", got)
+	}
+
+	// ContextWindowSize still reports the advertised window, not the budget.
+	if got := cw.ContextWindowSize(); got != 100000 {
+		t.Errorf("ContextWindowSize = %d, want 100000", got)
+	}
+}
+
 // TestFillPercent verifies FillPercent calculation.
 func TestFillPercent(t *testing.T) {
 	counter := llm.NewSimpleTokenCounter()

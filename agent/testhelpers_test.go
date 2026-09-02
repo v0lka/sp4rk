@@ -106,12 +106,29 @@ type mockContextManager struct {
 	fillPercent     float64
 	correctedTokens int
 	strategySet     bool
+
+	// contextWindowSize is the advertised context-window size reported by
+	// ContextWindowSize(). Zero disables the server-limit proximity diagnostic
+	// (the executor skips the signal when window <= 0), so existing tests that
+	// don't care about it are unaffected.
+	contextWindowSize int
+
+	// toolOverhead records the reserve set via SetToolOverhead (the executor
+	// reports the estimated tool-schema size when the ContextManager implements
+	// ToolOverheadAware). Asserted by the wiring test.
+	toolOverhead int
+
+	// outputLimit is the value returned by OutputLimit(). Defaults to 8192 so
+	// existing assertions (e.g. MaxTokens wiring) are unchanged; tests that
+	// exercise the server-limit diagnostic override it to a small value.
+	outputLimit int
 }
 
 func newMockContextManager() *mockContextManager {
 	return &mockContextManager{
 		messages:        []llm.Message{{Role: "system", Content: "you are helpful"}},
 		availableTokens: 100000,
+		outputLimit:     8192,
 		fillCheck:       FillCheck{Percent: 10, Status: "ok", Used: 1000, Max: 100000},
 	}
 }
@@ -166,7 +183,29 @@ func (m *mockContextManager) AvailableTokens() int {
 }
 
 func (m *mockContextManager) OutputLimit() int {
-	return 8192
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.outputLimit
+}
+
+// ContextWindowSize implements agent.ContextWindowSizeProvider. It returns the
+// advertised context-window size set on the mock; zero disables the
+// server-limit proximity diagnostic (the executor skips the signal when
+// window <= 0).
+func (m *mockContextManager) ContextWindowSize() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.contextWindowSize
+}
+
+// SetToolOverhead implements agent.ToolOverheadAware. It records the reserve
+// the executor reports for per-request tool schemas so tests can assert the
+// wiring; the mock's EffectiveMax/CheckFill are not driven by it, so existing
+// tests are unaffected.
+func (m *mockContextManager) SetToolOverhead(tokens int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.toolOverhead = tokens
 }
 
 func (m *mockContextManager) VulnerableOutputs() []VulnerableOutput {

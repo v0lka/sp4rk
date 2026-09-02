@@ -41,6 +41,53 @@ func TestSimpleTokenCounter_Count(t *testing.T) {
 	})
 }
 
+func TestEstimateToolDefinitions(t *testing.T) {
+	t.Run("empty slice returns 0", func(t *testing.T) {
+		if got := EstimateToolDefinitions(nil); got != 0 {
+			t.Errorf("EstimateToolDefinitions(nil) = %d, want 0", got)
+		}
+		if got := EstimateToolDefinitions([]ToolDefinition{}); got != 0 {
+			t.Errorf("EstimateToolDefinitions([]) = %d, want 0", got)
+		}
+	})
+
+	t.Run("counts name description and schema with per-tool overhead", func(t *testing.T) {
+		defs := []ToolDefinition{
+			{
+				Name:        "read_file",
+				Description: "reads a file",
+				InputSchema: json.RawMessage(`{"type":"object"}`),
+			},
+		}
+		// name "read_file"=9 chars -> 3; description "reads a file"=12 -> 3;
+		// schema `{"type":"object"}`=17 -> 5; overhead 20 => 31.
+		want := 3 + 3 + 5 + estimatedTokensPerToolOverhead
+		if got := EstimateToolDefinitions(defs); got != want {
+			t.Errorf("EstimateToolDefinitions(single) = %d, want %d", got, want)
+		}
+	})
+
+	t.Run("empty schema adds no schema tokens", func(t *testing.T) {
+		defs := []ToolDefinition{{Name: "ping", Description: "noop"}}
+		// name "ping"=4 -> 1; description "noop"=4 -> 1; schema 0; overhead 20 => 22.
+		want := 1 + 1 + estimatedTokensPerToolOverhead
+		if got := EstimateToolDefinitions(defs); got != want {
+			t.Errorf("EstimateToolDefinitions(no schema) = %d, want %d", got, want)
+		}
+	})
+
+	t.Run("scales with number of tools", func(t *testing.T) {
+		defs := make([]ToolDefinition, 3)
+		for i := range defs {
+			defs[i] = ToolDefinition{Name: "tool", Description: "a tool"}
+		}
+		got := EstimateToolDefinitions(defs)
+		if got <= 0 {
+			t.Fatalf("EstimateToolDefinitions(3 tools) = %d, want > 0", got)
+		}
+	})
+}
+
 func TestSimpleTokenCounter_CountMessages(t *testing.T) {
 	counter := NewSimpleTokenCounter()
 

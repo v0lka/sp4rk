@@ -901,6 +901,7 @@ func TestIsContextExceededError(t *testing.T) {
 		{"request too large", errors.New("request too large for model"), true},
 		{"input is too long", errors.New("input is too long"), true},
 		{"prompt is too long", errors.New("Prompt is too long"), true},
+		{"context size has been exceeded", errors.New("Engine protocol predict stream returned an error: {\"code\":500,\"message\":\"Context size has been exceeded.\",\"type\":\"server_error\"}"), true},
 		{"case insensitive", errors.New("CONTEXT LENGTH EXCEEDED"), true},
 		{"sentinel ErrContextWindowExceeded", llm.ErrContextWindowExceeded, true},
 		{"wrapped ErrContextWindowExceeded", fmt.Errorf("outer: %w", llm.ErrContextWindowExceeded), true},
@@ -2926,4 +2927,185 @@ func TestCheckRepeatIdenticalTool_ZeroThresholds(t *testing.T) {
 	}
 	_ = loopAct
 	_ = result
+}
+
+// diagDetailCapture records the name and details of every ExecutorDiagnostic
+// call so tests can assert both that a diagnostic fired and what payload it
+// carried. It embeds *NoopEvents to satisfy the remaining Events methods.
+// Unlike diagCapture it is not goroutine-safe: the executor loop under test is
+// single-threaded, so plain slice appends are sufficient.
+type diagDetailCapture struct {
+	*NoopEvents
+	events  []string
+	details []map[string]any
+}
+
+func (d *diagDetailCapture) ExecutorDiagnostic(_ int, event string, details map[string]any) {
+	d.events = append(d.events, event)
+	d.details = append(d.details, details)
+}
+
+func (d *diagDetailCapture) fired(event string) bool {
+	for _, e := range d.events {
+		if e == event {
+			return true
+		}
+	}
+	return false
+}
+
+// firstDetails returns the details payload of the first emitted event with the
+// given name, or nil if none fired.
+func (d *diagDetailCapture) firstDetails(event string) map[string]any {
+	for i, e := range d.events {
+		if e == event {
+			return d.details[i]
+		}
+	}
+	return nil
+}
+
+// contextManagerOnly wraps a ContextManager without adding any capability
+// interface methods, so the type assertion in the executor degrades gracefully
+// (the wrapped *mockContextManager's extra methods are hidden behind the
+// embedded ContextManager interface).
+type contextManagerOnly struct {
+	ContextManager
+}
+
+func TestCallLLMWithReactiveCompaction_ContextNearServerLimit(t *testing.T) {
+	newResp := func(inputTokens int) *llm.ChatResponse {
+		return &llm.ChatResponse{
+			Message:    llm.Message{Role: "assistant", Content: "hi"},
+			StopReason: "end_turn",
+			Usage:      llm.TokenUsage{InputTokens: inputTokens, OutputTokens: 10},
+		}
+	}
+
+	tests := []struct {
+		name        string
+		inputTokens int
+		window      int
+		outputLimit int
+		wantFired   bool
+	}{
+		{"above 90% fires", 950, 1000, 50, true},
+		{"exactly at 90% fires", 850, 1000, 50, true},
+		{"below 90% does not fire", 800, 1000, 50, false},
+		{"zero window disables", 950, 0, 50, false},
+		{"zero input tokens disables", 0, 1000, 50, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockLLM := &mockLLMCaller{responses: []*llm.ChatResponse{newResp(tt.inputTokens)}}
+			diag := &diagDetailCapture{NoopEvents: &NoopEvents{}}
+			exec := &Executor{llm: mockLLM, emitter: diag}
+
+			cm := newMockContextManager()
+			cm.contextWindowSize = tt.window
+			cm.outputLimit = tt.outputLimit
+
+			resp, action, err := exec.callLLMWithReactiveCompaction(context.Background(), &runState{}, cm, nil)
+			if err != nil {
+				t.Fatalf("callLLMWithReactiveCompaction() error = %v, want nil", err)
+			}
+			if action != actionNone {
+				t.Fatalf("callLLMWithReactiveCompaction() action = %v, want actionNone", action)
+			}
+			if resp == nil {
+				t.Fatal("callLLMWithReactiveCompaction() resp = nil, want non-nil")
+			}
+			if got := diag.fired("context_near_server_limit"); got != tt.wantFired {
+				t.Errorf("context_near_server_limit fired = %v, want %v", got, tt.wantFired)
+			}
+		})
+	}
+
+	t.Run("carries correct payload", func(t *testing.T) {
+		mockLLM := &mockLLMCaller{responses: []*llm.ChatResponse{newResp(950)}}
+		diag := &diagDetailCapture{NoopEvents: &NoopEvents{}}
+		exec := &Executor{llm: mockLLM, emitter: diag}
+
+		cm := newMockContextManager()
+		cm.contextWindowSize = 1000
+		cm.outputLimit = 50
+
+		if _, _, err := exec.callLLMWithReactiveCompaction(context.Background(), &runState{}, cm, nil); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		d := diag.firstDetails("context_near_server_limit")
+		if d == nil {
+			t.Fatal("expected context_near_server_limit diagnostic, got none")
+		}
+		want := map[string]int{"input_tokens": 950, "output_limit": 50, "context_window": 1000, "estimated": 1000}
+		for key, wantVal := range want {
+			gotVal, ok := d[key].(int)
+			if !ok {
+				t.Errorf("details[%q] = %v (%T), want int", key, d[key], d[key])
+				continue
+			}
+			if gotVal != wantVal {
+				t.Errorf("details[%q] = %d, want %d", key, gotVal, wantVal)
+			}
+		}
+	})
+
+	t.Run("context manager without provider does not fire", func(t *testing.T) {
+		mockLLM := &mockLLMCaller{responses: []*llm.ChatResponse{newResp(950)}}
+		diag := &diagDetailCapture{NoopEvents: &NoopEvents{}}
+		exec := &Executor{llm: mockLLM, emitter: diag}
+
+		// Hide *mockContextManager's ContextWindowSize behind the bare
+		// ContextManager interface so the provider type assertion fails.
+		cm := &contextManagerOnly{ContextManager: newMockContextManager()}
+
+		if _, _, err := exec.callLLMWithReactiveCompaction(context.Background(), &runState{}, cm, nil); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if diag.fired("context_near_server_limit") {
+			t.Error("context_near_server_limit fired without ContextWindowSizeProvider, want no fire")
+		}
+	})
+}
+
+func TestExecutor_Run_SetToolOverhead(t *testing.T) {
+	t.Run("reports reserve for provided tools", func(t *testing.T) {
+		mockLLM := &mockLLMCaller{responses: []*llm.ChatResponse{llmResponseFinish("done", "answer")}}
+		cm := newMockContextManager()
+		exec := newExecutorDefaultHITL(mockLLM, newMockToolExecutor(), &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+
+		taskTools := []tools.ToolDescriptor{
+			{Name: "read_file", Description: "reads a file", Source: "core"},
+			{Name: "write_file", Description: "writes a file", Source: "core"},
+		}
+
+		if _, err := exec.Run(context.Background(), taskTools, cm); err != nil {
+			t.Fatalf("Run() error = %v, want nil", err)
+		}
+
+		want := llm.EstimateToolDefinitions(exec.buildToolDefinitions(taskTools))
+		if cm.toolOverhead != want {
+			t.Errorf("toolOverhead = %d, want %d", cm.toolOverhead, want)
+		}
+	})
+
+	t.Run("still reserves finish tool with no task tools", func(t *testing.T) {
+		mockLLM := &mockLLMCaller{responses: []*llm.ChatResponse{llmResponseFinish("done", "answer")}}
+		cm := newMockContextManager()
+		exec := newExecutorDefaultHITL(mockLLM, newMockToolExecutor(), &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+
+		if _, err := exec.Run(context.Background(), nil, cm); err != nil {
+			t.Fatalf("Run() error = %v, want nil", err)
+		}
+
+		want := llm.EstimateToolDefinitions(exec.buildToolDefinitions(nil))
+		if cm.toolOverhead != want {
+			t.Errorf("toolOverhead (no tools) = %d, want %d", cm.toolOverhead, want)
+		}
+		if cm.toolOverhead == 0 {
+			t.Error("toolOverhead (no tools) = 0, want > 0 (finish tool reserve)")
+		}
+	})
 }

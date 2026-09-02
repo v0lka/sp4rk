@@ -1016,6 +1016,16 @@ func (e *Executor) Run(ctx context.Context, taskTools []tools.ToolDescriptor, cw
 	// Build tool definitions from taskTools
 	toolDefs := e.buildToolDefinitions(taskTools)
 
+	// Reserve the fixed per-request tool-schema overhead out of the context
+	// budget. Tool schemas are attached to every request but are not counted
+	// by the conversation tracker, so without this reserve the fill estimate
+	// systematically under-counts against local/self-hosted engines that
+	// overflow on the true wire size. ContextManagers that don't implement the
+	// capability skip the reserve (graceful degradation).
+	if oa, ok := cw.(ToolOverheadAware); ok {
+		oa.SetToolOverhead(llm.EstimateToolDefinitions(toolDefs))
+	}
+
 	// Track if we have meaningful tools (beyond just finish)
 	hasTools := len(taskTools) > 0
 
@@ -1268,6 +1278,7 @@ func isParseError(content string) bool {
 //	"request too large"             — OpenAI (variant)
 //	"input is too long"             — OpenAI / generic
 //	"prompt is too long"            — OpenAI / generic
+//	"context size has been exceeded" — llama.cpp / LM Studio engine protocol
 func isContextExceededError(err error) bool {
 	if err == nil {
 		return false
@@ -1284,6 +1295,7 @@ func isContextExceededError(err error) bool {
 		"request too large",
 		"input is too long",
 		"prompt is too long",
+		"context size has been exceeded",
 	}
 	for _, p := range patterns {
 		if strings.Contains(errStr, p) {

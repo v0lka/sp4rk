@@ -17,6 +17,42 @@ type TokenCounter interface {
 	CountMessages(msgs []Message) int
 }
 
+// estimatedTokensPerToolOverhead is a fixed framing allowance per tool
+// definition on top of the raw name/description/schema content estimate.
+//
+// The name, description and input schema contents are already counted above;
+// this constant covers the JSON wrapper keys and structural punctuation that
+// surround them on the wire — `{"type":"function","function":{"name":"",
+// "description":"","parameters":{}}}`. That framing is punctuation-heavy and
+// its field keys (`type`, `function`, `name`, `description`, `parameters`) are
+// common single-token words, so it tokenizes far denser than the ~4
+// chars/token prose heuristic would suggest: the fixed wrapper is ~77 chars
+// but only ~20 tokens. Using a flat 4 (the prose heuristic) would under-count
+// every tool by ~5x, so we pin a realistic per-tool framing allowance instead.
+const estimatedTokensPerToolOverhead = 20
+
+// EstimateToolDefinitions returns a conservative token estimate for the given
+// tool definitions using the same ~4 chars/token heuristic as
+// SimpleTokenCounter.
+//
+// Tool schemas are attached to every request but are not counted by the
+// conversation tracker (which only estimates message history), so callers
+// reserve this overhead out of the context budget to avoid under-estimating
+// wire usage against local/self-hosted engines whose KV cache overflows on the
+// true request size.
+func EstimateToolDefinitions(defs []ToolDefinition) int {
+	total := 0
+	for _, d := range defs {
+		total += (len(d.Name) + estimatedTokensPerChar - 1) / estimatedTokensPerChar
+		total += (len(d.Description) + estimatedTokensPerChar - 1) / estimatedTokensPerChar
+		if len(d.InputSchema) > 0 {
+			total += (len(d.InputSchema) + estimatedTokensPerChar - 1) / estimatedTokensPerChar
+		}
+		total += estimatedTokensPerToolOverhead
+	}
+	return total
+}
+
 // estimatedTokensPerChar is the approximate ratio of characters to tokens
 // used for fast token count estimation.
 const estimatedTokensPerChar = 4

@@ -173,6 +173,30 @@ type InterjectionConsumer interface {
 	ConsumePendingUserInterjection()
 }
 
+// ToolOverheadAware is an optional capability interface for ContextManager
+// implementations that can reserve a fixed token allowance for the per-request
+// tool schemas the executor attaches to every LLM call. The executor estimates
+// the size of the tool definitions it builds and reports it once via
+// SetToolOverhead; the window then subtracts that reserve from EffectiveMax so
+// compaction/fill thresholds reflect the true wire usage (which includes tool
+// schemas) instead of under-estimating it. Implementations that do not declare
+// this interface skip the reserve (graceful degradation). sp4rk's
+// memory.ContextWindow implements it.
+type ToolOverheadAware interface {
+	SetToolOverhead(tokens int)
+}
+
+// ContextWindowSizeProvider is an optional capability interface exposing the
+// model's advertised context-window size. The executor uses it to signal when
+// the real API-reported input tokens approach the server's KV-cache limit,
+// independent of the budget-based fill percentage (a soft estimate that
+// excludes tool schemas and framing). Implementations that do not declare this
+// interface skip the signal (graceful degradation). sp4rk's memory.ContextWindow
+// implements it.
+type ContextWindowSizeProvider interface {
+	ContextWindowSize() int
+}
+
 // StepLimitResponse represents the user's decision when the agent's step limit is reached.
 type StepLimitResponse string
 
