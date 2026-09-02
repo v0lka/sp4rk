@@ -152,6 +152,46 @@ func TestModelRegistry_KimiThinkingLockedModelsRejectSampling(t *testing.T) {
 	}
 }
 
+// Anthropic removed the temperature/top_p/top_k sampling parameters on the
+// adaptive-thinking generation (Claude Opus 4.7 and later, Claude Sonnet 5,
+// and Claude Fable 5): sending temperature — even a non-default value — now
+// returns HTTP 400 "`temperature` is deprecated for this model". These models
+// are steered via the adaptive thinking/effort controls instead. Their
+// built-in capabilities must therefore leave Temperature unset so
+// applyDefaultSampling injects no sampling fields for any call purpose, the
+// same shape as the o-series and kimi thinking-locked models. Regression guard
+// for routing calls failing with HTTP 400 against the Anthropic API.
+func TestModelRegistry_AnthropicAdaptiveThinkingModelsRejectSampling(t *testing.T) {
+	registry := NewModelRegistry(nil)
+	models := []string{
+		"claude-fable-5",
+		"claude-opus-5",
+		"claude-sonnet-5",
+		"claude-opus-4-8",
+		"claude-opus-4-7",
+	}
+	for _, model := range models {
+		t.Run(model, func(t *testing.T) {
+			meta, ok := registry.Resolve(context.Background(), model)
+			if !ok {
+				t.Fatalf("expected built-in catalog hit for %q", model)
+			}
+			if meta.Family != "anthropic" {
+				t.Errorf("Family = %q, want anthropic", meta.Family)
+			}
+			if meta.Capabilities == nil {
+				t.Fatal("Capabilities = nil, want non-nil")
+			}
+			if meta.Capabilities.Temperature {
+				t.Errorf("Capabilities.Temperature = true, want false: the endpoint rejects the temperature parameter (HTTP 400), so any injected sampling field is a guaranteed failure")
+			}
+			if !meta.Capabilities.Attachment || !meta.Capabilities.Reasoning || !meta.Capabilities.ToolCall {
+				t.Errorf("Capabilities = %+v, want Attachment, Reasoning and ToolCall preserved", meta.Capabilities)
+			}
+		})
+	}
+}
+
 func TestModelRegistry_FallbackForUnknownModel(t *testing.T) {
 	registry := NewModelRegistry(nil)
 
