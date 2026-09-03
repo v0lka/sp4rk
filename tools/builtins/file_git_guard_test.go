@@ -147,12 +147,29 @@ func TestJudge_GitInternal_CoversNestedReposAndDotGitTarget(t *testing.T) {
 // the session case-sensitivity flag: on a case-insensitive session a ".GIT"
 // component IS the git directory (flagged); on a case-sensitive session it is
 // an ordinary directory (not flagged) — mirroring tools.IsWithinRoot.
+//
+// The target deliberately uses a ".GIT" component that exists on disk in NO
+// spelling (under a freshly created "sub" directory). A ".GIT" component that
+// aliases the real on-disk ".git" directory is a different, platform-specific
+// story: Windows filepath.EvalSymlinks canonicalizes existing path components
+// to their on-disk spelling, so such a target arrives at the guard already
+// spelled ".git" and is correctly flagged regardless of the session flag —
+// the write genuinely hits git internals, and not flagging it would be a
+// bypass. A component that exists in no spelling survives resolution verbatim
+// on every platform, so the two subtests below exercise the guard's own case
+// handling — and only that.
 func TestJudge_GitInternal_CaseSensitivity(t *testing.T) {
 	ws := newGitGuardWorkspace(t)
+	if err := os.MkdirAll(filepath.Join(ws, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	base := tools.WithWorkspacePath(context.Background(), ws)
-	target := filepath.Join(ws, ".GIT", "config")
+	target := filepath.Join(ws, "sub", ".GIT", "config")
 	write := NewWriteFileTool()
-	input, _ := json.Marshal(map[string]string{"path": target, "content": "x"})
+	input, err := json.Marshal(map[string]string{"path": target, "content": "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	caseInsensitive := tools.WithCaseInsensitivePaths(base, true)
 	if outcome := write.Judge(caseInsensitive, input); outcome.Allow || outcome.Severity != tools.JudgeSeverityHard || outcome.ReasonCode != tools.ReasonCodeGitInternal {

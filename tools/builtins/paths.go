@@ -180,6 +180,13 @@ func formatOutsideRootsError(absPath string) error {
 // ".Git" component IS the git directory and is flagged, while on
 // case-sensitive filesystems (Linux ext4) only the literal ".git" is — a
 // distinct-cased sibling there is an ordinary directory, not git internals.
+// Note that resolution runs before this predicate: on Windows,
+// filepath.EvalSymlinks canonicalizes existing components to their on-disk
+// spelling, so a ".GIT" that aliases the real ".git" directory arrives here
+// already spelled ".git" and is flagged regardless of the session flag — the
+// write genuinely targets git internals. The flag governs only components
+// that exist on disk in no spelling: their spelling survives resolution on
+// every platform, so there — and only there — case sensitivity applies.
 //
 // Paths outside the workspace root (including the session temp directory,
 // which is a separate root) return false: they are not "inside a workspace"
