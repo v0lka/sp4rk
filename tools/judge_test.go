@@ -2334,8 +2334,9 @@ func TestJudgeReasonCode_Vocabulary(t *testing.T) {
 		ReasonCodeUnassessablePath:      "unassessable_path",
 		ReasonCodeSymlinkEscape:         "symlink_escape",
 		ReasonCodeSymlinkSuspicious:     "symlink_suspicious",
+		ReasonCodeGitInternal:           "git_internal_path",
 	}
-	const wantPublished = 9
+	const wantPublished = 10
 	if len(published) != wantPublished {
 		t.Fatalf("vocabulary size = %d, want %d — update this pin when publishing or retiring a code", len(published), wantPublished)
 	}

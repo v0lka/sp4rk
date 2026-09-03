@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/v0lka/sp4rk/pathutil"
 	"github.com/v0lka/sp4rk/tools"
@@ -151,4 +152,66 @@ func isPathInRootStr(ctx context.Context, absPath, root string) bool {
 // confirmation.
 func formatOutsideRootsError(absPath string) error {
 	return fmt.Errorf("path is outside the session roots: %s", absPath)
+}
+
+// isPathInGitDir reports whether absPath lies inside the workspace's git
+// internals — the path is contained within the workspace root and its
+// workspace-relative part contains a ".git" path component. This covers the
+// repository root's .git directory, nested repositories (submodules and
+// worktrees, where ".git" may be a gitdir-pointer file rather than a
+// directory), and any deeper path such as .git/objects or
+// .git/hooks/pre-commit. Regular dotfiles and dot-directories (.gitignore,
+// .github, .golangci) are NOT matched: only the exact ".git" component is.
+//
+// Scope is decided by [tools.IsWithinRoot] — the canonical containment check
+// — so it folds letter case exactly when locality auto-approval does. This
+// pairing is load-bearing: on a case-insensitive filesystem (macOS APFS,
+// Windows NTFS) a target spelled with a case-mismatched workspace prefix
+// ("/WS/.git/config" for workspace "/ws") IS the on-disk git directory, so a
+// lexical scope test here (filepath.Rel returns "../WS/…") would let that
+// spelling bypass the guard while the very same path auto-approves as local.
+// The workspace-relative remainder is still computed lexically with
+// filepath.Rel, so under folding it may carry ".." segments; the component
+// scan below sees every component regardless.
+//
+// Component matching respects the session case-sensitivity flag
+// ([tools.CaseInsensitivePathsFrom]) the same way [tools.IsWithinRoot] does:
+// on case-insensitive filesystems (macOS APFS, Windows NTFS) a ".GIT" or
+// ".Git" component IS the git directory and is flagged, while on
+// case-sensitive filesystems (Linux ext4) only the literal ".git" is — a
+// distinct-cased sibling there is an ordinary directory, not git internals.
+//
+// Paths outside the workspace root (including the session temp directory,
+// which is a separate root) return false: they are not "inside a workspace"
+// and are already handled by the outside-session-roots escalation. The
+// predicate fails open (false) when no workspace is attached or the workspace
+// root cannot be resolved — in those situations the surrounding judge flow
+// fails closed through its own containment checks instead.
+func isPathInGitDir(ctx context.Context, absPath string) bool {
+	ws := tools.WorkspacePathFrom(ctx)
+	if ws == "" {
+		return false
+	}
+	realWS, err := resolveWorkspaceRoot(ws)
+	if err != nil {
+		return false
+	}
+	// Scope: only paths the canonical containment check places inside the
+	// workspace subtree. IsWithinRoot folds letter case when the session flag
+	// says the filesystem does, so a case-mismatched spelling of a workspace
+	// path stays in scope — matching how locality auto-approval treats it.
+	if !tools.IsWithinRoot(ctx, realWS, absPath) {
+		return false
+	}
+	rel, relErr := filepath.Rel(realWS, absPath)
+	if relErr != nil {
+		return false
+	}
+	caseFold := tools.CaseInsensitivePathsFrom(ctx)
+	for _, component := range pathutil.SplitPathComponents(rel) {
+		if component == ".git" || (caseFold && strings.EqualFold(component, ".git")) {
+			return true
+		}
+	}
+	return false
 }

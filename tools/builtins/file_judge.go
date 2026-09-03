@@ -33,6 +33,16 @@ func hardOutcome(allowed bool, reason string, code tools.JudgeReasonCode) tools.
 // auto_approve_workspace_writes is enabled); writes outside both escalate to
 // user confirmation. Returns an allowed outcome if permitted, or a denied
 // outcome with an explanatory reason to defer to the confirmation flow.
+//
+// Git-internal guard: a target whose resolved path contains a ".git" path
+// component at or below the workspace root escalates as a HARD reason
+// ([tools.ReasonCodeGitInternal]) before the soft containment check runs —
+// mutating the repository's object database, refs, config, or hooks can
+// rewrite history or plant executable code, so the escalation must never be
+// auto-resolved, only confirmed interactively. This mirrors the symlink-escape
+// control's severity contract and covers every mutating file tool that routes
+// through this judge (write_file, edit_file, delete_file, create_directory,
+// delete_directory).
 func judgeWriteInSessionRoots(ctx context.Context, path string) tools.JudgeOutcome {
 	absPath, err := filepath.Abs(path)
 	if err != nil {
@@ -49,6 +59,14 @@ func judgeWriteInSessionRoots(ctx context.Context, path string) tools.JudgeOutco
 		if resolvedParent, parentErr := filepath.EvalSymlinks(parentDir); parentErr == nil {
 			absPath = filepath.Join(resolvedParent, filepath.Base(absPath))
 		}
+	}
+
+	// Hard git-internal guard: fires on the fully resolved path so a symlink
+	// into the workspace's .git is caught just like a literal path.
+	if isPathInGitDir(ctx, absPath) {
+		return hardOutcome(false,
+			"target path is inside git internals (.git): "+absPath,
+			tools.ReasonCodeGitInternal)
 	}
 
 	if isPathInSessionRoots(ctx, absPath) {

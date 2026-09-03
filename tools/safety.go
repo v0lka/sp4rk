@@ -118,6 +118,15 @@ const (
 	// hosts alongside ReasonCodeSymlinkEscape; unassessable-shaped but
 	// without a fired control, so hosts may let a strict judge clear it.
 	ReasonCodeSymlinkSuspicious JudgeReasonCode = "symlink_suspicious"
+	// ReasonCodeGitInternal marks a mutating operation whose target path
+	// contains a ".git" path component at or below the workspace root — the
+	// repository's object database, refs, config, and hooks (including nested
+	// repos, submodules, and worktrees, where ".git" may be a gitdir-pointer
+	// file rather than a directory). Writes there can rewrite history, forge
+	// refs, or plant executable hooks, so this is a fired security control
+	// (hard severity, mirroring ReasonCodeSymlinkEscape): the call escalates
+	// to user confirmation and hosts must never auto-override it.
+	ReasonCodeGitInternal JudgeReasonCode = "git_internal_path"
 )
 
 // JudgeOutcome is the result of a tool-local safety judge: whether the call is
