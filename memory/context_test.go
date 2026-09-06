@@ -591,16 +591,110 @@ func TestEffectiveMaxToolOverhead(t *testing.T) {
 		t.Errorf("EffectiveMax after negative overhead = %d, want %d (reset to base)", got, baseMax)
 	}
 
-	// An oversized reserve is clamped so EffectiveMax bottoms out at zero
-	// rather than leaking a negative Max into diagnostics.
+	// An oversized reserve is clamped to a fraction of the usable budget so
+	// EffectiveMax stays strictly positive: a clamp at the full budget would
+	// zero it, FillPercent would report 100%, and CheckFill would return
+	// "reject" with Max=0 on every step — deterministically killing runs
+	// whose real requests still fit.
 	cw.SetToolOverhead(baseMax + 5000)
-	if got := cw.EffectiveMax(); got != 0 {
-		t.Errorf("EffectiveMax after oversized overhead = %d, want 0 (clamped)", got)
+	wantReserve := baseMax * toolOverheadMaxReservePercent / 100
+	if got := cw.EffectiveMax(); got != baseMax-wantReserve {
+		t.Errorf("EffectiveMax after oversized overhead = %d, want %d (reserve clamped to %d)", got, baseMax-wantReserve, wantReserve)
+	}
+	if got := cw.EffectiveMax(); got <= 0 {
+		t.Errorf("EffectiveMax must stay positive after oversized overhead, got %d", got)
 	}
 
 	// ContextWindowSize still reports the advertised window, not the budget.
 	if got := cw.ContextWindowSize(); got != 100000 {
 		t.Errorf("ContextWindowSize = %d, want 100000", got)
+	}
+}
+
+// TestSetToolOverheadClampBoundary pins the exact clamp edge: reserves up to
+// toolOverheadMaxReservePercent of the usable budget pass through untouched;
+// anything above is clamped down to that boundary — never allowed to consume
+// the whole budget, which would zero EffectiveMax and permanently report the
+// window as full.
+func TestSetToolOverheadClampBoundary(t *testing.T) {
+	counter := llm.NewSimpleTokenCounter()
+	tracker := llm.NewContextTokenTracker(counter)
+	strategy := NewSlidingWindowStrategy(3, 5)
+
+	// Window 8192, output 4096, 5% margin (409) → usable budget 3687;
+	// clamp boundary = 80% of 3687 = 2949; EffectiveMax at boundary = 738.
+	modelMeta := llm.ModelMetadata{
+		ContextWindow: 8192,
+		OutputLimit:   4096,
+		TokenizerType: "approximate",
+	}
+	cw := NewContextWindow(ContextWindowConfig{SystemPrompt: "System", ModelMeta: modelMeta, Tracker: tracker, Thresholds: testThresholds(), Strategy: strategy})
+
+	const maxReserve = 8192 - 4096 - 409 // 3687
+	const boundary = maxReserve * toolOverheadMaxReservePercent / 100
+
+	// Exactly at the boundary: no clamping.
+	cw.SetToolOverhead(boundary)
+	if got := cw.EffectiveMax(); got != maxReserve-boundary {
+		t.Errorf("EffectiveMax at clamp boundary = %d, want %d", got, maxReserve-boundary)
+	}
+
+	// One token above the boundary: clamped back down to it.
+	cw.SetToolOverhead(boundary + 1)
+	if got := cw.EffectiveMax(); got != maxReserve-boundary {
+		t.Errorf("EffectiveMax above clamp boundary = %d, want %d (clamped)", got, maxReserve-boundary)
+	}
+
+	// A wildly oversized tool belt still leaves a live budget.
+	cw.SetToolOverhead(1 << 20)
+	if got := cw.EffectiveMax(); got != maxReserve-boundary {
+		t.Errorf("EffectiveMax after oversized overhead = %d, want %d", got, maxReserve-boundary)
+	}
+	if got := cw.EffectiveMax(); got <= 0 {
+		t.Errorf("EffectiveMax must stay positive for any usable budget, got %d", got)
+	}
+}
+
+// TestSetToolOverheadClampSmallWindows verifies the invariant that matters
+// for the motivating class (small-window local models): for every model
+// whose usable budget is positive, an oversized tool-schema reserve can never
+// push EffectiveMax to zero or below.
+func TestSetToolOverheadClampSmallWindows(t *testing.T) {
+	cases := []struct {
+		name         string
+		window       int
+		output       int
+		wantReserve  int // expected clamped reserve
+		wantMaxAfter int // expected EffectiveMax after the oversized reserve
+	}{
+		// margins are window*5/100 with integer truncation
+		{"8k window half output", 8192, 4096, 2949, 738},
+		{"4k window half output", 4096, 2048, 1475, 369},
+		{"2k window half output", 2048, 1024, 737, 185},
+		{"2k window 3/4 output", 2048, 1536, 328, 82},
+		{"1.2k window tight output", 1200, 1024, 92, 24},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			counter := llm.NewSimpleTokenCounter()
+			tracker := llm.NewContextTokenTracker(counter)
+			strategy := NewSlidingWindowStrategy(3, 5)
+			modelMeta := llm.ModelMetadata{
+				ContextWindow: tc.window,
+				OutputLimit:   tc.output,
+				TokenizerType: "approximate",
+			}
+			cw := NewContextWindow(ContextWindowConfig{SystemPrompt: "System", ModelMeta: modelMeta, Tracker: tracker, Thresholds: testThresholds(), Strategy: strategy})
+
+			maxReserve := tc.window - tc.output - tc.window*5/100
+			cw.SetToolOverhead(maxReserve + 10000) // far oversized belt
+			if got := cw.EffectiveMax(); got != tc.wantMaxAfter {
+				t.Errorf("EffectiveMax = %d, want %d (reserve %d of budget %d)", got, tc.wantMaxAfter, tc.wantReserve, maxReserve)
+			}
+			if got := cw.EffectiveMax(); got <= 0 {
+				t.Errorf("EffectiveMax = %d, must stay positive whenever the usable budget is positive", got)
+			}
+		})
 	}
 }
 

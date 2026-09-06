@@ -275,9 +275,24 @@ func (r *Router) validateContextWindow(model string, msgs []Message, meta ModelM
 // applyDefaultSampling fills family-aware sampling defaults on the request for
 // every parameter the caller left unset. Per-field priority: an explicit
 // ChatRequest value always wins, then the preset from the sampling func, then
-// the provider's default (field left nil). Skips models that don't support the
-// temperature parameter (e.g. reasoning models like o1, o3) — those models
-// equally reject top_p/top_k overrides, so no preset is injected at all.
+// the provider's default (field left nil) — except for models that AUTHORITATIVELY
+// declare they don't support the temperature parameter (e.g. reasoning models
+// like o1, o3, thinking-locked Kimi endpoints, adaptive-thinking Claude): those
+// models equally reject top_p/top_k and penalty overrides, so no sampling
+// field is injected and explicitly-set values are stripped as well — on the
+// wire they are guaranteed HTTP 400s ("temperature is deprecated for this
+// model"), hard-failing any caller that sets its own profile.
+//
+// "Authoritatively" is the operative word: the declaration must come from the
+// built-in catalog, a user override, or an observed runtime entry. Caps filled
+// by registry guesswork (meta.GuessedCapabilities — every Resolve path fills
+// unknown/local models with defaultUnknownCapabilities, whose Temperature is
+// the zero value false) are NOT trusted to strip anything: they mirror the
+// nil-Capabilities passthrough below, so a host's explicitly-configured
+// sampling for its local models (LM Studio, Ollama, vLLM, config-only entries)
+// survives, and no preset is injected into fields the host left unset — the
+// provider's own defaults govern them, leaving the host in control of models
+// the registry cannot vouch for.
 //
 // The caller resolves metadata once and passes it in (meta) so this method
 // performs no registry I/O of its own.
@@ -292,10 +307,32 @@ func (r *Router) validateContextWindow(model string, msgs []Message, meta ModelM
 // requests with no declared purpose keep the full vendor preset.
 func (r *Router) applyDefaultSampling(req *ChatRequest, meta ModelMetadata) {
 	if r.registry != nil {
-		// meta may be a raw/partial record with nil capabilities; only a
-		// declared Temperature=true unlocks the sampling defaults.
-		if meta.Capabilities == nil || !meta.Capabilities.Temperature {
-			return // model doesn't accept sampling params (e.g. reasoning models)
+		if meta.Capabilities != nil && !meta.Capabilities.Temperature && !meta.GuessedCapabilities {
+			// Authoritatively declared incapable of sampling parameters:
+			// strip explicitly-set values instead of passing them through.
+			// Mirrors the provider-level strip Anthropic requests get in
+			// extended-thinking mode, but at the router so every provider and
+			// every call purpose (including hosts' own service calls with a
+			// fixed profile) is covered.
+			req.Temperature = nil
+			req.TopP = nil
+			req.TopK = nil
+			req.RepetitionPenalty = nil
+			req.PresencePenalty = nil
+			return
+		}
+		if meta.Capabilities == nil || meta.GuessedCapabilities {
+			// meta may be a raw/partial record for a model absent from every
+			// registry tier (e.g. a locally-served custom model), or a record
+			// whose capabilities are the registry's optimistic guess
+			// (GuessedCapabilities — which is what every Resolve path returns
+			// for models unknown to the catalog and to the user's config):
+			// inject no preset, but let explicitly-set values pass through
+			// unchanged so the host keeps full control over models the
+			// registry cannot vouch for. The guessed branch mirrors the nil
+			// branch exactly — a guessed Temperature=false must not zero a
+			// host-configured sampling profile.
+			return
 		}
 	}
 

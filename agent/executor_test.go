@@ -3070,6 +3070,55 @@ func TestCallLLMWithReactiveCompaction_ContextNearServerLimit(t *testing.T) {
 	})
 }
 
+// TestCallLLMWithReactiveCompaction_ContextNearServerLimitLatch verifies the
+// rising-edge latch: within one Run (shared runState) the diagnostic fires
+// only on the transition into the near-limit condition, re-arms once a call
+// drops back below the fraction (e.g. after a compaction), and fires again on
+// the next genuine approach — instead of repeating on every step for the
+// rest of the run.
+func TestCallLLMWithReactiveCompaction_ContextNearServerLimitLatch(t *testing.T) {
+	newResp := func(inputTokens int) *llm.ChatResponse {
+		return &llm.ChatResponse{
+			Message:    llm.Message{Role: "assistant", Content: "hi"},
+			StopReason: "end_turn",
+			Usage:      llm.TokenUsage{InputTokens: inputTokens, OutputTokens: 10},
+		}
+	}
+
+	// Window 1000, output limit 50 → the condition is input ≥ 850.
+	mockLLM := &mockLLMCaller{responses: []*llm.ChatResponse{
+		newResp(950), // above threshold → fires (rising edge)
+		newResp(960), // still above → latched, no repeat
+		newResp(980), // still above → latched, no repeat
+		newResp(700), // below threshold → latch re-arms
+		newResp(970), // above again → fires again (new genuine approach)
+		newResp(990), // above → latched
+	}}
+	diag := &diagDetailCapture{NoopEvents: &NoopEvents{}}
+	exec := &Executor{llm: mockLLM, emitter: diag}
+
+	cm := newMockContextManager()
+	cm.contextWindowSize = 1000
+	cm.outputLimit = 50
+
+	state := &runState{} // a single Run — shared loop-local state
+	for range mockLLM.responses {
+		if _, _, err := exec.callLLMWithReactiveCompaction(context.Background(), state, cm, nil); err != nil {
+			t.Fatalf("callLLMWithReactiveCompaction() error = %v, want nil", err)
+		}
+	}
+
+	count := 0
+	for _, event := range diag.events {
+		if event == "context_near_server_limit" {
+			count++
+		}
+	}
+	if count != 2 {
+		t.Errorf("context_near_server_limit fired %d times, want 2 (first crossing + re-fire after dropping below; per-step repeats latched)", count)
+	}
+}
+
 func TestExecutor_Run_SetToolOverhead(t *testing.T) {
 	t.Run("reports reserve for provided tools", func(t *testing.T) {
 		mockLLM := &mockLLMCaller{responses: []*llm.ChatResponse{llmResponseFinish("done", "answer")}}

@@ -244,26 +244,42 @@ func (cw *ContextWindow) EffectiveMax() int {
 	return cw.modelMeta.ContextWindow - cw.modelMeta.OutputLimit - safetyMargin - cw.toolOverhead
 }
 
+// toolOverheadMaxReservePercent caps the tool-schema reserve at this share of
+// the maximum reserve (ContextWindow − OutputLimit − safety margin). The cap
+// guarantees EffectiveMax stays strictly positive no matter how large the
+// estimated tool belt is: a reserve clamped to the full maxReserve would zero
+// the budget, FillPercent would report 100%, and CheckFill would return
+// "reject" with Max=0 on every step — deterministically aborting runs whose
+// real requests still fit (the small-window local-model class this reserve
+// exists for).
+const toolOverheadMaxReservePercent = 80
+
 // SetToolOverhead reserves a fixed token allowance out of the context budget
 // for the per-request tool schemas the executor attaches to every LLM call.
 // Implements agent.ToolOverheadAware so the executor can report the size of
 // the tool definitions it builds; the reserve is then subtracted from
 // EffectiveMax so fill/compaction thresholds reflect the true wire usage
 // (which includes tool schemas) instead of under-estimating it.
+//
+// The reserve never consumes the whole budget: it is clamped to
+// toolOverheadMaxReservePercent of the usable window, so EffectiveMax stays
+// positive even for an over-sized (or over-estimated) tool belt. When the
+// clamp bites, the fill percentage under-reserves and degrades gracefully —
+// compaction fires later than ideal — instead of permanently reporting the
+// window as full. Negative input clears a previous reserve.
 func (cw *ContextWindow) SetToolOverhead(tokens int) {
 	if tokens < 0 {
 		tokens = 0
 	}
-	// Clamp the reserve so EffectiveMax never goes negative: the tool-schema
-	// reserve must not consume the output-limit and safety-margin allowances,
-	// otherwise CheckFill reports the window as permanently "reject" and leaks
-	// a negative Max into diagnostics even when the real request still fits.
+	// Clamp the reserve to a fraction of the usable budget so EffectiveMax
+	// never reaches zero (and thus never goes negative): the tool-schema
+	// reserve must not consume the output-limit and safety-margin allowances.
 	maxReserve := cw.modelMeta.ContextWindow - cw.modelMeta.OutputLimit - cw.modelMeta.ContextWindow*cw.safetyMargin/100
 	if maxReserve < 0 {
 		maxReserve = 0
 	}
-	if tokens > maxReserve {
-		tokens = maxReserve
+	if limit := maxReserve * toolOverheadMaxReservePercent / 100; tokens > limit {
+		tokens = limit
 	}
 	cw.toolOverhead = tokens
 }

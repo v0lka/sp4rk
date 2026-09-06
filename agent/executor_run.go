@@ -38,6 +38,7 @@ type runState struct {
 	reactiveCompactAttempted  bool
 	preCompactionNudgeEmitted bool
 	pendingVerifyEdit         bool // a successful file edit awaits verify-on-edit (debounce flag)
+	nearServerLimitLatched    bool // rising-edge latch for the context_near_server_limit diagnostic
 	unlimitedSteps            bool
 	effectiveMaxSteps         int
 	finishResult              *ExecutorResult
@@ -154,16 +155,29 @@ func (e *Executor) callLLMWithReactiveCompaction(ctx context.Context, state *run
 	// and fires when the true request size approaches the advertised context
 	// window, giving the host a chance to compact before the engine rejects
 	// the request with a context-exceeded error.
+	//
+	// Rising-edge latch: the condition can hold on every step for the rest
+	// of the run (output-heavy models cross the fraction early), so the
+	// diagnostic is emitted only on the transition into the condition and
+	// re-arms once a subsequent call drops back below it (e.g. after a
+	// compaction). This preserves the diagnostic's meaning — each emission
+	// marks a genuine new approach to the limit — without burying other
+	// diagnostics under per-step repeats.
 	if sp, ok := cw.(ContextWindowSizeProvider); ok {
 		if window := sp.ContextWindowSize(); window > 0 && resp.Usage.InputTokens > 0 {
 			estimated := resp.Usage.InputTokens + cw.OutputLimit()
-			if float64(estimated) >= float64(window)*contextServerLimitWarnFraction {
-				e.emitter.ExecutorDiagnostic(state.stepNum, "context_near_server_limit", map[string]any{
-					"input_tokens":   resp.Usage.InputTokens,
-					"output_limit":   cw.OutputLimit(),
-					"context_window": window,
-					"estimated":      estimated,
-				})
+			if nearLimit := float64(estimated) >= float64(window)*contextServerLimitWarnFraction; nearLimit {
+				if !state.nearServerLimitLatched {
+					state.nearServerLimitLatched = true
+					e.emitter.ExecutorDiagnostic(state.stepNum, "context_near_server_limit", map[string]any{
+						"input_tokens":   resp.Usage.InputTokens,
+						"output_limit":   cw.OutputLimit(),
+						"context_window": window,
+						"estimated":      estimated,
+					})
+				}
+			} else {
+				state.nearServerLimitLatched = false
 			}
 		}
 	}
@@ -1845,6 +1859,13 @@ func (e *Executor) handleCompactionAfterStep(ctx context.Context, cw ContextMana
 		state.reactiveCompactAttempted = false
 		state.preCompactionNudgeEmitted = false
 	case "reject":
+		if fill.Max <= 0 {
+			// Distinct from a genuine over-fill: the usable budget itself is
+			// non-positive (window ≤ output limit + safety margin), so no
+			// amount of compaction can recover — fail with a message that
+			// names the actual cause instead of "100% of 0 tokens".
+			return actionNone, fmt.Errorf("context budget is %d usable tokens before any content: the model's context window is too small for the configured output limit and safety margin (and the tool-schema reserve); compaction cannot recover", fill.Max)
+		}
 		if !state.reactiveCompactAttempted {
 			state.reactiveCompactAttempted = true
 			if result := cw.Compact(ctx); result != nil {

@@ -546,6 +546,141 @@ func TestRouterApplyDefaultSampling_RoutingPurposeReasoningModelSkipped(t *testi
 	}
 }
 
+// A model that declares it does not accept the temperature parameter rejects
+// every sampling field with a guaranteed HTTP 400 ("temperature is deprecated
+// for this model"), so explicitly-set values are stripped — not just the
+// preset. Regression guard for callers that set their own fixed sampling
+// profile on service calls (title generation, prompt optimization) and then
+// route to adaptive-thinking Claude / o-series / thinking-locked Kimi models.
+func TestRouterApplyDefaultSampling_ExplicitSamplingStrippedWithoutTemperatureCapability(t *testing.T) {
+	r := presetRouter()
+	r.registry = &ModelRegistry{}
+
+	req := fullSamplingRequest() // all five sampling fields explicitly set
+	r.applyDefaultSampling(&req, ModelMetadata{Family: "anthropic", Capabilities: &ModelCapabilities{Temperature: false}})
+
+	if req.Temperature != nil || req.TopP != nil || req.TopK != nil ||
+		req.RepetitionPenalty != nil || req.PresencePenalty != nil {
+		t.Errorf("explicit sampling fields must be stripped for models without temperature capability, got %+v", req)
+	}
+
+	// The strip is purpose-independent: the model rejects the parameter
+	// whether the call is deterministic or not.
+	det := ChatRequest{CallPurpose: CallPurposeRouting, Temperature: floatPtr(0.2), TopP: floatPtr(0.9)}
+	r.applyDefaultSampling(&det, ModelMetadata{Family: "openai_flagship", Capabilities: &ModelCapabilities{Temperature: false}})
+	if det.Temperature != nil || det.TopP != nil {
+		t.Errorf("explicit sampling fields must be stripped on deterministic calls too, got %+v", det)
+	}
+
+	// An unknown model (nil capabilities — e.g. a locally-served custom
+	// model) keeps explicitly-set values: no preset is injected, but the
+	// host retains full control over models the registry cannot vouch for.
+	unknown := fullSamplingRequest()
+	r.applyDefaultSampling(&unknown, ModelMetadata{Family: "custom"})
+	if unknown.Temperature == nil || unknown.TopP == nil || unknown.TopK == nil ||
+		unknown.RepetitionPenalty == nil || unknown.PresencePenalty == nil {
+		t.Errorf("explicit sampling fields must pass through for unknown models (nil capabilities), got %+v", unknown)
+	}
+}
+
+// Guessed capabilities must behave exactly like nil capabilities. Every
+// production Resolve path fills unknown/local models (LM Studio, Ollama,
+// vLLM, config-only entries without a `capabilities:` block) with
+// defaultUnknownCapabilities, whose Temperature is the zero value false — so
+// without the GuessedCapabilities signal the authoritative strip above would
+// silently zero the sampling profile a host explicitly configured. This test
+// constructs the metadata the way production does — via Resolve on a
+// registry that does not know the model (HuggingFace probe 404s into the
+// tier-5 fallback) — so it fails if the guess flag ever stops reaching the
+// router.
+func TestRouterApplyDefaultSampling_GuessedCapabilitiesKeepExplicitSampling(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	registry := NewModelRegistry(nil)
+	registry.httpClient = &http.Client{Transport: &rewriteTransport{base: http.DefaultTransport, serverURL: server.URL}}
+
+	meta, ok := registry.Resolve(context.Background(), "lm-studio-local-unknown-model")
+	if ok {
+		t.Fatal("expected ok=false for a model unknown to every tier")
+	}
+	if meta.Capabilities == nil {
+		t.Fatal("Resolve must fill non-nil capabilities for unknown models")
+	}
+	if meta.Capabilities.Temperature {
+		t.Fatal("fallback capabilities must have Temperature=false (the zero value)")
+	}
+	if !meta.GuessedCapabilities {
+		t.Fatal("fallback capabilities must be marked guessed — otherwise this test cannot guard the regression")
+	}
+
+	r := presetRouter()
+	r.registry = registry
+
+	// The regression: guessed Temperature=false used to hit the authoritative
+	// strip and silently zero the host's explicitly-configured sampling.
+	req := fullSamplingRequest()
+	r.applyDefaultSampling(&req, meta)
+	if req.Temperature == nil || *req.Temperature != 0.6 {
+		t.Errorf("explicit temperature must survive guessed capabilities, got %v", req.Temperature)
+	}
+	if req.TopP == nil || *req.TopP != 0.95 {
+		t.Errorf("explicit top_p must survive guessed capabilities, got %v", req.TopP)
+	}
+	if req.TopK == nil || *req.TopK != 20 {
+		t.Errorf("explicit top_k must survive guessed capabilities, got %v", req.TopK)
+	}
+	if req.RepetitionPenalty == nil || *req.RepetitionPenalty != 1.05 {
+		t.Errorf("explicit repetition_penalty must survive guessed capabilities, got %v", req.RepetitionPenalty)
+	}
+	if req.PresencePenalty == nil || *req.PresencePenalty != 0.1 {
+		t.Errorf("explicit presence_penalty must survive guessed capabilities, got %v", req.PresencePenalty)
+	}
+
+	// Mirrors the nil branch exactly: no preset injected into unset fields
+	// either — the provider's own defaults govern what the host left unset.
+	bare := ChatRequest{}
+	r.applyDefaultSampling(&bare, meta)
+	if bare.Temperature != nil || bare.TopP != nil || bare.TopK != nil ||
+		bare.RepetitionPenalty != nil || bare.PresencePenalty != nil {
+		t.Errorf("guessed capabilities must inject no preset (nil-passthrough semantics), got %+v", bare)
+	}
+
+	// Deterministic service calls (title generation, commit messages, prompt
+	// optimization on local models) keep an explicit profile too.
+	det := ChatRequest{CallPurpose: CallPurposeRouting, Temperature: floatPtr(0.2)}
+	r.applyDefaultSampling(&det, meta)
+	if det.Temperature == nil || *det.Temperature != 0.2 {
+		t.Errorf("explicit deterministic temperature must survive guessed capabilities, got %v", det.Temperature)
+	}
+	if det.TopP != nil {
+		t.Errorf("deterministic call must not gain preset fields with guessed capabilities, got %v", *det.TopP)
+	}
+}
+
+// Authoritative capabilities that declare temperature support behave exactly
+// like the caps-free path: an explicit value wins per-field, and unset fields
+// still get the preset.
+func TestRouterApplyDefaultSampling_AuthoritativeTemperatureSupportedInjectsDefaults(t *testing.T) {
+	r := presetRouter()
+	r.registry = &ModelRegistry{}
+
+	req := ChatRequest{Temperature: floatPtr(0.4)}
+	r.applyDefaultSampling(&req, ModelMetadata{Family: "qwen", Capabilities: &ModelCapabilities{Temperature: true}})
+
+	if req.Temperature == nil || *req.Temperature != 0.4 {
+		t.Errorf("explicit temperature must win over the preset, got %v", req.Temperature)
+	}
+	if req.TopP == nil || *req.TopP != 0.95 {
+		t.Errorf("unset top_p must get the preset with authoritative Temperature=true, got %v", req.TopP)
+	}
+	if req.TopK == nil || *req.TopK != 20 {
+		t.Errorf("unset top_k must get the preset with authoritative Temperature=true, got %v", req.TopK)
+	}
+}
+
 // DeterministicTemperature pins the family floors the router relies on.
 func TestDeterministicTemperature(t *testing.T) {
 	cases := map[string]float64{

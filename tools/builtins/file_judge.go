@@ -35,7 +35,8 @@ func hardOutcome(allowed bool, reason string, code tools.JudgeReasonCode) tools.
 // outcome with an explanatory reason to defer to the confirmation flow.
 //
 // Git-internal guard: a target whose resolved path contains a ".git" path
-// component at or below the workspace root escalates as a HARD reason
+// component (case-insensitively) at or below the workspace root or any
+// additional allowed root escalates as a HARD reason
 // ([tools.ReasonCodeGitInternal]) before the soft containment check runs —
 // mutating the repository's object database, refs, config, or hooks can
 // rewrite history or plant executable code, so the escalation must never be

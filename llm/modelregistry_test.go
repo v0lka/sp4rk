@@ -758,6 +758,66 @@ func TestModelRegistry_HuggingFace_AttachmentDefault(t *testing.T) {
 	}
 }
 
+// GuessedCapabilities distinguishes registry guesswork from declarations.
+// Router.applyDefaultSampling strips explicitly-set sampling only for an
+// AUTHORITATIVE Temperature=false declaration; every defaulted capability set
+// must carry the guessed marker so local/unknown models keep their
+// host-configured sampling (see TestRouterApplyDefaultSampling_GuessedCapabilitiesKeepExplicitSampling).
+func TestModelRegistry_GuessedCapabilitiesSignal(t *testing.T) {
+	// A HuggingFace-resolved record: config.json carries no capability data,
+	// so the filled set must be marked guessed.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"max_position_embeddings": 8192}`))
+	}))
+	defer server.Close()
+
+	registry := NewModelRegistry(map[string]ModelMetadata{
+		// Explicitly declared capabilities (a config `capabilities:` block)
+		// stay authoritative — even with Temperature left false.
+		"zzz-declared-local-model": {
+			ContextWindow: 65536,
+			Capabilities:  &ModelCapabilities{Attachment: true, ToolCall: true},
+		},
+		// A partial override (capabilities not pinned) inherits the fallback
+		// guess for a model no tier knows — and the guessed marker with it.
+		"zzz-partial-local-model": {ContextWindow: 32768},
+	})
+	registry.httpClient = &http.Client{
+		Transport: &rewriteTransport{base: http.DefaultTransport, serverURL: server.URL},
+	}
+
+	if meta, ok := registry.Resolve(context.Background(), "zzz-hf-guessed-model"); !ok {
+		t.Fatal("expected ok=true for HuggingFace-resolved model")
+	} else if !meta.GuessedCapabilities {
+		t.Error("HuggingFace-resolved capabilities must be marked guessed")
+	}
+
+	if meta, ok := registry.ResolveLocal("zzz-unknown-model"); ok {
+		t.Fatal("expected ok=false for a model unknown to every local tier")
+	} else if !meta.GuessedCapabilities {
+		t.Error("tier-5 fallback capabilities must be marked guessed")
+	}
+
+	if meta, ok := registry.Resolve(context.Background(), "gpt-4o"); !ok {
+		t.Fatal("expected ok=true for built-in model")
+	} else if meta.GuessedCapabilities {
+		t.Error("built-in catalog capabilities must stay authoritative (not guessed)")
+	}
+
+	if meta, ok := registry.Resolve(context.Background(), "zzz-declared-local-model"); !ok {
+		t.Fatal("expected ok=true for overridden model")
+	} else if meta.GuessedCapabilities {
+		t.Error("user-declared capabilities (config capabilities:) must stay authoritative")
+	}
+
+	if meta, ok := registry.Resolve(context.Background(), "zzz-partial-local-model"); !ok {
+		t.Fatal("expected ok=true for partial override")
+	} else if !meta.GuessedCapabilities {
+		t.Error("a partial override inheriting fallback capabilities must carry the guessed marker")
+	}
+}
+
 func TestModelRegistry_ThreadSafe(t *testing.T) {
 	registry := NewModelRegistry(nil)
 

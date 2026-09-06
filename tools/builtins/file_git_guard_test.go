@@ -143,46 +143,47 @@ func TestJudge_GitInternal_CoversNestedReposAndDotGitTarget(t *testing.T) {
 	}
 }
 
-// TestJudge_GitInternal_CaseSensitivity pins component-matching semantics to
-// the session case-sensitivity flag: on a case-insensitive session a ".GIT"
-// component IS the git directory (flagged); on a case-sensitive session it is
-// an ordinary directory (not flagged) — mirroring tools.IsWithinRoot.
+// TestJudge_GitInternal_CaseSensitivity pins that component matching folds
+// letter case UNCONDITIONALLY: a ".GIT" or ".Git" component is flagged as
+// git internals regardless of the session case-sensitivity flag. Folding is
+// the fail-safe direction — case-variant dot-git spellings can denote live
+// git internals (mechanism confirmed empirically against git 2.50.1) — so
+// the guard never bets on filesystem case sensitivity; the cost of a false
+// positive on an exotic case-distinct sibling is one interactive
+// confirmation, the cost of a false negative is a write into real git
+// internals. (The per-root SCOPE check still folds only under the session
+// flag — see TestJudge_GitInternal_CaseMismatchedWorkspacePrefix.)
 //
-// The target deliberately uses a ".GIT" component that exists on disk in NO
-// spelling (under a freshly created "sub" directory). A ".GIT" component that
-// aliases the real on-disk ".git" directory is a different, platform-specific
-// story: Windows filepath.EvalSymlinks canonicalizes existing path components
-// to their on-disk spelling, so such a target arrives at the guard already
-// spelled ".git" and is correctly flagged regardless of the session flag —
-// the write genuinely hits git internals, and not flagging it would be a
-// bypass. A component that exists in no spelling survives resolution verbatim
-// on every platform, so the two subtests below exercise the guard's own case
-// handling — and only that.
+// The target deliberately uses a case-variant component that exists on disk
+// in NO spelling (under a freshly created "sub" directory). A case-variant
+// component that aliases the real on-disk ".git" directory is a different,
+// platform-specific story: Windows filepath.EvalSymlinks canonicalizes
+// existing path components to their on-disk spelling, so such a target
+// arrives at the guard already spelled ".git" and is flagged on every
+// platform regardless — the write genuinely hits git internals. A component
+// that exists in no spelling survives resolution verbatim on every platform,
+// so the subtests below exercise the guard's own case handling — and only
+// that.
 func TestJudge_GitInternal_CaseSensitivity(t *testing.T) {
 	ws := newGitGuardWorkspace(t)
 	if err := os.MkdirAll(filepath.Join(ws, "sub"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	base := tools.WithWorkspacePath(context.Background(), ws)
-	target := filepath.Join(ws, "sub", ".GIT", "config")
 	write := NewWriteFileTool()
-	input, err := json.Marshal(map[string]string{"path": target, "content": "x"})
-	if err != nil {
-		t.Fatal(err)
-	}
 
-	caseInsensitive := tools.WithCaseInsensitivePaths(base, true)
-	if outcome := write.Judge(caseInsensitive, input); outcome.Allow || outcome.Severity != tools.JudgeSeverityHard || outcome.ReasonCode != tools.ReasonCodeGitInternal {
-		t.Fatalf("case-insensitive session .GIT: got %+v, want hard %s", outcome, tools.ReasonCodeGitInternal)
-	}
-
-	caseSensitive := tools.WithCaseInsensitivePaths(base, false)
-	outcome := write.Judge(caseSensitive, input)
-	if !outcome.Allow {
-		t.Fatalf("case-sensitive session .GIT is an ordinary dir: got %+v, want allow", outcome)
-	}
-	if outcome.ReasonCode != "" {
-		t.Fatalf("case-sensitive session .GIT should carry no reason code, got %q", outcome.ReasonCode)
+	for _, component := range []string{".GIT", ".Git"} {
+		input, err := json.Marshal(map[string]string{"path": filepath.Join(ws, "sub", component, "config"), "content": "x"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, fold := range []bool{true, false} {
+			ctx := tools.WithCaseInsensitivePaths(base, fold)
+			outcome := write.Judge(ctx, input)
+			if outcome.Allow || outcome.Severity != tools.JudgeSeverityHard || outcome.ReasonCode != tools.ReasonCodeGitInternal {
+				t.Fatalf("session fold=%v, component %q: got %+v, want hard %s", fold, component, outcome, tools.ReasonCodeGitInternal)
+			}
+		}
 	}
 }
 
@@ -262,15 +263,24 @@ func TestJudge_GitInternal_RegularDotfilesUnaffected(t *testing.T) {
 	}
 }
 
-// TestJudge_GitInternal_ScopedToWorkspaceRoot pins the guard's scope: paths
-// outside the workspace are handled by the outside-session-roots escalation
-// (soft), and the temp directory — an equal session root, but not the
-// workspace — is not guarded by this control.
+// TestJudge_GitInternal_ScopedToWorkspaceRoot pins the guard's scope: it
+// covers the workspace AND additional allowed roots (work directories) — a
+// .git write inside an allowed root escalates as HARD git-internal, it is no
+// longer softly auto-approved just because the root is a containment peer.
+// Paths outside every session root stay with the SOFT outside-roots
+// escalation. The session temp directory is a DELIBERATE exception — an
+// equal session root that this control intentionally does not guard
+// (host-managed per-session scratch space; a documented accepted-risk
+// decision in the host's security model, not an oversight).
 func TestJudge_GitInternal_ScopedToWorkspaceRoot(t *testing.T) {
 	ws := newGitGuardWorkspace(t)
 	other := t.TempDir()
+	allowed := t.TempDir()
 	tempDir := t.TempDir()
-	ctx := tools.WithTempDir(tools.WithWorkspacePath(context.Background(), ws), tempDir)
+	ctx := tools.WithAllowedRoots(
+		tools.WithTempDir(tools.WithWorkspacePath(context.Background(), ws), tempDir),
+		[]string{allowed},
+	)
 	write := NewWriteFileTool()
 
 	// Outside every session root: denied, but by the SOFT containment rule,
@@ -284,11 +294,68 @@ func TestJudge_GitInternal_ScopedToWorkspaceRoot(t *testing.T) {
 		t.Fatalf("out-of-roots .git write should stay soft/%s, got %+v", tools.ReasonCodeOutsideSessionRoots, outcome)
 	}
 
-	// Inside the temp dir: a peer root, auto-approved like any other write.
+	// Inside an allowed root (work directory): a .git write is HARD
+	// git-internal — the guard iterates workspace + allowed roots, so the
+	// write to <workdir>/.git does not slip through locality auto-approval.
+	input, _ = json.Marshal(map[string]string{"path": filepath.Join(allowed, ".git", "config"), "content": "x"})
+	outcome = write.Judge(ctx, input)
+	if outcome.Allow || outcome.Severity != tools.JudgeSeverityHard || outcome.ReasonCode != tools.ReasonCodeGitInternal {
+		t.Fatalf("allowed-root .git write: got %+v, want hard %s", outcome, tools.ReasonCodeGitInternal)
+	}
+
+	// No over-blocking: a plain write inside the allowed root still
+	// auto-approves as a local write.
+	input, _ = json.Marshal(map[string]string{"path": filepath.Join(allowed, "notes.txt"), "content": "x"})
+	outcome = write.Judge(ctx, input)
+	if !outcome.Allow {
+		t.Fatalf("allowed-root plain write should stay allowed, got %+v (reason: %q)", outcome, outcome.Reason)
+	}
+
+	// Inside the temp dir: a peer root that this control deliberately does
+	// not guard — a .git write there auto-approves like any other temp
+	// write.
 	input, _ = json.Marshal(map[string]string{"path": filepath.Join(tempDir, ".git", "config"), "content": "x"})
 	outcome = write.Judge(ctx, input)
 	if !outcome.Allow {
-		t.Fatalf("temp-dir .git write is outside the guard's scope: got %+v (reason: %q)", outcome, outcome.Reason)
+		t.Fatalf("temp-dir .git write is outside the guard's scope by design: got %+v (reason: %q)", outcome, outcome.Reason)
+	}
+}
+
+// TestJudge_GitInternal_RootInsideGitInternals pins that the guard scans the
+// ROOT'S OWN components too: a session root that itself ends inside a
+// ".git" tree — e.g. a workspace opened at <repo>/.git/worktrees/<name>, or
+// an allowed root at <repo>/.git — makes every target under it git
+// internals, even though the root-relative remainder alone never contains a
+// ".git" component.
+func TestJudge_GitInternal_RootInsideGitInternals(t *testing.T) {
+	base := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(base, ".git", "worktrees", "wt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := NewWriteFileTool()
+
+	// Workspace root inside git internals (linked-worktree admin layout):
+	// every write under the workspace escalates as hard git-internal.
+	ws := filepath.Join(base, ".git", "worktrees", "wt")
+	ctx := tools.WithWorkspacePath(context.Background(), ws)
+	input, _ := json.Marshal(map[string]string{"path": filepath.Join(ws, "HEAD"), "content": "x"})
+	outcome := write.Judge(ctx, input)
+	if outcome.Allow || outcome.Severity != tools.JudgeSeverityHard || outcome.ReasonCode != tools.ReasonCodeGitInternal {
+		t.Fatalf("workspace ending inside .git tree: got %+v, want hard %s", outcome, tools.ReasonCodeGitInternal)
+	}
+
+	// Allowed root ending exactly at a ".git" component, outside the
+	// workspace tree: the root's own components trigger the guard.
+	allowedBase := t.TempDir()
+	allowedRoot := filepath.Join(allowedBase, "repo", ".git")
+	if err := os.MkdirAll(allowedRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx = tools.WithAllowedRoots(tools.WithWorkspacePath(context.Background(), ws), []string{allowedRoot})
+	input, _ = json.Marshal(map[string]string{"path": filepath.Join(allowedRoot, "config"), "content": "x"})
+	outcome = write.Judge(ctx, input)
+	if outcome.Allow || outcome.Severity != tools.JudgeSeverityHard || outcome.ReasonCode != tools.ReasonCodeGitInternal {
+		t.Fatalf("allowed root ending at .git: got %+v, want hard %s", outcome, tools.ReasonCodeGitInternal)
 	}
 }
 

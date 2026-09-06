@@ -72,6 +72,24 @@ type ModelMetadata struct {
 	// SetCachedMetadata, SetRuntimeMetadata) are copied on write, so the
 	// caller's later mutations cannot reach the stored entries.
 	Capabilities *ModelCapabilities
+	// GuessedCapabilities reports whether Capabilities was filled by registry
+	// guesswork (defaultUnknownCapabilities: the tier-5 fallback, a
+	// HuggingFace-resolved record whose config.json carries no capability
+	// data, or finalizeMeta's nil-Capabilities fill) rather than declared by
+	// an authoritative source — the built-in catalog, a user override /
+	// config `capabilities:` block, or an observed runtime entry.
+	//
+	// ZERO VALUE MEANS AUTHORITATIVE. A ModelMetadata constructed by external
+	// code (e.g. a host wiring explicit capabilities out of its own config)
+	// defaults to "declared" and keeps the historical semantics where a
+	// non-nil Capabilities with Temperature=false is trusted as a real
+	// declaration. Only the registry's defaulting paths set it true, so
+	// downstream consumers (see Router.applyDefaultSampling) can distinguish
+	// "the catalog says this model rejects temperature" — strip
+	// explicitly-set sampling to avoid guaranteed 4xx rejects — from "we
+	// optimistically assumed capabilities for a model nobody knows", where
+	// the host stays in control exactly as it would be with nil capabilities.
+	GuessedCapabilities bool
 }
 
 // ModelMetadataSource is a function that can resolve model metadata from an external source.
@@ -352,10 +370,11 @@ func (r *ModelRegistry) negativeCacheFresh(key string) bool {
 // derive from the model ID via resolveFamily/resolveProtocol.
 func fallbackMetadata() ModelMetadata {
 	return ModelMetadata{
-		ContextWindow: 128000,
-		OutputLimit:   32768,
-		TokenizerType: "approximate",
-		Capabilities:  defaultUnknownCapabilities(),
+		ContextWindow:       128000,
+		OutputLimit:         32768,
+		TokenizerType:       "approximate",
+		Capabilities:        defaultUnknownCapabilities(),
+		GuessedCapabilities: true,
 	}
 }
 
@@ -476,8 +495,10 @@ func (r *ModelRegistry) RuntimeMetadata(model string) (ModelMetadata, bool) {
 		// A stored entry can carry nil Capabilities (cloneCapabilities(nil)
 		// yields nil). Normalize to the optimistic unknown set so callers can
 		// dereference Capabilities without a panic, mirroring finalizeMeta's
-		// read-side contract.
+		// read-side contract. The filled set is registry guesswork, so the
+		// guessed marker travels with it (see GuessedCapabilities).
 		meta.Capabilities = defaultUnknownCapabilities()
+		meta.GuessedCapabilities = true
 	} else {
 		meta.Capabilities = cloneCapabilities(meta.Capabilities)
 	}
@@ -562,6 +583,12 @@ func (r *ModelRegistry) enrichPartialWith(override ModelMetadata, baseline func(
 	}
 	if override.Capabilities == nil {
 		override.Capabilities = lower.Capabilities
+		// The guessed marker travels with the inherited pointer: a partial
+		// override (nil capabilities) for a model no tier knows inherits the
+		// fallback's optimistic guess, and that guess must not masquerade as
+		// a declaration downstream. Conversely, inheriting a catalog-declared
+		// set keeps the authoritative zero value.
+		override.GuessedCapabilities = lower.GuessedCapabilities
 	}
 	return override
 }
@@ -906,6 +933,10 @@ func getBuiltInIndex() map[string]ModelMetadata {
 // (no source recognized the model) and HuggingFace-resolved models (config.json
 // yields a context window but no capability information).
 //
+// Every caller that fills a record with this set must also set
+// ModelMetadata.GuessedCapabilities=true so downstream consumers can tell the
+// guess from a declaration (see the field's doc for the zero-value contract).
+//
 // Attachment support is assumed optimistically. It is far better to let a user
 // attach an image and surface a provider error at runtime than to silently
 // disable image uploads for a model the registry simply does not know about.
@@ -937,19 +968,24 @@ func cloneCapabilities(caps *ModelCapabilities) *ModelCapabilities {
 //     enriched against a partial cache entry) falls back to the optimistic
 //     unknown set, mirroring the tier-5 fallback rationale: better to surface
 //     a runtime provider error than silently deny image uploads for a model
-//     the registry knows nothing about.
+//     the registry knows nothing about. The filled set is guesswork, so
+//     GuessedCapabilities is set true alongside it.
 //   - non-nil Capabilities is cloned so the returned metadata never aliases
 //     registry state (built-in catalog entries are process-global; cache and
 //     runtime entries are shared across concurrent readers). Callers may
 //     mutate the returned struct freely.
 //
 // A non-nil value is otherwise returned as AUTHORITATIVE — an all-false set
-// stays all-false; the nil guard never overrides a declared value.
+// stays all-false; the nil guard never overrides a declared value. The
+// GuessedCapabilities marker is preserved from the record itself (true only
+// where the capabilities were produced by guesswork: the tier-5 fallback, a
+// HuggingFace-resolved record, or this function's nil fill).
 func finalizeMeta(model string, meta ModelMetadata) ModelMetadata {
 	meta.Family = resolveFamily(model, meta)
 	meta.Protocol = resolveProtocol(model, meta)
 	if meta.Capabilities == nil {
 		meta.Capabilities = defaultUnknownCapabilities()
+		meta.GuessedCapabilities = true
 		return meta
 	}
 	meta.Capabilities = cloneCapabilities(meta.Capabilities)
@@ -1025,9 +1061,10 @@ func (r *ModelRegistry) fetchFromHuggingFace(ctx context.Context, model string) 
 	}
 
 	return ModelMetadata{
-		ContextWindow: config.MaxPositionEmbeddings,
-		OutputLimit:   32768,
-		TokenizerType: "approximate",
+		ContextWindow:       config.MaxPositionEmbeddings,
+		OutputLimit:         32768,
+		TokenizerType:       "approximate",
+		GuessedCapabilities: true,
 		// config.json carries no capability information, so assume attachment
 		// support optimistically (see defaultUnknownCapabilities).
 		Capabilities: defaultUnknownCapabilities(),
