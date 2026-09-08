@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -123,16 +124,19 @@ func NewWebFetchToolWithClient(limits WebFetchLimits, client *http.Client) *WebF
 	// Always enforce redirect limit and SSRF protection on redirect targets.
 	// The initial URL is validated by Judge, but an HTTP redirect could
 	// otherwise bypass it (e.g. a public URL 302-ing to 169.254.169.254).
+	// The sentinel errors below let the retry loop recognize deterministic
+	// redirect failures (never retried) while keeping the message texts
+	// unchanged; the client wraps them in *url.Error, so match via errors.Is.
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		if len(via) >= 10 {
-			return errors.New("too many redirects (max 10)")
+			return errTooManyRedirects
 		}
 		addr, private, chkErr := resolveHostIsPrivate(req.Context(), req.URL.String())
 		if chkErr != nil {
-			return fmt.Errorf("SSRF check on redirect target failed: %w", chkErr)
+			return fmt.Errorf("%w: %w", errRedirectSSRFCheckFailed, chkErr)
 		}
 		if private {
-			return fmt.Errorf("redirect to private/reserved address refused: %s", addr)
+			return fmt.Errorf("%w: %s", errRedirectPrivateRefused, addr)
 		}
 		return nil
 	}
@@ -288,8 +292,128 @@ func (t *WebFetchTool) Execute(ctx context.Context, input json.RawMessage) (tool
 	return tools.ToolResult{Content: markdown, IsError: false}, nil
 }
 
-// fetchPage performs HTTP GET and returns the response body.
+// httpStatusError reports a non-2xx HTTP status from the origin server. It
+// lets the retry loop distinguish status failures (retried only for
+// transient codes) from transport-level failures (always retried). The
+// message text is part of the tool's observable error contract.
+type httpStatusError struct {
+	code int
+	text string
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("HTTP %d: %s", e.code, e.text)
+}
+
+// bodyLimitError reports that the response body exceeded the fetch cap. The
+// condition is deterministic for a given URL, so it is never retried. The
+// message text is part of the tool's observable error contract.
+type bodyLimitError struct{}
+
+func (e *bodyLimitError) Error() string {
+	return fmt.Sprintf("response body exceeds %d byte limit", maxWebFetchBodyBytes)
+}
+
+// Sentinel errors for deterministic redirect failures returned from
+// CheckRedirect. The http.Client wraps them in *url.Error, so the retry loop
+// matches them via errors.Is. The message texts are part of the tool's
+// observable error contract.
+var (
+	errTooManyRedirects        = errors.New("too many redirects (max 10)")
+	errRedirectSSRFCheckFailed = errors.New("SSRF check on redirect target failed")
+	errRedirectPrivateRefused  = errors.New("redirect to private/reserved address refused")
+)
+
+// retryableStatus reports whether an HTTP status code is transient and worth
+// retrying: request timeout, rate limiting, and any server-side error class.
+func retryableStatus(code int) bool {
+	return code == http.StatusRequestTimeout ||
+		code == http.StatusTooManyRequests ||
+		code >= http.StatusInternalServerError
+}
+
+// retryableFetchError reports whether retrying a failed fetch attempt may
+// plausibly succeed. Deterministic failures (non-transient statuses, the body
+// limit, refused redirects and SSRF-blocked redirect targets) are not
+// retried; transport-level failures (DNS, connect, TLS, per-attempt timeout,
+// mid-body read errors) are. Caller-context cancellation is handled
+// separately by the retry loop via ctx.Err(), not here.
+func retryableFetchError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var statusErr *httpStatusError
+	if errors.As(err, &statusErr) {
+		return retryableStatus(statusErr.code)
+	}
+	var limitErr *bodyLimitError
+	if errors.As(err, &limitErr) {
+		return false
+	}
+	if errors.Is(err, errTooManyRedirects) ||
+		errors.Is(err, errRedirectPrivateRefused) ||
+		errors.Is(err, errRedirectSSRFCheckFailed) {
+		return false
+	}
+	return true
+}
+
+// attemptTimeout scales the base HTTP timeout for a fetch attempt: attempt 0
+// uses the base timeout unchanged and each subsequent retry attempt doubles
+// it (base, 2×base, 4×base, …). A non-positive base means "no per-request
+// timeout" and is returned unchanged.
+func attemptTimeout(base time.Duration, attempt int) time.Duration {
+	if base <= 0 || attempt <= 0 {
+		return base
+	}
+	timeout := base
+	for range attempt {
+		if timeout > math.MaxInt64/2 {
+			return math.MaxInt64
+		}
+		timeout *= 2
+	}
+	return timeout
+}
+
+// fetchPage performs HTTP GET and returns the response body. A failed attempt
+// is retried up to limits.Retries times; each retry doubles the per-attempt
+// HTTP timeout (attempt 0 uses the base timeout). Only transient failures are
+// retried — see retryableFetchError — and a cancelled caller context stops
+// the loop immediately.
 func (t *WebFetchTool) fetchPage(ctx context.Context, targetURL string) (string, error) {
+	maxAttempts := t.limits.Retries + 1
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+
+	for attempt := 0; ; attempt++ {
+		content, err := t.fetchOnce(ctx, targetURL, attempt)
+		if err == nil {
+			return content, nil
+		}
+		// A done parent context means the caller cancelled or expired — that
+		// is not a transient fetch failure, so stop even when the last error
+		// itself looks retryable.
+		if ctx.Err() != nil || !retryableFetchError(err) || attempt+1 >= maxAttempts {
+			return "", err
+		}
+	}
+}
+
+// fetchOnce performs a single HTTP GET attempt and returns the response body.
+// Attempt 0 uses the tool's base client; every later attempt uses a shallow
+// copy of it whose Timeout is doubled per attempt. The shared Transport — and
+// with it the SSRF-safe dialing, redirect policy, and connection pool — is
+// reused unchanged across attempts.
+func (t *WebFetchTool) fetchOnce(ctx context.Context, targetURL string, attempt int) (string, error) {
+	client := t.client
+	if attempt > 0 {
+		c := *t.client // shallow copy: Transport and Jar are shared by pointer
+		c.Timeout = attemptTimeout(t.client.Timeout, attempt)
+		client = &c
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, http.NoBody)
 	if err != nil {
 		return "", fmt.Errorf("failed to create request: %w", err)
@@ -300,14 +424,14 @@ func (t *WebFetchTool) fetchPage(ctx context.Context, targetURL string) (string,
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
 
-	resp, err := t.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("request failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, resp.Status)
+		return "", &httpStatusError{code: resp.StatusCode, text: resp.Status}
 	}
 
 	// Cap the response body to bound memory use; the centralized
@@ -320,7 +444,7 @@ func (t *WebFetchTool) fetchPage(ctx context.Context, targetURL string) (string,
 		return "", fmt.Errorf("failed to read response: %w", err)
 	}
 	if len(body) > maxWebFetchBodyBytes {
-		return "", fmt.Errorf("response body exceeds %d byte limit", maxWebFetchBodyBytes)
+		return "", &bodyLimitError{}
 	}
 
 	return string(body), nil

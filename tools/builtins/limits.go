@@ -46,7 +46,8 @@ func DefaultRipgrepLimits() RipgrepLimits {
 
 // WebFetchLimits holds configurable limits for the web_fetch tool.
 type WebFetchLimits struct {
-	Timeout time.Duration // timeout for HTTP requests
+	Timeout time.Duration // timeout for HTTP requests; doubled on each retry attempt
+	Retries int           // number of retries after the initial attempt; 0 disables retrying
 }
 
 // WebSearchLimits holds configurable limits for the web_search tool.
