@@ -19,7 +19,7 @@ jobs:
           # Must match the `go` directive in go.mod: govulncheck below scans
           # this toolchain's stdlib and fails the build on known CVEs, so bump
           # go.mod and this pin together whenever Go ships a security patch.
-          go-version: "1.27.0"
+          go-version: "1.27.1"
 
       - name: Install system dependencies
         # build-essential provides gcc, which is required for cgo: the
@@ -55,7 +55,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.27.0"
+          go-version: "1.27.1"
 
       - name: Install system dependencies
         # macOS ships clang, satisfying the cgo requirement. ripgrep is
@@ -82,7 +82,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.27.0"
+          go-version: "1.27.1"
 
       - name: Install system dependencies
         # The windows-2022 image ships gcc 14.2.0, satisfying the cgo
@@ -95,6 +95,15 @@ jobs:
 
       - name: Lint (Go)
         run: golangci-lint run
+
+      - name: Test (Go, llm verbose)
+        # The llm package is this leg's recurring failure point, and a wedged
+        # runtime crash leaves NO test output at all (no timeout panic, no
+        # goroutine dump — the log shows only fatal runtime errors). Running
+        # llm first with -v guarantees the last "=== RUN TestX" line names
+        # the test in charge when the binary dies; the 8m package timeout
+        # fires before the harness kill so its dump is captured too.
+        run: go test -v -timeout 8m ./llm/...
 
       - name: Test (Go)
         run: go test ./...
