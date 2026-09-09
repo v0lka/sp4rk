@@ -94,6 +94,25 @@ type EmbedderConfig struct {
 	// the field is not validated, so callers should pass a non-negative value.
 	IntraOpThreads int
 
+	// ExecutionProvider selects the ONNX Runtime execution provider used for
+	// inference: ExecutionProviderCPU ("cpu") or ExecutionProviderCUDA
+	// ("cuda"). The empty string (the default) means "cpu" and preserves the
+	// legacy behavior exactly.
+	//
+	// ONNX Runtime does not pick a GPU on its own — pointing LibraryPath at a
+	// GPU build changes nothing unless the provider is requested here. "cuda"
+	// additionally requires the CUDA provider shared libraries next to
+	// LibraryPath and a working driver/toolkit; when any of that is missing,
+	// NewEmbedder fails loudly rather than silently falling back to the CPU.
+	// Unknown values are rejected.
+	ExecutionProvider string
+
+	// DeviceID is the GPU device index used when ExecutionProvider is "cuda".
+	// Defaults to 0, which is the right choice on single-GPU machines and
+	// selects the first device reported by the driver on multi-GPU ones. It is
+	// ignored by the CPU provider.
+	DeviceID int
+
 	// Logger for structured logging. If nil, a discard logger is used.
 	Logger *slog.Logger
 
@@ -136,6 +155,25 @@ type Embedder struct {
 	// Creation, use, and destruction are serialized by mu.
 	bucketSessions map[sessionKey]*onnxSession
 	sessOpts       *ort.SessionOptions
+	// runner pins every ONNX Runtime call to one OS thread; nil for the CPU
+	// provider, which does not need the pinning. See ortRunner.
+	runner *ortRunner
+}
+
+// runOnORTThread executes fn on r's dedicated thread, or inline when r is nil.
+func runOnORTThread(r *ortRunner, fn func()) {
+	if r == nil {
+		fn()
+		return
+	}
+	r.do(fn)
+}
+
+// onORTThread executes fn on the embedder's dedicated ONNX thread, or inline
+// when no runner is in use. The caller must hold e.mu, which is what keeps the
+// ONNX sessions single-threaded for the CPU provider too.
+func (e *Embedder) onORTThread(fn func()) {
+	runOnORTThread(e.runner, fn)
 }
 
 // NewEmbedder creates a new Embedder by loading the tokenizer and initializing
@@ -174,6 +212,13 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 		batchSize = DefaultBatchSize
 	}
 
+	// Normalized for logging only; buildSessionOptions accepts the empty
+	// string as a synonym for the CPU provider and validates the rest.
+	provider := cfg.ExecutionProvider
+	if provider == "" {
+		provider = ExecutionProviderCPU
+	}
+
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
@@ -187,18 +232,53 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 		logger.Warn("EnableBatchPipeline is ignored while EnableLengthBuckets is enabled; running in bucket mode")
 	}
 
-	logger.Info("initializing ONNX Runtime", "library", cfg.LibraryPath)
-	if err := initONNXRuntime(cfg.LibraryPath); err != nil {
-		return nil, fmt.Errorf("initializing ONNX Runtime: %w", err)
+	// GPU providers keep per-thread state that must not be duplicated across
+	// Go's scheduler threads (see ortRunner). Every ONNX call below — and
+	// every one made later through the returned Embedder — is funnelled onto
+	// this single thread. The CPU provider needs none of it and keeps calling
+	// ONNX inline, exactly as before.
+	var runner *ortRunner
+	if provider == ExecutionProviderCUDA {
+		runner = newORTRunner()
+	}
+	// cleanup releases whatever the aborted initialization already acquired,
+	// on the ONNX thread, and shuts that thread down.
+	cleanup := func(sessOpts *ort.SessionOptions) {
+		runOnORTThread(runner, func() {
+			if sessOpts != nil {
+				_ = sessOpts.Destroy()
+			}
+			_ = destroyONNXRuntime()
+		})
+		if runner != nil {
+			runner.stop()
+		}
 	}
 
-	// Build session options (limits intra-op threads when configured). Must
-	// run after initONNXRuntime, because ort.NewSessionOptions requires the
-	// ONNX environment to be initialized. A nil result preserves the legacy
-	// behavior (session created with nil *SessionOptions).
-	sessOpts, err := buildSessionOptions(cfg.IntraOpThreads)
+	logger.Info("initializing ONNX Runtime", "library", cfg.LibraryPath)
+	var initErr error
+	runOnORTThread(runner, func() { initErr = initONNXRuntime(cfg.LibraryPath) })
+	if initErr != nil {
+		if runner != nil {
+			runner.stop()
+		}
+		return nil, fmt.Errorf("initializing ONNX Runtime: %w", initErr)
+	}
+
+	// Build session options (selects the execution provider and limits
+	// intra-op threads when configured). Must run after initONNXRuntime,
+	// because ort.NewSessionOptions requires the ONNX environment to be
+	// initialized. A nil result preserves the legacy behavior (session created
+	// with nil *SessionOptions).
+	var (
+		sessOpts *ort.SessionOptions
+		err      error
+	)
+	runOnORTThread(runner, func() {
+		sessOpts, err = buildSessionOptions(cfg.ExecutionProvider, cfg.DeviceID, cfg.IntraOpThreads)
+	})
 	if err != nil {
-		_ = destroyONNXRuntime()
+		cleanup(nil)
 		return nil, fmt.Errorf("building ONNX session options: %w", err)
 	}
 
@@ -206,10 +286,7 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 	tok, err := NewTokenizer(cfg.TokenizerPath)
 	if err != nil {
 		// Clean up ONNX env on failure.
-		if sessOpts != nil {
-			_ = sessOpts.Destroy()
-		}
-		_ = destroyONNXRuntime()
+		cleanup(sessOpts)
 		return nil, fmt.Errorf("loading tokenizer: %w", err)
 	}
 
@@ -217,12 +294,11 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 	if !cfg.EnableLengthBuckets {
 		logger.Info("creating persistent ONNX session", "model", cfg.ModelPath)
 		sessionStarted := time.Now()
-		sess, err = newONNXSession(cfg.ModelPath, 1, maxSeqLen, hiddenDim, sessOpts, cfg.Telemetry)
+		runOnORTThread(runner, func() {
+			sess, err = newONNXSession(cfg.ModelPath, 1, maxSeqLen, hiddenDim, sessOpts, cfg.Telemetry)
+		})
 		if err != nil {
-			if sessOpts != nil {
-				_ = sessOpts.Destroy()
-			}
-			_ = destroyONNXRuntime()
+			cleanup(sessOpts)
 			return nil, fmt.Errorf("creating persistent ONNX session: %w", err)
 		}
 		cfg.Telemetry.observeSession(time.Since(sessionStarted))
@@ -235,6 +311,8 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 		"batchSize", batchSize,
 		"batchPipeline", cfg.EnableBatchPipeline,
 		"lengthBuckets", cfg.EnableLengthBuckets,
+		"executionProvider", provider,
+		"deviceID", cfg.DeviceID,
 	)
 
 	return &Embedder{
@@ -250,6 +328,7 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 		sess:           sess,
 		bucketSessions: make(map[sessionKey]*onnxSession, 4),
 		sessOpts:       sessOpts,
+		runner:         runner,
 	}, nil
 }
 
@@ -304,7 +383,11 @@ func (e *Embedder) EmbedDocuments(ctx context.Context, texts []string) ([][]floa
 	// This is the common case when chromem-go calls EmbeddingFunc one text at a time.
 	if numTexts == 1 && e.sess != nil {
 		e.logger.Debug("running inference (persistent session)", "seqLen", e.maxSeqLen)
-		vec, err := e.sess.run(inputIDs, attentionMask, tokenTypeIDs)
+		var (
+			vec []float32
+			err error
+		)
+		e.onORTThread(func() { vec, err = e.sess.run(inputIDs, attentionMask, tokenTypeIDs) })
 		if err != nil {
 			return nil, fmt.Errorf("embedding document: %w", err)
 		}
@@ -340,8 +423,14 @@ func (e *Embedder) EmbedDocuments(ctx context.Context, texts []string) ([][]floa
 			end = numTexts
 		}
 		lo, hi := start*e.maxSeqLen, end*e.maxSeqLen
-		vecs, err := e.batchSess.runBatch(end-start,
-			inputIDs[lo:hi], attentionMask[lo:hi], tokenTypeIDs[lo:hi])
+		var (
+			vecs [][]float32
+			err  error
+		)
+		e.onORTThread(func() {
+			vecs, err = e.batchSess.runBatch(end-start,
+				inputIDs[lo:hi], attentionMask[lo:hi], tokenTypeIDs[lo:hi])
+		})
 		if err != nil {
 			return nil, fmt.Errorf("embedding batch chunk [%d:%d] of %d documents: %w",
 				start, end, numTexts, err)
@@ -441,7 +530,13 @@ func (e *Embedder) ensureBatchSession() error {
 	e.logger.Info("creating persistent batch ONNX session (one-time init; loading the model takes a few seconds)",
 		"batchSize", e.batchSize, "seqLen", e.maxSeqLen)
 	started := time.Now()
-	sess, err := newONNXSession(e.modelPath, e.batchSize, e.maxSeqLen, e.hiddenDim, e.sessOpts, e.telemetry)
+	var (
+		sess *onnxSession
+		err  error
+	)
+	e.onORTThread(func() {
+		sess, err = newONNXSession(e.modelPath, e.batchSize, e.maxSeqLen, e.hiddenDim, e.sessOpts, e.telemetry)
+	})
 	if err != nil {
 		return fmt.Errorf("creating persistent batch ONNX session: %w", err)
 	}
@@ -483,27 +578,38 @@ func (e *Embedder) Close() error {
 	}
 	e.closed = true
 	e.logger.Info("closing embedder, destroying ONNX Runtime environment")
-	if e.sess != nil {
-		e.sess.destroy()
-		e.sess = nil
-	}
-	if e.batchSess != nil {
-		e.batchSess.destroy()
-		e.batchSess = nil
-	}
-	for key, sess := range e.bucketSessions {
-		sess.destroy()
-		delete(e.bucketSessions, key)
-	}
-	if e.sessOpts != nil {
-		_ = e.sessOpts.Destroy()
-		e.sessOpts = nil
+	// Teardown touches the same CUDA context the sessions were built on, so
+	// it runs on the ONNX thread too. One job for the whole sequence: the
+	// runner is stopped right after, and no ONNX call may outlive it.
+	var destroyErr error
+	e.onORTThread(func() {
+		if e.sess != nil {
+			e.sess.destroy()
+			e.sess = nil
+		}
+		if e.batchSess != nil {
+			e.batchSess.destroy()
+			e.batchSess = nil
+		}
+		for key, sess := range e.bucketSessions {
+			sess.destroy()
+			delete(e.bucketSessions, key)
+		}
+		if e.sessOpts != nil {
+			_ = e.sessOpts.Destroy()
+			e.sessOpts = nil
+		}
+		destroyErr = destroyONNXRuntime()
+	})
+	if e.runner != nil {
+		e.runner.stop()
+		e.runner = nil
 	}
 	// Mark the embedder closed so EmbedDocuments/EmbedQuery return an error
 	// instead of touching the destroyed ONNX environment.
 	e.tokenizer = nil
-	if err := destroyONNXRuntime(); err != nil {
-		return fmt.Errorf("destroying ONNX Runtime environment: %w", err)
+	if destroyErr != nil {
+		return fmt.Errorf("destroying ONNX Runtime environment: %w", destroyErr)
 	}
 	return nil
 }
