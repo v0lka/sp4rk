@@ -16,18 +16,6 @@ import (
 // function; the tests below pin its exactness for sliding_window and its
 // forecast-only nature for the LLM-backed strategies.
 
-// fixedSizeSummarizer is a deterministic Summarize fake: every call returns a
-// summary of exactly size tokens under mockTokenCounter{countPerChar: 1},
-// regardless of the block text it receives, and bumps *calls when non-nil.
-func fixedSizeSummarizer(size int, calls *int) func(context.Context, string) (string, error) {
-	return func(_ context.Context, _ string) (string, error) {
-		if calls != nil {
-			*calls++
-		}
-		return strings.Repeat("s", size), nil
-	}
-}
-
 // uniformMsgs builds n user messages whose Content is exactly charsPerMsg
 // bytes long, so under mockTokenCounter{countPerChar: 1} each message costs
 // exactly charsPerMsg tokens (CountMessages counts Content only).
