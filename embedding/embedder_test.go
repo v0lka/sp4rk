@@ -362,27 +362,46 @@ func TestTokenizer_EncodeBatch_EmptyTexts_MaxLenZero(t *testing.T) {
 // --- buildSessionOptions ---
 
 func TestBuildSessionOptions_Zero(t *testing.T) {
-	// intraOpThreads == 0 must return (nil, nil) without touching the ONNX
-	// runtime. This is the legacy / default code path and must not require
-	// the shared library to be initialized.
-	opts, err := buildSessionOptions(0)
-	if err != nil {
-		t.Fatalf("buildSessionOptions(0) error = %v, want nil", err)
-	}
-	if opts != nil {
-		t.Errorf("buildSessionOptions(0) opts = %p, want nil", opts)
+	// intraOpThreads == 0 on the CPU provider must return (nil, nil) without
+	// touching the ONNX runtime. This is the legacy / default code path and
+	// must not require the shared library to be initialized. The empty
+	// provider string is the zero value and a synonym for "cpu".
+	for _, provider := range []string{"", ExecutionProviderCPU} {
+		opts, err := buildSessionOptions(provider, 0, 0)
+		if err != nil {
+			t.Fatalf("buildSessionOptions(%q, 0, 0) error = %v, want nil", provider, err)
+		}
+		if opts != nil {
+			t.Errorf("buildSessionOptions(%q, 0, 0) opts = %p, want nil", provider, opts)
+		}
 	}
 }
 
 func TestBuildSessionOptions_Negative(t *testing.T) {
 	// Negative values are treated like 0: return (nil, nil).
 	for _, n := range []int{-1, -42} {
-		opts, err := buildSessionOptions(n)
+		opts, err := buildSessionOptions("", 0, n)
 		if err != nil {
-			t.Fatalf("buildSessionOptions(%d) error = %v, want nil", n, err)
+			t.Fatalf("buildSessionOptions(\"\", 0, %d) error = %v, want nil", n, err)
 		}
 		if opts != nil {
-			t.Errorf("buildSessionOptions(%d) opts = %p, want nil", n, opts)
+			t.Errorf("buildSessionOptions(\"\", 0, %d) opts = %p, want nil", n, opts)
+		}
+	}
+}
+
+func TestBuildSessionOptions_UnknownProvider(t *testing.T) {
+	// An unrecognized provider is rejected rather than silently downgraded to
+	// the CPU — a typo in the caller's configuration must not look like a
+	// working GPU setup. Rejection happens before any ONNX call, so this test
+	// needs no shared library.
+	for _, provider := range []string{"CUDA", "gpu", "cuda11", "coreml"} {
+		opts, err := buildSessionOptions(provider, 0, 0)
+		if err == nil {
+			t.Errorf("buildSessionOptions(%q, 0, 0) error = nil, want non-nil", provider)
+		}
+		if opts != nil {
+			t.Errorf("buildSessionOptions(%q, 0, 0) opts = %p, want nil", provider, opts)
 		}
 	}
 }
@@ -395,12 +414,12 @@ func TestBuildSessionOptions_Positive(t *testing.T) {
 	// when EMBEDDING_TEST_LIBRARY_PATH is unset.
 	_ = testLibraryPath(t)
 
-	opts, err := buildSessionOptions(4)
+	opts, err := buildSessionOptions("", 0, 4)
 	if err != nil {
-		t.Fatalf("buildSessionOptions(4) error = %v, want nil", err)
+		t.Fatalf("buildSessionOptions(\"\", 0, 4) error = %v, want nil", err)
 	}
 	if opts == nil {
-		t.Fatal("buildSessionOptions(4) opts = nil, want non-nil")
+		t.Fatal("buildSessionOptions(\"\", 0, 4) opts = nil, want non-nil")
 	}
 	t.Cleanup(func() {
 		if err := opts.Destroy(); err != nil {
