@@ -34,6 +34,11 @@ type CompactionDeps struct {
 	// MaxSummarizeTokens is the maximum token count for text sent to summarization.
 	// Defaults to 16000 if zero.
 	MaxSummarizeTokens int
+	// Forecast supplies the compression-ratio forecasts used by
+	// PredictCompaction to estimate the post-summary token count of the
+	// LLM-backed strategies. It is ignored by CompactConversationHistory and
+	// the step-based strategies — it exists only to feed the prediction.
+	Forecast CompactionForecast
 }
 
 // NewCompactionStrategy creates a CompactionStrategy by name.
