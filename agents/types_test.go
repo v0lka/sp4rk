@@ -73,6 +73,65 @@ func TestToolPreferenceWithError_MixedPresetErrorsWithParseMessage(t *testing.T)
 	}
 }
 
+func TestRequiredSkills(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		skills  string
+		want    []string
+		wantErr bool
+	}{
+		{name: "empty is nil", skills: "", want: nil},
+		{name: "whitespace only is nil", skills: "   ", want: nil},
+		{name: "single", skills: "code-review", want: []string{"code-review"}},
+		{name: "comma list trimmed", skills: "code-review, git-conventions", want: []string{"code-review", "git-conventions"}},
+		{name: "unpadded list", skills: "code-review,git-conventions", want: []string{"code-review", "git-conventions"}},
+		// A typo must fail the profile loudly, never silently change which
+		// skills a subagent gets.
+		{name: "empty leading item", skills: ",code-review", wantErr: true},
+		{name: "empty trailing item", skills: "code-review,", wantErr: true},
+		{name: "empty middle item", skills: "code-review,,git-conventions", wantErr: true},
+		{name: "duplicate", skills: "code-review,code-review", wantErr: true},
+		{name: "duplicate via padding", skills: "code-review, code-review", wantErr: true},
+		{name: "uppercase", skills: "Code-Review", wantErr: true},
+		{name: "underscore", skills: "code_review", wantErr: true},
+		{name: "leading hyphen", skills: "-code-review", wantErr: true},
+		{name: "trailing hyphen", skills: "code-review-", wantErr: true},
+		{name: "space inside name", skills: "code review", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			a := &Agent{Metadata: AgentMetadata{Skills: tt.skills}}
+			got, err := a.RequiredSkills()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("RequiredSkills(%q) error = %v, wantErr = %t", tt.skills, err, tt.wantErr)
+			}
+			if tt.wantErr {
+				return
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("RequiredSkills(%q) = %#v, want %#v", tt.skills, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRequiredSkills_AbsentAndEmptyAreNil(t *testing.T) {
+	t.Parallel()
+
+	// An absent `skills` field and an empty string both yield (nil, nil), so
+	// existing profiles that never declared `skills` are unaffected.
+	if got, err := (&Agent{}).RequiredSkills(); err != nil || got != nil {
+		t.Errorf("RequiredSkills with absent field = (%#v, %v), want (nil, nil)", got, err)
+	}
+	if got, err := (&Agent{Metadata: AgentMetadata{Skills: ""}}).RequiredSkills(); err != nil || got != nil {
+		t.Errorf("RequiredSkills with empty string = (%#v, %v), want (nil, nil)", got, err)
+	}
+}
+
 func TestDescriptor_HiddenPropagated(t *testing.T) {
 	t.Parallel()
 

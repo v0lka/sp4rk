@@ -8,7 +8,7 @@ Discovery, parsing, and management of **Subagent Profiles** — `AGENT.md` docum
 
 - `github.com/v0lka/sp4rk/agents` — `AgentManager`, `NewAgentManager`, `Scan`, `List`, `Get`
 - `github.com/v0lka/sp4rk/agents` (parsing) — `ParseAgent`, `ParseError`, `parseFrontmatter`
-- `github.com/v0lka/sp4rk/agents` (types) — `Agent`, `AgentMetadata`, `AgentDescriptor`, `ToolPreference`, `ToolPreferenceWithError`, `ToolGroupTokens`, `NormalizeToolGroupToken`
+- `github.com/v0lka/sp4rk/agents` (types) — `Agent`, `AgentMetadata`, `AgentDescriptor`, `ToolPreference`, `ToolPreferenceWithError`, `RequiredSkills`, `ToolGroupTokens`, `NormalizeToolGroupToken`
 
 ## Core Types
 
@@ -31,6 +31,7 @@ type AgentMetadata struct {
     AllowRedelegate bool   `yaml:"allow-redelegate,omitempty"` // nested delegation (default false)
     Hidden          bool   `yaml:"hidden,omitempty"`            // hide from #-autocomplete (default false)
     Color           string `yaml:"color,omitempty"`             // UI accent color for the agent badge
+    Skills          string `yaml:"skills,omitempty"`            // comma-list of skill names the subagent must have activated
 }
 
 // Lightweight discovery-time representation — what List() returns.
@@ -67,6 +68,7 @@ A profile lives at `<agents-dir>/<name>/AGENT.md`. The file is YAML frontmatter 
 | ----- | ---- |
 | `name` | Required. Lowercase alphanumeric and hyphens, no leading/trailing hyphens (`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`). Must match the parent directory name. |
 | `description` | Required (non-empty). |
+| `skills` | Optional. Comma-list of skill names the subagent must have activated. Each name must match the `name` shape; an empty item, a duplicate, or an invalid name is a `ParseError`. |
 | unknown keys | Silently ignored — not-yet-supported frontmatter fields (temperature/top-p, per-tool policy, mode, resources) do not break parsing. |
 
 A profile whose `name` does not match its parent directory name is rejected. A missing opening or closing `---` frontmatter delimiter is a parse error; the `---` must be at the start of a line so that `---` inside YAML string values is not mistaken for a delimiter.
@@ -90,6 +92,18 @@ AGENT.md files are validated at parse time (`validateToolsField` rejects the sam
 
 > Migration note: an earlier draft of the `tools:` field accepted comma-separated tool **names** (e.g. `edit_file,bash_exec`). That form is a `ParseError` — the field accepts group tokens only; express `edit_file,bash_exec` as `local-write,execute` (and `read_file` as `local-read`).
 
+## RequiredSkills
+
+`RequiredSkills() ([]string, error)` is the strict translation API for the declarative `skills` field — the list of skill names a subagent launched under this profile must have activated:
+
+| `skills` value | Returns | Meaning |
+| -------------- | ------- | ------- |
+| `""` (absent or empty; surrounding whitespace tolerated) | `nil`, no error | the profile requires no particular skills (existing profiles are unaffected) |
+| comma-list of skill names (e.g. `"code-review,git-conventions"`) | `[]string`, no error | the required skill names, trimmed |
+| empty item (a stray comma), duplicate name, or invalid name | error | fail-closed: a typo fails the profile loudly rather than silently changing which skills the subagent gets |
+
+Every item must match the agent-name pattern (lowercase alphanumeric with hyphens, no leading/trailing hyphens). AGENT.md files are validated at parse time (`validateSkillsField` rejects the same shapes with a `ParseError`), so an invalid profile is dropped from the catalog with a Warn instead of silently changing which skills a subagent gets; the error return matters for profiles built programmatically via the exported `Agent`/`AgentMetadata` types, which never pass through the parser. This package only parses the names — whether a named skill actually exists is resolved by the delegating runtime against its skill catalog at launch time.
+
 ## How a profile configures a subagent
 
 When a subagent is launched under a named profile, the execution layer applies the profile's fields:
@@ -98,6 +112,7 @@ When a subagent is launched under a named profile, the execution layer applies t
 | ----- | ---------- |
 | `Body` | the subagent's core directive / system prompt |
 | `Tools` (`ToolPreferenceWithError`) | the subagent's tool-group budget; validation errors abort preference resolution rather than widening access |
+| `Skills` (`RequiredSkills`) | the skill names the launched subagent must have activated; validation errors fail the profile rather than silently dropping skills |
 | `MaxSteps` | the ReAct iteration cap (0/absent → derived from task complexity) |
 | `Model` | forced via `agent.NewModelOverrideCaller` (wraps the caller so `req.Model` is set before the router resolves it) |
 | `AllowRedelegate` | whether the subagent may launch further subagents |
@@ -114,6 +129,7 @@ A plan step targets a profile via the `PlanStep.Agent` field (see [orchestration
 - `Scan` is idempotent (clears the catalog first); safe to call repeatedly.
 - An existing `AGENT.md` that fails parsing or validation is skipped with a Warn record; a directory without `AGENT.md` is a non-agent and is skipped at Debug.
 - Tool-group preferences are canonicalized and validated fail-closed by `ToolPreferenceWithError`; unknown, empty, duplicate, and mixed-preset lists return an error.
+- Skill requirements are validated fail-closed by `RequiredSkills`/`validateSkillsField`; empty-item, duplicate, and invalid-name lists return an error.
 - `Scan` follows directory symlinks.
 - A profile's `name` must match its parent directory name.
 - `List()` returns lightweight descriptors including hidden agents (the consumer filters hidden out); `Get()` returns the full profile for any name, hidden or not.

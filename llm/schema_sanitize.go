@@ -80,11 +80,7 @@ func sanitizeSchemaForOpenAI(raw json.RawMessage, strict bool) json.RawMessage {
 
 	defs := extractDefs(schema)
 	sanitized := sanitizeOpenAISchemaWithDefs(schema, defs, strict)
-	result, err := json.Marshal(sanitized)
-	if err != nil {
-		return raw
-	}
-	return result
+	return marshalPreservingKeyOrder(raw, sanitized)
 }
 
 // extractDefs pulls $defs or definitions from the schema for $ref resolution.
@@ -521,11 +517,7 @@ func SanitizeSchemaForAnthropic(raw json.RawMessage) json.RawMessage {
 
 	defs := extractDefs(schema)
 	sanitized := sanitizeAnthropicSchema(schema, defs)
-	result, err := json.Marshal(sanitized)
-	if err != nil {
-		return raw
-	}
-	return result
+	return marshalPreservingKeyOrder(raw, sanitized)
 }
 
 // sanitizeAnthropicSchema recursively processes a schema map for Anthropic compatibility.

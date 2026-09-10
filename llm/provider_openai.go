@@ -189,6 +189,7 @@ func (p *OpenAIProvider) ChatCompletion(ctx context.Context, req ChatRequest) (*
 			BaseURL:      p.baseURL,
 			APIKey:       p.apiKey,
 			ProviderName: p.name,
+			Logger:       p.logger,
 		}, req)
 	case ProtocolChatCompletions:
 		// Handled by the shared Chat Completions path below.
@@ -606,6 +607,8 @@ func (p *OpenAIProvider) convertChatResponseMessage(msg oai.ChatCompletionMessag
 			}
 		}
 	}
+
+	logToolCallArguments(p.log(), p.name, result.ToolCalls)
 
 	return result
 }

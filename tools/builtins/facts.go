@@ -15,14 +15,14 @@ const toolStoreFactDescription = `Purpose: store a durable fact for later retrie
 Use when: immediately after learning cross-step information — API signatures, architectural decisions, file locations, error patterns, intermediate results — before context grows large and earlier tool outputs become unavailable. Retrieve later with search_facts; facts persist across steps and execution cycles.
 Inputs: content (the fact itself, self-contained); keywords (3-10 retrieval keywords).
 Outputs: confirmation of storage.
-Example: content "auth middleware lives in core/middleware.go, enforced via applySecurityPolicies" with keywords [auth, middleware, policy, security].
+Example: content "auth middleware lives in core/middleware.go, enforced via applySecurityPolicies" with keywords ["auth", "middleware", "policy", "security"].
 Anti-example: not for ephemeral scratch that dies with the current turn; do not defer storing to the end of a long investigation — store early, store often.`
 
 const toolSearchFactsDescription = `Purpose: search previously stored facts by keywords.
 Use when: at the start of a new step or subtask — recover prior decisions and discoveries before re-reading sources. Results rank by relevance (most keyword matches first).
 Inputs: keywords (1-5 search terms).
 Outputs: the matching stored facts, best match first; empty when nothing matches.
-Example: keywords [auth, config] to recall where auth settings live.
+Example: keywords ["auth", "config"] to recall where auth settings live.
 Anti-example: not for discovering new information (search the codebase: ripgrep/semantic_search); if nothing matches, do not reconstruct from memory — re-read the source.`
 
 // ---------------------------------------------------------------------------
@@ -48,7 +48,7 @@ func NewStoreFactTool() *StoreFactTool {
 				"items": {"type": "string"},
 				"minItems": 3,
 				"maxItems": 10,
-				"description": "3-10 keywords for retrieval"
+				"description": "3-10 retrieval keywords (array of strings)"
 			},
 			"content": {
 				"type": "string",
@@ -65,6 +65,59 @@ func NewStoreFactTool() *StoreFactTool {
 type StoreFactInput struct {
 	Keywords []string `json:"keywords"`
 	Content  string   `json:"content"`
+}
+
+// UnmarshalJSON decodes store_fact input, coercing "keywords" that arrives as a
+// single comma-separated string into a keyword slice. Models occasionally emit
+// keywords as one string rather than a JSON array; treating that as a hard
+// parse error is needlessly brittle. A JSON array is decoded as usual.
+func (in *StoreFactInput) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Keywords json.RawMessage `json:"keywords"`
+		Content  string          `json:"content"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	in.Content = raw.Content
+	in.Keywords = decodeKeywords(raw.Keywords)
+	return nil
+}
+
+// decodeKeywords decodes a "keywords" value that is either a JSON array of
+// strings or a single comma-separated string. It returns nil when the value is
+// absent or cannot be interpreted, leaving validation to report the problem.
+func decodeKeywords(raw json.RawMessage) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return nil
+	}
+	switch t := v.(type) {
+	case []any:
+		out := make([]string, 0, len(t))
+		for _, e := range t {
+			s, ok := e.(string)
+			if !ok {
+				return nil
+			}
+			out = append(out, s)
+		}
+		return out
+	case string:
+		parts := strings.Split(t, ",")
+		out := make([]string, 0, len(parts))
+		for _, p := range parts {
+			if p = strings.TrimSpace(p); p != "" {
+				out = append(out, p)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
 }
 
 // Execute stores a fact via the FactStore from context.
@@ -132,7 +185,7 @@ func NewSearchFactsTool() *SearchFactsTool {
 				"items": {"type": "string"},
 				"minItems": 1,
 				"maxItems": 5,
-				"description": "Keywords to search for"
+				"description": "Keywords to search for (array of strings)"
 			}
 		},
 		"required": ["keywords"]
@@ -144,6 +197,19 @@ func NewSearchFactsTool() *SearchFactsTool {
 // SearchFactsInput represents the input parameters for search_facts.
 type SearchFactsInput struct {
 	Keywords []string `json:"keywords"`
+}
+
+// UnmarshalJSON decodes search_facts input, applying the same comma-separated
+// string coercion as StoreFactInput.
+func (in *SearchFactsInput) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Keywords json.RawMessage `json:"keywords"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	in.Keywords = decodeKeywords(raw.Keywords)
+	return nil
 }
 
 // Execute searches facts via the FactStore from context.
