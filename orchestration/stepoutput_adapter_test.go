@@ -60,21 +60,61 @@ func TestNewStepOutputStore_ListStepOutputs(t *testing.T) {
 	bb := NewMapBlackboard()
 	bb.SetStepResult("step_2", "second output", nil, nil)
 	bb.SetStepResult("step_1", "first output", nil, nil)
-	bb.SetStepResult("step_3", "third output", errors.New("fail"), nil) // should be excluded
+	bb.SetStepResult("step_3", "third output", errors.New("fail"), nil) // failed: excluded
+	// Paused checkpoint: surfaced with an explicit marker (a hidden step
+	// reads as vanished/failed to the model).
+	bb.SetStepResult("step_0", "", agent.ErrPaused, nil)
 
 	store := NewStepOutputStore(bb)
 
 	entries := store.ListStepOutputs()
-	if len(entries) != 2 {
-		t.Fatalf("expected 2 entries, got %d", len(entries))
+	if len(entries) != 3 {
+		t.Fatalf("expected 3 entries, got %d", len(entries))
 	}
 
 	// Deterministic order: sorted by step ID
-	if entries[0].StepID != "step_1" {
-		t.Errorf("entries[0].StepID = %q, want %q", entries[0].StepID, "step_1")
+	if entries[0].StepID != "step_0" {
+		t.Errorf("entries[0].StepID = %q, want %q", entries[0].StepID, "step_0")
 	}
-	if entries[1].StepID != "step_2" {
-		t.Errorf("entries[1].StepID = %q, want %q", entries[1].StepID, "step_2")
+	if entries[0].FullOutput != pausedCheckpointOutput {
+		t.Errorf("entries[0].FullOutput = %q, want the paused marker", entries[0].FullOutput)
+	}
+	if entries[1].StepID != "step_1" {
+		t.Errorf("entries[1].StepID = %q, want %q", entries[1].StepID, "step_1")
+	}
+	if entries[2].StepID != "step_2" {
+		t.Errorf("entries[2].StepID = %q, want %q", entries[2].StepID, "step_2")
+	}
+}
+
+// TestNewStepOutputStore_PausedCheckpointReadable verifies read_step_output's
+// backing store returns the paused marker (ok=true) for a checkpointed step —
+// including the string-reconstructed sentinel form a host produces when it
+// persists error text and rebuilds it via errors.New on restore.
+func TestNewStepOutputStore_PausedCheckpointReadable(t *testing.T) {
+	bb := NewMapBlackboard()
+	bb.SetStepResult("step_p", "", agent.ErrPaused, nil)
+	store := NewStepOutputStore(bb)
+
+	out, ok := store.GetStepOutput("step_p")
+	if !ok || out != pausedCheckpointOutput {
+		t.Fatalf("GetStepOutput(paused) = (%q, %v), want (%q, true)", out, ok, pausedCheckpointOutput)
+	}
+
+	// String-reconstructed sentinel (persistence round-trip form).
+	bb2 := NewMapBlackboard()
+	bb2.SetStepResult("step_r", "", errors.New(agent.ErrPaused.Error()), nil)
+	store2 := NewStepOutputStore(bb2)
+	out2, ok2 := store2.GetStepOutput("step_r")
+	if !ok2 || out2 != pausedCheckpointOutput {
+		t.Fatalf("GetStepOutput(round-tripped paused) = (%q, %v), want (%q, true)", out2, ok2, pausedCheckpointOutput)
+	}
+
+	// A genuinely failed step stays invisible.
+	bb3 := NewMapBlackboard()
+	bb3.SetStepResult("step_f", "partial", errors.New("boom"), nil)
+	if out, ok := NewStepOutputStore(bb3).GetStepOutput("step_f"); ok {
+		t.Fatalf("GetStepOutput(failed) = (%q, true), want invisible", out)
 	}
 }
 
