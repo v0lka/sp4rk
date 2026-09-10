@@ -51,9 +51,21 @@ func initONNXRuntime(libraryPath string) error {
 }
 
 // destroyONNXRuntime cleans up the global ONNX Runtime environment.
+//
+// Call counter note: onnxEnvDestroys exists so tests can assert that
+// NewEmbedder failure paths never invoke this function.
 func destroyONNXRuntime() error {
+	onnxEnvDestroys.Add(1)
 	return ort.DestroyEnvironment()
 }
+
+// onnxEnvDestroys counts destroyONNXRuntime invocations. Production code
+// never reads it; it exists so tests can assert that NewEmbedder failure
+// paths never destroy the process-global environment: initONNXRuntime is
+// sync.Once-guarded, so a destroyed environment can never be reinitialized,
+// which would make the "auto" CPU fallback (and any later retry) impossible.
+// Only Embedder.Close performs the full teardown.
+var onnxEnvDestroys atomic.Int64
 
 // Execution provider identifiers accepted by EmbedderConfig.ExecutionProvider
 // and buildSessionOptions. The empty string is a synonym for
@@ -69,7 +81,32 @@ const (
 	// libonnxruntime_providers_shared and libonnxruntime_providers_cuda sitting
 	// beside it (the runtime dlopens them from the main library's directory).
 	ExecutionProviderCUDA = "cuda"
+
+	// ExecutionProviderAuto asks NewEmbedder to prefer the CUDA execution
+	// provider and fall back to the CPU provider when CUDA is unavailable —
+	// the CPU-only ONNX Runtime build, a missing driver, or an invalid device
+	// id. Unlike an explicit ExecutionProviderCUDA, the fallback downgrades
+	// the request to a WARN log instead of failing NewEmbedder. Which provider
+	// actually won is observable via Embedder.ExecutionProvider.
+	ExecutionProviderAuto = "auto"
 )
+
+// normalizeExecutionProvider validates provider and normalizes the empty
+// string to ExecutionProviderCPU. "auto" passes through unchanged — it is
+// resolved by NewEmbedder, not by session construction. An unknown value is
+// an error, so a typo in configuration fails loudly instead of silently
+// degrading to the CPU.
+func normalizeExecutionProvider(provider string) (string, error) {
+	switch provider {
+	case "":
+		return ExecutionProviderCPU, nil
+	case ExecutionProviderCPU, ExecutionProviderCUDA, ExecutionProviderAuto:
+		return provider, nil
+	default:
+		return "", fmt.Errorf("unknown execution provider %q (want %q, %q or %q)",
+			provider, ExecutionProviderCPU, ExecutionProviderCUDA, ExecutionProviderAuto)
+	}
+}
 
 // buildSessionOptions constructs ONNX Runtime session options for the
 // requested execution provider, limiting intra-op parallelism to
@@ -95,14 +132,15 @@ const (
 // AppendExecutionProviderCUDA copies what it needs, so they are destroyed
 // before returning.
 func buildSessionOptions(provider string, deviceID, intraOpThreads int) (*ort.SessionOptions, error) {
-	switch provider {
-	case "", ExecutionProviderCPU, ExecutionProviderCUDA:
-	default:
-		return nil, fmt.Errorf("unknown execution provider %q (want %q or %q)",
-			provider, ExecutionProviderCPU, ExecutionProviderCUDA)
+	normalized, err := normalizeExecutionProvider(provider)
+	if err != nil {
+		return nil, err
+	}
+	if normalized == ExecutionProviderAuto {
+		return nil, fmt.Errorf("execution provider %q must be resolved by NewEmbedder before building session options", ExecutionProviderAuto)
 	}
 
-	cuda := provider == ExecutionProviderCUDA
+	cuda := normalized == ExecutionProviderCUDA
 	if !cuda && intraOpThreads <= 0 {
 		return nil, nil
 	}

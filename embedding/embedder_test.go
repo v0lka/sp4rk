@@ -1,11 +1,21 @@
 package embedding
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"math"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	ort "github.com/yalue/onnxruntime_go"
 )
 
 // testTokenizerPath returns the path to a test tokenizer.json if available.
@@ -393,9 +403,10 @@ func TestBuildSessionOptions_Negative(t *testing.T) {
 func TestBuildSessionOptions_UnknownProvider(t *testing.T) {
 	// An unrecognized provider is rejected rather than silently downgraded to
 	// the CPU — a typo in the caller's configuration must not look like a
-	// working GPU setup. Rejection happens before any ONNX call, so this test
-	// needs no shared library.
-	for _, provider := range []string{"CUDA", "gpu", "cuda11", "coreml"} {
+	// working GPU setup. "auto" is likewise refused here: it is a NewEmbedder
+	// directive, not a constructible provider. Rejection happens before any
+	// ONNX call, so this test needs no shared library.
+	for _, provider := range []string{"CUDA", "gpu", "cuda11", "coreml", ExecutionProviderAuto} {
 		opts, err := buildSessionOptions(provider, 0, 0)
 		if err == nil {
 			t.Errorf("buildSessionOptions(%q, 0, 0) error = nil, want non-nil", provider)
@@ -404,6 +415,383 @@ func TestBuildSessionOptions_UnknownProvider(t *testing.T) {
 			t.Errorf("buildSessionOptions(%q, 0, 0) opts = %p, want nil", provider, opts)
 		}
 	}
+}
+
+// --- Execution provider: normalization, auto fallback, effective getter ---
+
+// processCreatedCUDAContext records whether any test in this process has
+// driven a real CUDA inference. A CUDA context, once created, lives until the
+// ONNX Runtime environment is destroyed (end of the test binary), so
+// afterwards the driver legitimately lists our PID among its compute apps.
+// Tests that assert "own PID absent" must consult this flag first — the
+// shared-process suite cannot assume CUDA was never touched.
+var processCreatedCUDAContext atomic.Bool
+
+// providerLogs is a slog sink for assertions about WARN/INFO lines emitted by
+// NewEmbedder. Only WARN and above are captured: the fallback reason is a
+// WARN, and INFO-level noise (initializing, loading tokenizer, ...) would
+// only bloat the buffer.
+type providerLogs struct {
+	buf bytes.Buffer
+}
+
+func newProviderLogs() *providerLogs {
+	return &providerLogs{}
+}
+
+func (p *providerLogs) logger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(&p.buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+}
+
+func (p *providerLogs) contains(substr string) bool {
+	return strings.Contains(p.buf.String(), substr)
+}
+
+// TestNormalizeExecutionProvider covers every accepted spelling plus the
+// loud-rejection requirement: a typo must produce an error, never a silent
+// CPU degradation.
+func TestNormalizeExecutionProvider(t *testing.T) {
+	for _, provider := range []string{"", ExecutionProviderCPU, ExecutionProviderCUDA, ExecutionProviderAuto} {
+		got, err := normalizeExecutionProvider(provider)
+		if err != nil {
+			t.Errorf("normalizeExecutionProvider(%q) error = %v, want nil", provider, err)
+			continue
+		}
+		want := provider
+		if want == "" {
+			want = ExecutionProviderCPU
+		}
+		if got != want {
+			t.Errorf("normalizeExecutionProvider(%q) = %q, want %q", provider, got, want)
+		}
+	}
+	for _, provider := range []string{"CUDA", "gpu", "cuda11", "coreml", "Auto"} {
+		if _, err := normalizeExecutionProvider(provider); err == nil {
+			t.Errorf("normalizeExecutionProvider(%q) error = nil, want non-nil", provider)
+		}
+	}
+}
+
+// TestNewEmbedder_UnknownExecutionProvider verifies the loud rejection of an
+// unknown provider value end to end: NewEmbedder must fail with an error that
+// names the unknown provider, without touching the ONNX env lifecycle.
+func TestNewEmbedder_UnknownExecutionProvider(t *testing.T) {
+	destroys := onnxEnvDestroys.Load()
+	for _, provider := range []string{"CUDA", "gpu", "tensorrt", "AUTO"} {
+		_, err := NewEmbedder(EmbedderConfig{
+			ModelPath:         "m.onnx",
+			TokenizerPath:     "t.json",
+			LibraryPath:       "lib.so",
+			ExecutionProvider: provider,
+		})
+		if err == nil {
+			t.Errorf("NewEmbedder(provider=%q) error = nil, want non-nil", provider)
+			continue
+		}
+		if !strings.Contains(err.Error(), "unknown execution provider") {
+			t.Errorf("NewEmbedder(provider=%q) error = %v, want it to name the unknown provider", provider, err)
+		}
+	}
+	if got := onnxEnvDestroys.Load() - destroys; got != 0 {
+		t.Errorf("destroyONNXRuntime called %d times during rejected configs, want 0", got)
+	}
+}
+
+// TestNewEmbedder_FailurePaths_NeverDestroyEnv asserts the core safety
+// invariant behind the auto fallback: no NewEmbedder failure path may call
+// destroyONNXRuntime. initONNXRuntime is sync.Once-guarded per process, so a
+// destroyed environment could never be reinitialized — not for a later
+// NewEmbedder retry, and not for the CPU fallback itself. Only Embedder.Close
+// tears the environment down, exactly once, as the process's single owner.
+//
+// The cases below drive every early-return error path reachable in one
+// process: path validation failures (before ONNX is touched), an unknown
+// provider (validation), a tokenizer load failure (after env init and options
+// build — the deepest cleanup(sessOpts) path), and an explicit "cuda" that
+// fails (the loudest historical failure).
+func TestNewEmbedder_FailurePaths_NeverDestroyEnv(t *testing.T) {
+	destroys := onnxEnvDestroys.Load()
+
+	// Path validation failures (validated before ONNX is touched).
+	for _, cfg := range []EmbedderConfig{
+		{TokenizerPath: "t.json", LibraryPath: "lib.so"},
+		{ModelPath: "m.onnx", LibraryPath: "lib.so"},
+		{ModelPath: "m.onnx", TokenizerPath: "t.json"},
+	} {
+		if _, err := NewEmbedder(cfg); err == nil {
+			t.Errorf("NewEmbedder(%+v) expected error, got nil", cfg)
+		}
+	}
+
+	// Unknown provider.
+	if _, err := NewEmbedder(EmbedderConfig{
+		ModelPath: "m.onnx", TokenizerPath: "t.json", LibraryPath: "lib.so",
+		ExecutionProvider: "gpu",
+	}); err == nil {
+		t.Error("NewEmbedder(unknown provider) expected error, got nil")
+	}
+
+	if got := onnxEnvDestroys.Load() - destroys; got != 0 {
+		t.Errorf("destroyONNXRuntime called %d times across early failure paths, want 0", got)
+	}
+
+	// Tokenizer load failure — after env init, options build: exercises
+	// cleanup(sessOpts) with the process env still shared.
+	libPath := testLibraryPath(t)
+	if _, err := NewEmbedder(EmbedderConfig{
+		ModelPath:     "m.onnx",
+		TokenizerPath: filepath.Join(t.TempDir(), "nonexistent-tokenizer.json"),
+		LibraryPath:   libPath,
+	}); err == nil {
+		t.Error("NewEmbedder(missing tokenizer) expected error, got nil")
+	}
+	if got := onnxEnvDestroys.Load() - destroys; got != 0 {
+		t.Errorf("destroyONNXRuntime called %d times after tokenizer failure, want 0", got)
+	}
+
+	// Explicit "cuda" with a CUDA failure must fail loudly (not fall back),
+	// and still must not destroy the env on its way out.
+	if librarySupportsCUDA(t) {
+		if _, err := NewEmbedder(EmbedderConfig{
+			ModelPath:         testModelPath(t),
+			TokenizerPath:     testTokenizerPath(t),
+			LibraryPath:       libPath,
+			ExecutionProvider: ExecutionProviderCUDA,
+			DeviceID:          999, // rejected by the CUDA provider: no such device
+		}); err == nil {
+			t.Error("NewEmbedder(explicit cuda, invalid device) expected error, got nil")
+		}
+		if got := onnxEnvDestroys.Load() - destroys; got != 0 {
+			t.Errorf("destroyONNXRuntime called %d times after explicit-cuda failure, want 0", got)
+		}
+	}
+}
+
+// TestNewEmbedder_ExecutionProviderAuto_CPUOnlyBuild covers "auto" on a
+// CPU-only ONNX Runtime build: the CUDA attempt fails at provider-options
+// creation, a WARN naming the reason is logged, and the caller still receives
+// a fully working CPU embedder whose ExecutionProvider() reports "cpu".
+//
+// Which library the process loaded is decided once by TestMain, so this test
+// is driven by probing the loaded environment: it runs (rather than skips)
+// exactly when the initialized library is a CPU-only build.
+func TestNewEmbedder_ExecutionProviderAuto_CPUOnlyBuild(t *testing.T) {
+	libPath := testLibraryPath(t)
+	tokPath := testTokenizerPath(t)
+	modelPath := testModelPath(t)
+	if librarySupportsCUDA(t) {
+		t.Skip("ONNX Runtime library is a CUDA build; run with a CPU-only EMBEDDING_TEST_LIBRARY_PATH to exercise the CPU fallback")
+	}
+
+	logs := newProviderLogs()
+	destroys := onnxEnvDestroys.Load()
+	emb, err := NewEmbedder(EmbedderConfig{
+		ModelPath:         modelPath,
+		TokenizerPath:     tokPath,
+		LibraryPath:       libPath,
+		ExecutionProvider: ExecutionProviderAuto,
+		Logger:            logs.logger(),
+	})
+	if err != nil {
+		t.Fatalf("auto on CPU-only build: NewEmbedder() error = %v, want working CPU fallback", err)
+	}
+	t.Cleanup(func() { closeSessionOnly(emb) })
+
+	if got := emb.ExecutionProvider(); got != ExecutionProviderCPU {
+		t.Errorf("ExecutionProvider() = %q, want %q (CPU fallback after failed CUDA attempt)", got, ExecutionProviderCPU)
+	}
+	if !logs.contains("falling back to CPU") {
+		t.Errorf("missing WARN about the CUDA→CPU fallback in logs:\n%s", logs.buf.String())
+	}
+	if got := onnxEnvDestroys.Load() - destroys; got != 0 {
+		t.Errorf("destroyONNXRuntime called %d times during auto fallback, want 0", got)
+	}
+
+	// The fallback embedder must be fully functional, not half-initialized.
+	vec, err := emb.EmbedQuery(context.Background(), "auto fallback still embeds")
+	if err != nil {
+		t.Fatalf("EmbedQuery() error = %v", err)
+	}
+	if len(vec) != DefaultHiddenDim {
+		t.Errorf("embedding dim = %d, want %d", len(vec), DefaultHiddenDim)
+	}
+}
+
+// TestNewEmbedder_ExecutionProviderAuto_InvalidDevice covers "auto" on a CUDA
+// build when CUDA init fails for a non-build reason — here an invalid device
+// id, rejected by the CUDA provider while parsing provider options. The
+// embedder must still come up on CPU with a WARN.
+func TestNewEmbedder_ExecutionProviderAuto_InvalidDevice(t *testing.T) {
+	libPath := testLibraryPath(t)
+	tokPath := testTokenizerPath(t)
+	modelPath := testModelPath(t)
+	if !librarySupportsCUDA(t) {
+		t.Skip("ONNX Runtime library is not a CUDA build; skipping auto-with-failed-CUDA test")
+	}
+
+	logs := newProviderLogs()
+	destroys := onnxEnvDestroys.Load()
+	emb, err := NewEmbedder(EmbedderConfig{
+		ModelPath:         modelPath,
+		TokenizerPath:     tokPath,
+		LibraryPath:       libPath,
+		ExecutionProvider: ExecutionProviderAuto,
+		DeviceID:          999, // rejected by the CUDA provider: no such device
+		Logger:            logs.logger(),
+	})
+	if err != nil {
+		t.Fatalf("auto with invalid device: NewEmbedder() error = %v, want working CPU fallback", err)
+	}
+	t.Cleanup(func() { closeSessionOnly(emb) })
+
+	if got := emb.ExecutionProvider(); got != ExecutionProviderCPU {
+		t.Errorf("ExecutionProvider() = %q, want %q", got, ExecutionProviderCPU)
+	}
+	if !logs.contains("falling back to CPU") {
+		t.Errorf("missing WARN about the CUDA→CPU fallback in logs:\n%s", logs.buf.String())
+	}
+	if got := onnxEnvDestroys.Load() - destroys; got != 0 {
+		t.Errorf("destroyONNXRuntime called %d times during auto fallback, want 0", got)
+	}
+
+	if _, err := emb.EmbedQuery(context.Background(), "cpu fallback embeds"); err != nil {
+		t.Fatalf("EmbedQuery() error = %v", err)
+	}
+}
+
+// TestNewEmbedder_ExecutionProviderCUDA_InvalidDeviceFails covers the
+// complement of the auto fallback: an explicit "cuda" under the same CUDA
+// failure must return an error, not a silently degraded embedder.
+func TestNewEmbedder_ExecutionProviderCUDA_InvalidDeviceFails(t *testing.T) {
+	libPath := testLibraryPath(t)
+	tokPath := testTokenizerPath(t)
+	modelPath := testModelPath(t)
+	if !librarySupportsCUDA(t) {
+		t.Skip("ONNX Runtime library is not a CUDA build; skipping explicit-cuda failure test")
+	}
+
+	_, err := NewEmbedder(EmbedderConfig{
+		ModelPath:         modelPath,
+		TokenizerPath:     tokPath,
+		LibraryPath:       libPath,
+		ExecutionProvider: ExecutionProviderCUDA,
+		DeviceID:          999,
+		Logger:            slog.New(slog.DiscardHandler),
+	})
+	if err == nil {
+		t.Fatal("NewEmbedder(explicit cuda, DeviceID=999) error = nil, want non-nil (loud failure)")
+	}
+	if !strings.Contains(err.Error(), "building ONNX session options") {
+		t.Errorf("error should originate from session-options build, got: %v", err)
+	}
+}
+
+// TestNewEmbedder_ExecutionProviderAuto_GPU asserts the happy path on a real
+// GPU machine: "auto" resolves to CUDA and — the core requirement — the test
+// process's PID shows up in nvidia-smi's compute-apps list after a real
+// inference, so a silent CPU slide cannot hide behind a green test.
+func TestNewEmbedder_ExecutionProviderAuto_GPU(t *testing.T) {
+	libPath := testLibraryPath(t)
+	tokPath := testTokenizerPath(t)
+	modelPath := testModelPath(t)
+	if !librarySupportsCUDA(t) {
+		t.Skip("ONNX Runtime library is not a CUDA build; skipping GPU auto test")
+	}
+	nvidiaSMI := requireNvidiaSMI(t)
+
+	emb, err := NewEmbedder(EmbedderConfig{
+		ModelPath:         modelPath,
+		TokenizerPath:     tokPath,
+		LibraryPath:       libPath,
+		ExecutionProvider: ExecutionProviderAuto,
+		Logger:            slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatalf("NewEmbedder(auto on GPU) error = %v", err)
+	}
+	t.Cleanup(func() { closeSessionOnly(emb) })
+
+	if got := emb.ExecutionProvider(); got != ExecutionProviderCUDA {
+		t.Fatalf("ExecutionProvider() = %q, want %q on a CUDA-capable machine", got, ExecutionProviderCUDA)
+	}
+
+	// Real inference: CUDA contexts materialize lazily, so the PID appears in
+	// nvidia-smi's compute-apps only after Session.Run has executed on GPU.
+	if _, err := emb.EmbedQuery(context.Background(), "real inference to materialize the CUDA context"); err != nil {
+		t.Fatalf("EmbedQuery() error = %v", err)
+	}
+	// The CUDA context now exists for the rest of the process lifetime; let
+	// PID-absent assertions elsewhere in the suite know.
+	processCreatedCUDAContext.Store(true)
+
+	if !computeAppsContainsPID(nvidiaSMI, os.Getpid()) {
+		t.Errorf("test PID %d not found in `nvidia-smi --query-compute-apps=pid` after CUDA inference — inference did not reach the GPU", os.Getpid())
+	}
+}
+
+// TestEmbedder_ExecutionProviderGetter_ZeroValue pins the getter's contract
+// for embedders not built by NewEmbedder (tests, partial states): the
+// zero-value field must report the legacy CPU default, never "" or "auto".
+func TestEmbedder_ExecutionProviderGetter_ZeroValue(t *testing.T) {
+	e := &Embedder{}
+	if got := e.ExecutionProvider(); got != ExecutionProviderCPU {
+		t.Errorf("zero-value ExecutionProvider() = %q, want %q", got, ExecutionProviderCPU)
+	}
+}
+
+// librarySupportsCUDA reports whether the ONNX Runtime library this test run
+// initialized is a CUDA-capable build. ort.NewCUDAProviderOptions fails with
+// a distinctive error on CPU-only builds ("CUDA execution provider is not
+// enabled in this build"), which is a cheap, non-mutating probe. Requires the
+// ONNX env to be live; when TestMain did not initialize it the answer is
+// conservatively "no CUDA".
+func librarySupportsCUDA(t *testing.T) bool {
+	t.Helper()
+	if !onnxEnvManagedForTests || !ort.IsInitialized() {
+		return false
+	}
+	cudaOpts, err := ort.NewCUDAProviderOptions()
+	if err != nil {
+		// CPU-only build (or any other failure): treat as no CUDA.
+		return false
+	}
+	_ = cudaOpts.Destroy()
+	return true
+}
+
+// nvidiaSMIProbeTimeout bounds the nvidia-smi invocation used by test
+// assertions: a healthy nvidia-smi answers in tens of milliseconds, and a
+// wedged driver must never hang a test run.
+const nvidiaSMIProbeTimeout = 10 * time.Second
+
+// requireNvidiaSMI skips the test when nvidia-smi is unavailable (no NVIDIA
+// driver on this machine) and otherwise returns its path.
+func requireNvidiaSMI(t *testing.T) string {
+	t.Helper()
+	path, err := exec.LookPath("nvidia-smi")
+	if err != nil {
+		t.Skip("nvidia-smi not found; skipping GPU-visibility assertion")
+	}
+	return path
+}
+
+// computeAppsContainsPID runs nvidia-smi and reports whether pid appears
+// among the compute-app PIDs it lists.
+func computeAppsContainsPID(nvidiaSMI string, pid int) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), nvidiaSMIProbeTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, nvidiaSMI,
+		"--query-compute-apps=pid", "--format=csv,noheader").Output()
+	if err != nil {
+		return false
+	}
+	want := strconv.Itoa(pid)
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.TrimSpace(line) == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestBuildSessionOptions_Positive(t *testing.T) {

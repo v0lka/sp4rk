@@ -77,22 +77,31 @@ type EmbedderConfig struct {
 	IntraOpThreads int
 
 	// ExecutionProvider selects the ONNX Runtime execution provider used for
-	// inference: ExecutionProviderCPU ("cpu") or ExecutionProviderCUDA
-	// ("cuda"). The empty string (the default) means "cpu" and preserves the
-	// legacy behavior exactly.
+	// inference: ExecutionProviderCPU ("cpu"), ExecutionProviderCUDA ("cuda"),
+	// or ExecutionProviderAuto ("auto"). The empty string (the default) means
+	// "cpu" and preserves the legacy behavior exactly.
 	//
 	// ONNX Runtime does not pick a GPU on its own — pointing LibraryPath at a
 	// GPU build changes nothing unless the provider is requested here. "cuda"
 	// additionally requires the CUDA provider shared libraries next to
 	// LibraryPath and a working driver/toolkit; when any of that is missing,
 	// NewEmbedder fails loudly rather than silently falling back to the CPU.
+	//
+	// "auto" prefers CUDA and degrades gracefully: NewEmbedder attempts the
+	// CUDA provider and, when that attempt fails (CPU-only ONNX Runtime build,
+	// missing driver, invalid device id, ...), logs a WARN and continues on
+	// the CPU provider instead of failing. Which side won is observable via
+	// Embedder.ExecutionProvider. DeviceID participates only in the CUDA
+	// attempt, never in the CPU fallback.
+	//
 	// Unknown values are rejected.
 	ExecutionProvider string
 
-	// DeviceID is the GPU device index used when ExecutionProvider is "cuda".
-	// Defaults to 0, which is the right choice on single-GPU machines and
-	// selects the first device reported by the driver on multi-GPU ones. It is
-	// ignored by the CPU provider.
+	// DeviceID is the GPU device index used when ExecutionProvider resolves
+	// to "cuda" (explicitly or via "auto"'s first attempt). Defaults to 0,
+	// which is the right choice on single-GPU machines and selects the first
+	// device reported by the driver on multi-GPU ones. It is ignored by the
+	// CPU provider.
 	DeviceID int
 
 	// Logger for structured logging. If nil, a discard logger is used.
@@ -116,6 +125,11 @@ type Embedder struct {
 	// only ever embed single texts never pay for it). Guarded by mu.
 	batchSess *onnxSession
 	sessOpts  *ort.SessionOptions
+	// executionProvider is the provider inference actually runs on: always
+	// ExecutionProviderCPU or ExecutionProviderCUDA, never "auto" — the auto
+	// request is resolved during NewEmbedder, and ExecutionProvider() reports
+	// the winner.
+	executionProvider string
 	// runner pins every ONNX Runtime call to one OS thread; nil for the CPU
 	// provider, which does not need the pinning. See ortRunner.
 	runner *ortRunner
@@ -158,6 +172,13 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 		return nil, errors.New("LibraryPath is required")
 	}
 
+	// An unknown provider is a configuration error: it must fail loudly, not
+	// silently degrade to the CPU (which would look like a working setup).
+	requested, err := normalizeExecutionProvider(cfg.ExecutionProvider)
+	if err != nil {
+		return nil, err
+	}
+
 	maxSeqLen := cfg.MaxSeqLength
 	if maxSeqLen <= 0 {
 		maxSeqLen = DefaultMaxSeqLength
@@ -173,13 +194,6 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 		batchSize = DefaultBatchSize
 	}
 
-	// Normalized for logging only; buildSessionOptions accepts the empty
-	// string as a synonym for the CPU provider and validates the rest.
-	provider := cfg.ExecutionProvider
-	if provider == "" {
-		provider = ExecutionProviderCPU
-	}
-
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
@@ -189,19 +203,34 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 	// Go's scheduler threads (see ortRunner). Every ONNX call below — and
 	// every one made later through the returned Embedder — is funnelled onto
 	// this single thread. The CPU provider needs none of it and keeps calling
-	// ONNX inline, exactly as before.
+	// ONNX inline, exactly as before. "auto" starts on the runner because its
+	// first attempt is CUDA; the runner is stopped when that attempt fails
+	// and the CPU fallback continues inline.
+	effective := requested
 	var runner *ortRunner
-	if provider == ExecutionProviderCUDA {
+	if effective == ExecutionProviderCUDA || effective == ExecutionProviderAuto {
 		runner = newORTRunner()
 	}
-	// cleanup releases whatever the aborted initialization already acquired,
-	// on the ONNX thread, and shuts that thread down.
+	// attempt is the provider buildSessionOptions is asked for: "auto" is not
+	// a constructible provider, its first attempt is CUDA. Only used for the
+	// build call; `effective` tracks what inference will run on.
+	attempt := effective
+	if attempt == ExecutionProviderAuto {
+		attempt = ExecutionProviderCUDA
+	}
+
+	// cleanup releases whatever the aborted initialization already acquired
+	// and shuts the ONNX thread down. It must NEVER destroy the ONNX Runtime
+	// environment: initONNXRuntime is sync.Once-guarded per process, so a
+	// destroyed environment could never be reinitialized — not for a later
+	// NewEmbedder retry, and not for the "auto" CPU fallback below. Only
+	// Embedder.Close performs the full teardown, as the embedder's single
+	// owner at shutdown.
 	cleanup := func(sessOpts *ort.SessionOptions) {
 		runOnORTThread(runner, func() {
 			if sessOpts != nil {
 				_ = sessOpts.Destroy()
 			}
-			_ = destroyONNXRuntime()
 		})
 		if runner != nil {
 			runner.stop()
@@ -212,6 +241,9 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 	var initErr error
 	runOnORTThread(runner, func() { initErr = initONNXRuntime(cfg.LibraryPath) })
 	if initErr != nil {
+		// A failed environment initialization is fatal for every provider:
+		// the CPU fallback needs the same environment, so there is nothing to
+		// fall back to. (No env teardown here — see the cleanup note above.)
 		if runner != nil {
 			runner.stop()
 		}
@@ -223,56 +255,138 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 	// because ort.NewSessionOptions requires the ONNX environment to be
 	// initialized. A nil result preserves the legacy behavior (session created
 	// with nil *SessionOptions).
-	var (
-		sessOpts *ort.SessionOptions
-		err      error
-	)
-	runOnORTThread(runner, func() {
-		sessOpts, err = buildSessionOptions(cfg.ExecutionProvider, cfg.DeviceID, cfg.IntraOpThreads)
-	})
+	//
+	// For "auto" this is the CUDA attempt: a CPU-only ONNX Runtime build, a
+	// missing driver or an invalid device id all fail here, and the request
+	// degrades to the CPU provider with a WARN instead of an error.
+	buildOpts := func(provider string) (*ort.SessionOptions, error) {
+		var (
+			opts *ort.SessionOptions
+			err  error
+		)
+		runOnORTThread(runner, func() {
+			opts, err = buildSessionOptions(provider, cfg.DeviceID, cfg.IntraOpThreads)
+		})
+		return opts, err
+	}
+	sessOpts, err := buildOpts(attempt)
 	if err != nil {
-		cleanup(nil)
-		return nil, fmt.Errorf("building ONNX session options: %w", err)
+		if effective != ExecutionProviderAuto {
+			cleanup(nil)
+			return nil, fmt.Errorf("building ONNX session options: %w", err)
+		}
+		// auto: WARN and continue on CPU. The CUDA attempt may already have
+		// allocated nothing beyond options internals (buildSessionOptions
+		// destroys its own partial options on failure), so the fallback just
+		// abandons the dedicated thread and proceeds inline like a plain CPU
+		// embedder.
+		logger.Warn("CUDA execution provider unavailable, falling back to CPU",
+			"error", err.Error(), "deviceID", cfg.DeviceID)
+		runner.stop()
+		runner = nil
+		effective = ExecutionProviderCPU
+		sessOpts, err = buildOpts(effective)
+		if err != nil {
+			cleanup(sessOpts)
+			return nil, fmt.Errorf("building ONNX session options: %w", err)
+		}
+	}
+	// From here on sessOpts is owned by the embedder-to-be; cleanup(sessOpts)
+	// releases it on failure. A successful CUDA attempt also resolves "auto"
+	// to its winner.
+	if effective == ExecutionProviderAuto {
+		effective = ExecutionProviderCUDA
 	}
 
 	logger.Info("loading tokenizer", "path", cfg.TokenizerPath)
 	tok, err := NewTokenizer(cfg.TokenizerPath)
 	if err != nil {
-		// Clean up ONNX env on failure.
 		cleanup(sessOpts)
 		return nil, fmt.Errorf("loading tokenizer: %w", err)
 	}
 
-	logger.Info("creating persistent ONNX session", "model", cfg.ModelPath)
-	var sess *onnxSession
-	runOnORTThread(runner, func() {
-		sess, err = newONNXSession(cfg.ModelPath, 1, maxSeqLen, hiddenDim, sessOpts)
-	})
-	if err != nil {
-		cleanup(sessOpts)
-		return nil, fmt.Errorf("creating persistent ONNX session: %w", err)
+	newSess := func() (*onnxSession, error) {
+		var (
+			s    *onnxSession
+			sErr error
+		)
+		runOnORTThread(runner, func() {
+			s, sErr = newONNXSession(cfg.ModelPath, 1, maxSeqLen, hiddenDim, sessOpts)
+		})
+		return s, sErr
 	}
 
-	logger.Info("embedder initialized",
+	logger.Info("creating persistent ONNX session", "model", cfg.ModelPath)
+	sess, err := newSess()
+	if err != nil {
+		if effective != ExecutionProviderAuto {
+			cleanup(sessOpts)
+			return nil, fmt.Errorf("creating persistent ONNX session: %w", err)
+		}
+		// auto + CUDA options: the provider accepted the options but the
+		// session itself could not be built on the GPU (driver/device trouble,
+		// out of device memory at graph allocation). Retry once on the CPU
+		// provider before giving up — a failed attempt has already released
+		// its own tensors, and the CPU retry cannot make things worse.
+		cudaSessErr := err
+		logger.Warn("CUDA session creation failed, falling back to CPU",
+			"error", err.Error(), "deviceID", cfg.DeviceID)
+		cleanup(sessOpts)
+		runner = nil
+		effective = ExecutionProviderCPU
+		sessOpts, err = buildOpts(effective)
+		if err != nil {
+			cleanup(sessOpts)
+			return nil, fmt.Errorf("building ONNX session options: %w", err)
+		}
+		sess, err = newSess()
+		if err != nil {
+			cleanup(sessOpts)
+			return nil, fmt.Errorf("creating persistent ONNX session after CUDA→CPU fallback (original CUDA error: %w): %w", cudaSessErr, err)
+		}
+	}
+
+	initialized := []any{
 		"model", cfg.ModelPath,
 		"maxSeqLen", maxSeqLen,
 		"hiddenDim", hiddenDim,
 		"batchSize", batchSize,
-		"executionProvider", provider,
+		"executionProvider", effective,
 		"deviceID", cfg.DeviceID,
-	)
+	}
+	if requested != effective {
+		// An auto request that landed on the CPU must never be silent: the
+		// WARN above names the reason, and this line keeps the mismatch
+		// greppable in the single "embedder initialized" entry.
+		initialized = append(initialized, "requestedExecutionProvider", requested)
+	}
+	logger.Info("embedder initialized", initialized...)
 
 	return &Embedder{
-		tokenizer: tok,
-		modelPath: cfg.ModelPath,
-		maxSeqLen: maxSeqLen,
-		hiddenDim: hiddenDim,
-		batchSize: batchSize,
-		logger:    logger,
-		sess:      sess,
-		sessOpts:  sessOpts,
-		runner:    runner,
+		tokenizer:         tok,
+		modelPath:         cfg.ModelPath,
+		maxSeqLen:         maxSeqLen,
+		hiddenDim:         hiddenDim,
+		batchSize:         batchSize,
+		logger:            logger,
+		sess:              sess,
+		sessOpts:          sessOpts,
+		executionProvider: effective,
+		runner:            runner,
 	}, nil
+}
+
+// ExecutionProvider reports the execution provider the embedder actually runs
+// on: ExecutionProviderCPU ("cpu") or ExecutionProviderCUDA ("cuda"). The
+// "auto" request is resolved inside NewEmbedder, so this never returns "auto";
+// comparing the return value against the requested one is how callers detect
+// a silent CUDA→CPU slide — including the zero-value embedder, which reports
+// "cpu" (the legacy default).
+func (e *Embedder) ExecutionProvider() string {
+	if e.executionProvider == "" {
+		return ExecutionProviderCPU
+	}
+	return e.executionProvider
 }
 
 // EmbedDocuments embeds a batch of text documents and returns their embedding vectors.
