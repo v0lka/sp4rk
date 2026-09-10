@@ -35,6 +35,7 @@
 | Subagent Profiles, AGENT.md discovery, per-agent model/tools  | [domains/agents.md](domains/agents.md)                                          |
 | Prompt builder, system-prompt composition                     | [domains/prompt-building.md](domains/prompt-building.md)                        |
 | Embeddings, chunking, ONNX                                    | [domains/embedding.md](domains/embedding.md)                                    |
+| GPU/CUDA inference, execution providers, GPU diagnostics      | [domains/embedding.md](domains/embedding.md)                                    |
 | What an embedding application must provide (events, confirm)  | [contracts/agent-execution.md](contracts/agent-execution.md)                    |
 | LLM provider contract                                         | [contracts/llm-providers.md](contracts/llm-providers.md)                        |
 | Tool interface contract                                       | [contracts/tools.md](contracts/tools.md)                                        |
