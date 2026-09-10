@@ -39,6 +39,15 @@ import (
 // rebinding — they are excluded from the binding walk by design; a plain
 // "$_" reference is treated like any unbound name (environment value plus
 // the empty expansion), which still escalates path-suffixed uses.
+//
+// A name bound SOLELY by an assessable command substitution ("PKGS=$(go list
+// ./…)") is the one dynamic-looking binding that does NOT hard-escalate: the
+// substitution's own inner command is fully static (no dynamic reference, no
+// opaque construct, no unresolvable path token — see
+// [commandSubstitutionAssessable]), so a later "$PKGS" reference is treated as
+// assessable rather than flagged. Such a name is recorded in [envBindings.cmdSubst]
+// and is neither resolvable nor unassessable. A single non-assessable or
+// literal binding of the name poisons it back to dynamic (fail-closed union).
 type envBindings struct {
 	// values maps each assigned name to its DISTINCT literal values in
 	// first-assignment order.
@@ -58,6 +67,32 @@ type envBindings struct {
 	// parameters ("set x y", "set -- …", "shift"): "$1", "$@" and "$*" then
 	// hold statically unknown values (see [UnresolvablePathTokens]).
 	positionalRebound bool
+	// cmdSubst marks names promoted by the resolution pass as bound SOLELY by
+	// assessable command substitutions. Such a name is deliberately NOT
+	// dynamic, so a reference to it is not unassessable, yet it is still not
+	// resolvable (its value is the substitution's unknown output).
+	cmdSubst map[string]bool
+	// cmdSubstInners records, per name, the inner command text of every pure
+	// command-substitution binding seen by the walk (see
+	// [envBindings.walkAssign]), in first-seen order. The resolution pass
+	// ([envBindings.resolveCmdSubst]) promotes the name to cmdSubst only when
+	// every recorded inner is assessable and no other binding shape applies.
+	cmdSubstInners map[string][]string
+	// cmdSubstNodes records, per name, the AST nodes of the pure
+	// command-substitution bindings seen by the walk, parallel to and in the
+	// same order as [envBindings.cmdSubstInners]. On promotion
+	// ([envBindings.resolveCmdSubst]) the nodes are copied into
+	// [envBindings.approvedSubstNodes] so a caller walking the SAME AST
+	// (extractBashPaths) can recognize an approved binding substitution by node
+	// identity and recurse into its inner command for literal paths.
+	cmdSubstNodes map[string][]*syntax.CmdSubst
+	// approvedSubstNodes marks the substitution nodes of names promoted to
+	// [envBindings.cmdSubst] — the "approved binding nodes". Only these
+	// (assignment-context, fully-assessed) substitutions suppress the
+	// unexpandable flag ([expandWordPartsWithBindings]) and are recursed into
+	// ([extractBashPaths]); a bare "$(…)" in argument position is never
+	// recorded here (D1), so it stays unexpandable and is not walked.
+	approvedSubstNodes map[*syntax.CmdSubst]bool
 }
 
 // collectCommandEnvBindings parses a bash command string and returns the
@@ -83,7 +118,9 @@ func collectCommandEnvBindings(command string) *envBindings {
 // plain assignments are recorded as values; every other form — including
 // the rebinding builtins that never produce *syntax.Assign nodes — makes
 // the affected names (or, for "source"/"eval"-style constructs, every name)
-// ambiguous. See the envBindings type comment for the fail-closed contract.
+// ambiguous. A final resolution pass decides the tentatively-recorded command
+// substitutions (see [envBindings.cmdSubst] and [envBindings.resolveCmdSubst]).
+// See the envBindings type comment for the fail-closed contract.
 //
 // Because each phase is a single pre-pass over the whole command,
 // assignments declared inside blocks/subshells/branches are collected too —
@@ -93,8 +130,12 @@ func collectCommandEnvBindings(command string) *envBindings {
 // environment value in effect at a reference).
 func collectShellEnvBindings(file *syntax.File) *envBindings {
 	b := &envBindings{
-		values:  make(map[string][]string),
-		dynamic: make(map[string]bool),
+		values:             make(map[string][]string),
+		dynamic:            make(map[string]bool),
+		cmdSubst:           make(map[string]bool),
+		cmdSubstInners:     make(map[string][]string),
+		cmdSubstNodes:      make(map[string][]*syntax.CmdSubst),
+		approvedSubstNodes: make(map[*syntax.CmdSubst]bool),
 	}
 	// Phase 1: fold every assignment-shaped node.
 	syntax.Walk(file, func(node syntax.Node) bool {
@@ -135,6 +176,8 @@ func collectShellEnvBindings(file *syntax.File) *envBindings {
 		}
 		return true
 	})
+	// Phase 3: resolve the tentatively-recorded command substitutions.
+	b.resolveCmdSubst()
 	return b
 }
 
@@ -161,6 +204,21 @@ func (b *envBindings) walkAssign(n *syntax.Assign) {
 		// A naked "export D" (no value) preserves the variable's prior value,
 		// so it neither binds nor clears; leave the summary untouched.
 		return
+	}
+	// A pure command-substitution RHS — a bare $(cmd) or a double-quoted
+	// "$(cmd)" — is recorded tentatively instead of being marked dynamic: the
+	// post-walk resolution pass ([envBindings.resolveCmdSubst]) promotes the
+	// name to cmdSubst only when EVERY binding of it is an assessable
+	// substitution (see [commandSubstitutionAssessable]); otherwise it falls
+	// back to dynamic[name] (fail-closed union). Any other substitution shape
+	// (concatenated fragments, backquotes, an mksh form) is not pure and falls
+	// through to the dynamic handling below.
+	if cs, ok := pureCommandSubstNode(n.Value); ok {
+		if inner, ok := cmdSubstInner(cs); ok {
+			b.cmdSubstInners[name] = append(b.cmdSubstInners[name], inner)
+			b.cmdSubstNodes[name] = append(b.cmdSubstNodes[name], cs)
+			return
+		}
 	}
 	// An RHS requiring shell expansion is statically unknown — unless the
 	// expansion is a pure SELF-reference ("PATH=$PATH:/x"): an append-style
@@ -975,7 +1033,8 @@ func splitAssignWord(lit string) (name, value string, ok bool) {
 }
 
 // merge folds another binding summary (from a nested "bash -c '…'" parse)
-// into this one: opaque and dynamic markings union, literal values append
+// into this one: opaque, dynamic and resolved command-substitution markings
+// union, literal values and tentatively-recorded substitution inners append
 // without duplicates.
 func (b *envBindings) merge(o *envBindings) {
 	if o.opaque {
@@ -984,6 +1043,22 @@ func (b *envBindings) merge(o *envBindings) {
 	for name := range o.dynamic {
 		b.dynamic[name] = true
 	}
+	for name := range o.cmdSubst {
+		b.cmdSubst[name] = true
+	}
+	for name, inners := range o.cmdSubstInners {
+		for _, inner := range inners {
+			if !slicesContains(b.cmdSubstInners[name], inner) {
+				b.cmdSubstInners[name] = append(b.cmdSubstInners[name], inner)
+			}
+		}
+	}
+	for name, nodes := range o.cmdSubstNodes {
+		b.cmdSubstNodes[name] = append(b.cmdSubstNodes[name], nodes...)
+	}
+	for cs := range o.approvedSubstNodes {
+		b.approvedSubstNodes[cs] = true
+	}
 	for name, vals := range o.values {
 		for _, v := range vals {
 			if !slicesContains(b.values[name], v) {
@@ -991,6 +1066,196 @@ func (b *envBindings) merge(o *envBindings) {
 			}
 		}
 	}
+}
+
+// resolveCmdSubst is the post-walk resolution pass over the tentatively-
+// recorded command substitutions. A name is promoted to [envBindings.cmdSubst]
+// — so a reference to it is NOT unassessable, while it stays unresolvable
+// because its value is the substitution's output — only when EVERY recorded
+// inner is an assessable substitution ([commandSubstitutionAssessable]) and
+// the name carries neither a literal value nor any other dynamic binding. Any
+// other shape falls back to dynamic[name]: the fail-closed union means a
+// single literal, non-assessable or differently-shaped binding poisons the
+// whole name.
+func (b *envBindings) resolveCmdSubst() {
+	for name, inners := range b.cmdSubstInners {
+		assessable := len(inners) > 0
+		for _, inner := range inners {
+			if !commandSubstitutionAssessable(inner) {
+				assessable = false
+				break
+			}
+		}
+		if assessable && !b.opaque && !b.dynamic[name] && len(b.values[name]) == 0 {
+			b.cmdSubst[name] = true
+			for _, cs := range b.cmdSubstNodes[name] {
+				b.approvedSubstNodes[cs] = true
+			}
+			continue
+		}
+		delete(b.cmdSubst, name)
+		for _, cs := range b.cmdSubstNodes[name] {
+			delete(b.approvedSubstNodes, cs)
+		}
+		b.dynamic[name] = true
+	}
+}
+
+// commandSubstitutionAssessable reports whether the command substitution whose
+// inner command text is inner yields a value the walker may treat as
+// assessable — i.e. the substitution cannot smuggle in an out-of-root path no
+// pass can see. The inner must parse (a parse failure fails closed), must
+// contain no opaque construct and no dynamic binding, every one of its words
+// must be statically assessable ([innerWordAssessable]), and it must add no
+// unresolvable path tokens of its own
+// ([UnresolvablePathTokens](inner, ShellBash)).
+func commandSubstitutionAssessable(inner string) bool {
+	parser := syntax.NewParser()
+	file, err := parser.Parse(strings.NewReader(inner), "")
+	if err != nil {
+		return false
+	}
+	b := collectShellEnvBindings(file)
+	if b == nil || b.opaque || len(b.dynamic) > 0 {
+		return false
+	}
+	assessable := true
+	syntax.Walk(file, func(node syntax.Node) bool {
+		if w, ok := node.(*syntax.Word); ok && !innerWordAssessable(w, b) {
+			assessable = false
+		}
+		return true
+	})
+	if !assessable {
+		return false
+	}
+	return len(UnresolvablePathTokens(inner, ShellBash)) == 0
+}
+
+// innerWordAssessable reports whether a word appearing inside a command
+// substitution is statically assessable: literal fragments are; a word that is
+// exactly one command substitution is assessable iff that substitution itself
+// is (recursion — see [commandSubstitutionAssessable]); and a plain
+// "$NAME"/"${NAME}" reference is assessable when NAME is bound solely by an
+// assessable substitution ([envBindings.cmdSubst]). A reference to an unbound
+// or otherwise rebound name, a parameter-expansion modifier, an arithmetic or
+// process substitution, globbing, an ANSI-C/locale quote, or any composition
+// with such a part makes the word unassessable (fail closed).
+func innerWordAssessable(w *syntax.Word, b *envBindings) bool {
+	if w == nil {
+		return true
+	}
+	if inner, ok := pureCommandSubst(w); ok {
+		return commandSubstitutionAssessable(inner)
+	}
+	return innerPartsAssessable(w.Parts, b)
+}
+
+// innerPartsAssessable is the WordPart-level companion to
+// [innerWordAssessable].
+func innerPartsAssessable(parts []syntax.WordPart, b *envBindings) bool {
+	for _, part := range parts {
+		switch p := part.(type) {
+		case *syntax.Lit:
+			// Purely literal fragment.
+		case *syntax.SglQuoted:
+			// ANSI-C $'…' decodes escapes at runtime; the raw value is not the
+			// expanded one.
+			if p.Dollar {
+				return false
+			}
+		case *syntax.DblQuoted:
+			// $"…" is locale-translated at runtime; the plain "…" form is
+			// assessable only if its inner parts are.
+			if p.Dollar || !innerPartsAssessable(p.Parts, b) {
+				return false
+			}
+		case *syntax.ParamExp:
+			if paramExpHasModifier(p) || p.Param == nil {
+				return false
+			}
+			if b == nil || !b.cmdSubst[p.Param.Value] {
+				return false
+			}
+		default:
+			// *syntax.CmdSubst (a non-pure composition), *syntax.ProcSubst,
+			// *syntax.ArithmExp, *syntax.ExtGlob.
+			return false
+		}
+	}
+	return true
+}
+
+// pureCommandSubst reports whether w is exactly one command substitution —
+// either a bare *syntax.CmdSubst or a double-quoted word wrapping exactly one
+// — and, if so, returns the substitution's inner command text. Any other word
+// shape (concatenated literal fragments, single quotes, a locale-translated
+// dollar double-quote, backquotes, an mksh "${ …;}"/"${|…;}" form, or any
+// extra word part) is not a pure substitution — the RHS stays statically
+// unknown.
+func pureCommandSubst(w *syntax.Word) (string, bool) {
+	cs, ok := pureCommandSubstNode(w)
+	if !ok {
+		return "", false
+	}
+	return cmdSubstInner(cs)
+}
+
+// pureCommandSubstNode is the node-returning companion to [pureCommandSubst]:
+// it reports whether w is exactly one pure command substitution and, if so,
+// returns that *syntax.CmdSubst node — so a caller walking the SAME AST
+// (extractBashPaths) can recognize an approved binding node and recover its
+// inner source. The purity rules are those of [pureCommandSubstNodeParts].
+func pureCommandSubstNode(w *syntax.Word) (*syntax.CmdSubst, bool) {
+	if w == nil {
+		return nil, false
+	}
+	return pureCommandSubstNodeParts(w.Parts)
+}
+
+// pureCommandSubstNodeParts is the WordPart-level helper behind
+// [pureCommandSubstNode]: it recurses through an optional double-quote wrapper
+// to the single underlying command substitution, validating purity via
+// [cmdSubstInner] (which rejects backquotes, the mksh "${ …;}"/"${|…;}" forms,
+// and any node the printer cannot round-trip).
+func pureCommandSubstNodeParts(parts []syntax.WordPart) (*syntax.CmdSubst, bool) {
+	if len(parts) != 1 {
+		return nil, false
+	}
+	switch p := parts[0].(type) {
+	case *syntax.CmdSubst:
+		if _, ok := cmdSubstInner(p); !ok {
+			return nil, false
+		}
+		return p, true
+	case *syntax.DblQuoted:
+		if p.Dollar {
+			return nil, false
+		}
+		return pureCommandSubstNodeParts(p.Parts)
+	}
+	return nil, false
+}
+
+// cmdSubstInner returns the inner command text of a plain "$(…)" command
+// substitution. Backquote substitutions and the mksh "${ …;}"/"${|…;}" forms
+// carry quoting/temp-file/reply semantics the plain model does not cover, so
+// they are not pure. The inner text is recovered by re-printing the node (the
+// AST does not retain the source slice): the printer round-trips the
+// construct, and any printer failure fails closed.
+func cmdSubstInner(cs *syntax.CmdSubst) (string, bool) {
+	if cs == nil || cs.Backquotes || cs.TempFile || cs.ReplyVar {
+		return "", false
+	}
+	var sb strings.Builder
+	if err := syntax.NewPrinter().Print(&sb, cs); err != nil {
+		return "", false
+	}
+	s := sb.String()
+	if len(s) < 3 || !strings.HasPrefix(s, "$(") || !strings.HasSuffix(s, ")") {
+		return "", false
+	}
+	return s[2 : len(s)-1], true
 }
 
 // walkForClause folds for/select loops: the loop variable is rebound on each
@@ -1131,12 +1396,15 @@ func slicesContains(s []string, v string) bool {
 // resolvable reports whether name has exactly one assignment in the whole
 // command and it is a purely literal value: only then does a reference to it
 // statically expand to a known value. A nil receiver has no bindings, so no
-// name is resolvable; an opaque command never resolves any name.
+// name is resolvable; an opaque command never resolves any name; and a name
+// bound solely by an assessable command substitution ([envBindings.cmdSubst])
+// is deliberately NOT resolvable — it is assessable (not unassessable) yet its
+// value is the substitution's unknown output.
 func (b *envBindings) resolvable(name string) bool {
 	if b == nil || b.opaque {
 		return false
 	}
-	return !b.dynamic[name] && len(b.values[name]) == 1
+	return !b.dynamic[name] && !b.cmdSubst[name] && len(b.values[name]) == 1
 }
 
 // unassessable reports whether a reference to name cannot be assessed at
@@ -1149,6 +1417,26 @@ func (b *envBindings) unassessable(name string) bool {
 		return false
 	}
 	return b.opaque || b.dynamic[name]
+}
+
+// cmdSubstBound reports whether name is bound SOLELY by an assessable command
+// substitution ([envBindings.cmdSubst]): it has no literal value and no other
+// dynamic binding, so a bare "$NAME" reference contributes nothing to the
+// literal and does NOT make the word unexpandable — its unknown value is the
+// substitution's output, already assessed when the binding was resolved (see
+// [expandWordPartsWithBindings]). Such a name is deliberately not resolvable
+// ([envBindings.resolvable]).
+func (b *envBindings) cmdSubstBound(name string) bool {
+	return b != nil && b.cmdSubst[name] && !b.dynamic[name] && len(b.values[name]) == 0
+}
+
+// approvedSubstNode reports whether cs is the AST node of an approved binding
+// substitution — a pure command-substitution assignment RHS whose name the
+// resolution pass promoted to [envBindings.cmdSubst]. Node identity is
+// meaningful only for nodes of the SAME AST the bindings were collected from
+// (extractBashPaths collects and walks one file).
+func (b *envBindings) approvedSubstNode(cs *syntax.CmdSubst) bool {
+	return b != nil && cs != nil && b.approvedSubstNodes[cs]
 }
 
 // emptyExpansionPossible reports whether name may expand to the EMPTY string
@@ -1380,7 +1668,12 @@ func wordPartsHaveDynamicPart(parts []syntax.WordPart) bool {
 // "$VAR", "$(cmd)", backticks, process/command substitution, and arithmetic
 // are left unexpanded (the literal fragments are concatenated, matching the
 // shell's empty-expansion of an unset variable) and the word is marked
-// unexpandable so the caller can flag the command suspicious.
+// unexpandable so the caller can flag the command suspicious. Two
+// substitution-shaped exceptions do NOT mark the word unexpandable (see
+// [expandWordPartsWithBindings]): a reference to a name bound solely by an
+// assessable command substitution, and the approved binding substitution node
+// itself — both rest on [envBindings.cmdSubst], whose inner command was
+// assessed at resolution time.
 func expandWordWithBindings(w *syntax.Word, bindings *envBindings) (literal string, unexpandable bool) {
 	if w == nil {
 		return "", false
@@ -1431,6 +1724,16 @@ func expandWordPartsWithBindings(parts []syntax.WordPart, bindings *envBindings)
 			}
 			if p.Param != nil {
 				name := p.Param.Value
+				// A name bound SOLELY by an assessable command substitution
+				// ("X=$(…)", [envBindings.cmdSubst]) is assessable: the
+				// reference contributes no literal (the substitution's output
+				// is unknown to us) and does NOT make the word unexpandable —
+				// the substitution's own inner command was assessed when the
+				// binding was resolved. The name is never resolvable, so this
+				// is checked before the value/resolution logic below.
+				if bindings.cmdSubstBound(name) {
+					continue
+				}
 				val := bindings.finalValue(name)
 				if val != "" {
 					// Resolve-and-stay-suspicious for ambiguous names: the
@@ -1453,9 +1756,19 @@ func expandWordPartsWithBindings(parts []syntax.WordPart, bindings *envBindings)
 			} else {
 				unexp = true
 			}
+		case *syntax.CmdSubst:
+			// Only an APPROVED binding substitution — an assignment RHS whose
+			// name the resolution pass promoted to [envBindings.cmdSubst] — is
+			// assessable and leaves the word expandable: its inner command was
+			// assessed when the binding resolved (D1: assignment context
+			// only). Every other substitution — a bare "$(…)" in argument
+			// position, a backquote or mksh form, or one whose binding did not
+			// promote — stays unexpandable (fail closed).
+			if !bindings.approvedSubstNode(p) {
+				unexp = true
+			}
 		default:
-			// *syntax.CmdSubst, *syntax.ProcSubst, *syntax.ArithmExp,
-			// *syntax.ExtGlob.
+			// *syntax.ProcSubst, *syntax.ArithmExp, *syntax.ExtGlob.
 			unexp = true
 		}
 	}

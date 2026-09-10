@@ -49,6 +49,24 @@ The skip is narrow by construction (`tools.isPureSeparatorRunToken`) and preserv
 - A separator-run artifact cannot mask a real escape: a sed `//` and `/etc/passwd` in the same command still fails containment, because each token is extracted independently.
 - Command blacklists are untouched: the built-in shell tools' `ToolJudger` matches the raw command string against its blacklist patterns **before** path analysis (and its reason takes precedence), so `rm -rf /` is still escalated by an `rm -rf` pattern regardless of the skip. Its separator-run spelling `rm -rf //` is covered by the same blacklist: the skip removes the `//` token from path extraction (exactly as the bare `/` never matched the absolute-path pattern), so the blacklist is the authoritative backstop for bare-root deletions — a host deploying shell tools without an `rm -rf`-style pattern should add one. See [../domains/tool-system/builtins.md](../domains/tool-system/builtins.md).
 
+### Assignment-Form Command Substitutions Are Assessable
+
+The shell path extractors (`tools.ResolveShellPathTokens` behind the built-in shell tools' `Judge`, and the extractors behind `tools.DetectSymlinksInToolInput`) treat a shell expansion whose value cannot be determined statically as **unresolved**: the extractors flag it, the built-in tools escalate its unresolvable path tokens, and the host's symlink gate receives the `suspicious` flag. One expansion shape is the exception — a **validated assignment-form command substitution**: a pure `VAR=$(...)` (or `VAR="$(...)"` wrapping exactly one substitution) whose inner command is **fully assessable** is *resolved*, not unresolved, so it neither escalates nor raises the `suspicious` flag.
+
+"Fully assessable" reuses the same assessment pipeline, applied recursively (`tools.commandSubstitutionAssessable`): the inner command must parse; a fresh binding summary (`tools.collectShellEnvBindings`) must report no opaque construct (`eval`/`source`/`let`) and no dynamic binding; every inner word must be statically assessable — literal fragments are, a pure nested substitution recurses, and a plain `$NAME`/`${NAME}` reference is assessable only when `NAME` is itself bound solely by an assessable substitution — and `tools.UnresolvablePathTokens(inner, ShellBash)` must be empty.
+
+When a name is promoted (`tools.envBindings.cmdSubst`), a later `$VAR` reference is **assessable**: it does not escalate, and it does not resolve to a literal either — the name stays deliberately **not resolvable** because its value is the substitution's unknown output. The approved substitution's **inner literal paths are surfaced** to the symlink walk (`tools.extractBashPaths` recurses into it), so a target reachable through a symlink only inside the substitution is still detected.
+
+The exception is fail-closed by a **union** over all bindings (`tools.envBindings.resolveCmdSubst`): a name is promoted only when *every* recorded binding of it is a pure assessable substitution and it carries no literal value and no other dynamic binding. Any single literal, non-assessable, or differently-shaped binding — or an opaque construct — poisons the whole name back to dynamic, and the call stays unresolved.
+
+The scope is deliberately narrow:
+
+- A **bare `$(...)` in argument position** (`cat $(echo x)`) is not eligible — there is no assignment binding to promote — and stays unresolved.
+- A reference to a name **not** bound by an assessable substitution — including environment variables such as `$HOME` — stays unresolved.
+- The substitution's **stdout is not analyzed**: only the inner command's static assessability and its literal paths are assessed. This is an accepted residual risk of the exception (a substitution whose inner command reads a file can yield a value no pass inspects).
+
+`posh_exec` mirrors the bash rule with a static binding `$NAME = <literal RHS>`. Its char-level tokenizer bounds the RHS at the next statement/pipeline terminator and treats the binding as static only when the RHS carries no expandable token (`$`-expansion, backtick escape, or expandable double-quoted content); a bare `$NAME` reference is then literal only when the name is bound **exactly once** with a static RHS. Recognition is fail-closed for the same cases as bash: a suffixed reference (`$X/secret`), a name bound more than once, an unbound name, and `$(...)`/`(...)` all keep every reference unresolved.
+
 ## Tool Policies
 
 Every tool carries a `ToolPolicy` (`github.com/v0lka/sp4rk/tools`). It is an integer enum whose string mapping is stable:
