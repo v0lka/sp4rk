@@ -136,3 +136,60 @@ func TestRunOnORTThread_NilRunsInline(t *testing.T) {
 		t.Errorf("fn ran on goroutine %d, want the caller's %d", got, want)
 	}
 }
+
+func TestEmbedderOnORTThread_ParallelCallsShareOneThread(t *testing.T) {
+	// The production invariant behind the CUDA fix: Embedder funnels every
+	// ONNX touch through onORTThread, so no matter how many goroutines call
+	// EmbedQuery/EmbedDocuments concurrently (the indexer does), the ONNX
+	// work lands on exactly one OS thread for the embedder's whole lifetime.
+	// Unlike TestORTRunner_SingleThreadAcrossCallers this exercises the
+	// Embedder path rather than the bare runner, and unlike it this also
+	// pins the thread across two sequential waves of parallel callers — the
+	// footprint must stay flat over the embedder's lifetime, not just within
+	// one burst. No ONNX assets are needed: the calls stop at the runner and
+	// never reach the runtime.
+	e := &Embedder{runner: newORTRunner()}
+	defer e.runner.stop()
+
+	const callers = 32
+	ids := make([]uint64, callers)
+	runWave := func() {
+		var wg sync.WaitGroup
+		for i := range callers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				runtime.LockOSThread() // each caller sits on its own OS thread
+				defer runtime.UnlockOSThread()
+				e.onORTThread(func() { ids[i] = goroutineID(t) })
+			}()
+		}
+		wg.Wait()
+	}
+
+	runWave()
+	first := ids[0]
+	if first == 0 {
+		t.Fatal("no job ran in the first wave")
+	}
+	for i, id := range ids {
+		if id == 0 {
+			t.Fatalf("job %d did not run", i)
+		}
+		if id != first {
+			t.Errorf("job %d ran on goroutine %d, want %d (all calls must share one thread)", i, id, first)
+		}
+	}
+
+	// Second wave, later in the embedder's lifetime: still the same thread.
+	runWave()
+	for i, id := range ids {
+		if id != first {
+			t.Errorf("second wave job %d ran on goroutine %d, want %d (thread must not change over the lifetime)", i, id, first)
+		}
+	}
+
+	if first == goroutineID(t) {
+		t.Error("jobs ran on the calling goroutine, want the runner's dedicated one")
+	}
+}

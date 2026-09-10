@@ -18,8 +18,7 @@ import (
 // (session creation costs ~2s, inference ~50ms).
 var onnxSessionsCreated atomic.Int64
 
-// onnxInferenceRuns counts successful session.Run invocations across all
-// sessions (failed attempts are tracked only through Telemetry).
+// onnxInferenceRuns counts session.Run invocations across all sessions.
 // Production code never reads it; it exists so tests can assert that a batch
 // of n <= capacity texts performs exactly one inference per call.
 var onnxInferenceRuns atomic.Int64
@@ -54,9 +53,21 @@ func initONNXRuntime(libraryPath string) error {
 }
 
 // destroyONNXRuntime cleans up the global ONNX Runtime environment.
+//
+// Call counter note: onnxEnvDestroys exists so tests can assert that
+// NewEmbedder failure paths never invoke this function.
 func destroyONNXRuntime() error {
+	onnxEnvDestroys.Add(1)
 	return ort.DestroyEnvironment()
 }
+
+// onnxEnvDestroys counts destroyONNXRuntime invocations. Production code
+// never reads it; it exists so tests can assert that NewEmbedder failure
+// paths never destroy the process-global environment: initONNXRuntime is
+// sync.Once-guarded, so a destroyed environment can never be reinitialized,
+// which would make the "auto" CPU fallback (and any later retry) impossible.
+// Only Embedder.Close performs the full teardown.
+var onnxEnvDestroys atomic.Int64
 
 // Execution provider identifiers accepted by EmbedderConfig.ExecutionProvider
 // and buildSessionOptions. The empty string is a synonym for
@@ -72,7 +83,32 @@ const (
 	// libonnxruntime_providers_shared and libonnxruntime_providers_cuda sitting
 	// beside it (the runtime dlopens them from the main library's directory).
 	ExecutionProviderCUDA = "cuda"
+
+	// ExecutionProviderAuto asks NewEmbedder to prefer the CUDA execution
+	// provider and fall back to the CPU provider when CUDA is unavailable —
+	// the CPU-only ONNX Runtime build, a missing driver, or an invalid device
+	// id. Unlike an explicit ExecutionProviderCUDA, the fallback downgrades
+	// the request to a WARN log instead of failing NewEmbedder. Which provider
+	// actually won is observable via Embedder.ExecutionProvider.
+	ExecutionProviderAuto = "auto"
 )
+
+// normalizeExecutionProvider validates provider and normalizes the empty
+// string to ExecutionProviderCPU. "auto" passes through unchanged — it is
+// resolved by NewEmbedder, not by session construction. An unknown value is
+// an error, so a typo in configuration fails loudly instead of silently
+// degrading to the CPU.
+func normalizeExecutionProvider(provider string) (string, error) {
+	switch provider {
+	case "":
+		return ExecutionProviderCPU, nil
+	case ExecutionProviderCPU, ExecutionProviderCUDA, ExecutionProviderAuto:
+		return provider, nil
+	default:
+		return "", fmt.Errorf("unknown execution provider %q (want %q, %q or %q)",
+			provider, ExecutionProviderCPU, ExecutionProviderCUDA, ExecutionProviderAuto)
+	}
+}
 
 // buildSessionOptions constructs ONNX Runtime session options for the
 // requested execution provider, limiting intra-op parallelism to
@@ -98,14 +134,15 @@ const (
 // AppendExecutionProviderCUDA copies what it needs, so they are destroyed
 // before returning.
 func buildSessionOptions(provider string, deviceID, intraOpThreads int) (*ort.SessionOptions, error) {
-	switch provider {
-	case "", ExecutionProviderCPU, ExecutionProviderCUDA:
-	default:
-		return nil, fmt.Errorf("unknown execution provider %q (want %q or %q)",
-			provider, ExecutionProviderCPU, ExecutionProviderCUDA)
+	normalized, err := normalizeExecutionProvider(provider)
+	if err != nil {
+		return nil, err
+	}
+	if normalized == ExecutionProviderAuto {
+		return nil, fmt.Errorf("execution provider %q must be resolved by NewEmbedder before building session options", ExecutionProviderAuto)
 	}
 
-	cuda := provider == ExecutionProviderCUDA
+	cuda := normalized == ExecutionProviderCUDA
 	if !cuda && intraOpThreads <= 0 {
 		return nil, nil
 	}
@@ -261,14 +298,11 @@ func (s *onnxSession) run(inputIDs, attMask, tokenTypes []int64) ([]float32, err
 	copy(s.tokenTypes.GetData(), tokenTypes)
 
 	inferenceStarted := time.Now()
-	runErr := s.session.Run()
-	// Count every attempt (not only successes) so InferenceCount always
-	// equals Stages[StageONNXInference].Calls and a derived average
-	// inference latency stays meaningful after transient failures.
-	s.telemetry.observeInference(1, 1, time.Since(inferenceStarted))
-	if runErr != nil {
-		return nil, fmt.Errorf("running ONNX inference: %w", runErr)
+	if err := s.session.Run(); err != nil {
+		s.telemetry.observe(StageONNXInference, time.Since(inferenceStarted))
+		return nil, fmt.Errorf("running ONNX inference: %w", err)
 	}
+	s.telemetry.observeInference(1, 1, time.Since(inferenceStarted))
 	onnxInferenceRuns.Add(1)
 
 	results := meanPoolAndNormalize(s.output.GetData(), attMask, 1, s.seqLen, s.hiddenDim)
@@ -308,12 +342,11 @@ func (s *onnxSession) runBatch(n int, inputIDs, attMask, tokenTypes []int64) ([]
 	copy(typesData, tokenTypes)
 
 	inferenceStarted := time.Now()
-	runErr := s.session.Run()
-	// Count every attempt (not only successes) — see run for the rationale.
-	s.telemetry.observeInference(n, s.batchSize, time.Since(inferenceStarted))
-	if runErr != nil {
-		return nil, fmt.Errorf("running ONNX inference: %w", runErr)
+	if err := s.session.Run(); err != nil {
+		s.telemetry.observe(StageONNXInference, time.Since(inferenceStarted))
+		return nil, fmt.Errorf("running ONNX inference: %w", err)
 	}
+	s.telemetry.observeInference(n, s.batchSize, time.Since(inferenceStarted))
 	onnxInferenceRuns.Add(1)
 
 	// Rows are independent, so pool over the n real rows only; padded rows
