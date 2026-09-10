@@ -310,7 +310,7 @@ func (p *OpenAIProvider) buildChatParams(req ChatRequest) oai.ChatCompletionNewP
 				Function: oai.FunctionDefinitionParam{
 					Name:        tool.Name,
 					Description: oai.String(tool.Description),
-					Parameters:  p.convertSchemaToMap(SanitizeSchemaForOpenAI(tool.InputSchema)),
+					Parameters:  p.convertSchemaToMap(SanitizeSchemaForOpenAINonStrict(tool.InputSchema)),
 				},
 			}
 		}

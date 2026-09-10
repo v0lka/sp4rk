@@ -124,9 +124,10 @@ func findFrontmatterDelim(s string) int {
 	return -1
 }
 
-// validateAgent checks the v1 spec constraints on a parsed Agent. Only the
-// required fields are validated: name (present, regex, matches directory) and
-// description (present). Unknown fields are intentionally not checked.
+// validateAgent checks the v1 spec constraints on a parsed Agent. The required
+// fields are validated: name (present, regex, matches directory) and
+// description (present). The declarative comma-lists (`tools`, `skills`) are
+// validated fail-closed. Unknown fields are intentionally not checked.
 func validateAgent(agent *Agent, dirPath string) error {
 	// Name is required.
 	if agent.Metadata.Name == "" {
@@ -152,6 +153,13 @@ func validateAgent(agent *Agent, dirPath string) error {
 	// Tools: "all"/"read-only"/group-list — unknown groups fail the profile
 	// (fail-closed: a typo must not silently grant or drop capabilities).
 	if err := validateToolsField(agent.Metadata.Tools); err != nil {
+		return err
+	}
+
+	// Skills: comma-list of skill names — empty items, duplicates, and names
+	// that are not valid skill-name shapes fail the profile (fail-closed: a
+	// typo must not silently change which skills a subagent gets).
+	if err := validateSkillsField(agent.Metadata.Skills); err != nil {
 		return err
 	}
 

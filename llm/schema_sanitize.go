@@ -29,6 +29,13 @@ func getTypes(typeVal any) []string {
 }
 
 // SanitizeSchemaForOpenAI ensures strict mode compliance for OpenAI.
+//
+// Use it only for request paths that actually enable OpenAI strict function
+// calling (the Responses API sets strict=true). For ordinary Chat Completions
+// requests, where strict mode is not enabled, use
+// SanitizeSchemaForOpenAINonStrict instead: forcing every property into
+// required there makes optional parameters look mandatory and increases the
+// chance of malformed argument JSON.
 //   - Resolves $ref references against $defs/definitions
 //   - Filters out forbidden JSON Schema keywords ($schema, $id, $comment, $defs, definitions, default, examples)
 //   - Infers "type": "object" when properties or required are present but type is missing
@@ -36,6 +43,32 @@ func getTypes(typeVal any) []string {
 //   - Ensures the required array contains ALL property names from properties
 //   - Removes required entries that reference non-existent properties
 func SanitizeSchemaForOpenAI(raw json.RawMessage) json.RawMessage {
+	return sanitizeSchemaForOpenAI(raw, true)
+}
+
+// SanitizeSchemaForOpenAINonStrict normalizes a JSON Schema for OpenAI function
+// calling when strict mode is NOT enabled (e.g. Chat Completions, and
+// OpenAI-compatible gateways). It applies the same compatibility fixes as
+// SanitizeSchemaForOpenAI with one deliberate difference: it does not force
+// every property into the required array. Only the required entries declared by
+// the caller are kept (filtered to properties that actually exist), so optional
+// parameters — such as bash_exec's "timeout" and "working_directory" — remain
+// genuinely optional. Keeping them optional means the model is not pressured to
+// emit every field on every call, which reduces schema-induced argument errors.
+//   - Resolves $ref references against $defs/definitions
+//   - Filters out forbidden JSON Schema keywords ($schema, $id, $comment, $defs, definitions, default, examples)
+//   - Infers "type": "object" when properties or required are present but type is missing
+//   - Adds "additionalProperties": false to all object-type schemas (recursively)
+//   - Preserves the caller's required list, dropping only entries that reference non-existent properties
+func SanitizeSchemaForOpenAINonStrict(raw json.RawMessage) json.RawMessage {
+	return sanitizeSchemaForOpenAI(raw, false)
+}
+
+// sanitizeSchemaForOpenAI implements the shared OpenAI schema normalization.
+// When strict is true it enforces OpenAI strict-mode constraints (every
+// property listed in required); when false it preserves the caller's
+// optionality (see SanitizeSchemaForOpenAINonStrict).
+func sanitizeSchemaForOpenAI(raw json.RawMessage, strict bool) json.RawMessage {
 	if len(raw) == 0 {
 		return raw
 	}
@@ -46,7 +79,7 @@ func SanitizeSchemaForOpenAI(raw json.RawMessage) json.RawMessage {
 	}
 
 	defs := extractDefs(schema)
-	sanitized := sanitizeOpenAISchemaWithDefs(schema, defs)
+	sanitized := sanitizeOpenAISchemaWithDefs(schema, defs, strict)
 	result, err := json.Marshal(sanitized)
 	if err != nil {
 		return raw
@@ -302,9 +335,11 @@ func safeFallbackSchema() map[string]any {
 	}
 }
 
-// sanitizeOpenAISchemaWithDefs recursively processes a schema map for OpenAI strict mode,
-// carrying top-level definitions for $ref resolution.
-func sanitizeOpenAISchemaWithDefs(schema, defs map[string]any) map[string]any {
+// sanitizeOpenAISchemaWithDefs recursively processes a schema map for OpenAI
+// function calling, carrying top-level definitions for $ref resolution. When
+// strict is true it enforces strict-mode required semantics; when false it
+// preserves the caller's optional parameters.
+func sanitizeOpenAISchemaWithDefs(schema, defs map[string]any, strict bool) map[string]any {
 	if schema == nil {
 		return nil
 	}
@@ -350,42 +385,69 @@ func sanitizeOpenAISchemaWithDefs(schema, defs map[string]any) map[string]any {
 			result["properties"] = map[string]any{}
 		}
 
-		// Ensure required array contains ALL property names (strict mode).
-		// Phase 1: filter out required entries that don't exist in properties.
-		// Phase 2: add any property names missing from required.
+		// Normalize the required array. Behavior depends on strict mode:
+		//   - strict: the array MUST list every property (OpenAI strict requirement).
+		//     Phase 1 filters out required entries that don't exist in properties;
+		//     Phase 2 adds every property name missing from required.
+		//   - non-strict: preserve only the caller-declared required entries that
+		//     reference existing properties. Missing properties are NOT promoted, so
+		//     optional parameters stay optional.
 		props, propsOK := result["properties"].(map[string]any)
-		if propsOK && len(props) > 0 {
-			// Phase 1: keep only valid existing required entries
-			requiredSet := make(map[string]struct{})
-			if required, ok := result["required"].([]any); ok {
-				for _, req := range required {
-					if reqStr, ok := req.(string); ok {
-						if _, exists := props[reqStr]; exists {
-							requiredSet[reqStr] = struct{}{}
+		if strict {
+			if propsOK && len(props) > 0 {
+				// Phase 1: keep only valid existing required entries
+				requiredSet := make(map[string]struct{})
+				if required, ok := result["required"].([]any); ok {
+					for _, req := range required {
+						if reqStr, ok := req.(string); ok {
+							if _, exists := props[reqStr]; exists {
+								requiredSet[reqStr] = struct{}{}
+							}
 						}
 					}
 				}
-			}
 
-			// Phase 2: add any missing property names
-			for propName := range props {
-				requiredSet[propName] = struct{}{}
-			}
+				// Phase 2: add any missing property names
+				for propName := range props {
+					requiredSet[propName] = struct{}{}
+				}
 
-			// Build sorted required list for deterministic output
+				// Build sorted required list for deterministic output
+				sortedNames := make([]string, 0, len(requiredSet))
+				for name := range requiredSet {
+					sortedNames = append(sortedNames, name)
+				}
+				sort.Strings(sortedNames)
+				allRequired := make([]any, len(sortedNames))
+				for i, name := range sortedNames {
+					allRequired[i] = name
+				}
+				result["required"] = allRequired
+			} else {
+				// No properties or empty properties: strict mode still requires the array
+				result["required"] = []any{}
+			}
+		} else if required, ok := result["required"].([]any); ok {
+			// Keep only required entries that reference existing properties; never
+			// promote an optional property to required.
+			requiredSet := make(map[string]struct{})
+			for _, req := range required {
+				if reqStr, ok := req.(string); ok {
+					if _, exists := props[reqStr]; exists {
+						requiredSet[reqStr] = struct{}{}
+					}
+				}
+			}
 			sortedNames := make([]string, 0, len(requiredSet))
 			for name := range requiredSet {
 				sortedNames = append(sortedNames, name)
 			}
 			sort.Strings(sortedNames)
-			allRequired := make([]any, len(sortedNames))
+			kept := make([]any, len(sortedNames))
 			for i, name := range sortedNames {
-				allRequired[i] = name
+				kept[i] = name
 			}
-			result["required"] = allRequired
-		} else {
-			// No properties or empty properties: strict mode still requires the array
-			result["required"] = []any{}
+			result["required"] = kept
 		}
 	}
 
@@ -394,7 +456,7 @@ func sanitizeOpenAISchemaWithDefs(schema, defs map[string]any) map[string]any {
 		newProps := make(map[string]any)
 		for propName, propVal := range props {
 			if propMap, ok := propVal.(map[string]any); ok {
-				newProps[propName] = sanitizeOpenAISchemaWithDefs(propMap, defs)
+				newProps[propName] = sanitizeOpenAISchemaWithDefs(propMap, defs, strict)
 			} else {
 				newProps[propName] = propVal
 			}
@@ -406,12 +468,12 @@ func sanitizeOpenAISchemaWithDefs(schema, defs map[string]any) map[string]any {
 	if items, ok := result["items"]; ok {
 		switch v := items.(type) {
 		case map[string]any:
-			result["items"] = sanitizeOpenAISchemaWithDefs(v, defs)
+			result["items"] = sanitizeOpenAISchemaWithDefs(v, defs, strict)
 		case []any:
 			newItems := make([]any, len(v))
 			for i, item := range v {
 				if itemMap, ok := item.(map[string]any); ok {
-					newItems[i] = sanitizeOpenAISchemaWithDefs(itemMap, defs)
+					newItems[i] = sanitizeOpenAISchemaWithDefs(itemMap, defs, strict)
 				} else {
 					newItems[i] = item
 				}
@@ -426,7 +488,7 @@ func sanitizeOpenAISchemaWithDefs(schema, defs map[string]any) map[string]any {
 			newArr := make([]any, len(arr))
 			for i, item := range arr {
 				if itemMap, ok := item.(map[string]any); ok {
-					newArr[i] = sanitizeOpenAISchemaWithDefs(itemMap, defs)
+					newArr[i] = sanitizeOpenAISchemaWithDefs(itemMap, defs, strict)
 				} else {
 					newArr[i] = item
 				}

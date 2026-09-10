@@ -35,6 +35,7 @@ model: gpt-4o
 allow-redelegate: true
 hidden: false
 color: "#e06c75"
+skills: code-review, git-conventions
 ---
 
 You are a meticulous code reviewer. Always read the full diff before commenting.
@@ -55,6 +56,7 @@ You are a meticulous code reviewer. Always read the full diff before commenting.
 		AllowRedelegate: true,
 		Hidden:          false,
 		Color:           "#e06c75",
+		Skills:          "code-review, git-conventions",
 	}
 	if !reflect.DeepEqual(agent.Metadata, wantMeta) {
 		t.Errorf("metadata = %#v, want %#v", agent.Metadata, wantMeta)

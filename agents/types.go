@@ -43,6 +43,7 @@ type AgentMetadata struct {
 	AllowRedelegate bool   `yaml:"allow-redelegate,omitempty"` // permit nested delegation (default false)
 	Hidden          bool   `yaml:"hidden,omitempty"`           // hide from #-autocomplete (default false)
 	Color           string `yaml:"color,omitempty"`            // UI accent color for the agent badge
+	Skills          string `yaml:"skills,omitempty"`           // comma-list of skill names the profile requires (e.g. "code-review,git-conventions"); "" = none
 }
 
 // AgentDescriptor is the lightweight discovery-time representation of an agent
@@ -120,6 +121,45 @@ func (a *Agent) ToolPreferenceWithError() (any, error) {
 	}
 }
 
+// RequiredSkills translates the declarative `skills` frontmatter field into
+// the list of skill names a subagent launched under this profile must have
+// activated:
+//
+//   - "" (absent or empty) → (nil, nil), meaning the profile requires no
+//     particular skills.
+//   - a comma-separated list of skill names (e.g. "code-review,git-conventions")
+//     → a []string of trimmed skill names.
+//
+// Surrounding whitespace is tolerated. Every item must be a valid skill name —
+// the same shape as an agent name (lowercase alphanumeric with hyphens, no
+// leading/trailing hyphens, see agentNamePattern) — and an empty item (a stray
+// comma) or a duplicate name yields an error instead of being silently
+// dropped: a typo must fail the profile loudly, not silently change which
+// skills the subagent gets. The list form is validated with the same rules
+// (and the same error messages) the parser applies to AGENT.md files (see
+// validateSkillsField), so the parse-time and programmatic paths can never
+// diverge; the error return matters for profiles built programmatically,
+// which never pass through the parser.
+//
+// NOTE: this package only parses the names; whether a named skill actually
+// exists is resolved by the delegating runtime against its skill catalog at
+// launch time.
+func (a *Agent) RequiredSkills() ([]string, error) {
+	skills := strings.TrimSpace(a.Metadata.Skills)
+	if err := validateSkillsField(skills); err != nil {
+		return nil, err
+	}
+	if skills == "" {
+		return nil, nil
+	}
+	// Validation passed, so every item is a clean trimmed name.
+	var names []string
+	for _, part := range strings.Split(skills, ",") {
+		names = append(names, strings.TrimSpace(part))
+	}
+	return names, nil
+}
+
 // toolGroupTokens are the accepted `tools:` group tokens in canonical
 // kebab-case spelling. They mirror the sdktools ToolGroup values ("local_read"
 // etc. — underscore there, kebab here) one-to-one. This package is deliberately
@@ -182,6 +222,34 @@ func validateToolsField(tools string) error {
 			return fmt.Errorf("tools: duplicate group %q in %q", token, tools)
 		}
 		seen[canonical] = struct{}{}
+	}
+	return nil
+}
+
+// validateSkillsField validates the declarative `skills` frontmatter field:
+// "" (the profile requires no particular skills) or a non-empty comma list of
+// skill names. Surrounding whitespace is tolerated. Every item must match the
+// agent name pattern (lowercase alphanumeric with hyphens, no leading/trailing
+// hyphens — the same shape as a skill name), empty items (stray commas) are
+// rejected, and a repeated name is rejected — a typo or a stray duplicate must
+// fail the profile loudly, not silently change which skills a subagent gets.
+func validateSkillsField(skills string) error {
+	if strings.TrimSpace(skills) == "" {
+		return nil
+	}
+	seen := make(map[string]struct{}, 2)
+	for _, part := range strings.Split(skills, ",") {
+		name := strings.TrimSpace(part)
+		if name == "" {
+			return fmt.Errorf("skills: empty item in skill list %q", skills)
+		}
+		if !agentNamePattern.MatchString(name) {
+			return fmt.Errorf("skills: invalid skill name %q in %q (must be lowercase alphanumeric with hyphens, no leading/trailing hyphens)", name, skills)
+		}
+		if _, dup := seen[name]; dup {
+			return fmt.Errorf("skills: duplicate skill %q in %q", name, skills)
+		}
+		seen[name] = struct{}{}
 	}
 	return nil
 }
