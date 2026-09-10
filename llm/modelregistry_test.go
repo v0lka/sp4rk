@@ -69,6 +69,7 @@ func TestModelRegistry_BuiltInResolution(t *testing.T) {
 		{"deepseek-v4-pro", 1000000, 384000, "approximate"},
 		{"deepseek-v4-flash", 1000000, 384000, "approximate"},
 		{"deepseek-v4-flash-vision-exp", 1000000, 384000, "approximate"},
+		{"deepseek-flash", 1000000, 384000, "approximate"},
 
 		// New multimodal entries from the qwen/glm/deepseek wave — the
 		// prefixed spellings are the exact catalog keys; pin their windows
@@ -1404,6 +1405,7 @@ func TestResolveFamily_BuiltinModels(t *testing.T) {
 		{"deepseek-v4-pro", "deepseek"},
 		{"deepseek-v4-flash", "deepseek"},
 		{"deepseek-v4-flash-vision-exp", "deepseek"},
+		{"deepseek-flash", "deepseek"},
 
 		// Kimi models — the Kimi Code endpoint's short IDs ("k3", "k3-256k")
 		// contain no "kimi" substring, so these pin the explicit built-in
@@ -2760,6 +2762,7 @@ func TestResolveProtocol_BuiltinAndPattern(t *testing.T) {
 		// Chat Completions — other families / default
 		{"grok-4", ProtocolChatCompletions},
 		{"deepseek-v4-pro", ProtocolChatCompletions},
+		{"deepseek-flash", ProtocolChatCompletions},
 		{"llama-3.1-70b", ProtocolChatCompletions},
 		{"unknown-model", ProtocolChatCompletions},
 	}
