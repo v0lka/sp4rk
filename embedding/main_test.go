@@ -69,10 +69,15 @@ func closeSessionOnly(e *Embedder) {
 		e.batchSess.destroy()
 		e.batchSess = nil
 	}
+	for key, sess := range e.bucketSessions {
+		sess.destroy()
+		delete(e.bucketSessions, key)
+	}
 	if e.sessOpts != nil {
 		_ = e.sessOpts.Destroy()
 		e.sessOpts = nil
 	}
+	e.closed = true
 	e.tokenizer = nil
 }
 

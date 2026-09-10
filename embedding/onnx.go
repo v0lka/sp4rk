@@ -1,10 +1,12 @@
 package embedding
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	ort "github.com/yalue/onnxruntime_go"
 )
@@ -97,6 +99,8 @@ type onnxSession struct {
 	batchSize  int // fixed row capacity of the input/output tensors
 	seqLen     int
 	hiddenDim  int
+	telemetry  *Telemetry
+	closed     atomic.Bool
 }
 
 // newONNXSession creates a persistent ONNX session whose input tensors are
@@ -107,7 +111,7 @@ type onnxSession struct {
 // opts may be nil (legacy behavior) or a *SessionOptions produced by
 // buildSessionOptions to limit intra-op parallelism. opts ownership is NOT
 // transferred: the caller keeps the handle and must destroy it separately.
-func newONNXSession(modelPath string, batchSize, seqLen, hiddenDim int, opts *ort.SessionOptions) (*onnxSession, error) {
+func newONNXSession(modelPath string, batchSize, seqLen, hiddenDim int, opts *ort.SessionOptions, telemetry *Telemetry) (*onnxSession, error) {
 	if batchSize < 1 {
 		return nil, fmt.Errorf("batchSize must be >= 1, got %d", batchSize)
 	}
@@ -170,6 +174,7 @@ func newONNXSession(modelPath string, batchSize, seqLen, hiddenDim int, opts *or
 		batchSize:  batchSize,
 		seqLen:     seqLen,
 		hiddenDim:  hiddenDim,
+		telemetry:  telemetry,
 	}, nil
 }
 
@@ -177,6 +182,9 @@ func newONNXSession(modelPath string, batchSize, seqLen, hiddenDim int, opts *or
 // The caller must ensure len(inputIDs) == len(attMask) == len(tokenTypes) == seqLen.
 // Returns a single pooled, L2-normalized embedding vector.
 func (s *onnxSession) run(inputIDs, attMask, tokenTypes []int64) ([]float32, error) {
+	if s == nil || s.closed.Load() {
+		return nil, errors.New("ONNX session is closed")
+	}
 	// Validate input lengths to prevent stale data from prior inferences.
 	if len(inputIDs) != s.seqLen || len(attMask) != s.seqLen || len(tokenTypes) != s.seqLen {
 		return nil, fmt.Errorf("input length mismatch: got (%d,%d,%d), want seqLen=%d",
@@ -186,9 +194,12 @@ func (s *onnxSession) run(inputIDs, attMask, tokenTypes []int64) ([]float32, err
 	copy(s.attMask.GetData(), attMask)
 	copy(s.tokenTypes.GetData(), tokenTypes)
 
+	inferenceStarted := time.Now()
 	if err := s.session.Run(); err != nil {
+		s.telemetry.observe(StageONNXInference, time.Since(inferenceStarted))
 		return nil, fmt.Errorf("running ONNX inference: %w", err)
 	}
+	s.telemetry.observeInference(1, 1, time.Since(inferenceStarted))
 	onnxInferenceRuns.Add(1)
 
 	results := meanPoolAndNormalize(s.output.GetData(), attMask, 1, s.seqLen, s.hiddenDim)
@@ -202,6 +213,9 @@ func (s *onnxSession) run(inputIDs, attMask, tokenTypes []int64) ([]float32, err
 // embeddings; pooling covers only the first n rows, and padded rows are
 // never pooled.
 func (s *onnxSession) runBatch(n int, inputIDs, attMask, tokenTypes []int64) ([][]float32, error) {
+	if s == nil || s.closed.Load() {
+		return nil, errors.New("ONNX session is closed")
+	}
 	if n < 1 || n > s.batchSize {
 		return nil, fmt.Errorf("batch rows out of range: got %d, capacity %d", n, s.batchSize)
 	}
@@ -224,9 +238,12 @@ func (s *onnxSession) runBatch(n int, inputIDs, attMask, tokenTypes []int64) ([]
 	copy(maskData, attMask)
 	copy(typesData, tokenTypes)
 
+	inferenceStarted := time.Now()
 	if err := s.session.Run(); err != nil {
+		s.telemetry.observe(StageONNXInference, time.Since(inferenceStarted))
 		return nil, fmt.Errorf("running ONNX inference: %w", err)
 	}
+	s.telemetry.observeInference(n, s.batchSize, time.Since(inferenceStarted))
 	onnxInferenceRuns.Add(1)
 
 	// Rows are independent, so pool over the n real rows only; padded rows
@@ -235,22 +252,30 @@ func (s *onnxSession) runBatch(n int, inputIDs, attMask, tokenTypes []int64) ([]
 	return pooled, nil
 }
 
-// destroy releases the session and all associated tensors.
+// destroy releases the session and all associated tensors exactly once.
 func (s *onnxSession) destroy() {
+	if s == nil || !s.closed.CompareAndSwap(false, true) {
+		return
+	}
 	if s.session != nil {
 		_ = s.session.Destroy()
+		s.session = nil
 	}
 	if s.inputIDs != nil {
 		_ = s.inputIDs.Destroy()
+		s.inputIDs = nil
 	}
 	if s.attMask != nil {
 		_ = s.attMask.Destroy()
+		s.attMask = nil
 	}
 	if s.tokenTypes != nil {
 		_ = s.tokenTypes.Destroy()
+		s.tokenTypes = nil
 	}
 	if s.output != nil {
 		_ = s.output.Destroy()
+		s.output = nil
 	}
 }
 

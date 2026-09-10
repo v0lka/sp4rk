@@ -59,12 +59,26 @@ type EmbedderConfig struct {
 	// are processed in chunks of at most BatchSize rows with a single ONNX
 	// inference per full/padded chunk; smaller chunks are zero-padded up to the
 	// capacity (padded rows are masked out during pooling and discarded).
-	// A single text always uses the dedicated batchSize=1 fast-path session and
-	// never touches the batch session.
+	// In fixed mode, a single text uses the dedicated batchSize=1 fast-path
+	// session. In bucket mode, every call uses the lazily cached session for its
+	// smallest fitting sequence bucket.
 	// A value of 0 (the default) selects DefaultBatchSize (32). Negative values
 	// are treated like 0 rather than rejected: the field is not validated, so
 	// callers should pass a non-negative value.
 	BatchSize int
+
+	// EnableBatchPipeline overlaps tokenization of fixed-mode batch N+1 with
+	// ONNX inference of batch N. The producer is bounded to one completed batch
+	// ahead, while ONNX execution remains serialized by the Embedder mutex.
+	// It is opt-in: false preserves the serial baseline until benchmarks show a
+	// throughput improvement above the documented noise threshold.
+	EnableBatchPipeline bool
+
+	// EnableLengthBuckets groups tokenized documents into the smallest fitting
+	// fixed sequence length (64, 128, 256, or MaxSeqLength) and lazily creates
+	// one persistent ONNX session per used bucket. It is opt-in: false preserves
+	// the fixed-MaxSeqLength baseline and its single batch session.
+	EnableLengthBuckets bool
 
 	// IntraOpThreads limits the number of ONNX Runtime intra-op threads used
 	// during inference. A value of 0 (the default) preserves the legacy
@@ -78,25 +92,46 @@ type EmbedderConfig struct {
 
 	// Logger for structured logging. If nil, a discard logger is used.
 	Logger *slog.Logger
+
+	// Telemetry optionally collects bounded, content-free stage aggregates.
+	// Nil disables collection with no background goroutines or exporters.
+	Telemetry *Telemetry
+}
+
+// sessionKey identifies one persistent fixed-shape ONNX session.
+type sessionKey struct {
+	batchSize int
+	seqLen    int
+}
+
+// bucketItem retains the original result position while documents are grouped
+// by sequence length.
+type bucketItem struct {
+	index int
 }
 
 // Embedder provides ONNX-based text embedding using jina-embeddings-v2-small-en.
 // It is safe for concurrent use.
 type Embedder struct {
-	tokenizer *Tokenizer
-	modelPath string
-	maxSeqLen int
-	hiddenDim int
-	batchSize int
-	logger    *slog.Logger
-	mu        sync.Mutex
-	sess      *onnxSession // persistent session for batchSize=1 (fast path)
-	// batchSess is the persistent session for multi-text EmbedDocuments calls,
-	// with input tensors shaped [batchSize, maxSeqLen]. It is created lazily on
-	// the first multi-text call (session creation costs ~2s, so embedders that
-	// only ever embed single texts never pay for it). Guarded by mu.
+	tokenizer     *Tokenizer
+	modelPath     string
+	maxSeqLen     int
+	hiddenDim     int
+	batchSize     int
+	batchPipeline bool
+	lengthBuckets bool
+	logger        *slog.Logger
+	telemetry     *Telemetry
+	mu            sync.Mutex
+	closed        bool
+	sess          *onnxSession // legacy fixed-max session for batchSize=1
+	// batchSess is the legacy fixed-max session for multi-text calls. It remains
+	// the default until measured bucket benchmarks justify changing the default.
 	batchSess *onnxSession
-	sessOpts  *ort.SessionOptions
+	// bucketSessions contains only buckets used by successful inference calls.
+	// Creation, use, and destruction are serialized by mu.
+	bucketSessions map[sessionKey]*onnxSession
+	sessOpts       *ort.SessionOptions
 }
 
 // NewEmbedder creates a new Embedder by loading the tokenizer and initializing
@@ -166,14 +201,19 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 		return nil, fmt.Errorf("loading tokenizer: %w", err)
 	}
 
-	logger.Info("creating persistent ONNX session", "model", cfg.ModelPath)
-	sess, err := newONNXSession(cfg.ModelPath, 1, maxSeqLen, hiddenDim, sessOpts)
-	if err != nil {
-		if sessOpts != nil {
-			_ = sessOpts.Destroy()
+	var sess *onnxSession
+	if !cfg.EnableLengthBuckets {
+		logger.Info("creating persistent ONNX session", "model", cfg.ModelPath)
+		sessionStarted := time.Now()
+		sess, err = newONNXSession(cfg.ModelPath, 1, maxSeqLen, hiddenDim, sessOpts, cfg.Telemetry)
+		if err != nil {
+			if sessOpts != nil {
+				_ = sessOpts.Destroy()
+			}
+			_ = destroyONNXRuntime()
+			return nil, fmt.Errorf("creating persistent ONNX session: %w", err)
 		}
-		_ = destroyONNXRuntime()
-		return nil, fmt.Errorf("creating persistent ONNX session: %w", err)
+		cfg.Telemetry.observeSession(time.Since(sessionStarted))
 	}
 
 	logger.Info("embedder initialized",
@@ -181,17 +221,23 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 		"maxSeqLen", maxSeqLen,
 		"hiddenDim", hiddenDim,
 		"batchSize", batchSize,
+		"batchPipeline", cfg.EnableBatchPipeline,
+		"lengthBuckets", cfg.EnableLengthBuckets,
 	)
 
 	return &Embedder{
-		tokenizer: tok,
-		modelPath: cfg.ModelPath,
-		maxSeqLen: maxSeqLen,
-		hiddenDim: hiddenDim,
-		batchSize: batchSize,
-		logger:    logger,
-		sess:      sess,
-		sessOpts:  sessOpts,
+		tokenizer:      tok,
+		modelPath:      cfg.ModelPath,
+		maxSeqLen:      maxSeqLen,
+		hiddenDim:      hiddenDim,
+		batchSize:      batchSize,
+		batchPipeline:  cfg.EnableBatchPipeline,
+		lengthBuckets:  cfg.EnableLengthBuckets,
+		logger:         logger,
+		telemetry:      cfg.Telemetry,
+		sess:           sess,
+		bucketSessions: make(map[sessionKey]*onnxSession, 4),
+		sessOpts:       sessOpts,
 	}, nil
 }
 
@@ -211,7 +257,7 @@ func (e *Embedder) EmbedDocuments(ctx context.Context, texts []string) ([][]floa
 	defer e.mu.Unlock()
 
 	// Guard against use-after-close.
-	if e.tokenizer == nil {
+	if e.closed || e.tokenizer == nil {
 		return nil, errors.New("embedder is closed")
 	}
 
@@ -226,9 +272,20 @@ func (e *Embedder) EmbedDocuments(ctx context.Context, texts []string) ([][]floa
 	}
 
 	numTexts := len(texts)
-	inputIDs, attentionMask, tokenTypeIDs, err := e.tokenizer.EncodeBatch(texts, e.maxSeqLen)
+	if e.batchPipeline && !e.lengthBuckets && numTexts > e.batchSize {
+		if err := e.ensureBatchSession(); err != nil {
+			return nil, err
+		}
+		return e.embedFixedPipeline(ctx, texts)
+	}
+
+	inputIDs, attentionMask, tokenTypeIDs, lengths, err := e.tokenizeDocuments(texts)
 	if err != nil {
-		return nil, fmt.Errorf("embedding documents: tokenizer encode: %w", err)
+		return nil, err
+	}
+
+	if e.lengthBuckets {
+		return e.embedLengthBuckets(ctx, inputIDs, attentionMask, tokenTypeIDs, lengths)
 	}
 
 	// Fast path: use the persistent session for single-text embedding.
@@ -283,6 +340,86 @@ func (e *Embedder) EmbedDocuments(ctx context.Context, texts []string) ([][]floa
 	return results, nil
 }
 
+// sequenceBucket returns the smallest supported fixed sequence length that can
+// hold actualLen. MaxSeqLength remains the hard truncation ceiling.
+func (e *Embedder) sequenceBucket(actualLen int) int {
+	for _, bucket := range [...]int{64, 128, 256, 512} {
+		if bucket >= e.maxSeqLen {
+			return e.maxSeqLen
+		}
+		if actualLen <= bucket {
+			return bucket
+		}
+	}
+	return e.maxSeqLen
+}
+
+// embedLengthBuckets groups rows stably by sequence length and scatters each
+// embedding back to its original index. The caller holds e.mu.
+func (e *Embedder) embedLengthBuckets(ctx context.Context, inputIDs, attentionMask, tokenTypeIDs []int64, lengths []int) ([][]float32, error) {
+	groups := make(map[int][]bucketItem, 4)
+	bucketOrder := make([]int, 0, 4)
+	for i, length := range lengths {
+		bucket := e.sequenceBucket(length)
+		if _, ok := groups[bucket]; !ok {
+			bucketOrder = append(bucketOrder, bucket)
+		}
+		groups[bucket] = append(groups[bucket], bucketItem{index: i})
+	}
+
+	results := make([][]float32, len(lengths))
+	for _, bucket := range bucketOrder {
+		items := groups[bucket]
+		for start := 0; start < len(items); start += e.batchSize {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			end := min(start+e.batchSize, len(items))
+			rows := end - start
+			ids := make([]int64, rows*bucket)
+			mask := make([]int64, rows*bucket)
+			types := make([]int64, rows*bucket)
+			for row, item := range items[start:end] {
+				src := item.index * e.maxSeqLen
+				dst := row * bucket
+				copy(ids[dst:dst+bucket], inputIDs[src:src+bucket])
+				copy(mask[dst:dst+bucket], attentionMask[src:src+bucket])
+				copy(types[dst:dst+bucket], tokenTypeIDs[src:src+bucket])
+			}
+
+			sess, err := e.ensureBucketSession(bucket)
+			if err != nil {
+				return nil, err
+			}
+			vecs, err := sess.runBatch(rows, ids, mask, types)
+			if err != nil {
+				return nil, fmt.Errorf("embedding length bucket %d rows [%d:%d]: %w", bucket, start, end, err)
+			}
+			for row, item := range items[start:end] {
+				results[item.index] = vecs[row]
+			}
+		}
+	}
+	return results, nil
+}
+
+// ensureBucketSession lazily creates and caches one session per sequence bucket.
+// The caller must hold e.mu.
+func (e *Embedder) ensureBucketSession(seqLen int) (*onnxSession, error) {
+	key := sessionKey{batchSize: e.batchSize, seqLen: seqLen}
+	if sess := e.bucketSessions[key]; sess != nil {
+		return sess, nil
+	}
+	started := time.Now()
+	sess, err := newONNXSession(e.modelPath, e.batchSize, seqLen, e.hiddenDim, e.sessOpts, e.telemetry)
+	if err != nil {
+		return nil, fmt.Errorf("creating persistent ONNX session for length bucket %d: %w", seqLen, err)
+	}
+	e.bucketSessions[key] = sess
+	e.telemetry.observeSession(time.Since(started))
+	return sess, nil
+}
+
 // ensureBatchSession lazily creates the persistent batch ONNX session on its
 // first invocation. The caller must hold e.mu.
 func (e *Embedder) ensureBatchSession() error {
@@ -292,13 +429,15 @@ func (e *Embedder) ensureBatchSession() error {
 	e.logger.Info("creating persistent batch ONNX session (one-time init; loading the model takes a few seconds)",
 		"batchSize", e.batchSize, "seqLen", e.maxSeqLen)
 	started := time.Now()
-	sess, err := newONNXSession(e.modelPath, e.batchSize, e.maxSeqLen, e.hiddenDim, e.sessOpts)
+	sess, err := newONNXSession(e.modelPath, e.batchSize, e.maxSeqLen, e.hiddenDim, e.sessOpts, e.telemetry)
 	if err != nil {
 		return fmt.Errorf("creating persistent batch ONNX session: %w", err)
 	}
+	elapsed := time.Since(started)
 	e.batchSess = sess
+	e.telemetry.observeSession(elapsed)
 	e.logger.Info("persistent batch ONNX session ready",
-		"batchSize", e.batchSize, "elapsed", time.Since(started).Round(time.Millisecond))
+		"batchSize", e.batchSize, "elapsed", elapsed.Round(time.Millisecond))
 	return nil
 }
 
@@ -327,6 +466,10 @@ func (e *Embedder) Close() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	if e.closed {
+		return nil
+	}
+	e.closed = true
 	e.logger.Info("closing embedder, destroying ONNX Runtime environment")
 	if e.sess != nil {
 		e.sess.destroy()
@@ -335,6 +478,10 @@ func (e *Embedder) Close() error {
 	if e.batchSess != nil {
 		e.batchSess.destroy()
 		e.batchSess = nil
+	}
+	for key, sess := range e.bucketSessions {
+		sess.destroy()
+		delete(e.bucketSessions, key)
 	}
 	if e.sessOpts != nil {
 		_ = e.sessOpts.Destroy()
