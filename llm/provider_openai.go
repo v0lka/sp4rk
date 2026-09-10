@@ -189,6 +189,7 @@ func (p *OpenAIProvider) ChatCompletion(ctx context.Context, req ChatRequest) (*
 			BaseURL:      p.baseURL,
 			APIKey:       p.apiKey,
 			ProviderName: p.name,
+			Logger:       p.logger,
 		}, req)
 	case ProtocolChatCompletions:
 		// Handled by the shared Chat Completions path below.
@@ -310,7 +311,7 @@ func (p *OpenAIProvider) buildChatParams(req ChatRequest) oai.ChatCompletionNewP
 				Function: oai.FunctionDefinitionParam{
 					Name:        tool.Name,
 					Description: oai.String(tool.Description),
-					Parameters:  p.convertSchemaToMap(SanitizeSchemaForOpenAI(tool.InputSchema)),
+					Parameters:  p.convertSchemaToMap(SanitizeSchemaForOpenAINonStrict(tool.InputSchema)),
 				},
 			}
 		}
@@ -606,6 +607,8 @@ func (p *OpenAIProvider) convertChatResponseMessage(msg oai.ChatCompletionMessag
 			}
 		}
 	}
+
+	logToolCallArguments(p.log(), p.name, result.ToolCalls)
 
 	return result
 }

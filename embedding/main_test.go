@@ -61,18 +61,36 @@ func closeSessionOnly(e *Embedder) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if e.sess != nil {
-		e.sess.destroy()
-		e.sess = nil
+	// Mirror of Embedder.Close's teardown, minus the process-global
+	// environment destroy: the session teardown runs as one job on the
+	// embedder's ONNX thread (it touches the same CUDA context the sessions
+	// were built on), and the runner is stopped right after so no CUDA test
+	// leaves a locked OS thread behind. Safe on a partially constructed
+	// Embedder: nil sessions, a nil bucket map, and a nil runner are all
+	// handled, and a second call is a no-op.
+	e.onORTThread(func() {
+		if e.sess != nil {
+			e.sess.destroy()
+			e.sess = nil
+		}
+		if e.batchSess != nil {
+			e.batchSess.destroy()
+			e.batchSess = nil
+		}
+		for key, sess := range e.bucketSessions {
+			sess.destroy()
+			delete(e.bucketSessions, key)
+		}
+		if e.sessOpts != nil {
+			_ = e.sessOpts.Destroy()
+			e.sessOpts = nil
+		}
+	})
+	if e.runner != nil {
+		e.runner.stop()
+		e.runner = nil
 	}
-	if e.batchSess != nil {
-		e.batchSess.destroy()
-		e.batchSess = nil
-	}
-	if e.sessOpts != nil {
-		_ = e.sessOpts.Destroy()
-		e.sessOpts = nil
-	}
+	e.closed = true
 	e.tokenizer = nil
 }
 

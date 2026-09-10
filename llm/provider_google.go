@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -136,6 +137,7 @@ type googleCompletionConfig struct {
 	BaseURL      string
 	APIKey       string
 	ProviderName string
+	Logger       *slog.Logger
 }
 
 // googleCompletion calls the Google Generative Language API (Gemini) and
@@ -211,7 +213,12 @@ func googleCompletion(ctx context.Context, cfg googleCompletionConfig, req ChatR
 			providerName, err, truncateForError(respBody))
 	}
 
-	return parseGoogleResponse(req.Model, &genResp, respBody, providerName)
+	converted, err := parseGoogleResponse(req.Model, &genResp, respBody, providerName)
+	if err != nil {
+		return nil, err
+	}
+	logToolCallArguments(cfg.Logger, providerName, converted.Message.ToolCalls)
+	return converted, nil
 }
 
 // buildGoogleRequest converts a ChatRequest to the Google generateContent body.

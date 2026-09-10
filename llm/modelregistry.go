@@ -1443,6 +1443,18 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			Family:        "deepseek",
 			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
 		},
+		// deepseek-flash — DeepSeek-V4.1-Flash: a multimodal (text + image
+		// input) MoE with a 1M-token context and a continuously controllable
+		// reasoning effort (integer 1–100). Supports function calling;
+		// recommended sampling is temperature 1.0 / top_p 0.95.
+		// Source: https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash
+		"deepseek-flash": {
+			ContextWindow: 1000000,
+			OutputLimit:   384000,
+			TokenizerType: "approximate",
+			Family:        "deepseek",
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
 		// deepseek-v4-flash-vision-exp — experimental V4 Flash variant that
 		// additionally accepts image input (JPEG/PNG/GIF/WebP) alongside the
 		// same 1M context / 384K max output as V4 Flash. Images are billed

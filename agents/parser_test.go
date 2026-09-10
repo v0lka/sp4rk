@@ -35,6 +35,7 @@ model: gpt-4o
 allow-redelegate: true
 hidden: false
 color: "#e06c75"
+skills: code-review, git-conventions
 ---
 
 You are a meticulous code reviewer. Always read the full diff before commenting.
@@ -55,6 +56,7 @@ You are a meticulous code reviewer. Always read the full diff before commenting.
 		AllowRedelegate: true,
 		Hidden:          false,
 		Color:           "#e06c75",
+		Skills:          "code-review, git-conventions",
 	}
 	if !reflect.DeepEqual(agent.Metadata, wantMeta) {
 		t.Errorf("metadata = %#v, want %#v", agent.Metadata, wantMeta)
@@ -166,6 +168,67 @@ func TestParseAgent_ValidationErrors(t *testing.T) {
 				t.Fatal("expected ParseError, got nil")
 			}
 			// Must be a *ParseError.
+			var pe *ParseError
+			if !errors.As(err, &pe) {
+				t.Errorf("expected *ParseError, got %T: %v", err, err)
+			}
+		})
+	}
+}
+
+func TestParseAgent_ValidSkills(t *testing.T) {
+	t.Parallel()
+
+	// A comma-list with surrounding whitespace parses into a two-element list.
+	const content = "---\nname: skills-agent\ndescription: Has skills.\nskills: code-review, git-conventions\n---\nBody.\n"
+	dir := writeAgent(t, t.TempDir(), "skills-agent", content)
+
+	agent, err := ParseAgent(filepath.Join(dir, "AGENT.md"), dir)
+	if err != nil {
+		t.Fatalf("ParseAgent: unexpected error: %v", err)
+	}
+	got, err := agent.RequiredSkills()
+	if err != nil {
+		t.Fatalf("RequiredSkills: unexpected error: %v", err)
+	}
+	if want := []string{"code-review", "git-conventions"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("RequiredSkills() = %#v, want %#v", got, want)
+	}
+}
+
+func TestParseAgent_InvalidSkills(t *testing.T) {
+	t.Parallel()
+
+	// An empty item (stray comma), a duplicate, or a name that is not a valid
+	// skill/agent name must fail the parse loudly (ParseError) so the profile
+	// is dropped from the catalog with a Warn instead of silently changing
+	// which skills a subagent gets. Values are quoted so the failure comes
+	// from validateSkillsField, not from YAML.
+	tests := []struct {
+		name   string
+		skills string
+	}{
+		{name: "empty leading item", skills: ",code-review"},
+		{name: "empty trailing item", skills: "code-review,"},
+		{name: "empty middle item", skills: "code-review,,git-conventions"},
+		{name: "duplicate", skills: "code-review,code-review"},
+		{name: "uppercase name", skills: "Code-Review"},
+		{name: "underscore name", skills: "code_review"},
+		{name: "leading hyphen", skills: "-code-review"},
+		{name: "trailing hyphen", skills: "code-review-"},
+		{name: "space inside name", skills: "code review"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			content := "---\nname: skills-agent\ndescription: Has bad skills.\nskills: \"" + tt.skills + "\"\n---\nBody.\n"
+			dir := writeAgent(t, t.TempDir(), "skills-agent", content)
+
+			_, err := ParseAgent(filepath.Join(dir, "AGENT.md"), dir)
+			if err == nil {
+				t.Fatal("expected ParseError, got nil")
+			}
 			var pe *ParseError
 			if !errors.As(err, &pe) {
 				t.Errorf("expected *ParseError, got %T: %v", err, err)

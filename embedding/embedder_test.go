@@ -1165,7 +1165,7 @@ func TestEmbedder_BatchEmbedDocuments_Chunking(t *testing.T) {
 
 func TestNewONNXSession_ZeroBatchSize(t *testing.T) {
 	// The batchSize guard rejects the request before any ONNX call.
-	_, err := newONNXSession("model.onnx", 0, 8, 2, nil)
+	_, err := newONNXSession("model.onnx", 0, 8, 2, nil, nil)
 	if err == nil {
 		t.Error("newONNXSession(batchSize=0) expected error, got nil")
 	}

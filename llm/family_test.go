@@ -57,6 +57,7 @@ func TestDetectFamily(t *testing.T) {
 		{"deepseek-v4-pro", FamilyDeepSeek},
 		{"deepseek-v4-flash", FamilyDeepSeek},
 		{"deepseek-v4-flash-vision-exp", FamilyDeepSeek},
+		{"deepseek-flash", FamilyDeepSeek},
 		{"deepseek-chat", FamilyDeepSeek},
 
 		// Qwen / QwQ (Alibaba)

@@ -503,8 +503,8 @@ func TestSanitizeSchemaForOpenAI(t *testing.T) {
 		if !ok {
 			t.Fatal("required should exist")
 		}
-		if len(required) != 2 || required[0] != "age" || required[1] != "name" {
-			t.Errorf("required = %v, expected [age, name]", required)
+		if len(required) != 2 || required[0] != "name" || required[1] != "age" {
+			t.Errorf("required = %v, expected [name, age]", required)
 		}
 		if _, ok := parsed["properties"].(map[string]interface{}); !ok {
 			t.Fatal("properties should be preserved")
@@ -829,8 +829,8 @@ func TestSanitizeSchemaForOpenAI(t *testing.T) {
 		if !ok || len(itemsReq) != 2 {
 			t.Fatalf("traces.items.required should have 2 elements, got %v", itemsReq)
 		}
-		if itemsReq[0] != "metadata" || itemsReq[1] != "name" {
-			t.Errorf("traces.items.required = %v, expected [metadata, name]", itemsReq)
+		if itemsReq[0] != "name" || itemsReq[1] != "metadata" {
+			t.Errorf("traces.items.required = %v, expected [name, metadata]", itemsReq)
 		}
 
 		// traces.items.properties.name should not have default

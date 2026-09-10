@@ -50,7 +50,12 @@ func responsesAPICompletion(ctx context.Context, client *oai.Client, providerNam
 		return nil, wrapResponsesError(providerName, err)
 	}
 
-	return convertResponsesResponse(resp)
+	converted, err := convertResponsesResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+	logToolCallArguments(logger, providerName, converted.Message.ToolCalls)
+	return converted, nil
 }
 
 // buildResponsesParams constructs ResponseNewParams from a ChatRequest.

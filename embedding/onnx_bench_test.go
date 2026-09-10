@@ -4,136 +4,59 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"sort"
 	"strings"
 	"testing"
 	"time"
 )
 
-// Benchmarks comparing per-item embedding (one EmbedQuery call per document,
-// the pre-batching baseline) against batched EmbedDocuments at several fixed
-// batch-session capacities. They justify DefaultBatchSize with data.
-//
-// All benchmarks are env-gated: they need the same variables as the env-gated
-// tests in embedder_test.go and skip cleanly when any of them is unset:
-//
-//	EMBEDDING_TEST_MODEL_PATH     path to jina-v2-small.onnx
-//	EMBEDDING_TEST_TOKENIZER_PATH path to tokenizer.json
-//	EMBEDDING_TEST_LIBRARY_PATH   path to libonnxruntime.{dylib,so,dll}
-//
-// Run (single iteration per benchmark; a full corpus pass takes seconds):
+// Reproducible ONNX benchmarks. Assets are supplied explicitly and the entire
+// benchmark suite skips cleanly when any path is absent:
 //
 //	EMBEDDING_TEST_MODEL_PATH=... EMBEDDING_TEST_TOKENIZER_PATH=... \
-//	EMBEDDING_TEST_LIBRARY_PATH=... go test -bench=. -benchtime=1x ./embedding
+//	EMBEDDING_TEST_LIBRARY_PATH=... go test -bench=BenchmarkEmbedder -benchmem -benchtime=1x ./embedding
 //
-// The benchmarks go through the public EmbedDocuments/EmbedQuery API and reuse
-// the ONNX environment managed by TestMain, releasing only their own sessions
-// via closeSessionOnly. IntraOpThreads is left at 0 (all cores), matching the
-// c0wrk production default (vector_index.embedding_threads: 0).
+// The corpus is generated from fixed templates; it never reads repository
+// source files. Telemetry reports only aggregate counts/timings and cannot
+// contain corpus text or asset paths.
 
-const (
-	// benchDocCount is the number of documents embedded per benchmark
-	// iteration — large enough for several inferences at every batch size
-	// under test (128 docs/batch → 2 runs, 8 → 32 runs).
-	benchDocCount = 256
+const benchDocCount = 256
 
-	// benchChunkChars is the target chunk length in characters, matching the
-	// c0wrk vector-index default max_chunk_size (1500).
-	benchChunkChars = 1500
-)
-
-// benchAssets returns the model, tokenizer and ONNX library paths from the
-// environment, skipping the benchmark when any of them is unset.
 func benchAssets(tb testing.TB) (modelPath, tokenizerPath, libraryPath string) {
 	tb.Helper()
 	modelPath = os.Getenv("EMBEDDING_TEST_MODEL_PATH")
 	tokenizerPath = os.Getenv("EMBEDDING_TEST_TOKENIZER_PATH")
 	libraryPath = os.Getenv("EMBEDDING_TEST_LIBRARY_PATH")
 	if modelPath == "" || tokenizerPath == "" || libraryPath == "" {
-		tb.Skip("EMBEDDING_TEST_MODEL_PATH, EMBEDDING_TEST_TOKENIZER_PATH or EMBEDDING_TEST_LIBRARY_PATH not set; skipping ONNX benchmark")
+		tb.Skip("ONNX assets are not configured; set EMBEDDING_TEST_MODEL_PATH, EMBEDDING_TEST_TOKENIZER_PATH, and EMBEDDING_TEST_LIBRARY_PATH")
+	}
+	for label, path := range map[string]string{"model": modelPath, "tokenizer": tokenizerPath, "library": libraryPath} {
+		if _, err := os.Stat(path); err != nil {
+			tb.Skipf("ONNX %s asset unavailable; skipping benchmark: %v", label, err)
+		}
 	}
 	return modelPath, tokenizerPath, libraryPath
 }
 
-// benchChunks synthesizes docCount realistic chunk texts of ~chunkChars
-// characters from the package's own Go sources (read from the working
-// directory, which `go test` sets to the package dir). Source bytes are
-// concatenated and cut into chunks at whitespace boundaries; if the sources
-// yield fewer chunks than requested, the corpus wraps around (repeated
-// chunks cost the same tokenization and inference work, so throughput
-// numbers are unaffected).
-func benchChunks(tb testing.TB, docCount, chunkChars int) []string {
-	tb.Helper()
-
-	entries, err := os.ReadDir(".")
-	if err != nil {
-		tb.Skipf("cannot read package sources: %v; skipping corpus-dependent benchmark", err)
-	}
-	var names []string
-	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".go") {
-			names = append(names, e.Name())
-		}
-	}
-	sort.Strings(names)
-	if len(names) == 0 {
-		tb.Skip("no .go sources in working directory; skipping corpus-dependent benchmark")
-	}
-
-	var src strings.Builder
-	for _, name := range names {
-		data, err := os.ReadFile(name)
-		if err != nil {
-			tb.Fatalf("reading %s: %v", name, err)
-		}
-		src.WriteString("\n\n// ---- ")
-		src.WriteString(name)
-		src.WriteString(" ----\n\n")
-		src.Write(data)
-	}
-
-	// Materialize the corpus once: Builder.String() returns a copy, so
-	// calling it per chunk would allocate the whole corpus on every iteration.
-	corpus := src.String()
-	chunks := make([]string, 0, len(corpus)/chunkChars+1)
-	for i := 0; i < len(corpus); i += chunkChars {
-		end := i + chunkChars
-		if end > len(corpus) {
-			end = len(corpus)
-		}
-		chunk := corpus[i:end]
-		// Back off to the last whitespace so chunks do not cut words in half;
-		// the skipped tail bytes are simply not reused.
-		if end < len(corpus) {
-			if sp := strings.LastIndexAny(chunk, " \t\n"); sp > chunkChars/2 {
-				chunk = chunk[:sp]
-			}
-		}
-		chunks = append(chunks, chunk)
-	}
-	if len(chunks) == 0 {
-		tb.Fatalf("synthesized 0 chunks from %d source files", len(names))
-	}
-
-	docs := make([]string, docCount)
+func benchChunks(kind string, count int) []string {
+	docs := make([]string, count)
 	for i := range docs {
-		docs[i] = chunks[i%len(chunks)]
+		short := fmt.Sprintf("package corpus\nfunc item%d(value int) int { return value + %d }", i, i)
+		if kind == "short" || i%2 == 0 {
+			docs[i] = short
+			continue
+		}
+		tail := strings.Repeat(fmt.Sprintf(" deterministic worker %d validates telemetry batching and indexing latency.", i), 22)
+		docs[i] = short + tail
 	}
-	tb.Logf("corpus: %d docs of ~%d chars from %d unique chunks", docCount, chunkChars, len(chunks))
 	return docs
 }
 
-// newBenchEmbedder builds an Embedder on the env-provided assets with the
-// given batch capacity, releasing its sessions (but not the shared ONNX
-// environment) on cleanup.
-func newBenchEmbedder(tb testing.TB, batchSize int) *Embedder {
+func newBenchEmbedder(tb testing.TB, batchSize int, lengthBuckets bool, telemetry *Telemetry) *Embedder {
 	tb.Helper()
 	modelPath, tokenizerPath, libraryPath := benchAssets(tb)
 	e, err := NewEmbedder(EmbedderConfig{
-		ModelPath:     modelPath,
-		TokenizerPath: tokenizerPath,
-		LibraryPath:   libraryPath,
-		BatchSize:     batchSize,
+		ModelPath: modelPath, TokenizerPath: tokenizerPath, LibraryPath: libraryPath,
+		BatchSize: batchSize, EnableLengthBuckets: lengthBuckets, Telemetry: telemetry,
 	})
 	if err != nil {
 		tb.Fatalf("NewEmbedder(batchSize=%d): %v", batchSize, err)
@@ -142,95 +65,203 @@ func newBenchEmbedder(tb testing.TB, batchSize int) *Embedder {
 	return e
 }
 
-// reportBenchMetrics reports throughput (docs/sec) and per-inference-call
-// latency from the measured elapsed time and the exact ONNX inference count.
-func reportBenchMetrics(b *testing.B, docs int, elapsed time.Duration, runs int64) {
+func reportBenchMetrics(b *testing.B, s, setup TelemetrySnapshot, docs int, elapsed time.Duration, peakBefore uint64) {
 	b.Helper()
 	b.ReportMetric(float64(docs)*float64(b.N)/elapsed.Seconds(), "docs/sec")
-	b.ReportMetric(float64(elapsed)/float64(runs)/float64(time.Millisecond), "ms/inference")
-	b.ReportMetric(float64(runs)/float64(b.N), "inferences/op")
+	b.ReportMetric(float64(elapsed)/float64(time.Millisecond)/float64(b.N), "ms/op")
+	b.ReportMetric(float64(s.Stages[StageTokenization].Duration)/float64(time.Millisecond)/float64(b.N), "ms/tokenization")
+	b.ReportMetric(float64(s.Stages[StageONNXInference].Duration)/float64(time.Millisecond)/float64(b.N), "ms/inference-total")
+	b.ReportMetric(float64(s.InferenceCount)/float64(b.N), "inferences/op")
+	b.ReportMetric(float64(setup.SessionCount), "sessions")
+	b.ReportMetric(float64(setup.Stages[StageSessionCreate].Duration)/float64(time.Millisecond), "ms/session-create")
+	b.ReportMetric(s.BatchFill(), "batch-fill")
+	b.ReportMetric(s.AverageTokens(), "tokens/avg")
+	b.ReportMetric(float64(s.MinTokens), "tokens/min")
+	b.ReportMetric(float64(s.MaxTokens), "tokens/max")
+	peakAfter := benchmarkPeakRSSBytes()
+	b.ReportMetric(float64(peakAfter)/(1024*1024), "peak-RSS-MiB")
+	if peakAfter >= peakBefore {
+		b.ReportMetric(float64(peakAfter-peakBefore)/(1024*1024), "peak-RSS-delta-MiB")
+	}
 }
 
-// BenchmarkEmbedderPerItem is the baseline: documents embedded one at a time
-// through the single-text fast path, as chromem-go does when indexing without
-// batching. One inference per document.
 func BenchmarkEmbedderPerItem(b *testing.B) {
-	e := newBenchEmbedder(b, DefaultBatchSize)
-	docs := benchChunks(b, benchDocCount, benchChunkChars)
-	ctx := context.Background()
-
-	// Warm up the single-text session, tokenizer and first-run allocations.
-	for i := range 4 {
-		if _, err := e.EmbedQuery(ctx, docs[i]); err != nil {
-			b.Fatalf("warmup EmbedQuery: %v", err)
-		}
-	}
-	b.ResetTimer()
-
-	runsBefore := onnxInferenceRuns.Load()
-	started := time.Now()
-	for i := 0; i < b.N; i++ {
-		for _, doc := range docs {
-			if _, err := e.EmbedQuery(ctx, doc); err != nil {
-				b.Fatalf("EmbedQuery: %v", err)
+	for _, corpus := range []string{"short", "mixed"} {
+		b.Run("corpus="+corpus, func(b *testing.B) {
+			telemetry := &Telemetry{}
+			e := newBenchEmbedder(b, DefaultBatchSize, false, telemetry)
+			docs := benchChunks(corpus, benchDocCount)
+			ctx := context.Background()
+			if _, err := e.EmbedQuery(ctx, docs[0]); err != nil {
+				b.Fatal(err)
 			}
-		}
-	}
-	elapsed := time.Since(started)
-	runs := onnxInferenceRuns.Load() - runsBefore
-
-	if runs != int64(len(docs))*int64(b.N) {
-		b.Fatalf("inference runs = %d, want %d (one per document)", runs, int64(len(docs))*int64(b.N))
-	}
-	reportBenchMetrics(b, len(docs), elapsed, runs)
-}
-
-// BenchmarkEmbedderBatch measures batched EmbedDocuments throughput at the
-// batch capacities considered for DefaultBatchSize. Each sub-benchmark embeds
-// the full 256-doc corpus with a persistent batch session of the given
-// capacity, so per iteration it performs ceil(256/capacity) inferences.
-//
-// Memory note: the output tensor of a capacity-B session is
-// B×512×512×4 bytes = B MiB, so larger capacities trade peak memory for
-// throughput (B=128 → a 128 MiB output tensor per inference).
-func BenchmarkEmbedderBatch(b *testing.B) {
-	for _, size := range []int{8, 16, 32, 64, 128} {
-		b.Run(fmt.Sprintf("batch%d", size), func(b *testing.B) {
-			runBatchBenchmark(b, size)
+			setup := telemetry.Snapshot()
+			telemetry.Reset()
+			peakBefore := benchmarkPeakRSSBytes()
+			b.ReportAllocs()
+			b.ResetTimer()
+			started := time.Now()
+			for range b.N {
+				for _, doc := range docs {
+					if _, err := e.EmbedQuery(ctx, doc); err != nil {
+						b.Fatal(err)
+					}
+				}
+			}
+			elapsed := time.Since(started)
+			b.StopTimer()
+			s := telemetry.Snapshot()
+			if want := int64(len(docs) * b.N); s.InferenceCount != want {
+				b.Fatalf("inferences = %d, want %d", s.InferenceCount, want)
+			}
+			reportBenchMetrics(b, s, setup, len(docs), elapsed, peakBefore)
 		})
 	}
 }
 
-func runBatchBenchmark(b *testing.B, batchSize int) {
-	e := newBenchEmbedder(b, batchSize)
-	docs := benchChunks(b, benchDocCount, benchChunkChars)
-	ctx := context.Background()
-
-	// Warm up outside the measurement: one full EmbedDocuments call on a
-	// smaller slice triggers the lazy batch-session creation (~2s) plus
-	// first-run allocations for a full chunk of batchSize rows.
-	warm := docs[:min(batchSize, len(docs))]
-	if _, err := e.EmbedDocuments(ctx, warm); err != nil {
-		b.Fatalf("warmup EmbedDocuments(batch=%d): %v", batchSize, err)
+func BenchmarkEmbedderBatch(b *testing.B) {
+	for _, mode := range []struct {
+		name    string
+		buckets bool
+	}{
+		{name: "fixed"},
+		{name: "buckets", buckets: true},
+	} {
+		for _, corpus := range []string{"short", "mixed"} {
+			for _, size := range []int{8, 16, 32, 64} {
+				b.Run(fmt.Sprintf("mode=%s/corpus=%s/batch=%d", mode.name, corpus, size), func(b *testing.B) {
+					runBatchBenchmark(b, corpus, size, mode.buckets)
+				})
+			}
+		}
 	}
-	b.ResetTimer()
+}
 
-	runsBefore := onnxInferenceRuns.Load()
+func BenchmarkEmbedderBatchPipeline(b *testing.B) {
+	for _, pipeline := range []bool{false, true} {
+		mode := "serial"
+		if pipeline {
+			mode = "pipeline"
+		}
+		for _, corpus := range []string{"short", "mixed"} {
+			for _, size := range []int{8, 16, 32} {
+				b.Run(fmt.Sprintf("mode=%s/corpus=%s/batch=%d", mode, corpus, size), func(b *testing.B) {
+					runPipelineBenchmark(b, corpus, size, pipeline)
+				})
+			}
+		}
+	}
+}
+
+func runPipelineBenchmark(b *testing.B, corpus string, batchSize int, pipeline bool) {
+	telemetry := &Telemetry{}
+	modelPath, tokenizerPath, libraryPath := benchAssets(b)
+	e, err := NewEmbedder(EmbedderConfig{
+		ModelPath: modelPath, TokenizerPath: tokenizerPath, LibraryPath: libraryPath,
+		BatchSize: batchSize, EnableBatchPipeline: pipeline, Telemetry: telemetry,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { closeSessionOnly(e) })
+	docs := benchChunks(corpus, benchDocCount)
+	ctx := context.Background()
+	if _, err := e.EmbedDocuments(ctx, docs); err != nil {
+		b.Fatal(err)
+	}
+	setup := telemetry.Snapshot()
+	telemetry.Reset()
+	peakBefore := benchmarkPeakRSSBytes()
+	b.ReportAllocs()
+	b.ResetTimer()
 	started := time.Now()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		if _, err := e.EmbedDocuments(ctx, docs); err != nil {
-			b.Fatalf("EmbedDocuments(batch=%d): %v", batchSize, err)
+			b.Fatal(err)
 		}
 	}
 	elapsed := time.Since(started)
-	runs := onnxInferenceRuns.Load() - runsBefore
+	b.StopTimer()
 
-	wantRuns := int64(0)
-	for start := 0; start < len(docs); start += batchSize {
-		wantRuns++
+	s := telemetry.Snapshot()
+	wantInferences := int64((len(docs)+batchSize-1)/batchSize) * int64(b.N)
+	if s.InferenceCount != wantInferences {
+		b.Fatalf("inferences = %d, want %d", s.InferenceCount, wantInferences)
 	}
-	if runs != wantRuns*int64(b.N) {
-		b.Fatalf("inference runs = %d, want %d (ceil(%d/%d) per iteration)", runs, wantRuns*int64(b.N), len(docs), batchSize)
+	if s.SessionCount != 0 {
+		b.Fatalf("steady-state benchmark created %d sessions, want 0", s.SessionCount)
 	}
-	reportBenchMetrics(b, len(docs), elapsed, runs)
+	reportBenchMetrics(b, s, setup, len(docs), elapsed, peakBefore)
+}
+
+func BenchmarkEmbedderDynamicShape(b *testing.B) {
+	for _, corpus := range []string{"short", "mixed"} {
+		b.Run("corpus="+corpus, func(b *testing.B) {
+			modelPath, tokenizerPath, libraryPath := benchAssets(b)
+			if err := initONNXRuntime(libraryPath); err != nil {
+				b.Fatal(err)
+			}
+			tok, err := NewTokenizer(tokenizerPath)
+			if err != nil {
+				b.Fatal(err)
+			}
+			telemetry := &Telemetry{}
+			session, err := newDynamicBenchSession(modelPath, DefaultHiddenDim, nil, telemetry)
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.Cleanup(session.destroy)
+			docs := benchChunks(corpus, benchDocCount)
+			ctx := context.Background()
+			if _, err := benchmarkDynamicDocuments(ctx, tok, session, docs, DefaultMaxSeqLength); err != nil {
+				b.Fatal(err)
+			}
+			setup := telemetry.Snapshot()
+			telemetry.Reset()
+			peakBefore := benchmarkPeakRSSBytes()
+			b.ReportAllocs()
+			b.ResetTimer()
+			started := time.Now()
+			for range b.N {
+				if _, err := benchmarkDynamicDocuments(ctx, tok, session, docs, DefaultMaxSeqLength); err != nil {
+					b.Fatal(err)
+				}
+			}
+			elapsed := time.Since(started)
+			b.StopTimer()
+			reportBenchMetrics(b, telemetry.Snapshot(), setup, len(docs), elapsed, peakBefore)
+		})
+	}
+}
+
+func runBatchBenchmark(b *testing.B, corpus string, batchSize int, lengthBuckets bool) {
+	telemetry := &Telemetry{}
+	e := newBenchEmbedder(b, batchSize, lengthBuckets, telemetry)
+	docs := benchChunks(corpus, benchDocCount)
+	ctx := context.Background()
+	if _, err := e.EmbedDocuments(ctx, docs); err != nil {
+		b.Fatal(err)
+	}
+	setup := telemetry.Snapshot()
+	telemetry.Reset()
+	peakBefore := benchmarkPeakRSSBytes()
+	b.ReportAllocs()
+	b.ResetTimer()
+	started := time.Now()
+	for range b.N {
+		if _, err := e.EmbedDocuments(ctx, docs); err != nil {
+			b.Fatal(err)
+		}
+	}
+	elapsed := time.Since(started)
+	b.StopTimer()
+
+	s := telemetry.Snapshot()
+	if s.InferenceCount == 0 {
+		b.Fatal("benchmark performed zero inferences")
+	}
+	if s.SessionCount != 0 {
+		b.Fatalf("steady-state benchmark created %d sessions, want 0", s.SessionCount)
+	}
+	reportBenchMetrics(b, s, setup, len(docs), elapsed, peakBefore)
 }

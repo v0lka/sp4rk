@@ -462,6 +462,8 @@ func (p *AnthropicProvider) parseResponse(resp anthropic.MessagesResponse, rawBo
 		}
 	}
 
+	logToolCallArguments(p.log(), p.name, message.ToolCalls)
+
 	// Degenerate response guard: the SDK succeeded (no error) but the response
 	// carries neither text content nor tool calls. A well-formed Anthropic
 	// Messages response always has a non-empty stop_reason and at least one
