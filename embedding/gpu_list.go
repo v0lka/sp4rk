@@ -6,6 +6,8 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+
+	"github.com/v0lka/sp4rk/sysproc"
 )
 
 // GPUDevice describes one GPU reported by the NVIDIA driver.
@@ -37,17 +39,34 @@ type GPUDevice struct {
 //   - Otherwise a device per parseable output line; empty output (or output
 //     consisting entirely of prose such as "No running processes found" or
 //     "[N/A]") yields an empty, non-nil slice with a nil error.
-func ListGPUDevices() ([]GPUDevice, error) {
+//
+// Cancellation: the caller-supplied ctx governs cancellation. The call
+// derives its working context with context.WithTimeout(ctx,
+// gpuProbeTimeout), so the effective deadline is min(caller deadline, 2s) —
+// an earlier caller deadline always wins, while the internal cap remains the
+// upper bound for callers without one. A cancelled or expired context
+// surfaces as an error, but only once nvidia-smi is actually invoked: the
+// absent-tool fast path below returns the no-error empty result without
+// consulting ctx.
+func ListGPUDevices(ctx context.Context) ([]GPUDevice, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	bin, ok := nvidiaSmiPath()
 	if !ok {
 		return nil, nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), gpuProbeTimeout)
+	ctx, cancel := context.WithTimeout(ctx, gpuProbeTimeout)
 	defer cancel()
 
-	out, err := exec.CommandContext(ctx, bin,
-		"--query-gpu=index,name", "--format=csv,noheader").Output()
+	cmd := exec.CommandContext(ctx, bin,
+		"--query-gpu=index,name", "--format=csv,noheader")
+	// Suppress the console window a GUI-subsystem host would allocate for the
+	// child probe process (CREATE_NO_WINDOW on Windows; no-op elsewhere).
+	sysproc.HideConsole(cmd)
+	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("querying nvidia-smi GPU list: %w", err)
 	}

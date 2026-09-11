@@ -126,7 +126,7 @@ func TestGPUInUse_AbsentNvidiaSmi(t *testing.T) {
 	)
 	go func() {
 		defer close(done)
-		inUse, err = GPUInUse()
+		inUse, err = GPUInUse(context.Background())
 	}()
 
 	select {
@@ -150,7 +150,7 @@ func TestGPUInUse_AbsentNvidiaSmi(t *testing.T) {
 // actually bounds the call.
 func TestGPUInUse_LocalProbeRunsUnblocked(t *testing.T) {
 	start := time.Now()
-	inUse, err := GPUInUse()
+	inUse, err := GPUInUse(t.Context())
 	elapsed := time.Since(start)
 
 	if elapsed > gpuProbeTimeout+5*time.Second {
@@ -185,6 +185,70 @@ func containsPID(pids []int, pid int) bool {
 		}
 	}
 	return false
+}
+
+// TestGPUInUse_CanceledContext pins the cancellation contract: on a machine
+// with nvidia-smi, a pre-canceled context must surface as an error — never a
+// silent (false, nil) "not on GPU" answer — and must not hang. Skipped where
+// nvidia-smi is absent because the fast path returns before ctx is ever
+// consulted, so there is nothing to cancel.
+func TestGPUInUse_CanceledContext(t *testing.T) {
+	if _, ok := nvidiaSmiPath(); !ok {
+		t.Skip("nvidia-smi not found; cancellation path unreachable (absent-tool fast path ignores ctx)")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	done := make(chan struct{})
+	var (
+		inUse bool
+		err   error
+	)
+	go func() {
+		defer close(done)
+		inUse, err = GPUInUse(ctx)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("GPUInUse hung on a pre-canceled context")
+	}
+
+	if err == nil {
+		t.Errorf("GPUInUse(canceled ctx) = (%v, nil), want an error; cancellation must surface as 'unverified', never a silent false", inUse)
+	}
+	if inUse {
+		t.Error("GPUInUse(canceled ctx) = true, want false")
+	}
+}
+
+// TestGPUInUse_ShortCallerDeadline verifies budget composition: a caller
+// deadline earlier than the internal 2s cap wins. The call must complete
+// well inside the internal cap and the expiry must surface as an error —
+// min(caller deadline, gpuProbeTimeout) is what bounds the probe.
+func TestGPUInUse_ShortCallerDeadline(t *testing.T) {
+	if _, ok := nvidiaSmiPath(); !ok {
+		t.Skip("nvidia-smi not found; cancellation path unreachable (absent-tool fast path ignores ctx)")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	inUse, err := GPUInUse(ctx)
+	elapsed := time.Since(start)
+
+	if elapsed > time.Second {
+		t.Errorf("GPUInUse took %v with a 1ms caller deadline; min(caller, 2s) budget not respected", elapsed)
+	}
+	if err == nil {
+		t.Errorf("GPUInUse(1ms deadline) = (%v, nil), want an error; an expired context must surface as 'unverified'", inUse)
+	}
+	if inUse {
+		t.Error("GPUInUse(1ms deadline) = true, want false")
+	}
 }
 
 // =============================================================================
@@ -283,7 +347,7 @@ func TestGPUInUse_AfterRealCUDAInference(t *testing.T) {
 		t.Fatalf("EmbedDocuments under CUDA failed: %v", err)
 	}
 
-	inUse, err := GPUInUse()
+	inUse, err := GPUInUse(t.Context())
 	if err != nil {
 		t.Fatalf("GPUInUse() error = %v", err)
 	}

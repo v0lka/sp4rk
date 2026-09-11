@@ -115,7 +115,8 @@ type EmbedderConfig struct {
 	// to "cuda" (explicitly or via "auto"'s first attempt). Defaults to 0,
 	// which is the right choice on single-GPU machines and selects the first
 	// device reported by the driver on multi-GPU ones. It is ignored by the
-	// CPU provider.
+	// CPU provider. Negative values are rejected by NewEmbedder for every
+	// provider including cpu, so one config struct validates uniformly.
 	DeviceID int
 
 	// Logger for structured logging. If nil, a discard logger is used.
@@ -212,6 +213,17 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 	requested, err := normalizeExecutionProvider(cfg.ExecutionProvider)
 	if err != nil {
 		return nil, err
+	}
+
+	// A negative DeviceID is a configuration error in the same spirit: it must
+	// fail loudly for every provider, not silently degrade. On cuda it would
+	// sink into the CUDA provider options and surface as a confusing runtime
+	// rejection; on auto it would silently trigger the CPU fallback, hiding
+	// the misconfiguration behind a WARN; on cpu it would be silently ignored.
+	// All three are silent-failure shapes the loud-validation rule exists to
+	// prevent — one config struct validates uniformly for every provider.
+	if cfg.DeviceID < 0 {
+		return nil, fmt.Errorf("DeviceID must be a non-negative GPU ordinal, got %d", cfg.DeviceID)
 	}
 
 	maxSeqLen := cfg.MaxSeqLength

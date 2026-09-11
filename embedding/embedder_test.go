@@ -497,6 +497,37 @@ func TestNewEmbedder_UnknownExecutionProvider(t *testing.T) {
 	}
 }
 
+// TestNewEmbedder_NegativeDeviceID verifies the loud rejection of a negative
+// DeviceID for every execution provider: unlike an out-of-range positive
+// ordinal (a runtime CUDA rejection), a negative value is a configuration
+// error that must fail during validation, before any ONNX lifecycle is
+// touched.
+func TestNewEmbedder_NegativeDeviceID(t *testing.T) {
+	destroys := onnxEnvDestroys.Load()
+	for _, provider := range []string{ExecutionProviderCPU, ExecutionProviderCUDA, ExecutionProviderAuto} {
+		_, err := NewEmbedder(EmbedderConfig{
+			ModelPath:         "m.onnx",
+			TokenizerPath:     "t.json",
+			LibraryPath:       "lib.so",
+			ExecutionProvider: provider,
+			DeviceID:          -1,
+		})
+		if err == nil {
+			t.Errorf("NewEmbedder(provider=%q, DeviceID=-1) error = nil, want non-nil", provider)
+			continue
+		}
+		if !strings.Contains(err.Error(), "-1") {
+			t.Errorf("NewEmbedder(provider=%q, DeviceID=-1) error = %v, want it to name the value", provider, err)
+		}
+		if !strings.Contains(err.Error(), "DeviceID") {
+			t.Errorf("NewEmbedder(provider=%q, DeviceID=-1) error = %v, want it to name the field", provider, err)
+		}
+	}
+	if got := onnxEnvDestroys.Load() - destroys; got != 0 {
+		t.Errorf("destroyONNXRuntime called %d times during rejected configs, want 0", got)
+	}
+}
+
 // TestNewEmbedder_FailurePaths_NeverDestroyEnv asserts the core safety
 // invariant behind the auto fallback: no NewEmbedder failure path may call
 // destroyONNXRuntime. initONNXRuntime is sync.Once-guarded per process, so a
@@ -506,9 +537,10 @@ func TestNewEmbedder_UnknownExecutionProvider(t *testing.T) {
 //
 // The cases below drive every early-return error path reachable in one
 // process: path validation failures (before ONNX is touched), an unknown
-// provider (validation), a tokenizer load failure (after env init and options
-// build — the deepest cleanup(sessOpts) path), and an explicit "cuda" that
-// fails (the loudest historical failure).
+// provider (validation), a negative DeviceID (validation, every provider),
+// a tokenizer load failure (after env init and options build — the deepest
+// cleanup(sessOpts) path), and an explicit "cuda" that fails (the loudest
+// historical failure).
 func TestNewEmbedder_FailurePaths_NeverDestroyEnv(t *testing.T) {
 	destroys := onnxEnvDestroys.Load()
 
@@ -529,6 +561,19 @@ func TestNewEmbedder_FailurePaths_NeverDestroyEnv(t *testing.T) {
 		ExecutionProvider: "gpu",
 	}); err == nil {
 		t.Error("NewEmbedder(unknown provider) expected error, got nil")
+	}
+
+	// Negative DeviceID (validation): rejected for every provider before
+	// ONNX is touched, unlike an out-of-range positive ordinal, which stays a
+	// runtime CUDA rejection.
+	for _, provider := range []string{ExecutionProviderCPU, ExecutionProviderCUDA, ExecutionProviderAuto} {
+		if _, err := NewEmbedder(EmbedderConfig{
+			ModelPath: "m.onnx", TokenizerPath: "t.json", LibraryPath: "lib.so",
+			ExecutionProvider: provider,
+			DeviceID:          -1,
+		}); err == nil {
+			t.Errorf("NewEmbedder(provider=%q, DeviceID=-1) expected error, got nil", provider)
+		}
 	}
 
 	if got := onnxEnvDestroys.Load() - destroys; got != 0 {
@@ -1070,7 +1115,7 @@ func TestEmbedder_BatchEmbedDocuments_PaddedChunk(t *testing.T) {
 	}
 	defer closeSessionOnly(emb)
 
-	texts := batchTestTexts(2) // n=2 < capacity=4 -> rows 2..3 zero-padded
+	texts := batchTestTexts(2) // n=2 < capacity=4 → rows 2..3 zero-padded
 	ctx := context.Background()
 
 	refs := embedBatchRefs(t, emb, texts)
@@ -1082,7 +1127,7 @@ func TestEmbedder_BatchEmbedDocuments_PaddedChunk(t *testing.T) {
 		t.Fatalf("EmbedDocuments() error = %v", err)
 	}
 
-	// n <= capacity -> exactly one inference and one lazy session creation.
+	// n <= capacity → exactly one inference and one lazy session creation.
 	if d := onnxInferenceRuns.Load() - beforeRuns; d != 1 {
 		t.Errorf("n<=capacity performed %d inferences, want 1", d)
 	}
