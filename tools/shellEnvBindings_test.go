@@ -211,19 +211,49 @@ func TestExtractBashPaths_PlainBracedBindingStillResolves(t *testing.T) {
 	}
 }
 
-// TestExtractBashPaths_DynamicRHSNotBound covers a dynamic RHS: "$(echo ...)"
-// cannot be bound, so "$D/a" stays suspended/unexpandable and only the literal
-// suffix resolves.
+// TestExtractBashPaths_DynamicRHSNotBound covers a genuinely UNASSESSABLE RHS:
+// the substitution "X=$(read D < cfg; echo $D)" rebinds a name through a
+// construct the walk cannot assess, so its value cannot be bound, "$X/a" stays
+// unexpandable and only the literal suffix resolves. (A CLEAN substitution such
+// as "X=$(echo x)" is now assessable and does NOT escalate — see
+// TestExtractBashPaths_AssessableSubstitutionBinding.)
 func TestExtractBashPaths_DynamicRHSNotBound(t *testing.T) {
 	t.Setenv("D", "")
 	suffix := osAbsPath("a")
-	paths, suspicious := extractBashPaths(`D=$(echo x); cat "${D}`+bindingFixture("a")+`"`, "", "")
+	paths, suspicious := extractBashPaths(`X=$(read D < cfg; echo $D); cat "${X}`+bindingFixture("a")+`"`, "", "")
 	if !suspicious {
-		t.Fatalf("expected suspicious for a dynamic (unbindable) RHS, got suspicious=false, paths=%v", paths)
+		t.Fatalf("expected suspicious for an unassessable (unbindable) RHS, got suspicious=false, paths=%v", paths)
 	}
 	want := filepath.Clean(suffix)
 	if !sliceContains(paths, want) {
 		t.Fatalf("expected literal suffix %q in paths, got %v", want, paths)
+	}
+}
+
+// TestExtractBashPaths_AssessableSubstitutionBinding pins the narrowing the
+// binding walker introduces: a name bound SOLELY by an assessable command
+// substitution is assessable, so neither the binding RHS nor a reference to it
+// escalates. The common package-list pipeline must read clean, and the inner
+// command's literal paths are still surfaced (recursed) for symlink walking.
+func TestExtractBashPaths_AssessableSubstitutionBinding(t *testing.T) {
+	t.Setenv("X", "")
+	// A clean substitution binding does not escalate ...
+	if paths, suspicious := extractBashPaths(`X=$(echo x); echo "$X"`, "", ""); suspicious {
+		t.Fatalf("expected not suspicious for X=$(echo x); echo \"$X\", paths=%v", paths)
+	}
+	// ... and the acceptance command (builtin-style package listing) reads clean.
+	if paths, suspicious := extractBashPaths(`PKGS=$(go list ./... | grep -v node_modules); echo "$PKGS" | wc -l`, "", ""); suspicious {
+		t.Fatalf("expected not suspicious for a clean package-list binding, paths=%v", paths)
+	}
+	// The inner command of an approved binding is recursed, so a literal path
+	// reached only through the substitution is surfaced for symlink walking.
+	inner := filepath.ToSlash(osAbsPath("ws", "link", "secret"))
+	paths, suspicious := extractBashPaths(`X=$(cat `+inner+`); echo "$X"`, osAbsPath("wd"), osAbsPath("ws"))
+	if suspicious {
+		t.Fatalf("expected not suspicious for X=$(cat <path>), paths=%v", paths)
+	}
+	if want := filepath.Clean(osAbsPath("ws", "link", "secret")); !sliceContains(paths, want) {
+		t.Fatalf("expected inner path %q surfaced through the substitution, got %v", want, paths)
 	}
 }
 
@@ -550,10 +580,10 @@ func TestUnresolvablePathTokens_RebindingConstructsFailClosed(t *testing.T) {
 		{"dynamically-built command word is opaque", `E=eval; $E "$(cat cfg)"; cat "$D/x"`, []string{"$E", "$D"}},
 		{"dynamically-built external command word is opaque", `"$TOOL" --flag; cat "$D/x"`, []string{"$TOOL", "$D"}},
 		{"braced indexed reference to rebound array", `mapfile -t A < cfg; cat ${A[0]}`, []string{"${A[0]}"}},
-		{"braced slice reference to rebound name", `D=$(cat cfg); cat ${D:0}`, []string{"${D:0}"}},
+		{"braced slice reference to rebound name", `read D < cfg; cat ${D:0}`, []string{"${D:0}"}},
 		{"indirect reference form is unassessable", `D=$(cat cfg); X=D; cat ${!X}`, []string{"${!X}"}},
 		{"braced quote operator on rebound name", `read D < cfg; cat ${D@Q}`, []string{"${D@Q}"}},
-		{"braced case operator on rebound name", `D=$(cat cfg); cat ${D^}`, []string{"${D^}"}},
+		{"braced case operator on rebound name", `read D < cfg; cat ${D^}`, []string{"${D^}"}},
 		{"nested bash -c literal script is parsed", `bash -c 'read D < cfg; cat "$D/x"'`, []string{"$D"}},
 		{"nested sh -c expanded script is opaque", `sh -c "$(cat cfg)"; echo "$D"`, []string{"$D"}},
 		{"nested bash -c benign literal stays assessable", `bash -c 'echo hi'; echo "$D"`, nil},
@@ -799,5 +829,118 @@ func TestPathsOutsideRoots_ReboundVarWithAbsoluteSuffix(t *testing.T) {
 	cmd := `D=safe; read -r D < cfg; cat "$D/etc/passwd"`
 	if out := PathsOutsideRoots(ctx, cmd, ShellBash, ws); !sliceContains(out, "/etc/passwd") {
 		t.Fatalf("expected /etc/passwd reported outside roots, got %v", out)
+	}
+}
+
+// TestCommandSubstitutionAssessable is a table-driven test of the substitution
+// assessability predicate: a substitution counts as assessable only when its
+// inner command is fully static, while a dynamic reference, a rebinding
+// builtin, an opaque construct, a non-pure composition, or an unparseable
+// inner all fail closed. It also pins the recursive case (an inner that binds
+// a name via another assessable substitution).
+func TestCommandSubstitutionAssessable(t *testing.T) {
+	tests := []struct {
+		name  string
+		inner string
+		want  bool
+	}{
+		{name: "static command", inner: "go list ./... | grep -v node_modules", want: true},
+		{name: "dynamic reference", inner: "cat $HOME/f", want: false},
+		{name: "rebinding builtin", inner: "read D < cfg; echo $D", want: false},
+		{name: "opaque construct", inner: "source cfg", want: false},
+		{name: "nested assessable substitution", inner: "Y=$(go list ./...); echo $Y", want: true},
+		{name: "non-pure composition", inner: `echo "a$(date)"b`, want: false},
+		{name: "unparseable inner", inner: "echo $((", want: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := commandSubstitutionAssessable(tc.inner); got != tc.want {
+				t.Errorf("commandSubstitutionAssessable(%q) = %v, want %v", tc.inner, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCollectCommandEnvBindings_CommandSubstitution is the table-driven
+// counterpart at the binding-summary layer. It pins the promotion of a name
+// bound solely by an assessable command substitution — assessable
+// (unassessable == false) yet NOT dynamic and NOT resolvable — and the
+// fail-closed union for every poisoning shape: an opaque/dynamic inner, a
+// second non-assessable substitution, and a literal binding.
+func TestCollectCommandEnvBindings_CommandSubstitution(t *testing.T) {
+	tests := []struct {
+		name             string
+		command          string
+		ref              string
+		wantCmdSubst     bool
+		wantDynamic      bool
+		wantUnassessable bool
+		wantDynamicEmpty bool
+	}{
+		{
+			name:             "pure static substitution is assessable",
+			command:          `PKGS=$(go list ./... | grep -v node_modules); echo "$PKGS"`,
+			ref:              "PKGS",
+			wantCmdSubst:     true,
+			wantDynamic:      false,
+			wantUnassessable: false,
+			wantDynamicEmpty: true,
+		},
+		{
+			name:             "opaque inner fails closed",
+			command:          `X=$(read D < cfg; echo $D); echo $X`,
+			ref:              "X",
+			wantCmdSubst:     false,
+			wantDynamic:      true,
+			wantUnassessable: true,
+		},
+		{
+			name:             "union with a non-assessable substitution",
+			command:          `X=$(go list ./...); X=$(cat $HOME/f); echo $X`,
+			ref:              "X",
+			wantCmdSubst:     false,
+			wantDynamic:      true,
+			wantUnassessable: true,
+		},
+		{
+			name:             "literal binding blocks promotion",
+			command:          `X=$(go list ./...); X=/etc/passwd`,
+			ref:              "X",
+			wantCmdSubst:     false,
+			wantDynamic:      true,
+			wantUnassessable: true,
+		},
+		{
+			name:             "nested substitution recursion",
+			command:          `X=$(Y=$(go list ./...); echo $Y)`,
+			ref:              "X",
+			wantCmdSubst:     true,
+			wantDynamic:      false,
+			wantUnassessable: false,
+			wantDynamicEmpty: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			b := collectCommandEnvBindings(tc.command)
+			if b == nil {
+				t.Fatalf("parse failed for %q", tc.command)
+			}
+			if got := b.cmdSubst[tc.ref]; got != tc.wantCmdSubst {
+				t.Errorf("cmdSubst[%s] = %v, want %v", tc.ref, got, tc.wantCmdSubst)
+			}
+			if got := b.dynamic[tc.ref]; got != tc.wantDynamic {
+				t.Errorf("dynamic[%s] = %v, want %v", tc.ref, got, tc.wantDynamic)
+			}
+			if got := b.unassessable(tc.ref); got != tc.wantUnassessable {
+				t.Errorf("unassessable(%s) = %v, want %v", tc.ref, got, tc.wantUnassessable)
+			}
+			if tc.wantCmdSubst && b.resolvable(tc.ref) {
+				t.Errorf("assessable-substitution name %s must not be resolvable", tc.ref)
+			}
+			if tc.wantDynamicEmpty && len(b.dynamic) != 0 {
+				t.Errorf("dynamic map not empty: %v", b.dynamic)
+			}
+		})
 	}
 }

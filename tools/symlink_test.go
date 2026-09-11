@@ -229,10 +229,13 @@ func TestExtractBashPaths_VariableBinding(t *testing.T) {
 	// reference (it may sit in a branch not taken or after the reference), so
 	// the empty expansion stays possible and the word stays unexpandable. The
 	// non-suspicious case (env set and equal to the binding) is pinned by
-	// TestExtractBashPaths_BindingMatchingEnvNotSuspicious. Dynamic RHS
-	// ($(…)), bare command-substitution and unbound variables remain suspicious
-	// / unexpandable. Fixtures are OS-absolute (osAbsPath) so the table behaves
-	// identically on POSIX and Windows.
+	// TestExtractBashPaths_BindingMatchingEnvNotSuspicious. A genuinely
+	// UNASSESSABLE RHS (a substitution whose inner rebinds a name, e.g.
+	// "$(read D < cfg; echo $D)"), a bare command substitution in argument
+	// position, and unbound variables remain suspicious / unexpandable; a
+	// CLEAN substitution RHS ("$(echo x)") is now assessable and stays clean.
+	// Fixtures are OS-absolute (osAbsPath) so the table behaves identically on
+	// POSIX and Windows.
 	t.Setenv("D", "")
 	bind := filepath.ToSlash(osAbsPath("tmp", "build"))
 	other := filepath.ToSlash(osAbsPath("etc"))
@@ -249,7 +252,8 @@ func TestExtractBashPaths_VariableBinding(t *testing.T) {
 		{"simple assignment binds (empty env keeps empty expansion possible)", `D=` + bind + `; cat "$D/a"`, true, []string{clean("tmp", "build"), clean("tmp", "build", "a")}},
 		{"export binds like assignment (empty env keeps empty expansion possible)", `export D=` + bind + `; cat "$D/a"`, true, []string{clean("tmp", "build"), clean("tmp", "build", "a")}},
 		{"command-prefix assignment binds (arguments expand before the prefix takes effect)", `D=` + bind + ` mkdir "$D/x"`, true, []string{clean("tmp", "build"), clean("tmp", "build", "x")}},
-		{"dynamic RHS stays unbound", `D=$(echo x); cat "${D}` + dynSuffix + `"`, true, []string{clean("a")}},
+		{"unassessable RHS stays unbound", `D=$(read D < cfg; echo $D); cat "${D}` + dynSuffix + `"`, true, []string{clean("a")}},
+		{"assessable substitution RHS stays clean", `D=$(echo x); echo "$D"`, false, nil},
 		{"re-bound var stays suspicious (final literal still a candidate)", `D=` + other + `; D=` + last + `; echo "$D"`, true, []string{clean("etc"), clean("tmp")}},
 		{"bare command substitution stays suspicious", `cat $(echo x)`, true, nil},
 	}
@@ -633,6 +637,74 @@ func TestExtractPoshPaths_SkipsNonPathParams(t *testing.T) {
 	_, suspicious := extractPoshPaths(`Get-Content -Path C:\x\y -Raw`, osAbsPath("wd"), osAbsPath("ws"))
 	if suspicious {
 		t.Fatal("expected not suspicious")
+	}
+}
+
+// TestExtractPoshPaths_StaticBinding covers the "$NAME = <static RHS>" binding
+// recognition (D6, mirroring the bash extractBashPaths change): a later bare
+// "$NAME" reference to a statically-bound name is no longer an expansion, while
+// an expanding RHS, a suffixed reference, and "$(...)" stay suspicious. The
+// cases are platform-neutral — no host paths or separators are required.
+func TestExtractPoshPaths_StaticBinding(t *testing.T) {
+	wd := osAbsPath("wd")
+	ws := osAbsPath("ws")
+	cases := []struct {
+		name       string
+		command    string
+		suspicious bool
+	}{
+		{
+			// The acceptance case: a static list binding, referenced bare later.
+			name:       "static binding clears later bare reference",
+			command:    `$PKGS = go list ./... ; go test $PKGS`,
+			suspicious: false,
+		},
+		{
+			// RHS contains $env:HOME — expands, so the binding is not assessable.
+			name:       "expanding RHS keeps binding dynamic",
+			command:    `$X = Get-Content $env:HOME`,
+			suspicious: true,
+		},
+		{
+			// $X is static, but "$X/secret" carries a suffix -> not a bare ref.
+			name:       "reference with suffix stays suspicious",
+			command:    `$X = Get-ChildItem; Get-Content $X/secret`,
+			suspicious: true,
+		},
+		{
+			// $(...) is not assessable — unchanged metachar tokenization.
+			name:       "command substitution stays suspicious",
+			command:    `Get-Content $(Get-Location)`,
+			suspicious: true,
+		},
+		{
+			// No assignment at all: the name is unbound (fail-closed).
+			name:       "unbound reference stays suspicious",
+			command:    `Get-Content $X/secret`,
+			suspicious: true,
+		},
+		{
+			// Bound twice -> not assessable even though both RHS are literal.
+			name:       "rebound name stays suspicious",
+			command:    `$X = alpha; $X = beta; Get-Content $X`,
+			suspicious: true,
+		},
+		{
+			// RHS of a static binding, but the bare reference is in a later
+			// statement whose own $env token still expands.
+			name:       "static binding does not mask a later expansion",
+			command:    `$X = alpha; Get-Content $env:HOME`,
+			suspicious: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, suspicious := extractPoshPaths(tc.command, wd, ws)
+			if suspicious != tc.suspicious {
+				t.Fatalf("extractPoshPaths(%q) suspicious = %v, want %v",
+					tc.command, suspicious, tc.suspicious)
+			}
+		})
 	}
 }
 

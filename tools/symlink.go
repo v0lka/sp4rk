@@ -410,6 +410,11 @@ func extractBashPathsFromInput(input json.RawMessage, workspace string) (paths [
 
 // extractBashPaths parses a bash command using mvdan.cc/sh and extracts
 // path-like literals. Working directory is used for relative path resolution.
+// A "$VAR" reference whose name is bound once by an assessable command
+// substitution ([envBindings.cmdSubst]) no longer escalates, so an APPROVED
+// binding substitution's inner command is walked recursively to surface its
+// literal paths (a target reached through a symlink inside "X=$(cat …)" is
+// detected); a bare "$(…)" in argument position still escalates (D1).
 func extractBashPaths(command, workingDirectory, workspace string) (paths []string, hasUnexpandable bool) {
 	parser := syntax.NewParser()
 	file, err := parser.Parse(strings.NewReader(command), "")
@@ -428,6 +433,12 @@ func extractBashPaths(command, workingDirectory, workspace string) (paths []stri
 	syntax.Walk(file, func(node syntax.Node) bool {
 		switch n := node.(type) {
 		case *syntax.CmdSubst:
+			// Substitutions are consumed by the *syntax.Word case above, which
+			// expands bindings and recurses into an APPROVED binding
+			// substitution's inner command for literal paths. This case is only
+			// a fail-closed safety net for a substitution the walk reaches
+			// outside any Word: it cannot be statically resolved, so the
+			// command stays suspicious.
 			hasUnexpandable = true
 			return false // don't recurse into $(...) or `...`
 		case *syntax.ParamExp:
@@ -447,14 +458,36 @@ func extractBashPaths(command, workingDirectory, workspace string) (paths []stri
 		case *syntax.Word:
 			// Expand the word substituting in-command variable bindings. Bound
 			// variables resolve to their literal value; unbound/dynamic
-			// constructs ("$UNSET", "$(cmd)", backticks, globs, process
-			// substitution) mark the word unexpandable, so the command stays
-			// suspicious. The remaining literal fragments are still extracted as
-			// path candidates (an unset "$VAR" concatenated with a suffix expands
-			// to the suffix alone), mirroring the historical wordLiteral path.
+			// constructs ("$UNSET", a bare "$(cmd)", backticks, globs,
+			// process substitution) mark the word unexpandable, so the command
+			// stays suspicious. The remaining literal fragments are still
+			// extracted as path candidates (an unset "$VAR" concatenated with a
+			// suffix expands to the suffix alone), mirroring the historical
+			// wordLiteral path.
 			lit, unexp := expandWordWithBindings(n, bindings)
 			if unexp {
 				hasUnexpandable = true
+			}
+			// An approved binding substitution ("X=$(cat link/secret)") is
+			// assessable and no longer escalates on its own, so recover its
+			// inner source and walk it for literal paths — otherwise a target
+			// reached through a symlink only via such a substitution would go
+			// undetected. The inner command already passed the assessment that
+			// promoted the binding (see [commandSubstitutionAssessable]), so
+			// its paths are safe to surface. A bare "$(…)" in argument position
+			// is NOT approved and is left unexpanded (D1), so it is not walked
+			// here — the command stays suspicious.
+			if cs, ok := pureCommandSubstNode(n); ok && bindings.approvedSubstNode(cs) {
+				if inner, ok := cmdSubstInner(cs); ok {
+					subPaths, _ := extractBashPaths(inner, workingDirectory, workspace)
+					for _, p := range subPaths {
+						if _, dup := seen[p]; dup {
+							continue
+						}
+						seen[p] = struct{}{}
+						paths = append(paths, p)
+					}
+				}
 			}
 			if lit == "" || !looksLikePath(lit) {
 				return false
@@ -549,11 +582,26 @@ func extractPoshPathsFromInput(input json.RawMessage, workspace string) (paths [
 // Unclosed quotes or any internal inconsistency sets hasUnexpandable=true so the
 // caller fails closed (escalates to confirmation) rather than trusting a partial
 // parse.
+//
+// A "$NAME = <static RHS>" binding is recognized before evaluation (D6, mirroring
+// the bash extractBashPaths change): the RHS runs to the next statement/pipeline
+// terminator, and the binding is assessable only when that RHS is entirely
+// literal. A later bare "$NAME" reference to such a name is then treated as
+// literal rather than an expansion, so `$PKGS = go list ./... ; go test $PKGS` is
+// not suspicious while `$X = Get-Content $env:HOME` stays suspicious. Recognition
+// is fail-closed: `$(...)`/`(...)` groups, any suffix after the name ("$NAME/x"),
+// and names bound more than once or with a non-literal RHS all keep every "$NAME"
+// reference suspicious.
 func extractPoshPaths(command, workingDir, workspace string) (paths []string, hasUnexpandable bool) {
 	tokens, unclosed := poshTokenize(command)
 	if unclosed {
 		hasUnexpandable = true
 	}
+
+	// Resolve static "$NAME = <literal RHS>" bindings so a later bare "$NAME"
+	// reference is not treated as dynamic; recognition is fail-closed (see
+	// applyPoshStaticBindings).
+	applyPoshStaticBindings(tokens)
 
 	seen := make(map[string]struct{})
 	for i := range tokens {
@@ -590,6 +638,7 @@ type poshToken struct {
 	dollarExp bool   // a "$" appeared in an expansion context (outside single quotes)
 	quoteExp  bool   // content from an expandable (double-quoted) region
 	tickExp   bool   // a backtick escape/continuation appeared
+	sep       bool   // statement/pipeline terminator marker (content-free; bounds an assignment RHS)
 }
 
 // suspicious reports whether any expansion-context construct was seen in this
@@ -606,9 +655,19 @@ var poshMetachars = map[byte]bool{
 	'|': true, ';': true, '&': true, '(': true, ')': true, '{': true, '}': true,
 }
 
+// poshTerminators are the subset of poshMetachars that end a statement or
+// pipeline. They bound the right-hand side of an assignment when assessing
+// whether a binding is static (see applyPoshStaticBindings). Whitespace merely
+// separates tokens, and the grouping characters ( ) { } are not terminators.
+var poshTerminators = map[byte]bool{
+	';': true, '|': true, '\n': true, '\r': true,
+}
+
 // poshTokenize scans a PowerShell command char-by-char, producing tokens with
 // quote/escape state tracked. The second return value is true when an unclosed
-// quote was encountered (the caller uses it to fail closed).
+// quote was encountered (the caller uses it to fail closed). Statement and
+// pipeline terminators (; | newline) are emitted as content-free marker tokens
+// (poshToken.sep) so assignment-RHS assessment can bound the RHS.
 func poshTokenize(command string) (tokens []poshToken, unclosed bool) {
 	var cur strings.Builder
 	tok := poshToken{}
@@ -680,6 +739,11 @@ func poshTokenize(command string) (tokens []poshToken, unclosed bool) {
 				}
 			case poshMetachars[c]:
 				flush()
+				if poshTerminators[c] {
+					// Record a boundary so assignment-RHS assessment
+					// (applyPoshStaticBindings) stops at the statement/pipeline end.
+					tokens = append(tokens, poshToken{sep: true})
+				}
 			case c == '$':
 				tok.dollarExp = true
 				cur.WriteByte(c)
@@ -696,6 +760,102 @@ func poshTokenize(command string) (tokens []poshToken, unclosed bool) {
 	}
 	flush()
 	return tokens, unclosed
+}
+
+// applyPoshStaticBindings recognizes PowerShell assignment bindings of the form
+// "$NAME = <static RHS>" and clears the dollarExp flag on later bare "$NAME"
+// references, so a variable assigned a literal is not treated as dynamic. The
+// RHS runs from the token after "=" up to the next statement/pipeline terminator
+// (poshTerminators) or the end of the token stream. A binding is static only
+// when every RHS token is literal: no "$" expansion (dollarExp), no backtick
+// (tickExp), and no expandable double-quoted region (quoteExp).
+//
+// Recognition is deliberately fail-closed. A name is assessable only when it is
+// bound exactly once and that assignment is static; a name bound more than once,
+// or by a non-literal RHS, is never cleared. Only a bare "$NAME" reference is
+// cleared — a reference with any suffix after the name ("$NAME/x") or a
+// qualifier ("$env:NAME") is not a bare reference and stays dollarExp. The
+// "$(...)"/"(...)" groups are left to the existing metachar tokenization and
+// therefore stay suspicious.
+func applyPoshStaticBindings(tokens []poshToken) {
+	bound := make(map[string]int)
+	static := make(map[string]bool)
+	for i := 0; i+1 < len(tokens); i++ {
+		name, ok := poshBareVarRef(tokens[i])
+		if !ok || !poshAssignOp(tokens[i+1]) {
+			continue
+		}
+		bound[name]++
+		static[name] = static[name] || poshStaticRHS(tokens[i+2:])
+	}
+	if len(bound) == 0 {
+		return
+	}
+	for i := range tokens {
+		name, ok := poshBareVarRef(tokens[i])
+		if !ok {
+			continue
+		}
+		// Assessable only when bound once with a wholly literal RHS.
+		if bound[name] == 1 && static[name] {
+			tokens[i].dollarExp = false
+		}
+	}
+}
+
+// poshBareVarRef returns the variable name when tok is exactly a bare "$NAME"
+// reference — a "$" followed by a PowerShell variable name and nothing else. It
+// requires the token's expansion context (dollarExp) and rejects any qualifier
+// or suffix: "$env:NAME", "$NAME/x", "${NAME}", and "$(…)" all return ok=false.
+// Tokens carrying quote/backtick expansion content are rejected too.
+func poshBareVarRef(tok poshToken) (string, bool) {
+	if !tok.dollarExp || tok.quoteExp || tok.tickExp || len(tok.content) < 2 || tok.content[0] != '$' {
+		return "", false
+	}
+	name := tok.content[1:]
+	if !poshVarName(name) {
+		return "", false
+	}
+	return name, true
+}
+
+// poshVarName reports whether s is a PowerShell variable name: a non-empty run
+// of ASCII letters, digits, and underscores that does not start with a digit.
+func poshVarName(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c == '_':
+		case c >= '0' && c <= '9':
+			if i == 0 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return s != ""
+}
+
+// poshAssignOp reports whether tok is the assignment operator "=": a plain
+// literal "=" token carrying no expansion context and not a separator marker.
+func poshAssignOp(tok poshToken) bool {
+	return tok.content == "=" && !tok.dollarExp && !tok.quoteExp && !tok.tickExp && !tok.sep
+}
+
+// poshStaticRHS reports whether the RHS token run — from just after "=" up to
+// the first statement/pipeline terminator (or the end) — contains no expanding
+// construct.
+func poshStaticRHS(rhs []poshToken) bool {
+	for _, tok := range rhs {
+		if tok.sep {
+			break
+		}
+		if tok.dollarExp || tok.tickExp || tok.quoteExp {
+			return false
+		}
+	}
+	return true
 }
 
 // poshLooksLikePath reports whether a token resembles a filesystem path under
