@@ -3,6 +3,7 @@ package orchestration
 import (
 	"errors"
 	"sort"
+	"strings"
 
 	"github.com/v0lka/sp4rk/agent"
 )
@@ -15,14 +16,20 @@ import (
 const pausedCheckpointOutput = "[paused checkpoint — no final output yet]"
 
 // isPausedStepErr reports whether a step-result error is the cooperative-pause
-// sentinel. It matches both the in-memory sentinel (errors.Is) and a
-// string-reconstructed copy (message equality), the form produced by hosts
-// that persist error text and rebuild it via errors.New on restore.
+// sentinel. It matches the in-memory sentinel (errors.Is) plus the
+// string-reconstructed forms a persisting host produces on restore: the exact
+// sentinel message, or the sentinel as the TRAILING segment of a "%w"-style
+// wrap/prefix (e.g. "step 3: executor paused at step boundary") — c0wrk's
+// TaskPersistence/LoadTaskState rebuilds the error via errors.New(ErrorText).
+// The match is anchored to the END of the message, deliberately NOT an
+// arbitrary substring, so a genuinely failed step whose error text merely
+// mentions the sentence mid-way is never reclassified as a paused checkpoint.
 func isPausedStepErr(err error) bool {
 	if err == nil {
 		return false
 	}
-	return errors.Is(err, agent.ErrPaused) || err.Error() == agent.ErrPaused.Error()
+	return errors.Is(err, agent.ErrPaused) ||
+		strings.HasSuffix(err.Error(), agent.ErrPaused.Error())
 }
 
 // blackboardStepOutputStore adapts a Blackboard to the agent.StepOutputStore interface.

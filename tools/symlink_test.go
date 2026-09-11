@@ -275,6 +275,75 @@ func TestExtractBashPaths_VariableBinding(t *testing.T) {
 	}
 }
 
+// TestExtractBashPaths_ExpansionRHSInSubstitutionFailsClosed pins that a
+// command substituted in assignment position is only "assessable" (and thus
+// only promotes the name to a validated binding) when its inner words are
+// genuinely literal. Pathname globbing, brace expansion and tilde expansion
+// are performed by the shell at runtime, so a word carrying them must make the
+// substitution unassessable and keep the later reference suspicious
+// (shellEnvBindings.go innerWordAssessable doc; specs/architecture/
+// security-model.md).
+func TestExtractBashPaths_ExpansionRHSInSubstitutionFailsClosed(t *testing.T) {
+	wd, ws := osAbsPath("wd"), osAbsPath("ws")
+	for _, cmd := range []string{
+		`X=$(ls *); cat $X`,
+		`X=$(cat *.txt); cat $X`,
+		`X=$(cat [a-z]/passwd); cat $X`,
+		`X=$(ls {a,b}/passwd); cat $X`,
+		`X=$(echo ~/secret); cat $X`,
+	} {
+		t.Run(cmd, func(t *testing.T) {
+			paths, suspicious := extractBashPaths(cmd, wd, ws)
+			if !suspicious {
+				t.Fatalf("extractBashPaths(%q) suspicious = false, want true (glob/brace/tilde RHS must fail closed; paths=%v)", cmd, paths)
+			}
+		})
+	}
+}
+
+// TestExtractBashPaths_QuotedExpansionInSubstitutionNotSuspicious pins that
+// glob/brace characters INSIDE double quotes — where the shell performs no
+// glob/brace expansion — keep a command substitution assessable (the quoted
+// context must not be treated as dynamic).
+func TestExtractBashPaths_QuotedExpansionInSubstitutionNotSuspicious(t *testing.T) {
+	wd, ws := osAbsPath("wd"), osAbsPath("ws")
+	for _, cmd := range []string{
+		`X=$(echo "[INFO] done"); echo "$X"`,
+		`X=$(echo "a[b]c"); echo "$X"`,
+		`X=$(find . -name "*.go"); echo "$X"`,
+	} {
+		t.Run(cmd, func(t *testing.T) {
+			if _, suspicious := extractBashPaths(cmd, wd, ws); suspicious {
+				t.Fatalf("extractBashPaths(%q) suspicious = true, want false (quoted glob/brace chars are literal)", cmd)
+			}
+		})
+	}
+}
+
+// TestExtractBashPaths_ChildScriptBindingDoesNotRelieveCaller pins that a
+// CHILD-process script's binding never makes the CALLER's reference assessable:
+// `bash -c 'X=$(echo x)'; cat "$X"` must stay suspicious because X is unbound
+// in the caller (a child shell cannot rebind it), unlike the otherwise
+// identical same-shell `X=$(echo x); cat "$X"`.
+func TestExtractBashPaths_ChildScriptBindingDoesNotRelieveCaller(t *testing.T) {
+	wd, ws := osAbsPath("wd"), osAbsPath("ws")
+	for _, cmd := range []string{
+		`bash -c 'X=$(echo x)'; cat "$X"`,
+		`bash <<< 'X=$(echo x)'; cat "$X"`,
+		`env -S 'X=$(echo x)'; cat "$X"`,
+		`bash -c 'X=/etc'; cat "$X/passwd"`,
+	} {
+		t.Run(cmd, func(t *testing.T) {
+			if _, suspicious := extractBashPaths(cmd, wd, ws); !suspicious {
+				t.Fatalf("extractBashPaths(%q) suspicious = false, want true (a child script cannot rebind the caller)", cmd)
+			}
+		})
+	}
+	if _, suspicious := extractBashPaths(`X=$(echo x); cat "$X"`, wd, ws); suspicious {
+		t.Fatal("same-shell assessable substitution must stay not suspicious")
+	}
+}
+
 func TestExtractBashPaths_CommandSubstitution(t *testing.T) {
 	paths, suspicious := extractBashPaths("cat $(echo /tmp)", "", "/workspace")
 	if !suspicious {
@@ -282,6 +351,27 @@ func TestExtractBashPaths_CommandSubstitution(t *testing.T) {
 	}
 	if len(paths) != 0 {
 		t.Fatalf("expected no extractable paths from $(...), got %v", paths)
+	}
+}
+
+// TestExtractBashPaths_ExpansionRHSInAssignmentFailsClosed pins the outer
+// counterpart of the substitution case: a literal assignment RHS carrying
+// pathname globbing, brace expansion or a leading tilde is not a fixed value
+// (the shell expands it at runtime), so the name stays dynamic
+// (wordHasDynamicPart) and a later reference is suspicious.
+func TestExtractBashPaths_ExpansionRHSInAssignmentFailsClosed(t *testing.T) {
+	wd, ws := osAbsPath("wd"), osAbsPath("ws")
+	for _, cmd := range []string{
+		`X=*.txt; cat $X`,
+		`X={a,b}/passwd; cat $X`,
+		`X=~/secret; cat $X`,
+	} {
+		t.Run(cmd, func(t *testing.T) {
+			_, suspicious := extractBashPaths(cmd, wd, ws)
+			if !suspicious {
+				t.Fatalf("extractBashPaths(%q) suspicious = false, want true (glob/brace/tilde assignment RHS must fail closed)", cmd)
+			}
+		})
 	}
 }
 
@@ -678,6 +768,14 @@ func TestExtractPoshPaths_StaticBinding(t *testing.T) {
 			suspicious: true,
 		},
 		{
+			// A bare "(...)" group is a subexpression whose value is dynamic;
+			// it must never make the binding look static (security-model.md:
+			// "$(...)"/"(...)" keep every reference suspicious).
+			name:       "parenthesized RHS stays suspicious",
+			command:    `$F = (Get-Content C:\x\y); Remove-Item $F`,
+			suspicious: true,
+		},
+		{
 			// No assignment at all: the name is unbound (fail-closed).
 			name:       "unbound reference stays suspicious",
 			command:    `Get-Content $X/secret`,
@@ -705,6 +803,100 @@ func TestExtractPoshPaths_StaticBinding(t *testing.T) {
 					tc.command, suspicious, tc.suspicious)
 			}
 		})
+	}
+}
+
+// TestExtractPoshPaths_CommentTextNotAToken pins PowerShell comment handling:
+// comment text must never reach the token stream, so it can neither clear
+// dollarExp via a phantom "# $F = <literal>" static binding nor surface the
+// comment's own literals as path candidates. Both line comments ("#") and
+// block comments ("<# … #>") are covered, including the loop-variable shape
+// where the comment is the only recorded "binding" for the name.
+func TestExtractPoshPaths_CommentTextNotAToken(t *testing.T) {
+	wd := osAbsPath("wd")
+	ws := osAbsPath("ws")
+	cases := []struct {
+		name       string
+		command    string
+		suspicious bool
+	}{
+		{
+			// A trailing line comment must not clear the dynamic $F reference.
+			name:       "trailing line comment phantom binding",
+			command:    "Get-Content $F # $F = C:\\safe\\file",
+			suspicious: true,
+		},
+		{
+			name:       "comment line before command",
+			command:    "# $F = C:\\safe\\file\nGet-Content $F",
+			suspicious: true,
+		},
+		{
+			name:       "block comment before command",
+			command:    "<# $F = C:\\safe #>\nGet-Content $F",
+			suspicious: true,
+		},
+		{
+			name:       "block comment after command",
+			command:    "Get-Content $F <# $F = C:\\safe #>",
+			suspicious: true,
+		},
+		{
+			// The live hole from the review: a loop variable is unbound in the
+			// tokenizer's model, so a trailing comment would be the only
+			// "binding" and de-escalate the removal loop.
+			name:       "loop variable with phantom comment binding",
+			command:    "foreach ($F in Get-ChildItem $env:DIR) { Remove-Item $F } # $F = C:\\project\\safe.txt",
+			suspicious: true,
+		},
+		{
+			// An unclosed block comment is a parse error in PowerShell — fail
+			// closed like an unclosed quote.
+			name:       "unclosed block comment fails closed",
+			command:    "Get-Content <# never closed",
+			suspicious: true,
+		},
+		{
+			// A "#" inside a token is literal (mirrors PowerShell).
+			name:       "hash inside token stays literal",
+			command:    `Get-Content C:\a#b`,
+			suspicious: false,
+		},
+		{
+			// A "<#" not at a token start is literal content.
+			name:       "open-angle inside token stays literal",
+			command:    `Get-Content C:\a<#b`,
+			suspicious: false,
+		},
+		{
+			// Sanity: a real static binding still clears the bare reference.
+			name:       "real static binding still works",
+			command:    "$F = C:\\safe\\file\nGet-Content $F",
+			suspicious: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, suspicious := extractPoshPaths(tc.command, wd, ws)
+			if suspicious != tc.suspicious {
+				t.Fatalf("extractPoshPaths(%q) suspicious = %v, want %v",
+					tc.command, suspicious, tc.suspicious)
+			}
+		})
+	}
+
+	// Comment literals must not be surfaced as path candidates either.
+	paths, _ := extractPoshPaths("Get-Content $F # C:\\windows\\system32\\config", wd, ws)
+	for _, p := range paths {
+		if strings.Contains(p, "system32") {
+			t.Errorf("comment path surfaced as a path candidate: %s", p)
+		}
+	}
+	paths, _ = extractPoshPaths("<# C:\\windows\\system32 #>\nGet-Item C:\\safe", wd, ws)
+	for _, p := range paths {
+		if strings.Contains(p, "system32") {
+			t.Errorf("block-comment path surfaced as a path candidate: %s", p)
+		}
 	}
 }
 

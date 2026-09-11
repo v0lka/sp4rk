@@ -257,6 +257,26 @@ func TestExtractBashPaths_AssessableSubstitutionBinding(t *testing.T) {
 	}
 }
 
+// TestExtractBashPaths_NestedSubstInApprovedBindingStaysSuspicious pins the
+// fail-closed handling of a BARE nested substitution inside an approved binding
+// substitution: the inner walk refuses to mirror a non-approved nested node
+// (D1), so it cannot surface the nested path — and it previously DISCARDED its
+// recursive unexpandable verdict, letting `X=$(cat $(echo 'link'/passwd)); cat
+// $X` surface neither the path nor the suspicion flag (a fail-open versus the
+// pre-binding-assessment behavior, which marked any bare $(...) suspicious).
+// The recursive flag must now propagate to the outer walk.
+func TestExtractBashPaths_NestedSubstInApprovedBindingStaysSuspicious(t *testing.T) {
+	for _, cmd := range []string{
+		`X=$(cat $(echo 'link'/passwd)); cat $X`,
+		`X=$(cat $(echo link/passwd)); cat $X`,
+	} {
+		paths, suspicious := extractBashPaths(cmd, osAbsPath("wd"), osAbsPath("ws"))
+		if !suspicious {
+			t.Errorf("extractBashPaths(%q): a nested bare substitution inside an approved binding must stay suspicious, paths=%v", cmd, paths)
+		}
+	}
+}
+
 // TestExtractBashPaths_RebindingStaysSuspicious pins the fail-closed treatment
 // of re-bound names: "D=etc; D=tmp; echo \"$D\"" has TWO assignments to D, and
 // the pre-pass is position- and control-flow-unaware — it cannot prove which
@@ -542,6 +562,25 @@ func TestResolveShellPathTokens_DeadBranchDecoyUnionsEmptyExpansion(t *testing.T
 // unassessable — the runtime value is unknown (often attacker-controlled
 // file content), so the Judges escalate the token HARD instead of letting a
 // decoy literal binding auto-approve the command.
+// TestUnresolvablePathTokens_TrapReboundPositionalEscalates pins that a
+// same-shell trap handler rebinding positionals (set -- / shift) escalates a
+// later bare $1: the positionalRebound flag must cross the trap merge.
+func TestUnresolvablePathTokens_TrapReboundPositionalEscalates(t *testing.T) {
+	if tok := UnresolvablePathTokens(`trap 'set -- "$(cat /tmp/x)"' DEBUG; cat $1`, ShellBash); len(tok) == 0 {
+		t.Fatal("expected the trap-rebound positional $1 to be flagged")
+	}
+}
+
+// TestUnresolvablePathTokens_ChildScriptPositionalEscalates pins that a CHILD
+// shell script rebinding its own positionals (set -- / shift) escalates a
+// later bare $1 in that script: the positionalRebound flag must cross the
+// child-process merge (the outer positional scan reads it).
+func TestUnresolvablePathTokens_ChildScriptPositionalEscalates(t *testing.T) {
+	if tok := UnresolvablePathTokens(`bash -c 'set -- "$(cat p)"; cat $1'`, ShellBash); len(tok) == 0 {
+		t.Fatal("expected the child script's rebound positional $1 to be flagged")
+	}
+}
+
 func TestUnresolvablePathTokens_RebindingConstructsFailClosed(t *testing.T) {
 	cases := []struct {
 		name    string

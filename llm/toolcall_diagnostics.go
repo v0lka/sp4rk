@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"unicode/utf8"
 )
 
 // maxLoggedToolArgs bounds the raw argument payload captured per tool call so a
@@ -50,9 +51,17 @@ func logToolCallArguments(logger *slog.Logger, provider string, calls []ToolCall
 
 // truncateArgsForLog bounds an arguments payload to maxLoggedToolArgs bytes for
 // logging, marking the cut so a truncated value is never mistaken for the whole.
+// The cut point is backed off to a UTF-8 rune boundary: tool arguments routinely
+// carry non-ASCII text (file paths, file contents), and splitting a multi-byte
+// rune would end the logged prefix with invalid UTF-8 that renders as U+FFFD
+// mojibake in text handlers.
 func truncateArgsForLog(s string) string {
 	if len(s) <= maxLoggedToolArgs {
 		return s
 	}
-	return s[:maxLoggedToolArgs] + "...(truncated)"
+	end := maxLoggedToolArgs
+	for end > 0 && !utf8.RuneStart(s[end]) {
+		end--
+	}
+	return s[:end] + "...(truncated)"
 }

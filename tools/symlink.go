@@ -479,7 +479,18 @@ func extractBashPaths(command, workingDirectory, workspace string) (paths []stri
 			// here — the command stays suspicious.
 			if cs, ok := pureCommandSubstNode(n); ok && bindings.approvedSubstNode(cs) {
 				if inner, ok := cmdSubstInner(cs); ok {
-					subPaths, _ := extractBashPaths(inner, workingDirectory, workspace)
+					subPaths, subUnexp := extractBashPaths(inner, workingDirectory, workspace)
+					// Propagate the inner walk's unexpandable verdict. The inner
+					// walk refuses to mirror a BARE nested substitution in
+					// argument position (D1: a non-approved node is not walked;
+					// see the Word case below), so without this the constructs it
+					// could not resolve would be silently dropped instead of
+					// keeping the OUTER command suspicious. Dropping it is a
+					// fail-open: "X=$(cat $(echo 'link'/passwd)); cat $X" would
+					// surface neither the nested path nor any suspicion flag.
+					if subUnexp {
+						hasUnexpandable = true
+					}
 					for _, p := range subPaths {
 						if _, dup := seen[p]; dup {
 							continue
@@ -638,14 +649,16 @@ type poshToken struct {
 	dollarExp bool   // a "$" appeared in an expansion context (outside single quotes)
 	quoteExp  bool   // content from an expandable (double-quoted) region
 	tickExp   bool   // a backtick escape/continuation appeared
+	groupExp  bool   // a "(" or ")" grouping metachar appeared outside quotes
 	sep       bool   // statement/pipeline terminator marker (content-free; bounds an assignment RHS)
 }
 
 // suspicious reports whether any expansion-context construct was seen in this
-// token (expandable double quotes or a backtick). dollarExp is handled
-// separately by the caller because it also skips collection.
+// token (expandable double quotes, a backtick, or a bare "(...)"/"(...)") group
+// whose value is dynamic). dollarExp is handled separately by the caller
+// because it also skips collection.
 func (t *poshToken) suspicious() bool {
-	return t.quoteExp || t.tickExp
+	return t.quoteExp || t.tickExp || t.groupExp
 }
 
 // poshMetachars are PowerShell control operators/whitespace that terminate a
@@ -665,9 +678,14 @@ var poshTerminators = map[byte]bool{
 
 // poshTokenize scans a PowerShell command char-by-char, producing tokens with
 // quote/escape state tracked. The second return value is true when an unclosed
-// quote was encountered (the caller uses it to fail closed). Statement and
-// pipeline terminators (; | newline) are emitted as content-free marker tokens
-// (poshToken.sep) so assignment-RHS assessment can bound the RHS.
+// quote (or an unclosed block comment) was encountered (the caller uses it to
+// fail closed). Statement and pipeline terminators (; | newline) are emitted
+// as content-free marker tokens (poshToken.sep) so assignment-RHS assessment
+// can bound the RHS. Comments are skipped: a "#" at a token start runs to the
+// end of the line and a "<#" at a token start runs to the matching "#>"; a "#"
+// or "<#" inside a token ("C:\a#b") is literal. Comment text never becomes a
+// token, so it can neither surface phantom path candidates nor masquerade as a
+// static "$NAME = <literal>" binding.
 func poshTokenize(command string) (tokens []poshToken, unclosed bool) {
 	var cur strings.Builder
 	tok := poshToken{}
@@ -721,6 +739,28 @@ func poshTokenize(command string) (tokens []poshToken, unclosed bool) {
 			}
 		default: // outside quotes
 			switch {
+			case c == '<' && i+1 < len(command) && command[i+1] == '#' &&
+				!hasContent && !tok.dollarExp && !tok.quoteExp && !tok.tickExp:
+				// A "<#" at a token start begins a block comment: skip to the
+				// matching "#>" (or fail closed at end of input). Comment text
+				// must never reach the token stream — a "# $F = C:\safe" inside
+				// a comment would otherwise be mistaken for a static binding
+				// and clear dollarExp on genuinely dynamic "$F" references. A
+				// "<#" inside a token stays literal.
+				if end := strings.Index(command[i+2:], "#>"); end >= 0 {
+					i += 2 + end + 1 // land on '>' so the loop's i++ steps past "#>"
+				} else {
+					unclosed = true
+					i = len(command)
+				}
+			case c == '#' && !hasContent && !tok.dollarExp && !tok.quoteExp && !tok.tickExp:
+				// A "#" at a token start begins a line comment: skip to the
+				// next newline, which is then processed normally (flush +
+				// statement terminator marker). A "#" inside a token
+				// ("C:\a#b") is literal.
+				for i+1 < len(command) && command[i+1] != '\n' {
+					i++
+				}
 			case c == '\'':
 				inSingle = true
 				hasContent = true
@@ -743,6 +783,13 @@ func poshTokenize(command string) (tokens []poshToken, unclosed bool) {
 					// Record a boundary so assignment-RHS assessment
 					// (applyPoshStaticBindings) stops at the statement/pipeline end.
 					tokens = append(tokens, poshToken{sep: true})
+				} else if c == '(' || c == ')' {
+					// A bare "(...)" group is a subexpression whose value is
+					// dynamic. Emit a marker so a "$NAME = (...)" RHS is never
+					// judged static and the surrounding command stays
+					// suspicious (a "$(...)" already carries dollarExp on its
+					// "$" token).
+					tokens = append(tokens, poshToken{groupExp: true})
 				}
 			case c == '$':
 				tok.dollarExp = true
@@ -775,8 +822,9 @@ func poshTokenize(command string) (tokens []poshToken, unclosed bool) {
 // or by a non-literal RHS, is never cleared. Only a bare "$NAME" reference is
 // cleared — a reference with any suffix after the name ("$NAME/x") or a
 // qualifier ("$env:NAME") is not a bare reference and stays dollarExp. The
-// "$(...)"/"(...)" groups are left to the existing metachar tokenization and
-// therefore stay suspicious.
+// "$(...)"/"(...)" groups keep every reference suspicious: "$(...)" via the
+// dollarExp on its "$" token, and a bare "(...)" via the grouping marker the
+// tokenizer emits (see poshTokenize) — so a "$NAME = (...)" RHS is never static.
 func applyPoshStaticBindings(tokens []poshToken) {
 	bound := make(map[string]int)
 	static := make(map[string]bool)
@@ -851,7 +899,7 @@ func poshStaticRHS(rhs []poshToken) bool {
 		if tok.sep {
 			break
 		}
-		if tok.dollarExp || tok.tickExp || tok.quoteExp {
+		if tok.dollarExp || tok.tickExp || tok.quoteExp || tok.groupExp {
 			return false
 		}
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/v0lka/sp4rk/llm"
@@ -176,21 +177,23 @@ func compactConversationHierarchical(ctx context.Context, msgs []llm.Message, cf
 // HierarchicalStrategy.Compact: the three ratios (distant/middle/recent) are
 // normalized to sum to 1.0, the distant zone is int(n·distant), and the middle
 // zone spans up to the CUMULATIVE boundary middleEnd = int(n·(distant+middle)),
-// leaving the recent zone as the remainder n − middleEnd. Ratios ≤ 0 fall back
-// to sp4rk's defaults (0.4/0.3/0.3). The clamps shrink the middle (then the
-// distant) zone so the recent zone always keeps at least the final message, and
-// a history too short to form a distant zone is a no-op (both zones empty).
+// leaving the recent zone as the remainder n − middleEnd. Ratios ≤ 0 — or
+// non-finite (YAML ".nan"/".inf" parses to NaN/Inf, whose int conversion is
+// implementation-defined per the Go spec) — fall back to sp4rk's defaults
+// (0.4/0.3/0.3). The clamps shrink the middle (then the distant) zone so the
+// recent zone always keeps at least the final message, and a history too short
+// to form a distant zone is a no-op (both zones empty).
 func conversationHierarchicalZones(n int, cfg CompactionConfig) (distant, middle int) {
 	distantRatio := cfg.Hierarchical.DistantRatio
-	if distantRatio <= 0 {
+	if !usableRatio(distantRatio) {
 		distantRatio = 0.4
 	}
 	middleRatio := cfg.Hierarchical.MiddleRatio
-	if middleRatio <= 0 {
+	if !usableRatio(middleRatio) {
 		middleRatio = 0.3
 	}
 	recentRatio := cfg.Hierarchical.RecentRatio
-	if recentRatio <= 0 {
+	if !usableRatio(recentRatio) {
 		recentRatio = 0.3
 	}
 	// Normalize the three ratios to sum to 1.0, mirroring NewHierarchicalStrategy.
@@ -224,6 +227,15 @@ func conversationHierarchicalZones(n int, cfg CompactionConfig) (distant, middle
 	}
 	middle = middleEnd - distant
 	return distant, middle
+}
+
+// usableRatio reports whether a ratio can drive the compaction math — either a
+// configured hierarchical zone ratio or a forecast compression ratio: it must
+// be finite (NaN/Inf — which YAML ".nan"/".inf" values parse to, or a host
+// calibration with a zero denominator — convert to int implementation-defined-
+// ly per the Go spec) and positive. Anything else falls back to the defaults.
+func usableRatio(r float64) bool {
+	return r > 0 && !math.IsNaN(r) && !math.IsInf(r, 0)
 }
 
 // ConversationHierarchicalZones returns the distant/middle zone sizes for an
@@ -467,7 +479,7 @@ func predictConversationSummarizing(msgs []llm.Message, cfg CompactionConfig, de
 	tail := msgs[len(msgs)-keepLast:]
 	p.VerbatimTokens = countMessages(deps.TokenCounter, tail)
 	ratio := deps.Forecast.SummarizationRatio
-	if ratio <= 0 {
+	if !usableRatio(ratio) {
 		ratio = defaultSummarizationForecastRatio
 	}
 	blockSize := cfg.Summarization.BlockSize
@@ -479,10 +491,15 @@ func predictConversationSummarizing(msgs []llm.Message, cfg CompactionConfig, de
 	if maxSummarizeTokens <= 0 {
 		maxSummarizeTokens = 16000
 	}
+	truncateChars := cfg.Summarization.ObservationTruncate
+	if truncateChars <= 0 {
+		truncateChars = 500
+	}
 	summarized := 0
 	for i := 0; i < len(older); i += blockSize {
 		end := min(i+blockSize, len(older))
-		summarized += forecastSummaryTokens(clampSummarizeTokens(countMessages(deps.TokenCounter, older[i:end]), maxSummarizeTokens), ratio)
+		blockTokens := textTokens(deps.TokenCounter, conversationBlockText(older[i:end], truncateChars))
+		summarized += forecastSummaryTokens(clampSummarizeTokens(blockTokens, maxSummarizeTokens), ratio)
 	}
 	p.AfterTokens = p.VerbatimTokens + summarized
 	p.Reclaim = max(0, p.BeforeTokens-p.AfterTokens)
@@ -507,11 +524,11 @@ func predictConversationHierarchical(msgs []llm.Message, cfg CompactionConfig, d
 	p.VerbatimTokens = countMessages(deps.TokenCounter, recent)
 
 	distantRatio := deps.Forecast.HierarchicalDistantRatio
-	if distantRatio <= 0 {
+	if !usableRatio(distantRatio) {
 		distantRatio = defaultHierarchicalDistantForecastRatio
 	}
 	middleRatio := deps.Forecast.HierarchicalMiddleRatio
-	if middleRatio <= 0 {
+	if !usableRatio(middleRatio) {
 		middleRatio = defaultHierarchicalMiddleForecastRatio
 	}
 	blockSize := cfg.Summarization.BlockSize
@@ -522,13 +539,20 @@ func predictConversationHierarchical(msgs []llm.Message, cfg CompactionConfig, d
 	if maxSummarizeTokens <= 0 {
 		maxSummarizeTokens = 16000
 	}
+	truncateChars := cfg.Summarization.ObservationTruncate
+	if truncateChars <= 0 {
+		truncateChars = 500
+	}
 
-	distantTokens := clampSummarizeTokens(countMessages(deps.TokenCounter, msgs[:distant]), maxSummarizeTokens)
+	// The distant zone is ONE block (blockSize = distant in the real path),
+	// so its forecast input is that whole zone rendered as one block.
+	distantTokens := clampSummarizeTokens(textTokens(deps.TokenCounter, conversationBlockText(msgs[:distant], truncateChars)), maxSummarizeTokens)
 	middleTokens := 0
 	middleMsgs := msgs[distant : distant+middle]
 	for i := 0; i < len(middleMsgs); i += blockSize {
 		end := min(i+blockSize, len(middleMsgs))
-		middleTokens += clampSummarizeTokens(countMessages(deps.TokenCounter, middleMsgs[i:end]), maxSummarizeTokens)
+		blockTokens := textTokens(deps.TokenCounter, conversationBlockText(middleMsgs[i:end], truncateChars))
+		middleTokens += clampSummarizeTokens(blockTokens, maxSummarizeTokens)
 	}
 
 	p.AfterTokens = p.VerbatimTokens +
@@ -554,8 +578,11 @@ func forecastSummaryTokens(inputTokens int, ratio float64) int {
 // truncation: block text beyond maxSummarizeTokens is dropped before the LLM
 // sees it, so the forecast must clamp a block's input tokens to the same budget
 // rather than letting an over-long block inflate AfterTokens (and deflate
-// Reclaim). A zero or negative input is returned unchanged; the caller resolves
-// the 16000 default before calling.
+// Reclaim). The input is the token count of the block's RENDERED text (see
+// [conversationBlockText]) — the per-message ObservationTruncate cap and role
+// prefixes are part of that rendering, so they are modeled here too. A zero or
+// negative input is returned unchanged; the caller resolves the 16000 default
+// before calling.
 func clampSummarizeTokens(inputTokens, maxSummarizeTokens int) int {
 	if inputTokens > maxSummarizeTokens {
 		return maxSummarizeTokens
@@ -571,4 +598,14 @@ func countMessages(counter llm.TokenCounter, msgs []llm.Message) int {
 		return 0
 	}
 	return counter.CountMessages(msgs)
+}
+
+// textTokens is the plain-text counterpart of [countMessages]: a nil counter
+// yields 0, matching the "unknown, not fabricated" contract for prediction
+// fields.
+func textTokens(counter llm.TokenCounter, text string) int {
+	if counter == nil {
+		return 0
+	}
+	return counter.Count(text)
 }

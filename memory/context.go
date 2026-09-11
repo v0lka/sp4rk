@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"sync/atomic"
 
 	sdkagent "github.com/v0lka/sp4rk/agent"
 	"github.com/v0lka/sp4rk/llm"
@@ -88,8 +89,12 @@ type ContextWindow struct {
 	// LLM call. Tool schemas are not counted by the conversation tracker
 	// (which only estimates message history), so without this reserve the
 	// fill estimate under-counts against local/self-hosted engines whose KV
-	// cache overflows on the true wire size. Set via SetToolOverhead.
-	toolOverhead int
+	// cache overflows on the true wire size. Set via SetToolOverhead — at
+	// RUN boundaries (executor.Run), not only during host setup — so it is
+	// stored atomically: a host reading fill metrics
+	// (EffectiveMax/FillPercent/AvailableTokens) from another goroutine
+	// while a step's Run re-sets the reserve must not race on it.
+	toolOverhead atomic.Int64
 
 	// priorConversation holds messages from previous exchanges (prior
 	// user/assistant turns) that should appear in the prompt before the
@@ -241,7 +246,7 @@ func (cw *ContextWindow) SetHistoryMutation(m HistoryMutation) {
 // integer vs float rounding is intentional and acceptable.
 func (cw *ContextWindow) EffectiveMax() int {
 	safetyMargin := cw.modelMeta.ContextWindow * cw.safetyMargin / 100
-	return cw.modelMeta.ContextWindow - cw.modelMeta.OutputLimit - safetyMargin - cw.toolOverhead
+	return cw.modelMeta.ContextWindow - cw.modelMeta.OutputLimit - safetyMargin - int(cw.toolOverhead.Load())
 }
 
 // toolOverheadMaxReservePercent caps the tool-schema reserve at this share of
@@ -267,6 +272,10 @@ const toolOverheadMaxReservePercent = 80
 // clamp bites, the fill percentage under-reserves and degrades gracefully —
 // compaction fires later than ideal — instead of permanently reporting the
 // window as full. Negative input clears a previous reserve.
+//
+// The executor calls this at the start of every Run (including resumed runs
+// and per-step conductor runs), so the store is atomic — concurrent fill
+// readers on other goroutines never race the write.
 func (cw *ContextWindow) SetToolOverhead(tokens int) {
 	if tokens < 0 {
 		tokens = 0
@@ -281,7 +290,7 @@ func (cw *ContextWindow) SetToolOverhead(tokens int) {
 	if limit := maxReserve * toolOverheadMaxReservePercent / 100; tokens > limit {
 		tokens = limit
 	}
-	cw.toolOverhead = tokens
+	cw.toolOverhead.Store(int64(tokens))
 }
 
 // ContextWindowSize returns the model's advertised context-window size.

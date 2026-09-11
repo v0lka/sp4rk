@@ -191,6 +191,28 @@ func TestModelRegistry_AnthropicAdaptiveThinkingModelsRejectSampling(t *testing.
 			}
 		})
 	}
+
+	// Deliberate asymmetry, pinned so it reads as intentional rather than an
+	// oversight: the sampling-parameter removal is scoped to the
+	// adaptive-thinking models above (Claude Opus 4.7 and later, Claude
+	// Sonnet 5, and Claude Fable 5). The 4.5 generation still accepts the
+	// temperature parameter on its endpoints, so those entries must keep
+	// declaring Temperature: true — otherwise applyDefaultSampling would skip
+	// sampling presets for models that still honor them.
+	for _, model := range []string{"claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5"} {
+		t.Run(model, func(t *testing.T) {
+			meta, ok := registry.Resolve(context.Background(), model)
+			if !ok {
+				t.Fatalf("expected built-in catalog hit for %q", model)
+			}
+			if meta.Capabilities == nil {
+				t.Fatal("Capabilities = nil, want non-nil")
+			}
+			if !meta.Capabilities.Temperature {
+				t.Errorf("Capabilities.Temperature = false, want true: the 4.5 generation is outside the adaptive-thinking removal scope and still accepts the temperature parameter")
+			}
+		})
+	}
 }
 
 func TestModelRegistry_FallbackForUnknownModel(t *testing.T) {

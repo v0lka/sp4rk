@@ -26,11 +26,15 @@ type StageMetrics struct {
 // TelemetrySnapshot is an aggregate, content-free view of embedding work.
 // It contains no text, model paths, or caller-provided labels.
 type TelemetrySnapshot struct {
-	Stages         map[TelemetryStage]StageMetrics
-	Texts          int64
-	Tokens         int64
-	MinTokens      int
-	MaxTokens      int
+	Stages    map[TelemetryStage]StageMetrics
+	Texts     int64
+	Tokens    int64
+	MinTokens int
+	MaxTokens int
+	// InferenceCount counts ONNX inference ATTEMPTS, including ones that
+	// failed — it always equals Stages[StageONNXInference].Calls, so a
+	// derived average inference latency (Duration / InferenceCount) stays
+	// meaningful after transient failures.
 	InferenceCount int64
 	SessionCount   int64
 	BatchRows      int64

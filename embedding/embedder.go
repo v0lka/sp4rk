@@ -72,12 +72,16 @@ type EmbedderConfig struct {
 	// ahead, while ONNX execution remains serialized by the Embedder mutex.
 	// It is opt-in: false preserves the serial baseline until benchmarks show a
 	// throughput improvement above the documented noise threshold.
+	// It has no effect while EnableLengthBuckets is enabled — bucket mode
+	// tokenizes serially — and NewEmbedder logs a warning about that.
 	EnableBatchPipeline bool
 
 	// EnableLengthBuckets groups tokenized documents into the smallest fitting
 	// fixed sequence length (64, 128, 256, or MaxSeqLength) and lazily creates
 	// one persistent ONNX session per used bucket. It is opt-in: false preserves
-	// the fixed-MaxSeqLength baseline and its single batch session.
+	// the fixed-MaxSeqLength baseline and its single batch session. When also
+	// EnableBatchPipeline is set, the pipeline is inactive (bucket mode wins)
+	// and NewEmbedder logs a warning about that.
 	EnableLengthBuckets bool
 
 	// IntraOpThreads limits the number of ONNX Runtime intra-op threads used
@@ -244,6 +248,14 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
+	}
+
+	// The batch pipeline only engages in fixed mode; a host enabling both
+	// flags gets bucket mode with serial tokenization, which is easy to
+	// mistake for a pipeline that is silently underperforming — surface the
+	// interaction once instead.
+	if cfg.EnableBatchPipeline && cfg.EnableLengthBuckets {
+		logger.Warn("EnableBatchPipeline is ignored while EnableLengthBuckets is enabled; running in bucket mode")
 	}
 
 	// GPU providers keep per-thread state that must not be duplicated across

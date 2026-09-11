@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -32,6 +33,15 @@ Anti-example: do not construct or guess URLs from memory — only user-provided 
 // exceed the cap fail closed rather than silently truncating (which would
 // yield broken HTML/markdown).
 const maxWebFetchBodyBytes = 10 * 1024 * 1024 // 10 MB
+
+// Retry pacing: the delay before the first retry when the origin requested
+// none, doubled per subsequent retry, and the ceiling applied to both that
+// backoff and to any origin-requested Retry-After hint (so a hostile or
+// misconfigured header cannot stall the tool for minutes).
+const (
+	retryBackoffBase = 250 * time.Millisecond
+	maxRetryDelay    = 5 * time.Second
+)
 
 // WebFetchTool fetches web pages and converts HTML to markdown.
 type WebFetchTool struct {
@@ -297,12 +307,34 @@ func (t *WebFetchTool) Execute(ctx context.Context, input json.RawMessage) (tool
 // transient codes) from transport-level failures (always retried). The
 // message text is part of the tool's observable error contract.
 type httpStatusError struct {
-	code int
-	text string
+	code       int
+	text       string
+	retryAfter time.Duration // origin's Retry-After hint, 0 when absent or unparseable
 }
 
 func (e *httpStatusError) Error() string {
 	return fmt.Sprintf("HTTP %d: %s", e.code, e.text)
+}
+
+// parseRetryAfter parses a Retry-After header value — delay-seconds (an
+// integer) or an HTTP-date — into a duration relative to now. Absent,
+// malformed, or non-positive values return 0 (no requested delay).
+func parseRetryAfter(v string, now time.Time) time.Duration {
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(v); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		return time.Duration(secs) * time.Second
+	}
+	if ts, err := http.ParseTime(v); err == nil {
+		if d := ts.Sub(now); d > 0 {
+			return d
+		}
+	}
+	return 0
 }
 
 // bodyLimitError reports that the response body exceeded the fetch cap. The
@@ -376,15 +408,62 @@ func attemptTimeout(base time.Duration, attempt int) time.Duration {
 	return timeout
 }
 
+// retryDelay returns how long to wait before the retry attempt following the
+// failed attempt with the given index (0-based). An origin-requested delay
+// (Retry-After on a retryable status) takes precedence, bounded by
+// [maxRetryDelay] so a hostile or misconfigured header cannot stall the tool
+// for minutes; otherwise a short exponential backoff applies (250ms, 500ms,
+// 1s, …) so a rate-limited origin is not hit with an immediate request burst.
+func retryDelay(err error, attempt int) time.Duration {
+	var statusErr *httpStatusError
+	if errors.As(err, &statusErr) && statusErr.retryAfter > 0 {
+		return min(statusErr.retryAfter, maxRetryDelay)
+	}
+	shift := min(attempt, 8) // saturate; capped below anyway
+	if shift >= 63 {
+		return maxRetryDelay
+	}
+	return min(retryBackoffBase<<shift, maxRetryDelay)
+}
+
+// totalFetchBudget derives the wall-clock budget for the whole retry loop
+// from the base per-attempt timeout. The doubling per-attempt timeouts would
+// otherwise hold one tool call for base·(2^(retries+1)−1) against a
+// slow-dripping origin (e.g. Timeout 60s × Retries 5 ≈ 31 minutes) with no
+// signal to the caller beyond the hang. The budget covers the full doubling
+// schedule for up to three retries (2^(1+3)−1 = 15 ≤ 16) and saturates at
+// 16×base beyond that. A non-positive base means "no per-request timeout",
+// from which no budget can be derived; retries ≤ 0 means a single attempt
+// already bounded by the per-attempt timeout. Both return 0 (no budget).
+func totalFetchBudget(base time.Duration, retries int) time.Duration {
+	if base <= 0 || retries <= 0 {
+		return 0
+	}
+	shift := min(retries+1, 4)
+	if base > math.MaxInt64>>shift {
+		return math.MaxInt64
+	}
+	return base << shift
+}
+
 // fetchPage performs HTTP GET and returns the response body. A failed attempt
 // is retried up to limits.Retries times; each retry doubles the per-attempt
-// HTTP timeout (attempt 0 uses the base timeout). Only transient failures are
-// retried — see retryableFetchError — and a cancelled caller context stops
-// the loop immediately.
+// HTTP timeout (attempt 0 uses the base timeout), waits before re-issuing —
+// honoring a bounded Retry-After hint when the origin sent one, otherwise a
+// short exponential backoff — and the whole loop runs under a wall-clock
+// budget derived from the base timeout (see [totalFetchBudget]). Only
+// transient failures are retried — see retryableFetchError — and a cancelled
+// caller context stops the loop immediately.
 func (t *WebFetchTool) fetchPage(ctx context.Context, targetURL string) (string, error) {
 	maxAttempts := t.limits.Retries + 1
 	if maxAttempts < 1 {
 		maxAttempts = 1
+	}
+
+	if budget := totalFetchBudget(t.limits.Timeout, t.limits.Retries); budget > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, budget)
+		defer cancel()
 	}
 
 	for attempt := 0; ; attempt++ {
@@ -392,11 +471,19 @@ func (t *WebFetchTool) fetchPage(ctx context.Context, targetURL string) (string,
 		if err == nil {
 			return content, nil
 		}
-		// A done parent context means the caller cancelled or expired — that
-		// is not a transient fetch failure, so stop even when the last error
-		// itself looks retryable.
+		// A done parent context means the caller cancelled or the budget
+		// expired — that is not a transient fetch failure, so stop even when
+		// the last error itself looks retryable.
 		if ctx.Err() != nil || !retryableFetchError(err) || attempt+1 >= maxAttempts {
 			return "", err
+		}
+		delay := retryDelay(err, attempt)
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return "", err
+		case <-timer.C:
 		}
 	}
 }
@@ -431,7 +518,11 @@ func (t *WebFetchTool) fetchOnce(ctx context.Context, targetURL string, attempt 
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", &httpStatusError{code: resp.StatusCode, text: resp.Status}
+		return "", &httpStatusError{
+			code:       resp.StatusCode,
+			text:       resp.Status,
+			retryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
+		}
 	}
 
 	// Cap the response body to bound memory use; the centralized
