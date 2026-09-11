@@ -7,7 +7,12 @@ import (
 	"github.com/v0lka/sp4rk/tools"
 )
 
-const toolFinishDescription = `Signal task completion and deliver the final result. Call this tool exactly once, only after all work is done. Before calling finish, you MUST verify that every acceptance criterion from your task is satisfied — use tool calls to confirm, not assumptions. If any criterion is unmet, continue working instead of calling finish. The answer parameter should contain the complete result: findings, analysis, code summaries, or any deliverable relevant to the task. Include the specific deliverables requested by the task. Summarize key findings concisely.`
+const toolFinishDescription = `Purpose: signal task completion and deliver the final result to the user.
+Use when: all work is done and you have verified every acceptance criterion of your task with tool calls — not assumptions. Call this tool exactly once; if any criterion is unmet, keep working instead.
+Inputs: answer (the complete result: findings, analysis, code summaries, or any deliverable the task requested, summarized concisely).
+Outputs: signals completion; the answer string becomes the delivered result.
+Example: after tests pass and each criterion is confirmed, call finish with the full deliverable.
+Anti-example: not for progress updates, rhetorical messages, or intermediate notes — and never call it while a criterion is unmet or to ask the user a question (use ask_user).`
 
 // FinishTool is a special tool that signals task completion.
 type FinishTool struct{}
