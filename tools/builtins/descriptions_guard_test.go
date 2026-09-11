@@ -64,22 +64,25 @@ func TestBuiltinDescriptionsWithinGuardLimit(t *testing.T) {
 }
 
 // TestBuiltinDescriptionsFollowRubric guards the structural rubric: every
-// description must state its purpose and steer away from neighboring tools
-// (anti-example), which is what disambiguates conflicting tool pairs.
+// description must carry all six labels — purpose -> when-to-use -> inputs ->
+// outputs -> example -> anti-example — each starting its own line, so that
+// line-based markdown reformatters and host UIs can split the description into
+// bold-labelled paragraphs. The purpose/anti-example pair is what disambiguates
+// conflicting tool pairs.
 func TestBuiltinDescriptionsFollowRubric(t *testing.T) {
+	rubricSections := []string{"Purpose:", "Use when:", "Inputs:", "Outputs:", "Example:", "Anti-example:"}
 	for _, tool := range builtinTools(t) {
 		desc := tool.Description()
-		if !strings.Contains(desc, "Purpose:") {
-			t.Errorf("tool %s: description lacks a 'Purpose:' section", tool.Name())
-		}
-		if !strings.Contains(desc, "Use when:") {
-			t.Errorf("tool %s: description lacks a 'Use when:' section", tool.Name())
-		}
-		if !strings.Contains(desc, "Inputs:") {
-			t.Errorf("tool %s: description lacks an 'Inputs:' section", tool.Name())
-		}
-		if !strings.Contains(desc, "Anti-example:") {
-			t.Errorf("tool %s: description lacks an 'Anti-example:' section", tool.Name())
+		for _, section := range rubricSections {
+			if !strings.Contains(desc, section) {
+				t.Errorf("tool %s: description lacks a %q section", tool.Name(), section)
+			}
+			// Every rubric section must begin its own line, otherwise a
+			// line-based markdown reformatter cannot split it into
+			// bold-labelled paragraphs.
+			if !strings.Contains(desc, "\n"+section) && !strings.HasPrefix(desc, section) {
+				t.Errorf("tool %s: %q does not start a line — the markdown reformatter needs one label per line", tool.Name(), section)
+			}
 		}
 	}
 }
