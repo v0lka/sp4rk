@@ -100,12 +100,20 @@ type envBindings struct {
 // cannot be parsed (the caller then falls back to environment-only
 // resolution).
 func collectCommandEnvBindings(command string) *envBindings {
+	return collectCommandEnvBindingsAssess(command, newSubstAssessor())
+}
+
+// collectCommandEnvBindingsAssess is [collectCommandEnvBindings] sharing a
+// command-substitution assessor with the caller, so nested assessments
+// triggered while resolving this command's substitutions reuse the caller's
+// memoized verdicts (see [substAssessor]).
+func collectCommandEnvBindingsAssess(command string, a *substAssessor) *envBindings {
 	parser := syntax.NewParser()
 	file, err := parser.Parse(strings.NewReader(command), "")
 	if err != nil {
 		return nil
 	}
-	return collectShellEnvBindings(file)
+	return collectShellEnvBindingsAssess(file, a)
 }
 
 // collectShellEnvBindings walks a parsed bash AST and summarizes the variable
@@ -129,6 +137,13 @@ func collectCommandEnvBindings(command string) *envBindings {
 // possible, so a subshell or dead-branch binding can never mask the unset or
 // environment value in effect at a reference).
 func collectShellEnvBindings(file *syntax.File) *envBindings {
+	return collectShellEnvBindingsAssess(file, newSubstAssessor())
+}
+
+// collectShellEnvBindingsAssess is [collectShellEnvBindings] resolving the
+// recorded command substitutions through the given assessor, so a nested
+// assessment shares the caller's memoization and depth accounting.
+func collectShellEnvBindingsAssess(file *syntax.File, a *substAssessor) *envBindings {
 	b := &envBindings{
 		values:             make(map[string][]string),
 		dynamic:            make(map[string]bool),
@@ -177,7 +192,7 @@ func collectShellEnvBindings(file *syntax.File) *envBindings {
 		return true
 	})
 	// Phase 3: resolve the tentatively-recorded command substitutions.
-	b.resolveCmdSubst()
+	b.resolveCmdSubst(a)
 	return b
 }
 
@@ -603,7 +618,7 @@ func (b *envBindings) walkCallExpr(n *syntax.CallExpr) {
 					b.opaque = true
 					break
 				}
-				b.merge(inner)
+				b.mergeChildProcess(inner)
 				break
 			}
 			if strings.HasPrefix(lit, "-") {
@@ -863,7 +878,7 @@ func (b *envBindings) walkStmtStdinScript(s *syntax.Stmt) {
 			b.opaque = true // unparseable stdin script — fail closed
 			return
 		}
-		b.merge(inner)
+		b.mergeChildProcess(inner)
 		return
 	}
 }
@@ -955,7 +970,7 @@ func (b *envBindings) walkShellDash(args []*syntax.Word, rest int, cmd string) {
 				b.opaque = true // unparseable nested script — fail closed
 				return
 			}
-			b.merge(inner)
+			b.mergeChildProcess(inner)
 			// Words after the script become the child's POSITIONAL
 			// parameters ("bash -c '…' _ /e tc/passwd"): the script's "$1"
 			// references then hold statically unknown values.
@@ -1032,13 +1047,18 @@ func splitAssignWord(lit string) (name, value string, ok bool) {
 	return name, lit[eq+1:], true
 }
 
-// merge folds another binding summary (from a nested "bash -c '…'" parse)
-// into this one: opaque, dynamic and resolved command-substitution markings
-// union, literal values and tentatively-recorded substitution inners append
-// without duplicates.
+// merge folds another binding summary (from a SAME-SHELL nested parse, i.e. a
+// trap handler) into this one: opaque, dynamic, the positional-rebinding flag
+// and resolved command-substitution markings union, literal values and
+// tentatively-recorded substitution inners append without duplicates. A
+// CHILD-process script must use mergeChildProcess instead (a child cannot
+// rebind the caller).
 func (b *envBindings) merge(o *envBindings) {
 	if o.opaque {
 		b.opaque = true
+	}
+	if o.positionalRebound {
+		b.positionalRebound = true
 	}
 	for name := range o.dynamic {
 		b.dynamic[name] = true
@@ -1068,20 +1088,50 @@ func (b *envBindings) merge(o *envBindings) {
 	}
 }
 
+// mergeChildProcess folds a CHILD-process script's bindings (a "bash -c …"
+// script, a stdin/here-string script, or an "env -S …" script) into the
+// parent walk. A child interpreter runs in its own process and CANNOT rebind
+// the caller's variables, so only the over-approximating flags cross the
+// boundary: an opaque child, a name the child binds dynamically, and a child
+// that rebinds positionals (set --/shift) all still mark the caller's summary
+// the same way (fail-closed). Nothing that would make an outer reference
+// ASSESSABLE is copied — copying the child's literal values or substitution
+// bindings (cmdSubst/approvedSubstNodes) would let a later "$NAME" in the
+// CALLER be treated as known (and the unexpandable verdict masked) for a name
+// the caller never bound, defeating the symlink gate's suspicion escalation.
+// positionalRebound is copied because the child script's OWN "$1"/"$@"
+// references are surfaced by the outer positional scan, which reads this flag.
+// Same-shell merges (a trap handler) keep the full [envBindings.merge].
+func (b *envBindings) mergeChildProcess(o *envBindings) {
+	if o == nil {
+		return
+	}
+	if o.opaque {
+		b.opaque = true
+	}
+	if o.positionalRebound {
+		b.positionalRebound = true
+	}
+	for name := range o.dynamic {
+		b.dynamic[name] = true
+	}
+}
+
 // resolveCmdSubst is the post-walk resolution pass over the tentatively-
 // recorded command substitutions. A name is promoted to [envBindings.cmdSubst]
 // — so a reference to it is NOT unassessable, while it stays unresolvable
 // because its value is the substitution's output — only when EVERY recorded
-// inner is an assessable substitution ([commandSubstitutionAssessable]) and
-// the name carries neither a literal value nor any other dynamic binding. Any
-// other shape falls back to dynamic[name]: the fail-closed union means a
-// single literal, non-assessable or differently-shaped binding poisons the
-// whole name.
-func (b *envBindings) resolveCmdSubst() {
+// inner is an assessable substitution ([substAssessor.assess]) and the name
+// carries neither a literal value nor any other dynamic binding. Any other
+// shape falls back to dynamic[name]: the fail-closed union means a single
+// literal, non-assessable or differently-shaped binding poisons the whole
+// name. The assessor memoizes nested verdicts and depth-caps the recursion
+// (see [substAssessor]).
+func (b *envBindings) resolveCmdSubst(a *substAssessor) {
 	for name, inners := range b.cmdSubstInners {
 		assessable := len(inners) > 0
 		for _, inner := range inners {
-			if !commandSubstitutionAssessable(inner) {
+			if !a.assess(inner) {
 				assessable = false
 				break
 			}
@@ -1101,6 +1151,69 @@ func (b *envBindings) resolveCmdSubst() {
 	}
 }
 
+// maxSubstNestingDepth bounds how deeply a command-substitution assessment
+// may recurse into further nested substitutions. Realistic validated
+// substitutions ("X=$(cat path)" and a few levels of composition) nest far
+// shallower; deeper nesting is either adversarial — a prompt injection aiming
+// to burn CPU in the pre-confirmation judge — or malformed, and failing
+// closed beyond the cap simply falls back to the dynamic/HARD escalation
+// path. Together with memoization the cap keeps the worst-case analysis cost
+// polynomial in the input size (without it, every nesting level re-descends
+// through three full re-analyses, ~3^depth in total).
+const maxSubstNestingDepth = 8
+
+// maxSubstAssessorCalls bounds the TOTAL number of inner-command analyses a
+// single assessor performs. The depth cap alone is not enough: a deep nesting
+// chain re-descends the same analysis from several entry points, and each
+// analysis re-parses/re-prints an O(input) inner, so adversarial,
+// size-unbounded model input could still reach super-linear work before the
+// confirmation gate. Once the budget is exhausted the assessor fails closed
+// (dynamic/HARD escalation); realistic substitutions use a handful of calls.
+const maxSubstAssessorCalls = 256
+
+// substAssessor memoizes command-substitution assessability verdicts within
+// one top-level analysis pass, tracks the current recursion depth, and bounds
+// the total work via [maxSubstAssessorCalls]. The verdict for an inner command
+// text is a pure function of that text, so a nested re-assessment of an inner
+// already seen at another nesting level reuses the recorded verdict instead of
+// re-running the full pipeline (parse → binding walk → word walk →
+// UnresolvablePathTokens), which would otherwise recurse exponentially in the
+// nesting depth.
+type substAssessor struct {
+	memo  map[string]bool
+	depth int
+	calls int
+}
+
+func newSubstAssessor() *substAssessor {
+	return &substAssessor{memo: make(map[string]bool)}
+}
+
+// assess reports whether the command substitution whose inner command text
+// is inner yields a value the walker may treat as assessable, memoizing the
+// verdict per top-level analysis and failing closed beyond
+// [maxSubstNestingDepth] or once [maxSubstAssessorCalls] analyses have run. A
+// depth-capped (or budget-capped) verdict is deliberately NOT memoized: it
+// depends on the recursion depth / remaining budget, not only on the inner
+// text.
+func (a *substAssessor) assess(inner string) bool {
+	if verdict, ok := a.memo[inner]; ok {
+		return verdict
+	}
+	if a.depth >= maxSubstNestingDepth {
+		return false // fail closed on pathological nesting
+	}
+	if a.calls >= maxSubstAssessorCalls {
+		return false // fail closed once the analysis budget is exhausted
+	}
+	a.calls++
+	a.depth++
+	verdict := a.assessInner(inner)
+	a.depth--
+	a.memo[inner] = verdict
+	return verdict
+}
+
 // commandSubstitutionAssessable reports whether the command substitution whose
 // inner command text is inner yields a value the walker may treat as
 // assessable — i.e. the substitution cannot smuggle in an out-of-root path no
@@ -1108,56 +1221,99 @@ func (b *envBindings) resolveCmdSubst() {
 // contain no opaque construct and no dynamic binding, every one of its words
 // must be statically assessable ([innerWordAssessable]), and it must add no
 // unresolvable path tokens of its own
-// ([UnresolvablePathTokens](inner, ShellBash)).
+// ([UnresolvablePathTokens](inner, ShellBash)). It starts a fresh memoized
+// pass; callers inside an ongoing analysis share their assessor via
+// [collectShellEnvBindingsAssess] and [innerWordAssessable] instead.
 func commandSubstitutionAssessable(inner string) bool {
+	return newSubstAssessor().assess(inner)
+}
+
+// assessInner is the body of [substAssessor.assess] and must only be called
+// through it (depth accounting and memoization happen in assess).
+func (a *substAssessor) assessInner(inner string) bool {
 	parser := syntax.NewParser()
 	file, err := parser.Parse(strings.NewReader(inner), "")
 	if err != nil {
 		return false
 	}
-	b := collectShellEnvBindings(file)
+	b := collectShellEnvBindingsAssess(file, a)
 	if b == nil || b.opaque || len(b.dynamic) > 0 {
 		return false
 	}
 	assessable := true
 	syntax.Walk(file, func(node syntax.Node) bool {
-		if w, ok := node.(*syntax.Word); ok && !innerWordAssessable(w, b) {
+		w, ok := node.(*syntax.Word)
+		if !ok {
+			return true
+		}
+		if !innerWordAssessable(w, b, a) {
 			assessable = false
+		}
+		// A word that is exactly one command substitution was already fully
+		// assessed by innerWordAssessable → a.assess(inner), which parses and
+		// walks the substituted text itself. Descending into the subtree would
+		// re-print and re-assess every nested substitution word at every
+		// nesting level — quadratic work (dominated by the AST printer) on
+		// adversarial input. Prune it.
+		if _, ok := pureCommandSubstNode(w); ok {
+			return false
 		}
 		return true
 	})
 	if !assessable {
 		return false
 	}
-	return len(UnresolvablePathTokens(inner, ShellBash)) == 0
+	return len(unresolvablePathTokens(inner, ShellBash, a)) == 0
 }
 
 // innerWordAssessable reports whether a word appearing inside a command
 // substitution is statically assessable: literal fragments are; a word that is
 // exactly one command substitution is assessable iff that substitution itself
-// is (recursion — see [commandSubstitutionAssessable]); and a plain
+// is (recursion — through the shared [substAssessor]); and a plain
 // "$NAME"/"${NAME}" reference is assessable when NAME is bound solely by an
 // assessable substitution ([envBindings.cmdSubst]). A reference to an unbound
 // or otherwise rebound name, a parameter-expansion modifier, an arithmetic or
-// process substitution, globbing, an ANSI-C/locale quote, or any composition
-// with such a part makes the word unassessable (fail closed).
-func innerWordAssessable(w *syntax.Word, b *envBindings) bool {
+// process substitution, globbing, brace expansion, tilde expansion, an
+// ANSI-C/locale quote, or any composition with such a part makes the word
+// unassessable (fail closed).
+func innerWordAssessable(w *syntax.Word, b *envBindings, a *substAssessor) bool {
 	if w == nil {
 		return true
 	}
 	if inner, ok := pureCommandSubst(w); ok {
-		return commandSubstitutionAssessable(inner)
+		return a.assess(inner)
 	}
-	return innerPartsAssessable(w.Parts, b)
+	// A leading, unquoted "~" is tilde-expanded by the shell (to $HOME or a
+	// user's home), so the literal fragment is not the word's runtime value.
+	if len(w.Parts) > 0 {
+		if lit, ok := w.Parts[0].(*syntax.Lit); ok && strings.HasPrefix(lit.Value, "~") {
+			return false
+		}
+	}
+	return innerPartsAssessable(w.Parts, b, a)
 }
 
 // innerPartsAssessable is the WordPart-level companion to
 // [innerWordAssessable].
-func innerPartsAssessable(parts []syntax.WordPart, b *envBindings) bool {
+func innerPartsAssessable(parts []syntax.WordPart, b *envBindings, a *substAssessor) bool {
+	return innerPartsAssessableCtx(parts, b, a, false)
+}
+
+// innerPartsAssessableCtx is innerPartsAssessable's recursive core. quoted is
+// true while descending into a double-quoted region, where pathname globbing
+// and brace expansion do NOT occur — a literal fragment there stays literal.
+func innerPartsAssessableCtx(parts []syntax.WordPart, b *envBindings, a *substAssessor, quoted bool) bool {
 	for _, part := range parts {
 		switch p := part.(type) {
 		case *syntax.Lit:
-			// Purely literal fragment.
+			// Purely literal fragment — unless (outside double quotes) it
+			// carries a shell expansion the parser folds into the literal
+			// text: pathname globbing (* ? [ ]) or brace expansion ({ }),
+			// which the shell replaces with the matched paths / alternatives
+			// at runtime.
+			if !quoted && innerLitExpands(p.Value) {
+				return false
+			}
 		case *syntax.SglQuoted:
 			// ANSI-C $'…' decodes escapes at runtime; the raw value is not the
 			// expanded one.
@@ -1166,8 +1322,9 @@ func innerPartsAssessable(parts []syntax.WordPart, b *envBindings) bool {
 			}
 		case *syntax.DblQuoted:
 			// $"…" is locale-translated at runtime; the plain "…" form is
-			// assessable only if its inner parts are.
-			if p.Dollar || !innerPartsAssessable(p.Parts, b) {
+			// assessable only if its inner parts are. Its inner parts are a
+			// quoted context (no glob/brace expansion).
+			if p.Dollar || !innerPartsAssessableCtx(p.Parts, b, a, true) {
 				return false
 			}
 		case *syntax.ParamExp:
@@ -1184,6 +1341,16 @@ func innerPartsAssessable(parts []syntax.WordPart, b *envBindings) bool {
 		}
 	}
 	return true
+}
+
+// innerLitExpands reports whether an unquoted literal fragment is transformed
+// by the shell at runtime beyond its own text: pathname globbing (* ? [ ]) and
+// brace expansion ({ }). Tilde expansion is positional (a leading "~" only), so
+// it is handled at the word level by innerWordAssessable. An escaped metachar
+// (e.g. "\*") still trips this check — an over-conservative (fail-closed)
+// verdict, which is the safe direction.
+func innerLitExpands(value string) bool {
+	return strings.ContainsAny(value, "*?[]{}")
 }
 
 // pureCommandSubst reports whether w is exactly one command substitution —
@@ -1624,10 +1791,29 @@ func (b *envBindings) composeSelfReferenceCandidates(name string, w *syntax.Word
 }
 
 func wordPartsHaveDynamicPart(parts []syntax.WordPart) bool {
+	return wordPartsHaveDynamicPartInner(parts, false)
+}
+
+// wordPartsHaveDynamicPartInner is wordPartsHaveDynamicPart's recursive core.
+// quoted is true while descending into a double-quoted region, where pathname
+// globbing, brace expansion and tilde expansion do NOT occur — a literal
+// fragment there stays literal.
+func wordPartsHaveDynamicPartInner(parts []syntax.WordPart, quoted bool) bool {
+	// A leading, unquoted "~" is tilde-expanded by the shell.
+	if !quoted && len(parts) > 0 {
+		if lit, ok := parts[0].(*syntax.Lit); ok && strings.HasPrefix(lit.Value, "~") {
+			return true
+		}
+	}
 	for _, part := range parts {
 		switch p := part.(type) {
 		case *syntax.Lit:
-			// Purely literal fragment.
+			// Purely literal fragment — unless (outside double quotes) it
+			// carries pathname globbing or brace expansion, which the shell
+			// performs at runtime.
+			if !quoted && innerLitExpands(p.Value) {
+				return true
+			}
 		case *syntax.SglQuoted:
 			// ANSI-C $'…' quoting decodes escape sequences (\xHH, \nnn, \e,
 			// …) at RUNTIME, so the parser's raw Value is not the value the
@@ -1638,7 +1824,7 @@ func wordPartsHaveDynamicPart(parts []syntax.WordPart) bool {
 		case *syntax.DblQuoted:
 			// $"…" is locale-translated at runtime; the plain "…" form is
 			// static only if its inner parts are.
-			if p.Dollar || wordPartsHaveDynamicPart(p.Parts) {
+			if p.Dollar || wordPartsHaveDynamicPartInner(p.Parts, true) {
 				return true
 			}
 		default:

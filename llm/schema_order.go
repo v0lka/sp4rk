@@ -18,6 +18,12 @@ import (
 // On any inconsistency between vals and raw the function falls back to a plain
 // alphabetical marshal, so sanitization never fails because of ordering.
 func marshalPreservingKeyOrder(raw json.RawMessage, vals map[string]any) json.RawMessage {
+	if vals == nil {
+		// A nil schema marshals to "null" (json.Marshal of a nil map); the
+		// ordered writer would otherwise emit "{}" and silently change the
+		// value. Preserve json.Marshal's behavior for this degenerate input.
+		return json.RawMessage("null")
+	}
 	order, err := parseJSONKeyOrder(raw)
 	if err != nil {
 		return marshalAlphabetical(vals)
@@ -126,13 +132,20 @@ func writeOrderedJSON(buf *bytes.Buffer, val any, orig *orderNode) error {
 }
 
 // writeOrderedObject writes m with members ordered as in orig; members not
-// present in orig are appended in alphabetical order for determinism.
+// present in orig are appended in alphabetical order for determinism. A member
+// duplicated in the source document is emitted exactly once: Go's decoder (like
+// every mainstream JSON parser) accepts duplicate members with last-wins
+// semantics, so m already carries the merged value; emitting it twice would
+// produce ambiguous JSON that strict schema validators may reject outright.
 func writeOrderedObject(buf *bytes.Buffer, m map[string]any, orig *orderNode) error {
 	buf.WriteByte('{')
 	first := true
 	written := make(map[string]struct{}, len(m))
 	if orig != nil && orig.isObj {
 		for _, kv := range orig.kv {
+			if _, dup := written[kv.key]; dup {
+				continue // duplicate member in the source document; emit once
+			}
 			v, ok := m[kv.key]
 			if !ok {
 				continue

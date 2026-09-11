@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 
 	sdkagent "github.com/v0lka/sp4rk/agent"
@@ -2303,5 +2304,52 @@ func TestCompactTrackerOverwrittenByNextCorrection(t *testing.T) {
 	cw.CorrectTokenCount(1234)
 	if got := tracker.EstimateTotal(); got != 1234 {
 		t.Errorf("EstimateTotal after API correction = %d, want 1234", got)
+	}
+}
+
+// TestContextWindow_ToolOverheadConcurrentAccess pins the concurrency safety
+// of SetToolOverhead: the executor calls it at the start of EVERY Run (not
+// only during host setup), while a host may read fill metrics from another
+// goroutine — EffectiveMax/FillPercent/AvailableTokens readers must never
+// race the reserve write (run under -race in CI).
+func TestContextWindow_ToolOverheadConcurrentAccess(t *testing.T) {
+	counter := llm.NewSimpleTokenCounter()
+	tracker := llm.NewContextTokenTracker(counter)
+	cw := NewContextWindow(ContextWindowConfig{
+		SystemPrompt: "You are helpful.",
+		ModelMeta:    testModelMeta(128000),
+		Tracker:      tracker,
+		Thresholds:   testThresholds(),
+		Strategy:     NewSlidingWindowStrategy(5, 5),
+	})
+	cw.SetTask("concurrent overhead test")
+
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range 200 {
+				cw.SetToolOverhead(i % 1000)
+			}
+		}()
+	}
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 200 {
+				_ = cw.EffectiveMax()
+				_ = cw.FillPercent()
+				_ = cw.AvailableTokens()
+			}
+		}()
+	}
+	wg.Wait()
+
+	// The final reserve must still be observable and clamped sanely.
+	cw.SetToolOverhead(1 << 30)
+	if got := cw.toolOverhead.Load(); got <= 0 || got > 1<<30 {
+		t.Errorf("stored toolOverhead = %d, want a positive clamped reserve", got)
 	}
 }

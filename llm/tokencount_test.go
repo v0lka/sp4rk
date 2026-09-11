@@ -2,6 +2,8 @@ package llm
 
 import (
 	"encoding/json"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -60,10 +62,37 @@ func TestEstimateToolDefinitions(t *testing.T) {
 			},
 		}
 		// name "read_file"=9 chars -> 3; description "reads a file"=12 -> 3;
-		// schema `{"type":"object"}`=17 -> 5; overhead 20 => 31.
-		want := 3 + 3 + 5 + estimatedTokensPerToolOverhead
+		// schema counted from its sanitized form (`{"type":"object"}` gains
+		// additionalProperties:false on the wire); overhead 20.
+		sanitized := SanitizeSchemaForOpenAINonStrict(defs[0].InputSchema)
+		want := 3 + 3 + (len(sanitized)+estimatedTokensPerChar-1)/estimatedTokensPerChar + estimatedTokensPerToolOverhead
 		if got := EstimateToolDefinitions(defs); got != want {
 			t.Errorf("EstimateToolDefinitions(single) = %d, want %d", got, want)
+		}
+	})
+
+	t.Run("estimates $ref-heavy schemas from the sanitized form", func(t *testing.T) {
+		// A schema referencing one shared definition from many places is
+		// small raw ($defs carried once) but much larger on the wire, where
+		// sanitization inlines every $ref. The estimate must follow the
+		// sanitized size — otherwise the budget under-reserves for exactly
+		// the schemas that inflate most.
+		shared := `{"type":"string","description":"` + strings.Repeat("v", 96) + `"}`
+		refs := make([]string, 20)
+		for i := range refs {
+			refs[i] = `"p` + strconv.Itoa(i) + `":{"$ref":"#/$defs/shared"}`
+		}
+		schema := `{"type":"object","properties":{` + strings.Join(refs, ",") + `},"$defs":{"shared":` + shared + `}}`
+		defs := []ToolDefinition{{Name: "ref_heavy", InputSchema: json.RawMessage(schema)}}
+
+		got := EstimateToolDefinitions(defs)
+		// What the pre-sanitized-estimate behavior would have reserved:
+		// name + raw schema bytes + framing, with no description.
+		rawFormula := (len(schema)+estimatedTokensPerChar-1)/estimatedTokensPerChar +
+			(len("ref_heavy")+estimatedTokensPerChar-1)/estimatedTokensPerChar +
+			estimatedTokensPerToolOverhead
+		if got <= rawFormula {
+			t.Errorf("EstimateToolDefinitions($ref-heavy) = %d, want > raw-length formula %d (sanitized schema inlines every $ref)", got, rawFormula)
 		}
 	})
 

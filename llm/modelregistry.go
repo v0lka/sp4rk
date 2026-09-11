@@ -1282,6 +1282,15 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			Family:        "anthropic",
 			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
 		},
+		// Deliberate sampling asymmetry: the adaptive-thinking models above
+		// (Claude Opus 4.7 and later, Claude Sonnet 5, and Claude Fable 5)
+		// reject the temperature/top_p/top_k parameters, while the 4.6 and
+		// 4.5 generations below still accept them. The removal was scoped to
+		// exactly those adaptive-thinking models, so these entries keep
+		// Temperature: true on purpose — dropping it would silently disable
+		// sampling presets for endpoints that still honor them.
+		// TestModelRegistry_AnthropicAdaptiveThinkingModelsRejectSampling pins
+		// both directions of this asymmetry.
 		"claude-opus-4-6": {
 			ContextWindow: 1000000,
 			OutputLimit:   128000,

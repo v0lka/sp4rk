@@ -269,6 +269,14 @@ func isPathBearingParamExpansion(tok string) bool {
 //     NOT reported: [resolveEnvToken] assesses it (unioning the empty
 //     expansion).
 func UnresolvablePathTokens(command string, shell ShellKind) []string {
+	return unresolvablePathTokens(command, shell, newSubstAssessor())
+}
+
+// unresolvablePathTokens is [UnresolvablePathTokens] sharing a
+// command-substitution assessor with the caller, so nested assessments
+// triggered while analyzing this command's bindings reuse the caller's
+// memoized verdicts and depth accounting (see [substAssessor]).
+func unresolvablePathTokens(command string, shell ShellKind, a *substAssessor) []string {
 	re := unresolvableTokenRe[shell]
 	if re == nil {
 		return nil
@@ -306,7 +314,7 @@ func UnresolvablePathTokens(command string, shell ShellKind) []string {
 		out = append(out, tok)
 	}
 	if shell == ShellBash {
-		out = appendUnassessableVarTokens(command, seen, out)
+		out = appendUnassessableVarTokens(command, seen, out, a)
 	}
 	return out
 }
@@ -326,8 +334,8 @@ func UnresolvablePathTokens(command string, shell ShellKind) []string {
 // contains no dynamic or opaque rebinding at all, nothing else is appended
 // — plain literal bindings and environment-only names stay assessable
 // through [resolveEnvToken].
-func appendUnassessableVarTokens(command string, seen map[string]struct{}, out []string) []string {
-	bindings := collectCommandEnvBindings(command)
+func appendUnassessableVarTokens(command string, seen map[string]struct{}, out []string, a *substAssessor) []string {
+	bindings := collectCommandEnvBindingsAssess(command, a)
 	// Positional parameters are never statically assessable: their values
 	// come from the invocation context or an in-command "set --"/"shift"
 	// rebind. A reference carrying a PATH SUFFIX ("cat \"$1/etc/passwd\"")

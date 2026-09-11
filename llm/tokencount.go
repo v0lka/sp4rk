@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -40,17 +41,35 @@ const estimatedTokensPerToolOverhead = 20
 // reserve this overhead out of the context budget to avoid under-estimating
 // wire usage against local/self-hosted engines whose KV cache overflows on the
 // true request size.
+//
+// The schema contribution is measured on the sanitized form, not the raw
+// definition: providers receive SanitizeSchemaForOpenAI[NonStrict] /
+// SanitizeSchemaForAnthropic output, which inlines every $ref against $defs
+// (and, in strict mode, adds required/additionalProperties). A $ref-heavy raw
+// schema — the kind structured MCP tool catalogs emit — can be an order of
+// magnitude larger on the wire than raw, so measuring raw bytes would
+// under-reserve the budget for exactly the schemas that inflate most.
 func EstimateToolDefinitions(defs []ToolDefinition) int {
 	total := 0
 	for _, d := range defs {
 		total += (len(d.Name) + estimatedTokensPerChar - 1) / estimatedTokensPerChar
 		total += (len(d.Description) + estimatedTokensPerChar - 1) / estimatedTokensPerChar
-		if len(d.InputSchema) > 0 {
-			total += (len(d.InputSchema) + estimatedTokensPerChar - 1) / estimatedTokensPerChar
-		}
+		total += sanitizedSchemaTokenEstimate(d.InputSchema)
 		total += estimatedTokensPerToolOverhead
 	}
 	return total
+}
+
+// sanitizedSchemaTokenEstimate estimates the token cost of one tool input
+// schema as it travels on the wire, using the sanitized non-strict OpenAI form
+// as the representative payload. The strict and Anthropic sanitizations differ
+// only by small required/additionalProperties additions, which the fixed
+// per-tool framing allowance (estimatedTokensPerToolOverhead) already covers.
+// An empty schema contributes nothing, and an unparseable schema falls back to
+// its raw byte length (the sanitizer returns the input unchanged on failure).
+func sanitizedSchemaTokenEstimate(raw json.RawMessage) int {
+	n := len(SanitizeSchemaForOpenAINonStrict(raw))
+	return (n + estimatedTokensPerChar - 1) / estimatedTokensPerChar // ceiling division
 }
 
 // estimatedTokensPerChar is the approximate ratio of characters to tokens
