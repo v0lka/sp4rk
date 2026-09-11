@@ -391,7 +391,7 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 			sess, err = newSess()
 			if err != nil {
 				cleanup(sessOpts)
-				return nil, fmt.Errorf("creating persistent ONNX session after CUDA→CPU fallback (original CUDA error: %w): %w", cudaSessErr, err)
+				return nil, fmt.Errorf("creating persistent ONNX session after CUDA->CPU fallback (original CUDA error: %w): %w", cudaSessErr, err)
 			}
 		}
 	}
@@ -436,7 +436,7 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 // on: ExecutionProviderCPU ("cpu") or ExecutionProviderCUDA ("cuda"). The
 // "auto" request is resolved inside NewEmbedder, so this never returns "auto";
 // comparing the return value against the requested one is how callers detect
-// a silent CUDA→CPU slide — including the zero-value embedder, which reports
+// a silent CUDA->CPU slide — including the zero-value embedder, which reports
 // "cpu" (the legacy default).
 func (e *Embedder) ExecutionProvider() string {
 	if e.executionProvider == "" {
