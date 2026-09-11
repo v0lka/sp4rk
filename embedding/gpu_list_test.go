@@ -1,6 +1,7 @@
 package embedding
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -139,7 +140,7 @@ func TestListGPUDevices_AbsentNvidiaSmi(t *testing.T) {
 	)
 	go func() {
 		defer close(done)
-		devices, err = ListGPUDevices()
+		devices, err = ListGPUDevices(context.Background())
 	}()
 
 	select {
@@ -162,7 +163,7 @@ func TestListGPUDevices_AbsentNvidiaSmi(t *testing.T) {
 // context cap must bound the call.
 func TestListGPUDevices_LocalCallRunsUnblocked(t *testing.T) {
 	start := time.Now()
-	devices, err := ListGPUDevices()
+	devices, err := ListGPUDevices(t.Context())
 	elapsed := time.Since(start)
 
 	if elapsed > gpuProbeTimeout+5*time.Second {
@@ -191,4 +192,68 @@ func devicesEqual(a, b []GPUDevice) bool {
 		}
 	}
 	return true
+}
+
+// TestListGPUDevices_CanceledContext pins the cancellation contract: on a
+// machine with nvidia-smi, a pre-canceled context must surface as an error —
+// never a silent (nil, nil) "no GPUs" answer — and must not hang. Skipped
+// where nvidia-smi is absent because the fast path returns before ctx is
+// ever consulted, so there is nothing to cancel.
+func TestListGPUDevices_CanceledContext(t *testing.T) {
+	if _, ok := nvidiaSmiPath(); !ok {
+		t.Skip("nvidia-smi not found; cancellation path unreachable (absent-tool fast path ignores ctx)")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	done := make(chan struct{})
+	var (
+		devices []GPUDevice
+		err     error
+	)
+	go func() {
+		defer close(done)
+		devices, err = ListGPUDevices(ctx)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("ListGPUDevices hung on a pre-canceled context")
+	}
+
+	if err == nil {
+		t.Errorf("ListGPUDevices(canceled ctx) = (%v, nil), want an error; cancellation must not silently report an empty GPU list", devices)
+	}
+	if devices != nil {
+		t.Errorf("ListGPUDevices(canceled ctx) = %v, want nil", devices)
+	}
+}
+
+// TestListGPUDevices_ShortCallerDeadline verifies budget composition: a
+// caller deadline earlier than the internal 2s cap wins. The call must
+// complete well inside the internal cap and the expiry must surface as an
+// error — min(caller deadline, gpuProbeTimeout) is what bounds the probe.
+func TestListGPUDevices_ShortCallerDeadline(t *testing.T) {
+	if _, ok := nvidiaSmiPath(); !ok {
+		t.Skip("nvidia-smi not found; cancellation path unreachable (absent-tool fast path ignores ctx)")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	devices, err := ListGPUDevices(ctx)
+	elapsed := time.Since(start)
+
+	if elapsed > time.Second {
+		t.Errorf("ListGPUDevices took %v with a 1ms caller deadline; min(caller, 2s) budget not respected", elapsed)
+	}
+	if err == nil {
+		t.Errorf("ListGPUDevices(1ms deadline) = (%v, nil), want an error; an expired context must surface as an error", devices)
+	}
+	if devices != nil {
+		t.Errorf("ListGPUDevices(1ms deadline) = %v, want nil", devices)
+	}
 }

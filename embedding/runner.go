@@ -1,7 +1,6 @@
 package embedding
 
 import (
-	"fmt"
 	"runtime"
 )
 
@@ -44,10 +43,11 @@ func newORTRunner() *ortRunner {
 // do runs fn on the runner's thread and returns once fn has completed.
 //
 // A panic inside fn is recovered on the runner's thread and re-raised on the
-// caller's, wrapped with a marker. Letting it escape would kill the runner
-// goroutine and leave every later do blocked forever on a channel nobody
-// reads; re-raising keeps the failure visible to the caller's own recover
-// (the desktop app wraps embedder work in one) while the runner survives.
+// caller's, UNCHANGED: the caller's recover() sees the original panic value
+// with its original type. Letting it escape would kill the runner goroutine
+// and leave every later do blocked forever on a channel nobody reads;
+// re-raising keeps the failure visible to the caller's own recover (the
+// desktop app wraps embedder work in one) while the runner survives.
 func (r *ortRunner) do(fn func()) {
 	done := make(chan any, 1)
 	r.jobs <- func() {
@@ -55,7 +55,7 @@ func (r *ortRunner) do(fn func()) {
 		fn()
 	}
 	if p := <-done; p != nil {
-		panic(fmt.Sprintf("ONNX runner thread: %v", p))
+		panic(p)
 	}
 }
 

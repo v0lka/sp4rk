@@ -8,13 +8,19 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/v0lka/sp4rk/sysproc"
 )
 
 // gpuProbeTimeout bounds a single nvidia-smi probe invocation. A healthy
 // nvidia-smi answers in tens of milliseconds; the cap exists so that a wedged
 // driver or a hung NVML call can never stall a caller that treats GPUInUse as
 // a cheap, non-blocking monitoring check. On timeout the context kills the
-// process and the probe returns an error — it never hangs.
+// process and the probe returns an error — it never hangs. The cap composes
+// with a caller-supplied context: the probes derive their working context
+// via context.WithTimeout(ctx, gpuProbeTimeout), and WithTimeout honours an
+// earlier parent deadline, so the effective budget is min(caller deadline,
+// gpuProbeTimeout).
 const gpuProbeTimeout = 2 * time.Second
 
 // GPUInUse reports whether the NVIDIA driver currently registers *this*
@@ -51,17 +57,34 @@ const gpuProbeTimeout = 2 * time.Second
 // report host-namespace PIDs that never match the in-namespace os.Getpid();
 // the probe would then answer false even for a genuinely GPU-bound process.
 // The desktop app runs on the host, where the namespaces coincide.
-func GPUInUse() (bool, error) {
+//
+// Cancellation: the caller-supplied ctx governs cancellation. The probe
+// derives its working context with context.WithTimeout(ctx,
+// gpuProbeTimeout), so the effective deadline is min(caller deadline, 2s) —
+// an earlier caller deadline always wins, while the internal cap remains the
+// upper bound for callers without one. A cancelled or expired context
+// surfaces as an error, but only once nvidia-smi is actually invoked: the
+// absent-tool fast path below returns the no-error empty result without
+// consulting ctx.
+func GPUInUse(ctx context.Context) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	bin, ok := nvidiaSmiPath()
 	if !ok {
 		return false, nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), gpuProbeTimeout)
+	ctx, cancel := context.WithTimeout(ctx, gpuProbeTimeout)
 	defer cancel()
 
-	out, err := exec.CommandContext(ctx, bin,
-		"--query-compute-apps=pid", "--format=csv,noheader").Output()
+	cmd := exec.CommandContext(ctx, bin,
+		"--query-compute-apps=pid", "--format=csv,noheader")
+	// Suppress the console window a GUI-subsystem host would allocate for the
+	// child probe process (CREATE_NO_WINDOW on Windows; no-op elsewhere).
+	sysproc.HideConsole(cmd)
+	out, err := cmd.Output()
 	if err != nil {
 		return false, fmt.Errorf("querying nvidia-smi compute apps: %w", err)
 	}

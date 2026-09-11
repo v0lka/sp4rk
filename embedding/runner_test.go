@@ -13,6 +13,17 @@ import (
 // unlocks, so "same goroutine" and "same OS thread" are equivalent for it —
 // which is the property these tests actually care about and cannot observe
 // directly in portable Go.
+//
+// This helper is invoked from inside r.do/onORTThread job closures, which
+// run on the runner's dedicated goroutine — NOT the test goroutine. The
+// testing package forbids FailNow (i.e. t.Fatalf) outside the goroutine
+// running the test: it must call runtime.Goexit on the right goroutine to
+// fail the test, and calling it elsewhere is undefined behavior (it can
+// mark the wrong test failed, or leave the test hanging). t.Errorf only
+// flags a failure and returns, so it is safe from any goroutine. On a
+// parse failure we therefore report via t.Errorf and return 0; the
+// callers' existing "id == 0" checks on the test goroutine then propagate
+// the failure to the test proper.
 func goroutineID(t *testing.T) uint64 {
 	t.Helper()
 	var buf [64]byte
@@ -20,16 +31,19 @@ func goroutineID(t *testing.T) uint64 {
 	line := buf[:n]
 	const prefix = "goroutine "
 	if !bytes.HasPrefix(line, []byte(prefix)) {
-		t.Fatalf("unexpected stack header %q", line)
+		t.Errorf("unexpected stack header %q", line)
+		return 0
 	}
 	rest := line[len(prefix):]
 	sp := bytes.IndexByte(rest, ' ')
 	if sp < 0 {
-		t.Fatalf("unexpected stack header %q", line)
+		t.Errorf("unexpected stack header %q", line)
+		return 0
 	}
 	id, err := strconv.ParseUint(string(rest[:sp]), 10, 64)
 	if err != nil {
-		t.Fatalf("parsing goroutine id from %q: %v", line, err)
+		t.Errorf("parsing goroutine id from %q: %v", line, err)
+		return 0
 	}
 	return id
 }
@@ -105,14 +119,22 @@ func TestORTRunner_Serializes(t *testing.T) {
 
 func TestORTRunner_PanicReachesCallerAndRunnerSurvives(t *testing.T) {
 	// A panic inside a job must not kill the runner goroutine: that would
-	// leave every later do() blocked forever on a channel nobody reads.
+	// leave every later do() blocked forever on a channel nobody reads. The
+	// re-raised value must also be the ORIGINAL panic value with its type
+	// intact, so a caller matching on the value (rather than just checking
+	// non-nil) sees exactly what the job panicked with.
 	r := newORTRunner()
 	defer r.stop()
 
 	func() {
 		defer func() {
-			if recover() == nil {
+			p := recover()
+			if p == nil {
 				t.Error("do() did not propagate the job's panic to the caller")
+				return
+			}
+			if p != any("boom") {
+				t.Errorf("recovered panic = %#v (%T), want the original value %q (string)", p, p, "boom")
 			}
 		}()
 		r.do(func() { panic("boom") })
