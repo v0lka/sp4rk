@@ -8,7 +8,8 @@ Provides the tool abstraction for the agent: a single `Tool` interface, a thread
 
 - `github.com/v0lka/sp4rk/tools` — `Tool` interface, `BaseTool`, `ToolResult`, `ToolPolicy`, `ToolJudger` (`JudgeOutcome` + `JudgeSeverity` + `JudgeReasonCode`), `ToolJudge` (`StrictJudgeRequest`, `Judge`/`JudgeStrict`), `ToolDescriptor` (carries `Group`), `ToolRegistry`, `StripParamsFromSchema`
 - `github.com/v0lka/sp4rk/tools/group.go` — `ToolGroup` and the 8 declared groups (`execute`, `local_read`, `local_write`, `remote_read`, `remote_write`, `system`, `local_mcp`, `remote_mcp`), `AllToolGroups()`, `IsValidToolGroup()`, `MCPToolGroup(transport)`
-- `github.com/v0lka/sp4rk/tools` (registry) — `Register`/`RegisterWithSource`/`RegisterWithSourceCategory`, `Execute` (fail-closed policy enforcement), `List`/`ListFiltered`, MCP shadowing protection
+- `github.com/v0lka/sp4rk/tools` (registry) — `Register`/`RegisterWithSource`/`RegisterWithSourceCategory`, `Execute` (pre-dispatch input validation + fail-closed policy enforcement), `List`/`ListFiltered`, MCP shadowing protection
+- `github.com/v0lka/sp4rk/tools/inputvalidate.go` — `ValidateToolInput(tool, schema, input)` and `InputValidationError`: the recursive structural tool-input validator `Execute` enforces before any policy (see [Input Validation](#input-validation) below); `SetInputValidationEnabled` on the registry is the opt-out handle
 - `github.com/v0lka/sp4rk/tools` (context helpers) — `WithWorkspacePath`, `WithTempDir`, `WithAllowedRoots`, `SessionRoots`, `WithTaskContext`. `SessionRoots` returns the deduplicated union of workspace + temp + additional allowed roots consulted by every path-containment check.
 - `github.com/v0lka/sp4rk/tools/builtins` — built-in tool catalog
 - `github.com/v0lka/sp4rk/tools/mcp` — MCP gateway (dynamic tool discovery/proxying)
@@ -71,7 +72,11 @@ type ToolDescriptor struct {
 ToolRegistry.Execute(ctx, name, input)
 │
 ├─ 1. Look up the tool by name → not found ⇒ error ToolResult
-└─ 2. Resolve effective policy (per-tool override, else the tool's DefaultPolicy):
+├─ 2. Pre-dispatch input validation (ValidateToolInput — fail-open; see
+│     [Input Validation](#input-validation); opt out via
+│     SetInputValidationEnabled(false)) → structurally invalid ⇒ error
+│     ToolResult naming the offending path and the valid parameters
+└─ 3. Resolve effective policy (per-tool override, else the tool's DefaultPolicy):
       ├─ PolicyAlwaysAllow  → execute (escalate to confirmation if a ToolJudger flags it)
       ├─ PolicyAlwaysDeny   → reject with an error result
       └─ PolicyUserConfirm  → consult ConfirmFunc; DENIED (fail-closed) if none configured
@@ -83,10 +88,24 @@ The separate LLM-backed `ToolJudge` exposes two host-invoked modes. Advisory `Ju
 
 > **Breaking change (cache_mode):** `CacheStrategy` is a required method on the exported `agent.ToolExecutor` interface. External implementors (custom registries, wrappers, mocks) must add it — returning `tools.CacheModeDefault` preserves prior behavior. On the `Tool` side the capability remains optional via `ContentBackedReader`.
 
+## Input Validation
+
+`ToolRegistry.Execute` validates every call's input against the target tool's `InputSchema()` BEFORE any policy, override, or confirmation flow is consulted. Provider-side JSON-schema validation comes for free on native tool definitions (one typed tool call per tool), but it is absent whenever arguments travel as a free-form object — meta-tool envelopes (`batch`, E2S-style `action.args`), replayed or queued calls — and `json.Unmarshal` silently ignores unknown fields, so a wrong argument name would execute the tool with defaulted parameters. The registry-level check closes that gap for every call routed through `Execute` (a host wrapper that shadows `Execute` applies its own check — the SDK-level enforcement only covers the SDK path).
+
+The validator (`ValidateToolInput`) is deliberately lightweight — no external JSON-schema dependency — and **recursive**:
+
+- **What it checks** — the input is a JSON object; every `required` key is present; declared property types match (JSON type names; `integer` accepts any JSON number since `encoding/json` decodes all numbers as float64; an array-typed `["string","null"]` accepts either member); unknown keys are rejected against the declared property set; recursion descends into nested object properties and array `items`, with error paths like `tasks[2].id` naming the offending value. Depth is capped (`maxValidationDepth` = 16).
+- **Closed-set semantics** — a schema level without `additionalProperties` is a **closed set**: keys not declared in `properties` are rejected. `additionalProperties: true` (or the object form, a schema for extra keys) reopens that level.
+- **Fail-open rules** — anything the validator does not model never blocks a call: an unparseable schema or input at a level, `$ref` subtrees (no resolver by design), levels without a `properties` object, unmodeled type forms (`oneOf`/`anyOf`), and values nested deeper than the depth cap. A violation is returned as an `InputValidationError` rendered into an error `ToolResult` (`IsError: true`, nil Go error) that lists the valid parameters, so the model can fix the arguments and retry without ever reaching the tool or the confirmation flow.
+- **Disable handle** — `SetInputValidationEnabled(false)` restores the pre-validation behavior (inputs are handed to the tool untouched, before any policy is consulted). Validation is enabled by default (`NewToolRegistry`).
+
+This is defense-in-depth (OWASP ASI02-R2), not a policy gate: it complements, never replaces, per-tool validation and host security gates.
+
 ## Invariants
 
 - Tool names are unique within the registry.
 - The registry is thread-safe (`sync.RWMutex`).
+- `Execute` validates the call input structurally (`ValidateToolInput`) before any policy or override is consulted; the check fails OPEN — an unmodeled schema construct never blocks a call the tool itself would accept. Opt out with `SetInputValidationEnabled(false)` (enabled by default).
 - `Execute` is **fail-closed**: a `PolicyUserConfirm` tool with no `ConfirmFunc` configured is DENIED — mutating tools never execute silently.
 - A `PolicyAlwaysAllow` tool may implement `ToolJudger` to escalate a call to confirmation; a denied escalation is also fail-closed.
 - `ToolJudge.JudgeStrict` performs one independent LLM evaluation per invocation and always maps ambiguous or failed evaluation to `VerdictConfirm`.
@@ -102,6 +121,7 @@ Policy is set per tool at the engine level. Hosts are encouraged to resolve poli
 registry.SetPolicyOverride("bash_exec", tools.PolicyAlwaysAllow) // deliberate opt-in
 registry.ClearPolicyOverride("bash_exec")
 registry.SetConfirmFunc(myConfirmFunc)   // consulted for PolicyUserConfirm + judge escalation
+registry.SetInputValidationEnabled(false) // opt out of pre-dispatch input validation (enabled by default)
 ```
 
 Stage 1 truncation limits are configured per tool on the executor (see [../orchestration/executor.md](../orchestration/executor.md)); tool result budget (Stage 2) is configured on the executor's `ToolResultBudget`.

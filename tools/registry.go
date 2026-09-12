@@ -12,8 +12,11 @@ import (
 // ToolRegistry stores all available tools and provides them to Executor.
 // Thread-safe via sync.RWMutex.
 //
-// Execute applies fail-closed security policy enforcement based on each
-// tool's DefaultPolicy() (or a per-tool override set via SetPolicyOverride):
+// Execute first validates the call input against the tool's declared JSON
+// Schema (ValidateToolInput, fail-open; disable via
+// SetInputValidationEnabled(false)), then applies fail-closed security
+// policy enforcement based on each tool's DefaultPolicy() (or a per-tool
+// override set via SetPolicyOverride):
 //   - PolicyAlwaysAllow: executes directly. If the tool implements ToolJudger
 //     and the judge flags the call, it is escalated to user confirmation.
 //   - PolicyAlwaysDeny: the call is rejected.
@@ -26,23 +29,36 @@ import (
 // registry that shadows Execute) are unaffected as long as they do not route
 // calls through this Execute method.
 type ToolRegistry struct {
-	tools           map[string]Tool
-	toolSources     map[string]string
-	toolCategories  map[string]ToolSourceCategory
-	policyOverrides map[string]ToolPolicy
-	confirmFunc     ConfirmFunc
-	logger          *slog.Logger
-	mu              sync.RWMutex
+	tools                  map[string]Tool
+	toolSources            map[string]string
+	toolCategories         map[string]ToolSourceCategory
+	policyOverrides        map[string]ToolPolicy
+	confirmFunc            ConfirmFunc
+	logger                 *slog.Logger
+	inputValidationEnabled bool
+	mu                     sync.RWMutex
 }
 
 // NewToolRegistry creates a new ToolRegistry with an empty tool map.
+// Pre-dispatch input validation is enabled by default.
 func NewToolRegistry() *ToolRegistry {
 	return &ToolRegistry{
-		tools:           make(map[string]Tool),
-		toolSources:     make(map[string]string),
-		toolCategories:  make(map[string]ToolSourceCategory),
-		policyOverrides: make(map[string]ToolPolicy),
+		tools:                  make(map[string]Tool),
+		toolSources:            make(map[string]string),
+		toolCategories:         make(map[string]ToolSourceCategory),
+		policyOverrides:        make(map[string]ToolPolicy),
+		inputValidationEnabled: true,
 	}
+}
+
+// SetInputValidationEnabled toggles pre-dispatch input validation in
+// Execute (ValidateToolInput). Validation is enabled by default; passing
+// false restores the pre-validation behaviour (inputs are handed to the
+// tool untouched, before any policy is consulted).
+func (r *ToolRegistry) SetInputValidationEnabled(enabled bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.inputValidationEnabled = enabled
 }
 
 // SetLogger sets the logger used for registration warnings.
@@ -232,12 +248,28 @@ func (r *ToolRegistry) ListFiltered(excludeNames map[string]bool) []ToolDescript
 }
 
 // Execute looks up a tool by name and executes it with the given input,
-// applying fail-closed policy enforcement (see the ToolRegistry doc comment).
+// applying pre-dispatch input validation (ValidateToolInput, fail-open) and
+// fail-closed policy enforcement (see the ToolRegistry doc comment).
 // Returns a not-found error result if the tool is not registered.
 func (r *ToolRegistry) Execute(ctx context.Context, name string, input json.RawMessage) (ToolResult, error) {
 	tool, ok := r.Get(name)
 	if !ok {
 		return ToolResult{Content: "tool not found: " + name, IsError: true}, nil
+	}
+
+	// Pre-dispatch input validation (fail-open, before any policy or
+	// override is consulted): structurally invalid input (missing required
+	// parameters, wrong types, unknown parameters) is rejected with an
+	// actionable ToolResult (IsError=true, nil Go error) so the model can
+	// fix the arguments and retry, without ever reaching the confirmation
+	// flow or the tool itself.
+	r.mu.RLock()
+	validationEnabled := r.inputValidationEnabled
+	r.mu.RUnlock()
+	if validationEnabled {
+		if err := ValidateToolInput(tool.Name(), tool.InputSchema(), input); err != nil {
+			return ErrorResult("%v", err), nil
+		}
 	}
 
 	r.mu.RLock()
