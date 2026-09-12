@@ -1330,7 +1330,7 @@ func (e *Executor) processToolResult(
 						maxSliceHint = cfg.MaxLines
 					}
 				}
-				nudge := formatFragmentationNudge(cacheHash, toolName, maxSliceHint)
+				nudge := FormatFragmentationNudge(cacheHash, toolName, maxSliceHint)
 				observation += nudge
 			} else if meta.FileBacked {
 				// File-backed entries (read_file) get a nudge even without
@@ -1358,7 +1358,7 @@ func (e *Executor) processToolResult(
 							maxSliceHint = cfg.MaxLines
 						}
 					}
-					observation += formatFragmentationNudge(cacheHash, toolName, maxSliceHint)
+					observation += FormatFragmentationNudge(cacheHash, toolName, maxSliceHint)
 				}
 			}
 		}

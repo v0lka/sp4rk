@@ -21,7 +21,8 @@
 | Manual compaction of a resumed task (CompactOnStart)         | [domains/orchestration/conductor.md](domains/orchestration/conductor.md)                                        |
 | Cooperative pause, live user messages, resume interjections    | [architecture/data-flow.md](architecture/data-flow.md), [domains/orchestration/conductor.md](domains/orchestration/conductor.md), [domains/orchestration/executor.md](domains/orchestration/executor.md), [domains/memory/README.md](domains/memory/README.md) |
 | Post-edit verification after write_file/edit_file              | [contracts/agent-execution.md](contracts/agent-execution.md), [domains/orchestration/executor.md](domains/orchestration/executor.md), [domains/orchestration/conductor.md](domains/orchestration/conductor.md) |
-| Tool registry, execution pipeline                             | [domains/tool-system/README.md](domains/tool-system/README.md)                  |
+| Tool registry, execution pipeline, pre-dispatch input validation | [domains/tool-system/README.md](domains/tool-system/README.md)              |
+| Structural tool-input validation (ValidateToolInput): closed-set schemas, fail-open rules, disable handle | [domains/tool-system/README.md](domains/tool-system/README.md) |
 | Tool-result caching, file-backed vs content-backed modes      | [domains/orchestration/executor.md](domains/orchestration/executor.md), [domains/tool-system/README.md](domains/tool-system/README.md) |
 | Adding/modifying built-in tools                               | [domains/tool-system/builtins.md](domains/tool-system/builtins.md)              |
 | Ignore rules (.gitignore/.aiignore), glob & ripgrep filtering | [architecture/layers.md](architecture/layers.md), [contracts/tools.md](contracts/tools.md), [domains/tool-system/builtins.md](domains/tool-system/builtins.md) |
@@ -107,7 +108,7 @@ See [META.md](META.md) for document templates, naming rules, and update protocol
 
 ### domains/tool-system/
 
-- [README.md](domains/tool-system/README.md) - Tool registry and execution pipeline
+- [README.md](domains/tool-system/README.md) - Tool registry, execution pipeline, and pre-dispatch input validation
 - [builtins.md](domains/tool-system/builtins.md) - Built-in tool catalog and extension guide
 - [mcp-gateway.md](domains/tool-system/mcp-gateway.md) - MCP server lifecycle and dynamic tools
 

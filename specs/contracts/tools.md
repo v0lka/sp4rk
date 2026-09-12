@@ -53,7 +53,7 @@ At startup the host builds the tool surface in this order:
 
 - **Host → registry:** tool registration (name, `Tool`, source, category), `SetConfirmFunc`, `SetPolicyOverride`.
 - **executor → registry:** `Execute(ctx, name, input json.RawMessage)` and the `agent.ToolExecutor` helpers `GetToolSource(name)` / `IsToolUntrusted(name)` / `CacheStrategy(ctx, name, input)` (returns a `CacheMode`).
-- **registry → Tool:** `Execute(ctx, input json.RawMessage)` after policy is satisfied.
+- **registry → Tool:** `Execute(ctx, input json.RawMessage)` after input validation passes (`ValidateToolInput`, fail-open) and policy is satisfied.
 - **registry → ContentBackedReader:** during `CacheStrategy`, if the tool implements `ContentBackedReader`, `IsContentBacked(ctx, input)` is consulted per-input to choose content-backed vs file-backed caching.
 - **registry → ConfirmFunc:** a `ConfirmationRequest` whenever the effective policy is `PolicyUserConfirm` or a judge escalates; the host returns a `ConfirmationResponse`.
 - **registry → ToolJudger:** before an `AlwaysAllow` tool executes, `Judge(ctx, input)` is consulted; a `false` verdict with reasoning escalates to confirmation. `JudgeOutcome.Severity` is delivered to the host as `ConfirmationRequest.JudgeSeverity` — `hard` (never auto-resolvable) or `soft` (a strict judge may allow it); an unclassified outcome is `hard` (fail-closed). `JudgeOutcome.ReasonCode` is delivered as `ConfirmationRequest.JudgeReasonCode` — the machine-checkable classification hosts key deterministic policy decisions off instead of matching the `JudgeReasoning` prose.

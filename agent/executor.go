@@ -806,11 +806,14 @@ func (e *Executor) applyPerToolTruncation(content, toolName string) (string, boo
 	return content, truncated
 }
 
-// formatFragmentationNudge returns a message instructing the LLM how to read
+// FormatFragmentationNudge returns a message instructing the LLM how to read
 // truncated output in fragments via tool_result_read.
 // When maxSliceHint is 0, the truncation was triggered by a byte limit
 // (MaxLines was 0); the message is adjusted accordingly.
-func formatFragmentationNudge(hash, toolName string, maxSliceHint int) string {
+// It is exported so alternate loop implementations (e.g. c0wrk's E2S loop)
+// can reuse it and every execution mode shows the model the identical
+// recovery contract for tool_result_read.
+func FormatFragmentationNudge(hash, toolName string, maxSliceHint int) string {
 	if maxSliceHint == 0 {
 		return fmt.Sprintf(
 			"\n\n[This output was truncated to the configured byte limit for '%s'. "+
@@ -836,7 +839,7 @@ const fileBackedNudgePrefix = "\n\n[File content cached with hash:"
 
 // formatFileBackedNudge returns a message informing the LLM that the file
 // content is cached with the given hash and that additional fragments can be
-// read via tool_result_read. Unlike formatFragmentationNudge, this is appended
+// read via tool_result_read. Unlike FormatFragmentationNudge, this is appended
 // even when Stage 1 truncation did not fire — it serves the token-economy use
 // case (LLM reads fragments on demand) rather than truncation recovery.
 func formatFileBackedNudge(hash string) string {
