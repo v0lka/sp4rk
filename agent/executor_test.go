@@ -2779,12 +2779,12 @@ func TestCompactJSON_Empty(t *testing.T) {
 	}
 }
 
-// --- formatFragmentationNudge test ---
+// --- FormatFragmentationNudge test ---
 
 func TestFormatFragmentationNudge(t *testing.T) {
-	result := formatFragmentationNudge("abc123hash", "read_file", 100)
+	result := FormatFragmentationNudge("abc123hash", "read_file", 100)
 	if result == "" {
-		t.Fatal("formatFragmentationNudge returned empty string")
+		t.Fatal("FormatFragmentationNudge returned empty string")
 	}
 	if !strings.Contains(result, "truncated to 100 lines") {
 		t.Error("expected 'truncated to 100 lines' in nudge")
@@ -2801,9 +2801,9 @@ func TestFormatFragmentationNudge(t *testing.T) {
 }
 
 func TestFormatFragmentationNudge_ByteOnly(t *testing.T) {
-	result := formatFragmentationNudge("abc123hash", "web_fetch", 0)
+	result := FormatFragmentationNudge("abc123hash", "web_fetch", 0)
 	if result == "" {
-		t.Fatal("formatFragmentationNudge with maxSliceHint=0 returned empty string")
+		t.Fatal("FormatFragmentationNudge with maxSliceHint=0 returned empty string")
 	}
 	if strings.Contains(result, "truncated to 0 lines") {
 		t.Error("byte-only truncation must not say '0 lines'")
