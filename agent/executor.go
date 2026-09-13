@@ -810,8 +810,8 @@ func (e *Executor) applyPerToolTruncation(content, toolName string) (string, boo
 // truncated output in fragments via tool_result_read.
 // When maxSliceHint is 0, the truncation was triggered by a byte limit
 // (MaxLines was 0); the message is adjusted accordingly.
-// It is exported so alternate loop implementations (e.g. c0wrk's E2S loop)
-// can reuse it and every execution mode shows the model the identical
+// It is exported so alternate loop implementations (host-owned loops that
+// reuse this SDK's agent primitives) can render the identical
 // recovery contract for tool_result_read.
 func FormatFragmentationNudge(hash, toolName string, maxSliceHint int) string {
 	if maxSliceHint == 0 {

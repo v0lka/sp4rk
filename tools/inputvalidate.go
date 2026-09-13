@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -56,7 +58,11 @@ type InputValidationError struct {
 // Error renders the actionable validation message for the model.
 func (e *InputValidationError) Error() string {
 	var msg string
-	if e.Path != "" {
+	// Top-level properties and array elements quote the value's own name in
+	// the reason ("parameter \"path\" must be…"), so repeating it as an
+	// `at <path>` location would duplicate it — emit the location only when
+	// the reason does not already carry it.
+	if e.Path != "" && !strings.Contains(e.Reason, "\""+e.Path+"\"") {
 		msg = fmt.Sprintf("input for %q is invalid at %s: %s", e.Tool, e.Path, e.Reason)
 	} else {
 		msg = fmt.Sprintf("input for %q is invalid: %s", e.Tool, e.Reason)
@@ -74,6 +80,11 @@ func (e *InputValidationError) Error() string {
 // problem otherwise. Both arguments are raw JSON documents; input may be
 // nil/empty, which is treated as an empty object (so any required parameter
 // fails, while schemas without required parameters pass).
+//
+// The schema argument comes FIRST and the raw input arguments SECOND — both
+// are json.RawMessage, so a silent swap parses the input as the schema and
+// disables validation (no top-level properties → early nil). Host Execute
+// wrappers call it before dispatch.
 func ValidateToolInput(tool string, schema, input json.RawMessage) error {
 	var node schemaNode
 	if err := json.Unmarshal(schema, &node); err != nil {
@@ -142,7 +153,7 @@ func validateSchemaObject(tool, path string, node schemaNode, obj map[string]jso
 			return &InputValidationError{
 				Tool:        tool,
 				Path:        path,
-				Reason:      fmt.Sprintf("unknown parameter %q (not accepted by this tool; check the tool's schema in Available Tools)", k),
+				Reason:      fmt.Sprintf("unknown parameter %q (not accepted by this tool; check the tool's parameter list)", k),
 				ValidParams: names,
 			}
 		}
@@ -181,13 +192,14 @@ func validateSchemaValue(tool, name, path string, schemaRaw, value json.RawMessa
 	}
 
 	// Type check the declared "type" (a string or an array of strings). A
-	// schema without "type" (or with a type form we do not model, e.g.
-	// oneOf) skips the check.
+	// schema without "type" — or with a type form the decoder does not
+	// model (explicit null, empty strings, non-string junk) — skips the
+	// check fail-open.
 	if allowed := decodeSchemaTypes(node.Type); len(allowed) > 0 {
 		actual := jsonTypeNameOf(value)
 		match := false
 		for _, want := range allowed {
-			if typesCompatible(want, actual) {
+			if typeValueCompatible(want, value) {
 				match = true
 				break
 			}
@@ -240,11 +252,14 @@ func joinPath(path, key string) string {
 }
 
 // additionalPropertiesAllowed reports whether a schema level accepts keys
-// beyond its declared properties: absent means a closed set (tool schemas
-// declare every parameter), a boolean is taken at face value, and the object
-// form (a schema for the extra keys) allows them.
+// beyond its declared properties: absent or an explicit JSON null (a null
+// keyword is ignored, i.e. equivalent to absent — decoding null into a bool
+// would be a silent no-op, so it is checked explicitly) means a closed set
+// (tool schemas declare every parameter), a boolean is taken at face value,
+// and the object form (a schema for the extra keys) allows them.
 func additionalPropertiesAllowed(raw json.RawMessage) bool {
-	if len(raw) == 0 {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return false
 	}
 	var asBool bool
@@ -255,30 +270,71 @@ func additionalPropertiesAllowed(raw json.RawMessage) bool {
 }
 
 // decodeSchemaTypes parses a schema "type" value, which may be a string
-// ("integer") or an array of strings (["string","null"]).
+// ("integer") or an array of strings (["string","null"]). Forms the decoder
+// does not model return nil so the caller skips the type check fail-open:
+// an explicit JSON null (some generators emit "type":null — decoding it
+// into a string is a silent no-op that would otherwise yield an "" type
+// matching nothing), an empty string, an empty array, arrays whose members
+// are all empty, and non-string junk.
 func decodeSchemaTypes(raw json.RawMessage) []string {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
 	var single string
 	if err := json.Unmarshal(raw, &single); err == nil {
+		if single == "" {
+			return nil
+		}
 		return []string{single}
 	}
 	var many []string
 	if err := json.Unmarshal(raw, &many); err == nil {
-		return many
+		types := make([]string, 0, len(many))
+		for _, t := range many {
+			if t != "" {
+				types = append(types, t)
+			}
+		}
+		if len(types) == 0 {
+			return nil
+		}
+		return types
 	}
 	return nil
 }
 
-// typesCompatible maps schema type names onto observed JSON value types.
-func typesCompatible(want, actual string) bool {
+// typeValueCompatible maps one declared schema type name onto a raw JSON
+// value. JSON Schema "integer" accepts only numbers with a zero fractional
+// part (1, 1.0 and 1e2 qualify; 1.5 does not), but encoding/json reports
+// every number as a single "number" kind — so the integer check inspects
+// the number's textual form, which also avoids float64 precision loss on
+// large integer literals.
+func typeValueCompatible(want string, value json.RawMessage) bool {
+	actual := jsonTypeNameOf(value)
 	if want == actual {
 		return true
 	}
-	// JSON Schema "integer" accepts any integral JSON number; encoding/json
-	// decodes all numbers as float64, so both number kinds arrive as "number".
 	if want == "integer" && actual == "number" {
-		return true
+		return isIntegralJSONNumber(value)
 	}
 	return false
+}
+
+// isIntegralJSONNumber reports whether a raw JSON number has no fractional
+// part: literals an int64 parse covers qualify directly; the rest are
+// parsed as float64 and checked for a zero fraction (1.0, 2e3 qualify).
+// A number too large to reason about fails open as integral.
+func isIntegralJSONNumber(raw json.RawMessage) bool {
+	text := string(bytes.TrimSpace(raw))
+	if _, err := strconv.ParseInt(text, 10, 64); err == nil {
+		return true
+	}
+	f, err := strconv.ParseFloat(text, 64)
+	if err != nil {
+		return true // out of float64 range: cannot reason, fail open
+	}
+	return f == math.Trunc(f)
 }
 
 // jsonTypeNameOf reports the JSON type name of a raw value ("null" for an

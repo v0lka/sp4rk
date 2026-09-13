@@ -3,6 +3,7 @@ package tools
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -102,8 +103,10 @@ func TestValidateToolInput_TypeMismatch(t *testing.T) {
 	if !errors.As(err, &verr) || verr.Path != "path" {
 		t.Fatalf("type error must carry the parameter path, got %v", err)
 	}
-	// Integer-typed parameter accepts a JSON number (encoding/json decodes
-	// all numbers as float64; the validator maps integer→number).
+	// Integer-typed parameter accepts a JSON number, but only one with a
+	// zero fractional part (encoding/json reports every number as a single
+	// "number" kind; the validator inspects the literal's textual form —
+	// see TestValidateToolInput_IntegerGranularity).
 	if err := ValidateToolInput("read_file", json.RawMessage(readFileTestSchema), json.RawMessage(`{"path":"a","start_line":5}`)); err != nil {
 		t.Fatalf("integer parameter with number value must pass: %v", err)
 	}
@@ -370,5 +373,103 @@ func TestValidateToolInput_DepthCapFailsOpen(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), `missing required parameter "deepest_prop"`) {
 		t.Errorf("message must name the missing deepest parameter: %q", err.Error())
+	}
+}
+
+// Unmodeled "type" forms — an explicit JSON null (some generators emit
+// "type":null), an empty string, an empty array, arrays of empty strings —
+// must skip the type check fail-open instead of decoding into "" (which
+// matches no value and rejected everything with a garbled message).
+func TestValidateToolInput_NullAndEmptyTypeFormsFailOpen(t *testing.T) {
+	cases := []struct {
+		name   string
+		schema string
+		args   string
+	}{
+		{"type null", `{"type":"object","properties":{"a":{"type":null}}}`, `{"a":"s"}`},
+		{"type null with null value", `{"type":"object","properties":{"a":{"type":null}}}`, `{"a":null}`},
+		{"type null still applies properties", `{"type":"object","properties":{"a":{"type":null,"properties":{"x":{"type":"string"}}}}}`, `{"a":{"x":"y"}}`},
+		{"type empty string", `{"type":"object","properties":{"a":{"type":""}}}`, `{"a":7}`},
+		{"type empty array", `{"type":"object","properties":{"a":{"type":[]}}}`, `{"a":7}`},
+		{"type array of empty members", `{"type":"object","properties":{"a":{"type":["",""]}}}`, `{"a":7}`},
+	}
+	for _, tc := range cases {
+		if err := ValidateToolInput("t", json.RawMessage(tc.schema), json.RawMessage(tc.args)); err != nil {
+			t.Errorf("%s: must fail open, got %v", tc.name, err)
+		}
+	}
+
+	// Empty members are dropped but live members still constrain.
+	err := ValidateToolInput("t", json.RawMessage(`{"type":"object","properties":{"a":{"type":["","string"]}}}`), json.RawMessage(`{"a":7}`))
+	if err == nil || !strings.Contains(err.Error(), `parameter "a" must be of type string, got number`) {
+		t.Fatalf("live array members must still constrain after dropping empty ones: %v", err)
+	}
+}
+
+// "additionalProperties": null is equivalent to absent (a null keyword is
+// ignored), and absent means a closed set — tool schemas declare every
+// parameter. The boolean forms keep working at face value.
+func TestValidateToolInput_AdditionalPropertiesNullMeansClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		schema string
+	}{
+		{"explicit null", `{"type":"object","properties":{"a":{"type":"string"}},"additionalProperties":null}`},
+		{"absent", `{"type":"object","properties":{"a":{"type":"string"}}}`},
+		{"explicit false", `{"type":"object","properties":{"a":{"type":"string"}},"additionalProperties":false}`},
+	} {
+		err := ValidateToolInput("t", json.RawMessage(tc.schema), json.RawMessage(`{"a":"s","extra":1}`))
+		if err == nil || !strings.Contains(err.Error(), `unknown parameter "extra"`) {
+			t.Errorf("%s: extra key must be rejected against the closed set, got %v", tc.name, err)
+		}
+	}
+	if err := ValidateToolInput("t", json.RawMessage(`{"type":"object","properties":{"a":{"type":"string"}},"additionalProperties":true}`), json.RawMessage(`{"a":"s","extra":1}`)); err != nil {
+		t.Errorf("additionalProperties:true must allow extra keys, got %v", err)
+	}
+}
+
+// JSON Schema "integer" accepts only zero-fraction numbers: 1, -3, 1.0 and
+// 2e3 qualify; 1.5 does not (encoding/json reports every number as one
+// "number" kind, so the literal's textual form decides). "number" accepts
+// fractional values unconditionally.
+func TestValidateToolInput_IntegerGranularity(t *testing.T) {
+	schema := json.RawMessage(`{"type":"object","properties":{"n":{"type":"integer"}}}`)
+	for _, args := range []string{`{"n":1}`, `{"n":-3}`, `{"n":0}`, `{"n":1.0}`, `{"n":2e3}`, `{"n":9007199254740993}`} {
+		if err := ValidateToolInput("t", schema, json.RawMessage(args)); err != nil {
+			t.Errorf("%s: zero-fraction number must satisfy integer, got %v", args, err)
+		}
+	}
+	for _, args := range []string{`{"n":1.5}`, `{"n":-0.25}`, `{"n":2.0001}`} {
+		err := ValidateToolInput("t", schema, json.RawMessage(args))
+		if err == nil || !strings.Contains(err.Error(), `parameter "n" must be of type integer, got number`) {
+			t.Errorf("%s: fractional number must fail the integer check with an actionable message, got %v", args, err)
+		}
+	}
+	numberSchema := json.RawMessage(`{"type":"object","properties":{"n":{"type":"number"}}}`)
+	if err := ValidateToolInput("t", numberSchema, json.RawMessage(`{"n":1.5}`)); err != nil {
+		t.Errorf("number type must accept fractional values, got %v", err)
+	}
+}
+
+// An explicit null against a declared non-nullable type is rejected with
+// the regular type-mismatch message (strict JSON Schema semantics — the
+// Go dispatch layer would silently zero the field, but the validator is
+// the model-facing gate and names the problem); a declared-nullable
+// parameter (type array with a "null" member) accepts it.
+func TestValidateToolInput_NullAgainstNonNullableRejected(t *testing.T) {
+	schema := json.RawMessage(`{"type":"object","properties":{"s":{"type":"string"},"o":{"type":"object","properties":{"x":{"type":"string"}}},"i":{"type":"integer"}}}`)
+	for _, tc := range []struct{ key, wantType string }{
+		{"s", "string"},
+		{"o", "object"},
+		{"i", "integer"},
+	} {
+		err := ValidateToolInput("t", schema, json.RawMessage(fmt.Sprintf(`{%q:null}`, tc.key)))
+		if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("parameter %q must be of type %s, got null", tc.key, tc.wantType)) {
+			t.Errorf("null against non-nullable %s must be rejected verbatim, got %v", tc.wantType, err)
+		}
+	}
+	nullable := json.RawMessage(`{"type":"object","properties":{"a":{"type":["string","null"]}}}`)
+	if err := ValidateToolInput("t", nullable, json.RawMessage(`{"a":null}`)); err != nil {
+		t.Errorf("declared-nullable null must pass, got %v", err)
 	}
 }
