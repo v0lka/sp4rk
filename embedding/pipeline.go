@@ -102,8 +102,14 @@ func (e *Embedder) embedFixedPipeline(ctx context.Context, texts []string) ([][]
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		vecs, err := e.batchSess.runBatch(batch.end-batch.start,
-			batch.inputIDs, batch.attentionMask, batch.tokenTypeIDs)
+		var (
+			vecs [][]float32
+			err  error
+		)
+		e.onORTThread(func() {
+			vecs, err = e.batchSess.runBatch(batch.end-batch.start,
+				batch.inputIDs, batch.attentionMask, batch.tokenTypeIDs)
+		})
 		if err != nil {
 			return nil, fmt.Errorf("embedding batch chunk [%d:%d] of %d documents: %w",
 				batch.start, batch.end, len(texts), err)

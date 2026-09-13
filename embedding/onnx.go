@@ -18,7 +18,8 @@ import (
 // (session creation costs ~2s, inference ~50ms).
 var onnxSessionsCreated atomic.Int64
 
-// onnxInferenceRuns counts session.Run invocations across all sessions.
+// onnxInferenceRuns counts successful session.Run invocations across all
+// sessions (failed attempts are tracked only through Telemetry).
 // Production code never reads it; it exists so tests can assert that a batch
 // of n <= capacity texts performs exactly one inference per call.
 var onnxInferenceRuns atomic.Int64
@@ -298,11 +299,14 @@ func (s *onnxSession) run(inputIDs, attMask, tokenTypes []int64) ([]float32, err
 	copy(s.tokenTypes.GetData(), tokenTypes)
 
 	inferenceStarted := time.Now()
-	if err := s.session.Run(); err != nil {
-		s.telemetry.observe(StageONNXInference, time.Since(inferenceStarted))
-		return nil, fmt.Errorf("running ONNX inference: %w", err)
-	}
+	runErr := s.session.Run()
+	// Count every attempt (not only successes) so InferenceCount always
+	// equals Stages[StageONNXInference].Calls and a derived average
+	// inference latency stays meaningful after transient failures.
 	s.telemetry.observeInference(1, 1, time.Since(inferenceStarted))
+	if runErr != nil {
+		return nil, fmt.Errorf("running ONNX inference: %w", runErr)
+	}
 	onnxInferenceRuns.Add(1)
 
 	results := meanPoolAndNormalize(s.output.GetData(), attMask, 1, s.seqLen, s.hiddenDim)
@@ -342,11 +346,12 @@ func (s *onnxSession) runBatch(n int, inputIDs, attMask, tokenTypes []int64) ([]
 	copy(typesData, tokenTypes)
 
 	inferenceStarted := time.Now()
-	if err := s.session.Run(); err != nil {
-		s.telemetry.observe(StageONNXInference, time.Since(inferenceStarted))
-		return nil, fmt.Errorf("running ONNX inference: %w", err)
-	}
+	runErr := s.session.Run()
+	// Count every attempt (not only successes) — see run for the rationale.
 	s.telemetry.observeInference(n, s.batchSize, time.Since(inferenceStarted))
+	if runErr != nil {
+		return nil, fmt.Errorf("running ONNX inference: %w", runErr)
+	}
 	onnxInferenceRuns.Add(1)
 
 	// Rows are independent, so pool over the n real rows only; padded rows
