@@ -144,7 +144,7 @@ If `emitter` is `nil`, `RunSubAgent` substitutes `NoopEvents`, so the events are
 
 ## Defense-in-depth: DetectToolCallSyntaxInContent
 
-A known LLM failure mode is *printing* a tool invocation as prose — writing a fenced code block with a tool-name language tag (e.g. ` ```bash_exec `) instead of emitting a proper `tool_use` block. The executor's implicit-finish detector should catch this and abort with `Finished: false`, but `RunSubAgent` adds a second guard as defense-in-depth:
+A known LLM failure mode is *printing* a tool invocation as prose — writing a fenced code block with a tool-name language tag (e.g. ` ```bash_exec `), or the JSON form of the call (e.g. `{"answer": "..."}` for the finish tool, or `{"name": "...", "arguments": {...}}`), instead of emitting a proper `tool_use` block. The executor's implicit-finish detector should catch this and abort with `Finished: false`, but `RunSubAgent` adds a second guard as defense-in-depth:
 
 ```go
 if success && DetectToolCallSyntaxInContent(result.Output) {

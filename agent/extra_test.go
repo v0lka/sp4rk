@@ -1048,6 +1048,23 @@ func TestDetectToolCallSyntaxInContent(t *testing.T) {
 		{"indented fenced tool", "  ```bash_exec\n", true},
 		{"tool with suffix", "```bash_exec (batched)\n", true},
 		{"legit explanation mentioning tool name", "Use the `bash_exec` tool to run commands.", false},
+		// JSON tool-call leaks (the model types the call instead of using a tool_use block).
+		{"json finish args", `{"answer": "all done"}`, true},
+		{"json finish args surrounding whitespace", "  \n{\"answer\":\"done\"}\n ", true},
+		{"json finish args escaped newline", `{"answer":"line1\nline2"}`, true},
+		{"json finish args fenced", "```json\n{\"answer\": \"done\"}\n```", true},
+		{"json finish args fenced no lang", "```\n{\"answer\": \"done\"}\n```", true},
+		{"json name/arguments envelope", `{"name":"read_file","arguments":{"path":"a"}}`, true},
+		{"json tool/args envelope", `{"tool":"finish","args":{"answer":"x"}}`, true},
+		{"json openai function envelope", `{"function":{"name":"read_file","arguments":"{}"}}`, true},
+		{"json non-string answer", `{"answer":42}`, false},
+		{"json answer with extra fields", `{"answer":"42","confidence":0.9}`, false},
+		{"json unrelated keys", `{"result":42,"status":"ok"}`, false},
+		{"json empty object", `{}`, false},
+		{"json array of calls", `[{"answer":"x"}]`, false},
+		{"prose embedding json", `Here is the example: {"answer":"x"}`, false},
+		{"fenced json object not a tool call", "```json\n{\"foo\":1}\n```", false},
+		{"legit structured json answer", `{"summary":"done","files":["a","b"]}`, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1116,6 +1133,70 @@ func TestExecutor_Run_ToolCallSyntaxNudge_ThenRecovery(t *testing.T) {
 	}
 	if !result.Finished {
 		t.Error("expected Finished=true after recovery from tool-call syntax nudge")
+	}
+}
+
+func TestExecutor_Run_JSONToolCallLeakNudge_ThenAbort(t *testing.T) {
+	// The model prints the finish tool's arguments as raw JSON text
+	// ({"answer": "..."}) instead of emitting a finish tool_use block. This is
+	// the "printed a tool call as text" failure-mode in its JSON form — after 3
+	// special nudges the executor aborts with Finished=false instead of
+	// surfacing the raw JSON as the final answer.
+	leakResp := &llm.ChatResponse{
+		Message:    llm.Message{Role: "assistant", Content: `{"answer": "the final answer"}`},
+		StopReason: "end_turn",
+		Usage:      llm.TokenUsage{InputTokens: 50, OutputTokens: 50},
+	}
+	mockLLM := &mockLLMCaller{
+		responses: []*llm.ChatResponse{leakResp, leakResp, leakResp, leakResp},
+	}
+	cm := newMockContextManager()
+	exec := newExecutorDefaultHITL(mockLLM, newMockToolExecutor(), &mockTokenCounter{}, 20, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+
+	result, err := exec.Run(context.Background(), []tools.ToolDescriptor{
+		{Name: "finish", Description: "finish", Source: "core"},
+	}, cm)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Finished {
+		t.Error("expected Finished=false (abort after 3 JSON tool-call leak nudges)")
+	}
+	if !strings.Contains(result.Output, "Aborted") {
+		t.Errorf("expected abort message, got %q", result.Output)
+	}
+	if strings.Contains(result.Output, `"answer"`) {
+		t.Errorf("raw JSON must not surface as the final output: %q", result.Output)
+	}
+}
+
+func TestExecutor_Run_JSONToolCallLeakNudge_ThenRecovery(t *testing.T) {
+	// Model leaks the finish args as JSON text once, then recovers and uses a
+	// real finish tool_use block after the nudge.
+	mockLLM := &mockLLMCaller{
+		responses: []*llm.ChatResponse{
+			{
+				Message:    llm.Message{Role: "assistant", Content: `{"answer":"premature"}`},
+				StopReason: "end_turn",
+				Usage:      llm.TokenUsage{InputTokens: 50, OutputTokens: 50},
+			},
+			llmResponseFinish("done", "completed"),
+		},
+	}
+	cm := newMockContextManager()
+	exec := newExecutorDefaultHITL(mockLLM, newMockToolExecutor(), &mockTokenCounter{}, 20, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+
+	result, err := exec.Run(context.Background(), []tools.ToolDescriptor{
+		{Name: "finish", Description: "finish", Source: "core"},
+	}, cm)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.Finished {
+		t.Error("expected Finished=true after recovery from a JSON tool-call leak")
+	}
+	if result.Output != "completed" {
+		t.Errorf("Output = %q, want %q", result.Output, "completed")
 	}
 }
 

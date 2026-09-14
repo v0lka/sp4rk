@@ -21,7 +21,7 @@ import (
 
 const executorNudge = "[System] You have tools available that can help answer this request. Before finishing, try using relevant tools to discover the answer. Do NOT say you cannot determine something without first attempting to use your tools."
 
-const executorToolCallSyntaxNudge = "[System] You printed tool-call syntax (e.g. ```bash_exec) as text in your response instead of invoking the tool through the tool_use block. This is an error — tools must be called via the tool_use mechanism, not typed as text. Re-issue your tool call correctly using the tool_use block."
+const executorToolCallSyntaxNudge = "[System] You printed a tool call as text in your response instead of invoking it through the tool_use block — either a fenced code block (e.g. ```bash_exec) or a JSON object (e.g. {\"answer\": \"...\"}). This is an error — tools must be called via the tool_use mechanism, not typed as text. Re-issue your tool call correctly using the tool_use block."
 
 // toolCallSyntaxRe matches a fenced code block at the start of a line whose
 // language tag looks like a sp4rk tool name (lowercase words joined by
@@ -30,13 +30,101 @@ const executorToolCallSyntaxNudge = "[System] You printed tool-call syntax (e.g.
 // of emitting a tool_use block, this pattern is a reliable signal.
 var toolCallSyntaxRe = regexp.MustCompile("(?m)^\\s*```\\w+_\\w+")
 
+// jsonToolCallNameKeys are the key names that carry a tool name in a printed
+// tool-call JSON envelope. The OpenAI nested form ({"function": {...}}) is
+// handled separately so a plain "function" field cannot false-positive.
+var jsonToolCallNameKeys = [...]string{"name", "tool"}
+
+// jsonToolCallArgKeys are the argument-container key names used by the common
+// tool-call JSON envelopes (sp4rk/Anthropic "arguments", sp4rk "args",
+// generic "parameters"/"input"). A bare JSON object that pairs a tool-name key
+// with one of these is a printed tool call, not an answer.
+var jsonToolCallArgKeys = [...]string{"arguments", "args", "parameters", "input"}
+
 // DetectToolCallSyntaxInContent reports whether content contains tool-call
-// syntax printed as text — a failure-mode sign where the model writes a
-// fenced code block with a tool-name language tag (e.g. ```bash_exec) instead
-// of emitting a proper tool_use block. Callers use this to avoid treating
-// such output as a legitimate "implicit finish".
+// syntax printed as text — a failure-mode sign where the model "types" a tool
+// invocation instead of emitting a proper tool_use block. Two shapes are
+// recognized:
+//
+//   - a fenced code block whose language tag looks like a sp4rk tool name
+//     (e.g. ```bash_exec, ```read_file);
+//   - a JSON tool-call envelope printed as the whole response — the finish
+//     tool's arguments ({"answer": "..."}), or a name/arguments pair
+//     ({"name": "read_file", "arguments": {...}}, {"tool": "...", "args":
+//     {...}}, an OpenAI-style {"function": {"name": ..., "arguments": ...}}),
+//     optionally wrapped in a single ```json fence.
+//
+// Callers use this to avoid treating such output as a legitimate "implicit
+// finish" (which would surface the raw tool-call text as the final answer).
+// The JSON check is deliberately strict — the ENTIRE trimmed content must be a
+// single JSON object in one of those shapes — so a genuine answer that merely
+// embeds a JSON snippet, or a JSON answer whose shape is not tool-call-like, is
+// not misclassified.
 func DetectToolCallSyntaxInContent(content string) bool {
-	return toolCallSyntaxRe.MatchString(content)
+	if toolCallSyntaxRe.MatchString(content) {
+		return true
+	}
+	return looksLikeJSONToolCall(content)
+}
+
+// looksLikeJSONToolCall reports whether content is a lone JSON tool-call
+// envelope printed as text. See DetectToolCallSyntaxInContent for the shapes.
+func looksLikeJSONToolCall(content string) bool {
+	trimmed := stripSingleCodeFence(strings.TrimSpace(content))
+	if !strings.HasPrefix(trimmed, "{") || !strings.HasSuffix(trimmed, "}") {
+		return false
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(trimmed), &obj); err != nil {
+		return false
+	}
+	// Finish-tool arguments leak: the sole field is a string "answer".
+	if len(obj) == 1 {
+		if raw, ok := obj["answer"]; ok {
+			var answer string
+			return json.Unmarshal(raw, &answer) == nil
+		}
+	}
+	// Generic tool-call envelope: a tool-name key paired with an arguments key.
+	if hasAnyKey(obj, jsonToolCallNameKeys[:]) && hasAnyKey(obj, jsonToolCallArgKeys[:]) {
+		return true
+	}
+	// OpenAI-style nesting: {"function": {"name": ..., "arguments": ...}}.
+	if raw, ok := obj["function"]; ok {
+		var fn map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &fn); err == nil {
+			return hasAnyKey(fn, []string{"name"}) && hasAnyKey(fn, jsonToolCallArgKeys[:])
+		}
+	}
+	return false
+}
+
+// hasAnyKey reports whether obj has at least one of the given keys.
+func hasAnyKey(obj map[string]json.RawMessage, keys []string) bool {
+	for _, k := range keys {
+		if _, ok := obj[k]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// stripSingleCodeFence removes one leading/trailing Markdown code fence
+// (e.g. ```json … ```) and returns the trimmed inner text. Non-fenced input is
+// returned unchanged (still trimmed).
+func stripSingleCodeFence(s string) string {
+	if !strings.HasPrefix(s, "```") {
+		return s
+	}
+	nl := strings.IndexByte(s, '\n')
+	if nl < 0 {
+		return s
+	}
+	body := s[nl+1:]
+	if idx := strings.LastIndex(body, "```"); idx >= 0 {
+		body = body[:idx]
+	}
+	return strings.TrimSpace(body)
 }
 
 // defaultNonCacheableTools is the set of sp4rk-provided tool names whose results

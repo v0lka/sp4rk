@@ -77,7 +77,7 @@ Runs multiple `SubAgentTask`s concurrently and collects all results. Results are
 
 ### Defense-in-depth
 
-`DetectToolCallSyntaxInContent` reports whether content contains tool-call syntax printed as text (a fenced code block with a tool-name language tag). `RunSubAgent` applies it as a second guard after the executor's own implicit-finish detector:
+`DetectToolCallSyntaxInContent` reports whether content contains tool-call syntax printed as text (a fenced code block with a tool-name language tag, or a lone JSON tool-call envelope such as `{"answer": "..."}` or `{"name": "...", "arguments": {...}}`). `RunSubAgent` applies it as a second guard after the executor's own implicit-finish detector:
 
 ```go
 if success && DetectToolCallSyntaxInContent(result.Output) {
