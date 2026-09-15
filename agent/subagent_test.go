@@ -146,6 +146,45 @@ func TestRunSubAgent_MaxStepsExhausted(t *testing.T) {
 	}
 }
 
+// panickingLLMCaller panics on every Call, simulating a nil-dereference bug
+// (or any other panic) deep inside the executor's LLM path.
+type panickingLLMCaller struct{}
+
+func (panickingLLMCaller) Call(context.Context, llm.ChatRequest) (*llm.ChatResponse, error) {
+	panic("boom")
+}
+
+func TestRunSubAgent_RecoversPanic(t *testing.T) {
+	// A panic in sub-agent execution must not crash the process: RunSubAgent
+	// recovers it, logs the stack, emits a failed completion, and returns an
+	// error through the result channel so the host can mark the step failed and
+	// continue.
+	cm := newMockContextManager()
+	events := &recordingEvents{}
+	exec := newExecutorDefaultHITL(panickingLLMCaller{}, newMockToolExecutor(), &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+
+	ch := RunSubAgent(context.Background(), "step_panic", exec, cm, nil, "panicking task", events, nil)
+	result := <-ch
+
+	if result.Error == nil {
+		t.Fatal("expected an error from the recovered panic, got nil")
+	}
+	if result.StepID != "step_panic" {
+		t.Errorf("StepID = %q, want %q", result.StepID, "step_panic")
+	}
+
+	// Hosts must observe a terminal SubAgentComplete(success=false) event.
+	foundComplete := false
+	for _, e := range events.events {
+		if e == "SubAgentComplete:step_panic:false" {
+			foundComplete = true
+		}
+	}
+	if !foundComplete {
+		t.Errorf("expected SubAgentComplete:step_panic:false event, got %v", events.events)
+	}
+}
+
 func TestRunSubAgentsParallel_Empty(t *testing.T) {
 	results := RunSubAgentsParallel(context.Background(), nil)
 	if results != nil {

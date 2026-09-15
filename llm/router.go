@@ -450,6 +450,14 @@ func (r *Router) Call(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 
 	for attempt := 0; attempt <= r.maxRetries; attempt++ {
 		resp, err := provider.ChatCompletion(ctx, req)
+		// Defense in depth: a Provider must never return (nil, nil), but a
+		// buggy or non-conforming provider can (e.g. a JSON `null` body decoded
+		// into a nil response). Surface it as a retryable error rather than
+		// dereferencing nil below.
+		if err == nil && resp == nil {
+			err = NewError(provider.Name(), 0, true,
+				errors.New("llm: provider returned a nil response with no error"))
+		}
 		if err == nil {
 			// Ensure model is set in response
 			if resp.Model == "" {

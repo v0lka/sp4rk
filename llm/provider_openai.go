@@ -201,6 +201,18 @@ func (p *OpenAIProvider) ChatCompletion(ctx context.Context, req ChatRequest) (*
 	if err != nil {
 		return nil, p.wrapError(fmt.Errorf("openai chat completion: %w", err))
 	}
+	// The OpenAI SDK decodes an HTTP 200 response whose JSON body is the
+	// literal `null` into a nil response pointer with a nil error (JSON null
+	// unmarshalled into a **struct clears the pointer). A compatible gateway
+	// can emit that instead of a completion object during a transient upstream
+	// fault, so guard before dereferencing resp below — a nil dereference here
+	// panics inside the caller's goroutine and, for a sub-agent, tears down the
+	// host process. Classified as retryable so the router's backoff loop gets a
+	// chance to recover.
+	if resp == nil {
+		return nil, NewError(p.name, 0, true,
+			errors.New("openai chat completion: provider returned HTTP 200 with a null body"))
+	}
 
 	if len(resp.Choices) == 0 {
 		return nil, WrapProviderError(p.name, 0, errors.New("no choices in response"))

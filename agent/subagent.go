@@ -3,6 +3,9 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
+	"runtime/debug"
 	"time"
 
 	"github.com/v0lka/sp4rk/tools"
@@ -32,10 +35,30 @@ func RunSubAgent(ctx context.Context, stepID string, executor *Executor, cm Cont
 
 	go func() {
 		defer close(ch)
+		startTime := time.Now()
+
+		// A panic anywhere in sub-agent execution must not tear down the host
+		// process. Execution runs on this goroutine, so the host cannot wrap it
+		// with its own recover — guard here, log the stack, emit a failed
+		// completion, and hand the conductor an error so the step fails in
+		// isolation and execution continues.
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("subagent execution panicked",
+					"step_id", stepID,
+					"panic", r,
+					"stack", string(debug.Stack()),
+				)
+				emitter.SubAgentComplete(stepID, false, time.Since(startTime))
+				ch <- SubAgentResult{
+					StepID: stepID,
+					Error:  fmt.Errorf("subagent %s panicked: %v", stepID, r),
+				}
+			}
+		}()
 
 		// Emit subagent launch
 		emitter.SubAgentLaunch(stepID, taskDesc)
-		startTime := time.Now()
 
 		// Set task context for tool execution
 		ctx = tools.WithTaskContext(ctx, taskDesc)

@@ -2104,3 +2104,42 @@ func TestApplyGLMReasoning(t *testing.T) {
 		})
 	}
 }
+
+// TestOpenAIProvider_NullResponseBodyIsError is a regression test for a crash
+// where a provider returned HTTP 200 with the literal JSON body `null`. The
+// openai-go SDK decodes JSON null into a nil response pointer with a nil error
+// (unmarshalling null into a **struct clears the pointer), and the provider
+// dereferenced it, panicking in the caller's goroutine — for a sub-agent that
+// panic tore down the whole process.
+func TestOpenAIProvider_NullResponseBodyIsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("null"))
+	}))
+	t.Cleanup(srv.Close)
+
+	p, err := NewOpenAIProvider(OpenAIProviderConfig{
+		Name:       "deepseek",
+		APIKey:     "k",
+		BaseURL:    srv.URL,
+		HTTPClient: srv.Client(),
+	})
+	if err != nil {
+		t.Fatalf("NewOpenAIProvider failed: %v", err)
+	}
+
+	resp, err := p.ChatCompletion(context.Background(), ChatRequest{
+		Model:    "deepseek-flash",
+		Messages: []Message{{Role: "user", Content: "hi"}},
+	})
+	if err == nil {
+		t.Fatal("expected an error for a null response body, got nil")
+	}
+	if resp != nil {
+		t.Fatalf("expected nil response, got %+v", resp)
+	}
+	if !IsRetryable(err) {
+		t.Errorf("expected null-body error to be retryable, got %v", err)
+	}
+}
