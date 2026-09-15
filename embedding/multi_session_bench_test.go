@@ -98,7 +98,7 @@ func newBenchmarkSessionPool(modelPath string, workers, threads, batchSize, seqL
 	}
 	owners := make([]*benchmarkSessionOwner, 0, workers)
 	for range workers {
-		opts, optsErr := buildSessionOptions(threads)
+		opts, optsErr := buildSessionOptions(ExecutionProviderCPU, 0, threads)
 		if optsErr != nil {
 			for _, owner := range owners {
 				owner.close()

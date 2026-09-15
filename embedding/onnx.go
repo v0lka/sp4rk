@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -53,35 +54,137 @@ func initONNXRuntime(libraryPath string) error {
 }
 
 // destroyONNXRuntime cleans up the global ONNX Runtime environment.
+//
+// Call counter note: onnxEnvDestroys exists so tests can assert that
+// NewEmbedder failure paths never invoke this function.
 func destroyONNXRuntime() error {
+	onnxEnvDestroys.Add(1)
 	return ort.DestroyEnvironment()
 }
 
-// buildSessionOptions constructs ONNX Runtime session options limiting
-// intra-op parallelism to intraOpThreads. It returns nil when
-// intraOpThreads <= 0, preserving the legacy behavior in which
-// NewAdvancedSession is called with a nil *SessionOptions (byte-identical to
-// the pre-existing code path). When intraOpThreads > 0, a fresh
-// *SessionOptions is allocated via ort.NewSessionOptions and configured with
-// SetIntraOpNumThreads.
+// onnxEnvDestroys counts destroyONNXRuntime invocations. Production code
+// never reads it; it exists so tests can assert that NewEmbedder failure
+// paths never destroy the process-global environment: initONNXRuntime is
+// sync.Once-guarded, so a destroyed environment can never be reinitialized,
+// which would make the "auto" CPU fallback (and any later retry) impossible.
+// Only Embedder.Close performs the full teardown.
+var onnxEnvDestroys atomic.Int64
+
+// Execution provider identifiers accepted by EmbedderConfig.ExecutionProvider
+// and buildSessionOptions. The empty string is a synonym for
+// ExecutionProviderCPU and is the zero-value default.
+const (
+	// ExecutionProviderCPU runs inference on the ONNX Runtime CPU execution
+	// provider — the runtime's own default when no provider is appended.
+	ExecutionProviderCPU = "cpu"
+
+	// ExecutionProviderCUDA runs inference on an NVIDIA GPU via the CUDA
+	// execution provider. It requires a CUDA-enabled ONNX Runtime build:
+	// LibraryPath must point at a libonnxruntime built with GPU support, with
+	// libonnxruntime_providers_shared and libonnxruntime_providers_cuda sitting
+	// beside it (the runtime dlopens them from the main library's directory).
+	ExecutionProviderCUDA = "cuda"
+
+	// ExecutionProviderAuto asks NewEmbedder to prefer the CUDA execution
+	// provider and fall back to the CPU provider when CUDA is unavailable —
+	// the CPU-only ONNX Runtime build, a missing driver, or an invalid device
+	// id. Unlike an explicit ExecutionProviderCUDA, the fallback downgrades
+	// the request to a WARN log instead of failing NewEmbedder. Which provider
+	// actually won is observable via Embedder.ExecutionProvider.
+	ExecutionProviderAuto = "auto"
+)
+
+// normalizeExecutionProvider validates provider and normalizes the empty
+// string to ExecutionProviderCPU. "auto" passes through unchanged — it is
+// resolved by NewEmbedder, not by session construction. An unknown value is
+// an error, so a typo in configuration fails loudly instead of silently
+// degrading to the CPU.
+func normalizeExecutionProvider(provider string) (string, error) {
+	switch provider {
+	case "":
+		return ExecutionProviderCPU, nil
+	case ExecutionProviderCPU, ExecutionProviderCUDA, ExecutionProviderAuto:
+		return provider, nil
+	default:
+		return "", fmt.Errorf("unknown execution provider %q (want %q, %q or %q)",
+			provider, ExecutionProviderCPU, ExecutionProviderCUDA, ExecutionProviderAuto)
+	}
+}
+
+// buildSessionOptions constructs ONNX Runtime session options for the
+// requested execution provider, limiting intra-op parallelism to
+// intraOpThreads.
 //
-// The ONNX Runtime environment must be initialized before calling this with a
-// positive thread count, because ort.NewSessionOptions requires it. The
-// caller owns the returned options and must call Destroy() exactly once when
-// they are no longer needed (typically in Embedder.Close).
-func buildSessionOptions(intraOpThreads int) (*ort.SessionOptions, error) {
-	if intraOpThreads <= 0 {
+// It returns nil when the CPU provider is requested and intraOpThreads <= 0,
+// preserving the legacy behavior in which NewAdvancedSession is called with a
+// nil *SessionOptions (byte-identical to the pre-existing code path).
+// Otherwise a fresh *SessionOptions is allocated via ort.NewSessionOptions and
+// configured: SetIntraOpNumThreads for a positive intraOpThreads, and an
+// appended CUDA execution provider for provider == ExecutionProviderCUDA.
+//
+// ONNX Runtime never selects a GPU on its own: without an explicit
+// AppendExecutionProviderCUDA call it executes the graph on the CPU provider
+// even when the shared library is a GPU build. That is why a non-nil
+// *SessionOptions is mandatory for CUDA regardless of the thread count.
+//
+// The ONNX Runtime environment must be initialized before calling this with
+// anything but the legacy nil-returning combination, because
+// ort.NewSessionOptions requires it. The caller owns the returned options and
+// must call Destroy() exactly once when they are no longer needed (typically
+// in Embedder.Close). The CUDA provider options are owned by this function:
+// AppendExecutionProviderCUDA copies what it needs, so they are destroyed
+// before returning.
+func buildSessionOptions(provider string, deviceID, intraOpThreads int) (*ort.SessionOptions, error) {
+	normalized, err := normalizeExecutionProvider(provider)
+	if err != nil {
+		return nil, err
+	}
+	if normalized == ExecutionProviderAuto {
+		return nil, fmt.Errorf("execution provider %q must be resolved by NewEmbedder before building session options", ExecutionProviderAuto)
+	}
+
+	cuda := normalized == ExecutionProviderCUDA
+	if !cuda && intraOpThreads <= 0 {
 		return nil, nil
 	}
+
 	opts, err := ort.NewSessionOptions()
 	if err != nil {
 		return nil, fmt.Errorf("creating ONNX session options: %w", err)
 	}
-	if err := opts.SetIntraOpNumThreads(intraOpThreads); err != nil {
-		_ = opts.Destroy()
-		return nil, fmt.Errorf("setting intra-op thread count: %w", err)
+	if intraOpThreads > 0 {
+		if err := opts.SetIntraOpNumThreads(intraOpThreads); err != nil {
+			_ = opts.Destroy()
+			return nil, fmt.Errorf("setting intra-op thread count: %w", err)
+		}
+	}
+	if cuda {
+		if err := appendCUDAProvider(opts, deviceID); err != nil {
+			_ = opts.Destroy()
+			return nil, err
+		}
 	}
 	return opts, nil
+}
+
+// appendCUDAProvider configures and appends the CUDA execution provider to
+// opts, pinning it to deviceID. Everything beyond the device id is left at the
+// runtime's defaults. On failure opts is left untouched for the caller to
+// destroy.
+func appendCUDAProvider(opts *ort.SessionOptions, deviceID int) error {
+	cudaOpts, err := ort.NewCUDAProviderOptions()
+	if err != nil {
+		return fmt.Errorf("creating CUDA provider options: %w", err)
+	}
+	defer func() { _ = cudaOpts.Destroy() }()
+
+	if err := cudaOpts.Update(map[string]string{"device_id": strconv.Itoa(deviceID)}); err != nil {
+		return fmt.Errorf("setting CUDA device_id=%d: %w", deviceID, err)
+	}
+	if err := opts.AppendExecutionProviderCUDA(cudaOpts); err != nil {
+		return fmt.Errorf("appending CUDA execution provider: %w", err)
+	}
+	return nil
 }
 
 // onnxSession holds a reusable ONNX Runtime session with pre-allocated tensors
