@@ -51,6 +51,16 @@ type ConductorConfig struct {
 	// that extend the sp4rk-provided defaults. Empty = sp4rk defaults only.
 	NonCacheableTools []string
 
+	// StopTools lists ordinary tool names that TERMINATE the ReAct loop when
+	// they execute successfully (see agent.Executor.SetStopTools). The host
+	// uses it to enforce a turn boundary at the executor level: e.g. the c0wrk
+	// goal loop marks declare_goal_status as a stop tool so a per-turn working
+	// run ends the moment the agent declares its goal status, letting the loop
+	// advance turn-by-turn and enforce its turn budget without depending on the
+	// model to stop calling tools. A failed call to a stop tool never terminates
+	// the run. Empty (default) preserves the previous behavior.
+	StopTools []string
+
 	// ConversationHistory holds prior user/assistant exchanges from the
 	// session. When non-empty, the Conductor injects it into the
 	// ContextManager so the LLM sees the dialogue context leading up to the
@@ -340,6 +350,12 @@ func (c *Conductor) Run(
 	if len(c.cfg.NonCacheableTools) > 0 {
 		executor.AddNonCacheableTools(c.cfg.NonCacheableTools...)
 	}
+	// Stop-tool terminator: a successful call to any listed tool ends the run
+	// (see ConductorConfig.StopTools). Installed unconditionally so a host can
+	// model a turn boundary at the executor level.
+	if len(c.cfg.StopTools) > 0 {
+		executor.SetStopTools(c.cfg.StopTools...)
+	}
 
 	// Cooperative pause signal: install the checker on the executor so Run
 	// polls it at every step boundary. A true return stops the loop with
@@ -402,9 +418,14 @@ func (c *Conductor) Run(
 
 	output := ""
 	var steps []agent.Step
+	summary := ""
 	if result != nil {
 		output = result.Output
 		steps = result.Steps
+		// Preserve the model's own final text when the run ended on a
+		// host-designated stop tool; Output alone is then only the tool's short
+		// confirmation (see agent.ExecutorResult.Summary).
+		summary = result.Summary
 	}
 	// A paused run is a recoverable checkpoint, not a failure: leave Output
 	// empty rather than surfacing the raw ErrPaused sentinel string
@@ -428,6 +449,7 @@ func (c *Conductor) Run(
 
 	return &ExecutionResult{
 		Output:      output,
+		Summary:     summary,
 		Steps:       steps,
 		Blackboard:  bb,
 		Status:      status,

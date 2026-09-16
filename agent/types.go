@@ -56,6 +56,14 @@ type ExecutorResult struct {
 	// message (e.g. the mutation gate rejecting a finish). Empty when Output
 	// already carries the abort reason, or when the run finished.
 	AbortReason string `json:"abort_reason,omitempty"`
+	// Summary carries the model's own final text (the assistant message for the
+	// response that ended the run) when the run terminated on a host-designated
+	// stop tool (see Executor.SetStopTools) rather than the inline finish tool.
+	// A stop tool has no `answer` argument, so Output alone holds only the tool's
+	// short confirmation; Summary preserves the turn's modeled output for callers
+	// that need it (e.g. the goal loop seeding the independent verifier). Always
+	// empty for runs that do not end on a stop tool.
+	Summary string `json:"summary,omitempty"`
 }
 
 // SubAgentResult — result from a SubAgent.
