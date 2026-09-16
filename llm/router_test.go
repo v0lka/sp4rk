@@ -763,9 +763,9 @@ func TestRouter_ContextWindowValidation(t *testing.T) {
 	}
 }
 
-// TestNewRouter_PerProviderHTTPClient verifies the per-provider HTTP client
-// override: an entry carrying HTTPClient uses it for its own requests, while
-// an entry without it falls back to the router-level RouterConfig.HTTPClient.
+// TestNewRouter_PerProviderHTTPClient verifies HTTP client resolution order:
+// a per-entry ProviderEntry.HTTPClient wins over the router-level
+// RouterConfig.HTTPClient, which in turn is used when the entry carries none.
 // The TLS test server's self-signed certificate makes the distinction
 // observable — only a client that trusts it (srv.Client()) completes the
 // handshake; any other client fails with a certificate error.
@@ -829,8 +829,54 @@ func TestNewRouter_PerProviderHTTPClient(t *testing.T) {
 	}); err == nil {
 		t.Fatal("expected default client to reject the self-signed certificate, got nil error")
 	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("expected the failed handshake to leave the hit count at 1, got %d", got)
+	}
+
+	// With no per-entry client but a router-level RouterConfig.HTTPClient
+	// that trusts the certificate, the router-level client is used instead
+	// of the SDK default.
+	cfg = routerCfg()
+	cfg.Providers[0].HTTPClient = nil
+	cfg.HTTPClient = srv.Client()
+	r3, err := NewRouter(context.Background(), cfg, nil)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
+	if _, err := r3.Call(context.Background(), ChatRequest{
+		Model:    "pinned/m",
+		Messages: []Message{{Role: "user", Content: "hi"}},
+	}); err != nil {
+		t.Fatalf("expected router-level client to succeed against the TLS test server, got: %v", err)
+	}
+	if got := hits.Load(); got != 2 {
+		t.Fatalf("expected exactly 2 server hits, got %d", got)
+	}
+
+	// A per-entry client takes precedence over the router-level one: the
+	// router-level client here uses the default transport (nil Transport)
+	// and would reject the certificate, so success proves the entry's
+	// client won.
+	cfg = routerCfg()
+	cfg.HTTPClient = &http.Client{}
+	r4, err := NewRouter(context.Background(), cfg, nil)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
+	if _, err := r4.Call(context.Background(), ChatRequest{
+		Model:    "pinned/m",
+		Messages: []Message{{Role: "user", Content: "hi"}},
+	}); err != nil {
+		t.Fatalf("expected per-entry client to take precedence over the router-level client, got: %v", err)
+	}
+	if got := hits.Load(); got != 3 {
+		t.Fatalf("expected exactly 3 server hits, got %d", got)
+	}
 }
 
+// TestNewRouter_TwoProvidersSameModelName verifies that the router's reverse
+// index keeps two providers exposing the same bare model name distinguishable.
+// This is the core multi-provider disambiguation scenario.
 func TestNewRouter_TwoProvidersSameModelName(t *testing.T) {
 	cfg := RouterConfig{
 		Providers: []ProviderEntry{

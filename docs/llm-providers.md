@@ -35,6 +35,7 @@ type ProviderEntry struct {
     APIKey       string   // already-expanded API key
     BaseURL      string   // already-expanded base URL
     Models       []string // enabled model names for this provider
+    HTTPClient   *http.Client // optional per-provider client override
 }
 ```
 
@@ -42,6 +43,7 @@ type ProviderEntry struct {
 - **`ProviderType`** — selects the backend implementation. Supported values: `"anthropic"` and `"openai"`. The `"openai"` type covers any OpenAI-compatible endpoint (set `BaseURL` to point at a proxy, LM Studio, vLLM, etc.), and a single `"openai"`-typed provider can serve *all four* API protocols (Chat Completions, Responses, Anthropic Messages, Google generateContent) — Google and Anthropic models reached through an `"openai"` provider are handled by delegation *inside* the OpenAI provider, not by a new `ProviderType`.
 - **`APIKey`** / **`BaseURL`** — must be pre-resolved by the caller (environment variables expanded, etc.) before constructing the router.
 - **`Models`** — the bare model names enabled for this provider. The first provider's first model becomes the initial active model.
+- **`HTTPClient`** — optional per-provider `*http.Client` override (e.g. a custom TLS configuration for a single self-signed endpoint). Resolution order per entry: `ProviderEntry.HTTPClient` → `RouterConfig.HTTPClient` → SDK default; a nil entry field falls through to the router-level client, and a zero-value entry behaves exactly as before.
 
 ## Anthropic-compatible endpoints
 
@@ -73,7 +75,7 @@ type RouterConfig struct {
     MaxBackoff          time.Duration // default 30s; negative = 0
     SafetyMarginPercent int           // default 5
     OutputTokenReserve  int           // default 4096
-    HTTPClient          *http.Client  // optional proxy-configured client
+    HTTPClient          *http.Client  // optional router-level client (overridden per entry by ProviderEntry.HTTPClient)
     SamplingFunc        SamplingFunc  // optional family-aware multi-parameter defaults
     Logger              *slog.Logger  // optional logger for ambiguity warnings
 }
