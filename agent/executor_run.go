@@ -865,18 +865,25 @@ func (e *Executor) processSingleToolCall(
 
 		// If mutation gate was triggered (nudge attempted) but still no mutation,
 		// mark as not finished so the orchestrator treats this as a failure.
+		// Output keeps the model's answer (it is a genuine answer, just without a
+		// mutation); AbortReason carries a short, structured cause so consumers
+		// that surface a failure reason (RunSubAgent) don't mistake the answer
+		// prose for the abort cause.
 		finished := true
+		abortReason := ""
 		if e.mutationRequired && !e.hasMutatingToolExecuted(state) {
 			finished = false
+			abortReason = "finish rejected: required mutation was not performed"
 			e.emitter.ExecutorDiagnostic(state.stepNum, "mutation_gate_rejected", map[string]any{
 				"reason": "finish_without_mutation_after_nudge",
 			})
 		}
 
 		state.finishResult = &ExecutorResult{
-			Output:   params.Answer,
-			Steps:    state.allSteps,
-			Finished: finished,
+			Output:      params.Answer,
+			Steps:       state.allSteps,
+			Finished:    finished,
+			AbortReason: abortReason,
 		}
 		return nil, actionBreak, nil // stop processing further tool calls
 	}

@@ -51,6 +51,11 @@ type ExecutorResult struct {
 	Output   string `json:"output"`
 	Steps    []Step `json:"steps"`
 	Finished bool   `json:"finished"` // true if finish action, false if budget exhausted
+	// AbortReason carries a short, structured cause when the run did not finish
+	// (Finished=false) but Output holds a meaningful answer rather than an abort
+	// message (e.g. the mutation gate rejecting a finish). Empty when Output
+	// already carries the abort reason, or when the run finished.
+	AbortReason string `json:"abort_reason,omitempty"`
 }
 
 // SubAgentResult — result from a SubAgent.

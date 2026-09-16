@@ -23,7 +23,7 @@ type Events interface {
     ToolResult(stepNum, callIdx, resultLen int, preview string, isError bool)
     StepComplete(stepNum int, duration time.Duration)
     SubAgentLaunch(stepID, description string)
-    SubAgentComplete(stepID string, success bool, duration time.Duration)
+    SubAgentComplete(stepID string, success bool, duration time.Duration, errMsg string)
     AssistantChunk(content string)
     AssistantDone(content string, inputTokens, outputTokens int)
     ContextFill(fillPercent float64, usedTokens, maxTokens int, status string, stepID string)
@@ -60,7 +60,7 @@ type Events interface {
 | Method | Description |
 |--------|-------------|
 | `SubAgentLaunch(stepID, description)` | Fired when a sub-agent starts running a plan step in a goroutine. `description` is the task description. |
-| `SubAgentComplete(stepID, success, duration)` | Fired when a sub-agent finishes. `success` is `true` only if the executor finished without error. See [Subagents](subagents.md). |
+| `SubAgentComplete(stepID, success, duration, errMsg)` | Fired when a sub-agent finishes. `success` is `true` only if the executor finished without error; `errMsg` carries the failure reason (`""` on success). See [Subagents](subagents.md). |
 
 #### Streaming
 
@@ -278,10 +278,14 @@ func (e *PrintingEvents) SubAgentLaunch(stepID, description string) {
     fmt.Printf("│ 🚀 SubAgent launched: %s — %s\n", stepID, truncate(description, 80))
 }
 
-func (e *PrintingEvents) SubAgentComplete(stepID string, success bool, duration time.Duration) {
+func (e *PrintingEvents) SubAgentComplete(stepID string, success bool, duration time.Duration, errMsg string) {
     status := "succeeded"
     if !success {
         status = "failed"
+    }
+    if errMsg != "" {
+        fmt.Printf("│ 📥 SubAgent %s %s (%v): %s\n", stepID, status, duration, errMsg)
+        return
     }
     fmt.Printf("│ 📥 SubAgent %s %s (%v)\n", stepID, status, duration)
 }

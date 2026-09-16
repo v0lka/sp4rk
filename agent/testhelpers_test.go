@@ -233,12 +233,24 @@ func (m *mockTokenCounter) CountMessages(msgs []llm.Message) int {
 type recordingEvents struct {
 	mu     sync.Mutex
 	events []string
+	// completeErr holds the errMsg from the most recent SubAgentComplete call.
+	// It is captured in a dedicated field (the recorded string keeps its
+	// historical "SubAgentComplete:<id>:<success>" format so existing
+	// exact-string assertions stay valid).
+	completeErr string
 }
 
 func (r *recordingEvents) record(name string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.events = append(r.events, name)
+}
+
+// lastCompleteErr returns the errMsg passed to the most recent SubAgentComplete.
+func (r *recordingEvents) lastCompleteErr() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.completeErr
 }
 
 func (r *recordingEvents) StepStart(stepNum int) {
@@ -265,8 +277,11 @@ func (r *recordingEvents) SubAgentLaunch(stepID, description string) {
 	r.record("SubAgentLaunch:" + stepID)
 }
 
-func (r *recordingEvents) SubAgentComplete(stepID string, success bool, _ time.Duration) {
-	r.record(fmt.Sprintf("SubAgentComplete:%s:%v", stepID, success))
+func (r *recordingEvents) SubAgentComplete(stepID string, success bool, _ time.Duration, errMsg string) {
+	r.mu.Lock()
+	r.completeErr = errMsg
+	r.events = append(r.events, fmt.Sprintf("SubAgentComplete:%s:%v", stepID, success))
+	r.mu.Unlock()
 }
 
 func (r *recordingEvents) SubAgentPaused(stepID string, _ time.Duration) {

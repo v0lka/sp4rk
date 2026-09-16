@@ -44,7 +44,7 @@ The returned channel is buffered (capacity 1) and closed when the goroutine fini
 2. **Injects context** — task description (`WithTaskContext`), step ID (`WithStepID`), and (if provided) the checklist callback (`WithStepTodoUpdateFunc`).
 3. **Runs the executor** — `executor.Run(ctx, taskTools, cm)` inside the goroutine.
 4. **Defense-in-depth check** — even if the executor reports `Finished: true`, the output is scanned for printed tool-call syntax; if detected the result is treated as a failure.
-5. **Emits `SubAgentComplete`** — with the outcome and wall-clock duration.
+5. **Emits `SubAgentComplete`** — with the outcome, wall-clock duration, and the failure reason (`""` on success).
 6. **Sends the result** on the channel.
 
 ### Context cancellation
@@ -116,7 +116,7 @@ Profile application is an execution-layer concern: `RunSubAgent`/`RunSubAgentsPa
 - Each `SubAgentTask` has its own `Executor` and `ContextManager` — sharing a single `Executor` across concurrent tasks violates the executor's single-execution invariant.
 - The result channel is always closed; exactly one `SubAgentResult` is sent.
 - A subagent never shares its `ContextManager` with its launcher or with other subagents.
-- `SubAgentLaunch` always fires before the executor runs; `SubAgentComplete` always fires after, even on failure or cancellation.
+- `SubAgentLaunch` always fires before the executor runs; `SubAgentComplete` always fires after, even on failure or cancellation, and carries the failure reason in its `errMsg` argument (`""` on success).
 - `success` requires `result.Finished && !DetectToolCallSyntaxInContent(result.Output)`.
 
 ## Related Specs

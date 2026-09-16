@@ -47,6 +47,9 @@ func TestExecutor_MutationGate_FinishWithoutMutation_NudgesThenRejects(t *testin
 	if result.Output == "" {
 		t.Error("expected non-empty output (the finish answer)")
 	}
+	if result.AbortReason == "" {
+		t.Error("expected a structured AbortReason on mutation-gate rejection")
+	}
 }
 
 func TestExecutor_MutationGate_FinishAfterMutation_Accepts(t *testing.T) {
@@ -182,6 +185,9 @@ func TestExecutor_MutationGate_RejectedToolDoesNotCount(t *testing.T) {
 	// Second finish (after nudge) should be rejected as Finished=false.
 	if result.Finished {
 		t.Error("expected Finished=false — rejected write_file should not count as mutation")
+	}
+	if result.AbortReason == "" {
+		t.Error("expected a structured AbortReason on mutation-gate rejection")
 	}
 }
 
