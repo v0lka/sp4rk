@@ -3,6 +3,9 @@ package llm
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -760,9 +763,74 @@ func TestRouter_ContextWindowValidation(t *testing.T) {
 	}
 }
 
-// TestNewRouter_TwoProvidersSameModelName verifies that the router's reverse
-// index keeps two providers exposing the same bare model name distinguishable.
-// This is the core multi-provider disambiguation scenario.
+// TestNewRouter_PerProviderHTTPClient verifies the per-provider HTTP client
+// override: an entry carrying HTTPClient uses it for its own requests, while
+// an entry without it falls back to the router-level RouterConfig.HTTPClient.
+// The TLS test server's self-signed certificate makes the distinction
+// observable — only a client that trusts it (srv.Client()) completes the
+// handshake; any other client fails with a certificate error.
+func TestNewRouter_PerProviderHTTPClient(t *testing.T) {
+	const completionBody = `{"id":"x","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`
+
+	var hits atomic.Int32
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(completionBody))
+	}))
+	t.Cleanup(srv.Close)
+
+	routerCfg := func() RouterConfig {
+		return RouterConfig{
+			MaxRetries:     -1, // no retries: fail fast on TLS errors
+			InitialBackoff: time.Millisecond,
+			MaxBackoff:     time.Millisecond,
+			Providers: []ProviderEntry{
+				{
+					Name:         "pinned",
+					ProviderType: "openai",
+					BaseURL:      srv.URL,
+					APIKey:       "k",
+					Models:       []string{"m"},
+					HTTPClient:   srv.Client(), // per-entry override trusting the self-signed cert
+				},
+			},
+		}
+	}
+
+	// The pinned entry's own client must be used: the call succeeds against
+	// the self-signed server.
+	r1, err := NewRouter(context.Background(), routerCfg(), nil)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
+	if _, err := r1.Call(context.Background(), ChatRequest{
+		Model:    "pinned/m",
+		Messages: []Message{{Role: "user", Content: "hi"}},
+	}); err != nil {
+		t.Fatalf("expected per-entry client to succeed against the TLS test server, got: %v", err)
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 server hit, got %d", got)
+	}
+
+	// Without the per-entry client (and no router-level client), the default
+	// transport rejects the self-signed certificate — proving the entry's
+	// HTTPClient was the reason the first call succeeded.
+	cfg := routerCfg()
+	cfg.Providers[0].HTTPClient = nil
+	r2, err := NewRouter(context.Background(), cfg, nil)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
+	if _, err := r2.Call(context.Background(), ChatRequest{
+		Model:    "pinned/m",
+		Messages: []Message{{Role: "user", Content: "hi"}},
+	}); err == nil {
+		t.Fatal("expected default client to reject the self-signed certificate, got nil error")
+	}
+}
+
 func TestNewRouter_TwoProvidersSameModelName(t *testing.T) {
 	cfg := RouterConfig{
 		Providers: []ProviderEntry{

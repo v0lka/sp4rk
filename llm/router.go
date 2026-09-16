@@ -61,6 +61,10 @@ type ProviderEntry struct {
 	APIKey       string   // already-expanded API key
 	BaseURL      string   // already-expanded base URL
 	Models       []string // enabled model names for this provider
+	// HTTPClient optionally overrides the router-level client for this
+	// provider only (e.g. a per-provider TLS configuration). nil = use
+	// RouterConfig.HTTPClient (which may itself be nil → SDK default).
+	HTTPClient *http.Client
 }
 
 // Router routes LLM calls to the active provider.
@@ -106,7 +110,14 @@ func NewRouter(ctx context.Context, cfg RouterConfig, registry *ModelRegistry) (
 		if entry.ProviderType == "" {
 			return nil, fmt.Errorf("provider %q has no type", entry.Name)
 		}
-		provider, err := createProviderFromConfig(ctx, entry.Name, entry.ProviderType, entry.APIKey, entry.BaseURL, cfg.HTTPClient, cfg.Logger)
+		// Per-provider client override: an entry may carry its own HTTP client
+		// (e.g. host-app TLS pinning for one self-signed endpoint); otherwise
+		// every provider shares the router-level client.
+		providerClient := entry.HTTPClient
+		if providerClient == nil {
+			providerClient = cfg.HTTPClient
+		}
+		provider, err := createProviderFromConfig(ctx, entry.Name, entry.ProviderType, entry.APIKey, entry.BaseURL, providerClient, cfg.Logger)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create provider %q: %w", entry.Name, err)
 		}

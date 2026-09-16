@@ -22,6 +22,7 @@ type ProviderEntry struct {
     APIKey       string   // pre-expanded key
     BaseURL      string   // pre-expanded base URL
     Models       []string // enabled model names
+    HTTPClient   *http.Client // optional per-provider client override (nil = router-level client)
 }
 
 type ModelMetadata struct {
@@ -230,6 +231,8 @@ The Conductor accepts a multimodal task via `ConductorConfig.ContentBlocks`: whe
 | `Logger` | optional | Logs ambiguity warnings on bare-name resolution. |
 
 `APIKey`/`BaseURL`/`Models` must be pre-resolved by the caller (env vars expanded, durations parsed) before `NewRouter`.
+
+`ProviderEntry.HTTPClient` (optional) overrides the router-level client for that one provider — e.g. a host app giving a single self-signed endpoint its own TLS configuration. Resolution order per entry: `ProviderEntry.HTTPClient` → `RouterConfig.HTTPClient` → SDK default. A zero-value entry behaves exactly as before (shared router-level client).
 
 ## Extension Points
 
