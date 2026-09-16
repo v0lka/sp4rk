@@ -865,18 +865,25 @@ func (e *Executor) processSingleToolCall(
 
 		// If mutation gate was triggered (nudge attempted) but still no mutation,
 		// mark as not finished so the orchestrator treats this as a failure.
+		// Output keeps the model's answer (it is a genuine answer, just without a
+		// mutation); AbortReason carries a short, structured cause so consumers
+		// that surface a failure reason (RunSubAgent) don't mistake the answer
+		// prose for the abort cause.
 		finished := true
+		abortReason := ""
 		if e.mutationRequired && !e.hasMutatingToolExecuted(state) {
 			finished = false
+			abortReason = "finish rejected: required mutation was not performed"
 			e.emitter.ExecutorDiagnostic(state.stepNum, "mutation_gate_rejected", map[string]any{
 				"reason": "finish_without_mutation_after_nudge",
 			})
 		}
 
 		state.finishResult = &ExecutorResult{
-			Output:   params.Answer,
-			Steps:    state.allSteps,
-			Finished: finished,
+			Output:      params.Answer,
+			Steps:       state.allSteps,
+			Finished:    finished,
+			AbortReason: abortReason,
 		}
 		return nil, actionBreak, nil // stop processing further tool calls
 	}
@@ -1055,7 +1062,82 @@ func (e *Executor) processSingleToolCall(
 	// Add step to context window
 	cw.AddStep(step)
 
+	// Stop-tool terminator: a successful call to a host-designated stop tool
+	// ends the run HERE (Finished=true, the call's observation as the output)
+	// instead of continuing to the next step. See Executor.stopTools /
+	// SetStopTools. The helper also applies the finish guard, so a stop tool
+	// cannot bypass the pending-async-join gate.
+	if act := e.stopToolTermination(ctx, action.Name, observation, thought, result.IsError, resp, state, cw); act != actionNone {
+		return nil, act, nil
+	}
+
 	return nil, actionNone, nil
+}
+
+// stopToolTermination decides whether a just-executed tool call is a
+// host-designated stop tool that must end the run — the "turn terminator"
+// distinct from the inline finish tool (see Executor.stopTools / SetStopTools).
+//
+// It returns actionNone when the call is not a successful stop tool (the caller
+// continues the loop as usual). Otherwise it either terminates the run — setting
+// state.finishResult with Finished=true and the call's observation as the output
+// — or, when the installed finish guard rejects the termination, injects the
+// guard's nudge step and returns actionBreak so the caller retries the action
+// (the run does NOT terminate). The guard mirrors the finish path: a stop tool
+// is a terminal boundary exactly like finish, so it must not bypass the
+// pending-async-delegation join gate (that gate exists precisely to stop
+// background work from being silently abandoned — a goal turn that ends on a
+// verdict while subagents are still running would otherwise re-open exactly that
+// failure mode).
+//
+// A FAILED stop-tool call (isError) never terminates the run; the caller returns
+// the error observation to the model as usual.
+//
+// Shared by processSingleToolCall and processBatchTool so a stop tool terminates
+// the run whether the model calls it standalone or inside a batch.
+func (e *Executor) stopToolTermination(
+	ctx context.Context,
+	toolName, observation, thought string,
+	isError bool,
+	resp *llm.ChatResponse,
+	state *runState,
+	cw ContextManager,
+) loopAction {
+	if isError {
+		return actionNone
+	}
+	if _, stop := e.stopTools[toolName]; !stop {
+		return actionNone
+	}
+
+	if e.finishGuard != nil {
+		if guardErr := e.finishGuard(ctx); guardErr != nil {
+			nudgeStep := Step{
+				Thought:        thought,
+				UserNudge:      guardErr.Error(),
+				ReasoningItems: resp.Message.ReasoningItems,
+				TokensUsed:     resp.Usage.InputTokens + resp.Usage.OutputTokens,
+			}
+			state.allSteps = append(state.allSteps, nudgeStep)
+			cw.AddStep(nudgeStep)
+			e.emitter.ExecutorDiagnostic(state.stepNum, "stop_tool_guard_rejected", map[string]any{"tool": toolName, "reason": guardErr.Error()})
+			return actionBreak // retry — the guard rejection is a nudge, not a termination
+		}
+	}
+
+	e.emitter.ExecutorDiagnostic(state.stepNum, "stop_tool_terminated", map[string]any{"tool": toolName})
+	state.finishResult = &ExecutorResult{
+		Output:   observation,
+		Steps:    state.allSteps,
+		Finished: true,
+		// Summary carries the model's own final text (the assistant message for
+		// the response that made the call). A stop tool has no `answer` argument
+		// like finish, so Output alone would be only the tool's short
+		// confirmation; Summary preserves the turn's modeled output for callers
+		// that need it (the goal loop seeds the independent verifier from it).
+		Summary: thought,
+	}
+	return actionBreak
 }
 
 // processBatchTool handles the batch meta-tool by executing each sub-call
@@ -1288,6 +1370,16 @@ func (e *Executor) processBatchTool(
 		}
 		state.allSteps = append(state.allSteps, step)
 		cw.AddStep(step)
+
+		// Stop-tool terminator: a successful stop-tool sub-call ends the run
+		// from within the batch too, exactly as it would standalone — otherwise
+		// batching the call (a common model habit) would silently defeat the
+		// turn boundary the host installed and let the agent keep working past
+		// its verdict. Shares the standalone path's logic, including the finish
+		// guard.
+		if act := e.stopToolTermination(ctx, subCall.Name, observation, thought, result.IsError, resp, state, cw); act != actionNone {
+			return nil, act, nil
+		}
 	}
 
 	return nil, actionNone, nil

@@ -420,6 +420,19 @@ type Executor struct {
 	// async delegations.
 	finishGuard func(ctx context.Context) error
 
+	// stopTools names ordinary (host-registered) tool calls that TERMINATE the
+	// ReAct loop when they execute successfully — a "turn terminator" distinct
+	// from the inline finish tool. When a call to one of these tools succeeds,
+	// the run ends with Finished=true (the tool's observation becomes the run
+	// output) instead of continuing to the next step. It exists so a host can
+	// model an explicit control-plane hand-off: e.g. a goal loop's per-turn
+	// working run ends the moment the agent declares its goal status, so the
+	// turn boundary (and the loop's turn budget) is enforced by the executor
+	// rather than relying on the model to stop calling tools. A failed call to
+	// a stop tool never terminates the run. Set via SetStopTools; nil (default)
+	// keeps the previous behavior — every ordinary tool keeps the loop running.
+	stopTools map[string]struct{}
+
 	// resumeSteps holds pre-existing ReAct steps used to resume an executor
 	// from a checkpoint. When non-empty, Run seeds the run state with these
 	// steps so the step counter continues from len(steps)+1 and the full
@@ -668,6 +681,27 @@ func (e *Executor) SetPreWarningPercent(percent int) { e.preWarningPercent = per
 // containing the error message. Used by the sp4rk Conductor to prevent
 // abandoning pending async delegations.
 func (e *Executor) SetFinishGuard(fn func(ctx context.Context) error) { e.finishGuard = fn }
+
+// SetStopTools marks ordinary tool names that terminate the ReAct loop when
+// they execute successfully (see the stopTools field). A successful call to any
+// listed tool ends the run with Finished=true, using the call's observation as
+// the run output — the same terminal semantics as an explicit finish, but driven
+// by a host-registered tool rather than the inline finish tool. A failed call to
+// a stop tool does not terminate the run. Passing no names (or only empty
+// strings) clears the set and restores the default behavior.
+func (e *Executor) SetStopTools(names ...string) {
+	m := make(map[string]struct{}, len(names))
+	for _, n := range names {
+		if n != "" {
+			m[n] = struct{}{}
+		}
+	}
+	if len(m) == 0 {
+		e.stopTools = nil
+		return
+	}
+	e.stopTools = m
+}
 
 // SetPauseChecker installs a cooperative pause signal checked at every step
 // boundary in Run (immediately after the context-cancellation check). When the

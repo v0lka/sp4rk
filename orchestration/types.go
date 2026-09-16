@@ -104,7 +104,13 @@ const (
 
 // ExecutionResult is the output of Orchestrator.Execute.
 type ExecutionResult struct {
-	Output       string          `json:"output"`
+	Output string `json:"output"`
+	// Summary mirrors agent.ExecutorResult.Summary: the model's own final text
+	// when the producing run ended on a host-designated stop tool rather than
+	// the inline finish tool; empty otherwise. Lets a host recover the turn's
+	// modeled output when Output holds only the stop tool's short confirmation
+	// (the c0wrk goal loop seeds the independent verifier from it).
+	Summary      string          `json:"summary,omitempty"`
 	Steps        []agent.Step    `json:"-"`
 	Plan         *Plan           `json:"plan,omitempty"`
 	Blackboard   Blackboard      `json:"-"`

@@ -40,7 +40,7 @@ Each `RunSubAgent` call:
 1. emits `SubAgentLaunch(stepID, taskDesc)`,
 2. injects the task description + step ID into the context,
 3. runs `executor.Run` in the goroutine,
-4. emits `SubAgentComplete(stepID, success, duration)`,
+4. emits `SubAgentComplete(stepID, success, duration, errMsg)`,
 5. sends one `SubAgentResult` on a buffered (cap 1) channel and closes it.
 
 The result channel is **always closed** (via `defer`), so receivers never block

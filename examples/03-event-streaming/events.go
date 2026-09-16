@@ -92,10 +92,14 @@ func (e *PrintingEvents) SubAgentLaunch(stepID, description string) {
 	fmt.Printf("│ 🚀 SubAgent launched: %s — %s\n", stepID, truncate(description, 80))
 }
 
-func (e *PrintingEvents) SubAgentComplete(stepID string, success bool, duration time.Duration) {
+func (e *PrintingEvents) SubAgentComplete(stepID string, success bool, duration time.Duration, errMsg string) {
 	status := "succeeded"
 	if !success {
 		status = "failed"
+	}
+	if errMsg != "" {
+		fmt.Printf("│ 📥 SubAgent %s %s (%v): %s\n", stepID, status, duration, truncate(errMsg, 120))
+		return
 	}
 	fmt.Printf("│ 📥 SubAgent %s %s (%v)\n", stepID, status, duration)
 }

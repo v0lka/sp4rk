@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime/debug"
+	"sync"
 	"time"
 
 	"github.com/v0lka/sp4rk/tools"
@@ -49,10 +50,11 @@ func RunSubAgent(ctx context.Context, stepID string, executor *Executor, cm Cont
 					"panic", r,
 					"stack", string(debug.Stack()),
 				)
-				emitter.SubAgentComplete(stepID, false, time.Since(startTime))
+				panicErr := fmt.Errorf("subagent %s panicked: %v", stepID, r)
+				emitter.SubAgentComplete(stepID, false, time.Since(startTime), panicErr.Error())
 				ch <- SubAgentResult{
 					StepID: stepID,
-					Error:  fmt.Errorf("subagent %s panicked: %v", stepID, r),
+					Error:  panicErr,
 				}
 			}
 		}()
@@ -88,6 +90,26 @@ func RunSubAgent(ctx context.Context, stepID string, executor *Executor, cm Cont
 			}
 		}
 
+		// Compute the terminal failure reason once so the emitted event and the
+		// returned SubAgentResult.Error agree. On success errMsg stays ""; on a
+		// hard error it is err.Error(); on an incomplete (never-finished) run it
+		// prefers the executor's structured AbortReason, then falls back to Output
+		// (a short "Aborted: …" message for the circuit-breaker / fruitless /
+		// max-steps branches), then to a generic one when both are empty.
+		// AbortReason exists precisely so a prose answer (mutation-gate rejection)
+		// is never surfaced as the failure cause.
+		errMsg := ""
+		if err != nil {
+			errMsg = err.Error()
+		} else if !result.Finished {
+			errMsg = "step execution did not complete within max steps"
+			if result.AbortReason != "" {
+				errMsg = result.AbortReason
+			} else if result.Output != "" {
+				errMsg = result.Output
+			}
+		}
+
 		// Emit subagent completion. A cooperative pause (PauseChecker tripped at
 		// a step boundary, surfaced as ErrPaused) is a recoverable checkpoint,
 		// not a failure — emit a distinct SubAgentPaused event instead of
@@ -95,7 +117,7 @@ func RunSubAgent(ctx context.Context, stepID string, executor *Executor, cm Cont
 		if isPaused(err) {
 			emitter.SubAgentPaused(stepID, duration)
 		} else {
-			emitter.SubAgentComplete(stepID, success, duration)
+			emitter.SubAgentComplete(stepID, success, duration, errMsg)
 		}
 
 		if err != nil {
@@ -107,14 +129,9 @@ func RunSubAgent(ctx context.Context, stepID string, executor *Executor, cm Cont
 			return
 		}
 
-		// Treat incomplete execution (no proper finish) as a step failure.
-		// Use the executor's output as the error message when available — it contains
-		// the specific abort reason (e.g. circuit breaker, fruitless abort, max steps).
+		// Treat incomplete execution (no proper finish) as a step failure,
+		// reusing the reason computed above as the error message.
 		if !result.Finished {
-			errMsg := "step execution did not complete within max steps"
-			if result.Output != "" {
-				errMsg = result.Output
-			}
 			ch <- SubAgentResult{StepID: stepID, Output: result.Output, Steps: result.Steps, Error: errors.New(errMsg)}
 			return
 		}
@@ -129,26 +146,72 @@ func RunSubAgent(ctx context.Context, stepID string, executor *Executor, cm Cont
 	return ch
 }
 
+// RunSubAgentsParallelOption configures RunSubAgentsParallel.
+type RunSubAgentsParallelOption func(*runSubAgentsParallelConfig)
+
+// runSubAgentsParallelConfig carries the resolved options.
+type runSubAgentsParallelConfig struct {
+	// maxConcurrency caps how many subagents execute at once. <= 0 means
+	// unlimited (the historical, unbounded fan-out).
+	maxConcurrency int
+}
+
+// WithMaxParallelSubagents caps the number of subagents that execute
+// concurrently. When n <= 0 the fan-out is unbounded (the historical
+// behavior). A positive n bounds peak concurrency — and therefore the peak
+// rate of subagent lifecycle events — without changing the result set or its
+// input order: subagents beyond the cap are queued and started as running
+// slots free up.
+func WithMaxParallelSubagents(n int) RunSubAgentsParallelOption {
+	return func(c *runSubAgentsParallelConfig) { c.maxConcurrency = n }
+}
+
 // RunSubAgentsParallel runs multiple SubAgents concurrently and collects results.
 // Returns results in input order (not completion order); a slow agent blocks
 // all subsequent results from being returned.
-func RunSubAgentsParallel(ctx context.Context, agents []SubAgentTask) (results []SubAgentResult) {
+//
+// By default every subagent is launched at once (unbounded fan-out). Pass
+// WithMaxParallelSubagents to cap how many run concurrently; the cap is a
+// single chokepoint shared by every caller (e.g. a host's delegate tool and
+// plan-wave dispatcher), so the limit holds across all of them.
+func RunSubAgentsParallel(ctx context.Context, agents []SubAgentTask, opts ...RunSubAgentsParallelOption) (results []SubAgentResult) {
 	if len(agents) == 0 {
 		return nil
 	}
 
-	// Launch all agents and collect their channels
-	channels := make([]<-chan SubAgentResult, len(agents))
-	for i, ag := range agents {
-		channels[i] = RunSubAgent(ctx, ag.StepID, ag.Executor, ag.CM, ag.TaskTools, ag.TaskDesc, ag.Emitter, ag.TodoUpdateFunc)
+	var cfg runSubAgentsParallelConfig
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&cfg)
+		}
 	}
 
-	// Collect all results
-	results = make([]SubAgentResult, 0, len(agents))
-	for _, ch := range channels {
-		result := <-ch
-		results = append(results, result)
+	// Resolve the effective cap: <= 0 or a cap >= the task count means
+	// "run everything at once".
+	maxConcurrency := cfg.maxConcurrency
+	if maxConcurrency <= 0 || maxConcurrency > len(agents) {
+		maxConcurrency = len(agents)
 	}
+
+	// Index-addressed results preserve input order regardless of completion
+	// order; each worker writes only its own slot. A semaphore bounds how many
+	// workers hold a running slot at once — a worker blocked on acquisition has
+	// not called RunSubAgent yet, so no SubAgentLaunch event fires for it until
+	// a slot frees, which is exactly what lowers the peak event rate.
+	results = make([]SubAgentResult, len(agents))
+	sem := make(chan struct{}, maxConcurrency)
+	var wg sync.WaitGroup
+	for i := range agents {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			sem <- struct{}{}        // acquire a running slot
+			defer func() { <-sem }() // release it once this subagent settles
+			ag := agents[i]
+			results[i] = <-RunSubAgent(ctx, ag.StepID, ag.Executor, ag.CM, ag.TaskTools, ag.TaskDesc, ag.Emitter, ag.TodoUpdateFunc)
+		}(i)
+	}
+	wg.Wait()
 
 	return results
 }

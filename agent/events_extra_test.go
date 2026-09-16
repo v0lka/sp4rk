@@ -40,7 +40,7 @@ func TestNoopEvents_SubAgentLaunch(t *testing.T) {
 
 func TestNoopEvents_SubAgentComplete(t *testing.T) {
 	n := &NoopEvents{}
-	n.SubAgentComplete("step_1", true, 200*time.Millisecond)
+	n.SubAgentComplete("step_1", true, 200*time.Millisecond, "")
 }
 
 func TestNoopEvents_SubAgentPaused(t *testing.T) {
@@ -89,7 +89,7 @@ func TestNoopEvents_AllMethods_NoPanic(t *testing.T) {
 		func() { n.ToolResult(1, 0, 42, "preview", false) },
 		func() { n.StepComplete(1, 100*time.Millisecond) },
 		func() { n.SubAgentLaunch("step_1", "do") },
-		func() { n.SubAgentComplete("step_1", true, 200*time.Millisecond) },
+		func() { n.SubAgentComplete("step_1", true, 200*time.Millisecond, "") },
 		func() { n.SubAgentPaused("step_1", 250*time.Millisecond) },
 		func() { n.AssistantChunk("partial") },
 		func() { n.AssistantDone("full", 100, 50) },

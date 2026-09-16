@@ -4,7 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/v0lka/sp4rk/llm"
 	"github.com/v0lka/sp4rk/tools"
@@ -65,6 +70,102 @@ func TestRunSubAgent_WithEmitter(t *testing.T) {
 	if !foundComplete {
 		t.Error("expected SubAgentComplete event with success=true")
 	}
+	if got := events.lastCompleteErr(); got != "" {
+		t.Errorf("successful SubAgentComplete errMsg = %q, want empty", got)
+	}
+}
+
+// TestRunSubAgent_CompleteCarriesFailureReason asserts the terminal
+// SubAgentComplete event carries the SAME failure reason as the returned
+// SubAgentResult.Error. Hosts (c0wrk) surface that reason in the subagent chat
+// block, so the two must agree.
+func TestRunSubAgent_CompleteCarriesFailureReason(t *testing.T) {
+	t.Run("llm error", func(t *testing.T) {
+		events := &recordingEvents{}
+		mockLLM := &mockLLMCaller{errors: []error{errors.New("llm failed")}}
+		exec := newExecutorDefaultHITL(mockLLM, newMockToolExecutor(), &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+
+		ch := RunSubAgent(context.Background(), "step_1", exec, newMockContextManager(), nil, "task", events, nil)
+		result := <-ch
+		if result.Error == nil {
+			t.Fatal("expected error")
+		}
+		if got := events.lastCompleteErr(); got != result.Error.Error() {
+			t.Errorf("SubAgentComplete errMsg = %q, want %q", got, result.Error.Error())
+		}
+	})
+
+	t.Run("max steps exhausted carries the abort reason", func(t *testing.T) {
+		events := &recordingEvents{}
+		mockLLM := &mockLLMCaller{
+			responses: []*llm.ChatResponse{
+				llmResponseWithToolCall("t1", "tool1", json.RawMessage(`{}`)),
+				llmResponseWithToolCall("t2", "tool2", json.RawMessage(`{}`)),
+			},
+		}
+		exec := newExecutorDefaultHITL(mockLLM, newMockToolExecutor(), &mockTokenCounter{}, 2, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+
+		ch := RunSubAgent(context.Background(), "step_1", exec, newMockContextManager(), []tools.ToolDescriptor{
+			{Name: "tool1", Description: "t", Source: "core"},
+		}, "task", events, nil)
+		result := <-ch
+		if result.Error == nil {
+			t.Fatal("expected error for max steps exhaustion")
+		}
+		got := events.lastCompleteErr()
+		if got == "" || got != result.Error.Error() {
+			t.Errorf("SubAgentComplete errMsg = %q, want non-empty %q", got, result.Error.Error())
+		}
+	})
+
+	t.Run("recovered panic", func(t *testing.T) {
+		events := &recordingEvents{}
+		exec := newExecutorDefaultHITL(panickingLLMCaller{}, newMockToolExecutor(), &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+
+		ch := RunSubAgent(context.Background(), "step_panic", exec, newMockContextManager(), nil, "task", events, nil)
+		result := <-ch
+		if result.Error == nil {
+			t.Fatal("expected an error from the recovered panic")
+		}
+		got := events.lastCompleteErr()
+		if got == "" || got != result.Error.Error() {
+			t.Errorf("SubAgentComplete errMsg = %q, want non-empty %q", got, result.Error.Error())
+		}
+	})
+
+	// The mutation gate rejects a finish whose Output is the model's ANSWER
+	// (prose), not an "Aborted: …" message. The structured AbortReason must be
+	// forwarded instead so the answer prose never surfaces as the failure cause.
+	t.Run("mutation-gate rejection forwards the structured reason, not the answer prose", func(t *testing.T) {
+		const answerMarker = "PROSE_ANSWER_MUST_NOT_SURFACE"
+		events := &recordingEvents{}
+		mockLLM := &mockLLMCaller{
+			responses: []*llm.ChatResponse{
+				llmResponseFinish("first attempt", answerMarker),
+				llmResponseFinish("second attempt", answerMarker),
+			},
+		}
+		exec := newExecutorDefaultHITL(mockLLM, newMockToolExecutor(), &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+		exec.SetMutationRequired(true)
+
+		ch := RunSubAgent(context.Background(), "step_1", exec, newMockContextManager(), []tools.ToolDescriptor{
+			{Name: "read_file", Description: "read", Source: "core"},
+		}, "task", events, nil)
+		result := <-ch
+		if result.Error == nil {
+			t.Fatal("expected error for mutation-gate rejection")
+		}
+		got := events.lastCompleteErr()
+		if got == "" {
+			t.Fatal("expected a non-empty failure reason from the mutation gate")
+		}
+		if strings.Contains(got, answerMarker) {
+			t.Errorf("errMsg = %q must not carry the model answer prose", got)
+		}
+		if got != result.Error.Error() {
+			t.Errorf("SubAgentComplete errMsg = %q, want %q", got, result.Error.Error())
+		}
+	})
 }
 
 func TestRunSubAgent_Paused(t *testing.T) {
@@ -268,5 +369,167 @@ func TestRunSubAgentsParallel_MixedResults(t *testing.T) {
 	}
 	if successCount != 1 || errorCount != 1 {
 		t.Errorf("expected 1 success and 1 error, got %d success, %d error", successCount, errorCount)
+	}
+}
+
+// peakConcurrencyCaller is a shared LLMCaller that records the peak number of
+// simultaneous calls and parks each call until `target` are in flight (or a
+// grace period elapses), making the observation deterministic. Each subagent
+// performs exactly one call, so peak in-flight calls == peak concurrent
+// subagents (and, since a subagent only calls the LLM once it has acquired a
+// running slot, it also equals the peak SubAgentLaunch event rate).
+type peakConcurrencyCaller struct {
+	target    int32
+	active    int32
+	maxActive int32
+}
+
+func (m *peakConcurrencyCaller) Call(_ context.Context, _ llm.ChatRequest) (*llm.ChatResponse, error) {
+	cur := atomic.AddInt32(&m.active, 1)
+	for {
+		prev := atomic.LoadInt32(&m.maxActive)
+		if cur <= prev || atomic.CompareAndSwapInt32(&m.maxActive, prev, cur) {
+			break
+		}
+	}
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for atomic.LoadInt32(&m.active) < m.target && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(5 * time.Millisecond)
+	atomic.AddInt32(&m.active, -1)
+	return llmResponseFinish("done", "ok"), nil
+}
+
+// peakTaskSet builds n subagent tasks whose single LLM call shares one
+// peakConcurrencyCaller, so the caller observes the true peak across all of
+// them.
+func peakTaskSet(n int, caller *peakConcurrencyCaller) []SubAgentTask {
+	agents := make([]SubAgentTask, n)
+	for i := range agents {
+		agents[i] = SubAgentTask{
+			StepID:   fmt.Sprintf("step_%d", i),
+			Executor: newExecutorDefaultHITL(caller, newMockToolExecutor(), &mockTokenCounter{}, 5, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig),
+			CM:       newMockContextManager(),
+			TaskDesc: fmt.Sprintf("task %d", i),
+		}
+	}
+	return agents
+}
+
+// TestRunSubAgentsParallel_MaxParallelSubagents proves WithMaxParallelSubagents
+// bounds peak concurrency: no more than the limit run at once, results still
+// come back complete and in input order, and — without the option — the fan-out
+// stays unbounded (the historical behavior). This is the single chokepoint the
+// host's delegate tool and plan-wave dispatcher both funnel through.
+func TestRunSubAgentsParallel_MaxParallelSubagents(t *testing.T) {
+	const tasks = 8
+
+	t.Run("cap binds concurrency", func(t *testing.T) {
+		const limit = 3
+		caller := &peakConcurrencyCaller{target: limit}
+		results := RunSubAgentsParallel(context.Background(), peakTaskSet(tasks, caller), WithMaxParallelSubagents(limit))
+
+		if len(results) != tasks {
+			t.Fatalf("got %d results, want %d", len(results), tasks)
+		}
+		for i, r := range results {
+			if r.StepID != fmt.Sprintf("step_%d", i) {
+				t.Errorf("results[%d].StepID = %q, want step_%d (input order preserved)", i, r.StepID, i)
+			}
+			if r.Error != nil {
+				t.Errorf("step_%d error: %v", i, r.Error)
+			}
+		}
+		if got := atomic.LoadInt32(&caller.maxActive); got != limit {
+			t.Errorf("peak concurrent subagents = %d, want exactly %d", got, limit)
+		}
+	})
+
+	t.Run("no cap is unbounded", func(t *testing.T) {
+		caller := &peakConcurrencyCaller{target: tasks}
+		results := RunSubAgentsParallel(context.Background(), peakTaskSet(tasks, caller))
+		if len(results) != tasks {
+			t.Fatalf("got %d results, want %d", len(results), tasks)
+		}
+		if got := atomic.LoadInt32(&caller.maxActive); got != tasks {
+			t.Errorf("peak concurrent subagents = %d, want %d (unbounded fan-out)", got, tasks)
+		}
+	})
+}
+
+// concurrencyGaugeEvents wraps recordingEvents and tracks the peak number of
+// subagents simultaneously mid-lifecycle, as observed through the lifecycle
+// events themselves: SubAgentLaunch increments the gauge, SubAgentComplete /
+// SubAgentPaused decrements it. Because a subagent only emits its launch after
+// acquiring a running slot, the peak gauge value is exactly the peak rate of
+// subagent lifecycle events — the quantity the concurrency cap is meant to
+// bound.
+type concurrencyGaugeEvents struct {
+	recordingEvents
+
+	mu     sync.Mutex
+	active int
+	peak   int
+}
+
+func (e *concurrencyGaugeEvents) SubAgentLaunch(stepID, description string) {
+	e.mu.Lock()
+	e.active++
+	if e.active > e.peak {
+		e.peak = e.active
+	}
+	e.mu.Unlock()
+	e.recordingEvents.SubAgentLaunch(stepID, description)
+}
+
+func (e *concurrencyGaugeEvents) SubAgentComplete(stepID string, success bool, d time.Duration, errMsg string) {
+	e.mu.Lock()
+	if e.active > 0 {
+		e.active--
+	}
+	e.mu.Unlock()
+	e.recordingEvents.SubAgentComplete(stepID, success, d, errMsg)
+}
+
+func (e *concurrencyGaugeEvents) SubAgentPaused(stepID string, d time.Duration) {
+	e.mu.Lock()
+	if e.active > 0 {
+		e.active--
+	}
+	e.mu.Unlock()
+	e.recordingEvents.SubAgentPaused(stepID, d)
+}
+
+func (e *concurrencyGaugeEvents) peakValue() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.peak
+}
+
+// TestRunSubAgentsParallel_PeakEventRateBounded is the direct evidence for the
+// "peak subagent event rate drops" property: the number of subagents
+// simultaneously mid-lifecycle (launched but not yet completed) never exceeds
+// the cap, so the burst of SubAgentLaunch/Complete events is bounded — and with
+// the cap set it stays strictly below the unbounded fan-out.
+func TestRunSubAgentsParallel_PeakEventRateBounded(t *testing.T) {
+	const (
+		tasks = 8
+		limit = 3
+	)
+
+	events := &concurrencyGaugeEvents{}
+	caller := &peakConcurrencyCaller{target: limit}
+	agents := peakTaskSet(tasks, caller)
+	for i := range agents {
+		agents[i].Emitter = events
+	}
+
+	results := RunSubAgentsParallel(context.Background(), agents, WithMaxParallelSubagents(limit))
+	if len(results) != tasks {
+		t.Fatalf("got %d results, want %d", len(results), tasks)
+	}
+	if got := events.peakValue(); got != limit {
+		t.Errorf("peak simultaneous subagent events = %d, want %d (event rate must be bounded by the cap)", got, limit)
 	}
 }

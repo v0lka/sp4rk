@@ -61,7 +61,7 @@ type Events interface {
     ToolResult(stepNum, callIdx, resultLen int, preview string, isError bool)
     StepComplete(stepNum int, duration time.Duration)
     SubAgentLaunch(stepID, description string)
-    SubAgentComplete(stepID string, success bool, duration time.Duration)
+    SubAgentComplete(stepID string, success bool, duration time.Duration, errMsg string)
     AssistantChunk(content string)
     AssistantDone(content string, inputTokens, outputTokens int)
     ContextFill(fillPercent float64, usedTokens, maxTokens int, status string, stepID string)
@@ -104,7 +104,7 @@ This is the **recommended pattern** for custom event sinks. It also future-proof
 | `Finishing`        | When the agent calls `finish`              | `summary`                          |
 | `ExecutorDiagnostic`| Internal nudges, circuit breakers         | `event`, `details`                 |
 | `SubAgentLaunch`   | A delegated sub-agent starts               | `stepID`, `description`            |
-| `SubAgentComplete` | A delegated sub-agent finishes             | `success`, `duration`              |
+| `SubAgentComplete` | A delegated sub-agent finishes             | `success`, `duration`, `errMsg`    |
 
 ### 4. Context fill status
 

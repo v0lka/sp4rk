@@ -21,7 +21,7 @@ The host application consumes the agent execution types from `github.com/v0lka/s
 | `InterjectionConsumer` | agent | Optionally implemented by `ContextManager` | Retires a resume-with-nudge message only after a successful LLM response, so reactive-compaction retries preserve it |
 | `EditVerifyRunner` / `EditVerifyResult` | agent | Implemented by host / consumed by executor | Runs a user-configured post-edit verification command and returns combined output, exit status, timeout state, and infrastructure error |
 | `Step` | agent | Consumed by host | Single ReAct iteration record (thought, reasoning, action `llm.ToolCall`, observation, error/untrusted flags, cache hash) |
-| `ExecutorResult` | agent | Consumed by host | Executor output: final string, the full `[]Step` trajectory, and a `Finished` flag |
+| `ExecutorResult` | agent | Consumed by host | Executor output: final string, the full `[]Step` trajectory, a `Finished` flag, and an optional `AbortReason` (a short structured failure cause for a non-finished run whose `Output` is a meaningful answer rather than an abort message — e.g. the mutation gate) |
 | `StepLimitResponse` | agent | Consumed by host | `allow_once` / `allow_more` / `allow_always` / `deny` returned from `OnStepLimit` |
 | `HITLToolDecision` | agent | Consumed by host | `{Allow bool; ModifiedInput json.RawMessage; Reason string}` returned from `OnToolCall` |
 | `CircuitBreakerConfig` | agent | Provided by host config | Circuit-breaker thresholds (repeat/truncation/parse-error/fruitless abort) protecting the loop |
@@ -63,7 +63,8 @@ Data is plain Go values (structs, slices, `json.RawMessage`). No host-specific t
 - Post-edit verification failures, timeouts, and runner infrastructure failures are rendered into the `[verify_on_edit]` observation note; they do not replace the edited tool result or become an executor Go error.
 - `HITLHandler` methods may return a Go `error`; the executor treats a handler error according to its loop contract (typically aborting the affected step).
 - `HITLToolDecision` with `Allow=false` is **not** an error — it is a normal rejection that becomes the tool's observation.
-- Circuit-breaker aborts (repeated identical calls, repeated truncation, repeated parse errors, fruitless loops) terminate the loop and are reflected in `ExecutorResult.Finished=false`.
+- Circuit-breaker aborts (repeated identical calls, repeated truncation, repeated parse errors, fruitless loops) terminate the loop and are reflected in `ExecutorResult.Finished=false`, with the short abort reason in `Output`.
+- A **mutation-gate** rejection (a `finish` accepted on the second attempt without a mutating tool call) also sets `Finished=false`, but keeps the model's answer in `Output` and carries a short, structured cause in `ExecutorResult.AbortReason` so consumers that surface a failure reason never mistake the answer prose for the abort cause.
 
 ## Breaking Change Checklist
 

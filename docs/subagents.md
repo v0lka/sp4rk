@@ -66,7 +66,7 @@ The returned channel is buffered (capacity 1) and closed when the goroutine fini
 2. **Injects context** — the task description, step ID, and (if provided) the checklist callback are attached to the context (see [Context injection](#context-injection)).
 3. **Runs the executor** — `executor.Run(ctx, taskTools, cm)` is called inside the goroutine.
 4. **Defense-in-depth check** — even if the executor reports `Finished: true`, the output is scanned for printed tool-call syntax (a failure mode where the model writes a fenced code block with a tool-name tag instead of emitting a `tool_use` block). If detected, the result is treated as a failure.
-5. **Emits `SubAgentComplete`** — `emitter.SubAgentComplete(stepID, success, duration)` fires with the outcome and wall-clock duration.
+5. **Emits `SubAgentComplete`** — `emitter.SubAgentComplete(stepID, success, duration, errMsg)` fires with the outcome, wall-clock duration, and the failure reason (`""` on success).
 6. **Sends the result** — a `SubAgentResult` is sent on the channel.
 
 ### Context cancellation
@@ -138,7 +138,7 @@ These are the same helpers used in standalone executor runs (see [Agent Executor
 Subagents emit two events through the provided `Events` sink:
 
 - **`SubAgentLaunch(stepID, description)`** — fired when the goroutine starts, before the executor runs.
-- **`SubAgentComplete(stepID, success, duration)`** — fired when the goroutine finishes, with the success flag and wall-clock duration.
+- **`SubAgentComplete(stepID, success, duration, errMsg)`** — fired when the goroutine finishes, with the success flag, wall-clock duration, and the failure reason (`""` on success).
 
 If `emitter` is `nil`, `RunSubAgent` substitutes `NoopEvents`, so the events are silently dropped. See [Events](events.md#sub-agent-events) for the full method signatures.
 

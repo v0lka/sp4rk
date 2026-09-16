@@ -21,7 +21,11 @@ type Events interface {
 	ToolResult(stepNum, callIdx, resultLen int, preview string, isError bool)
 	StepComplete(stepNum int, duration time.Duration)
 	SubAgentLaunch(stepID, description string)
-	SubAgentComplete(stepID string, success bool, duration time.Duration)
+	// SubAgentComplete is emitted when a sub-agent finishes (or fails). success
+	// reports whether the executor finished without error, and errMsg carries
+	// the failure reason ("" on success), mirroring the OrchestrationEvents
+	// StepComplete error argument.
+	SubAgentComplete(stepID string, success bool, duration time.Duration, errMsg string)
 	// SubAgentPaused is emitted instead of SubAgentComplete when the sub-agent
 	// stopped via a cooperative pause checkpoint (executor.ErrPaused) rather
 	// than finishing or failing. A pause is a recoverable checkpoint, not a
@@ -65,7 +69,7 @@ func (n *NoopEvents) StepComplete(_ int, _ time.Duration) {}
 func (n *NoopEvents) SubAgentLaunch(_, _ string) {}
 
 // SubAgentComplete is a no-op.
-func (n *NoopEvents) SubAgentComplete(_ string, _ bool, _ time.Duration) {}
+func (n *NoopEvents) SubAgentComplete(_ string, _ bool, _ time.Duration, _ string) {}
 
 // SubAgentPaused is a no-op.
 func (n *NoopEvents) SubAgentPaused(_ string, _ time.Duration) {}
