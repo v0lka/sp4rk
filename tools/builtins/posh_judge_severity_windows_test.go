@@ -255,8 +255,14 @@ func TestPoshExecTool_ReasonCodes(t *testing.T) {
 			wantCode: tools.ReasonCodeCommandBlacklist,
 		},
 		{
+			// The flags are deliberately ordered "-Force -Recurse" so the
+			// command does NOT match the blacklist pattern
+			// `Remove-Item\s+-Recurse`: the blacklist is operator policy and
+			// always wins (see TestBashExecTool_Judge_BlacklistBeatsCriteria),
+			// so a system-write case that matches it would report
+			// command_blacklist and never reach the flowsh criterion.
 			name:     "system write is hard command_system_write",
-			command:  `Remove-Item -Recurse -Force C:\Windows\System32`,
+			command:  `Remove-Item -Force -Recurse C:\Windows\System32`,
 			wantSev:  tools.JudgeSeverityHard,
 			wantCode: tools.ReasonCodeCommandSystemWrite,
 		},

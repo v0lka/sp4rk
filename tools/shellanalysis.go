@@ -493,7 +493,7 @@ func shellOutsideRoots(ctx context.Context, report *api.Report, workDir string, 
 				continue
 			}
 			abs, ok := shellResolveTarget(t, base)
-			if !ok || IsHarmlessDevicePath(abs) {
+			if !ok || shellIsHarmlessDevicePath(abs) {
 				continue
 			}
 			inside := false
@@ -522,7 +522,7 @@ func shellOutsideRoots(ctx context.Context, report *api.Report, workDir string, 
 // Raw-device reads (/dev/urandom, /dev/zero, …) ARE excluded — they are
 // routine inputs, not a scope concern, and a raw device is "system" only as
 // a write target. Harmless devices (/dev/null, /dev/full) are exempt via
-// [IsHarmlessDevicePath] inside the containment walk.
+// [shellIsHarmlessDevicePath] inside the containment walk.
 func shellOutsideRootDirectNonSystemTargets(ctx context.Context, report *api.Report, workDir string) []string {
 	var out []string
 	for _, t := range shellOutsideRoots(ctx, report, workDir, shellFSAllKinds, true) {
@@ -542,8 +542,8 @@ func shellOutsideRootDirectNonSystemTargets(ctx context.Context, report *api.Rep
 
 // shellIsRawDeviceTarget reports whether an absolute path names a raw device —
 // the POSIX /dev tree — rather than a system file. Reads from it (/dev/urandom,
-// /dev/zero, /dev/random) are routine; [IsHarmlessDevicePath] already exempts
-// the bit buckets before this is consulted.
+// /dev/zero, /dev/random) are routine; [shellIsHarmlessDevicePath] already
+// exempts the bit buckets before this is consulted.
 func shellIsRawDeviceTarget(absPath string) bool {
 	if absPath == "" {
 		return false
@@ -637,11 +637,36 @@ var windowsSystemPathPrefixes = []string{
 	`c:\program files (x86)`, `\program files (x86)`,
 }
 
+// shellIsHarmlessDevicePath reports whether an absolute shell-analysis target
+// is a harmless bit-bucket device (/dev/null, /dev/full; Windows NUL), evaluated
+// independently of the host OS.
+//
+// Unlike the host-gated [IsHarmlessDevicePath] — correct for filesystem tools,
+// which act on the real host filesystem, where "/dev/null" on a Windows host is
+// an ordinary out-of-root path — this is the shell-analysis view: it classifies
+// command semantics, not host files. A POSIX-rooted target stays "/dev/null" on
+// every host ([resolveShellToken] keeps it forward-slashed and absolute), and
+// in the dialect that produced it the path IS the bit bucket, so the criteria
+// must exempt it regardless of where the analyzer itself runs — otherwise the
+// same command reaches a different verdict on a Windows CI host than on POSIX.
+// Windows-shaped NUL targets keep the host-gated treatment by delegating to
+// [IsHarmlessDevicePath] (the posh dialect only ever executes on Windows, so
+// its device names match exactly where the tool runs).
+func shellIsHarmlessDevicePath(absPath string) bool {
+	if absPath == "" {
+		return false
+	}
+	if harmlessPOSIXDevices[path.Clean(filepath.ToSlash(absPath))] {
+		return true
+	}
+	return IsHarmlessDevicePath(absPath)
+}
+
 // shellIsSystemOrRawDevicePath reports whether an absolute target is a
 // system path (POSIX prefixes, Windows System32 / Program Files) or a
 // non-harmless raw device under /dev. Harmless bit-bucket devices
-// (/dev/null, /dev/full, and Windows NUL via [IsHarmlessDevicePath]) are
-// exempt so routine redirections never fire.
+// (/dev/null, /dev/full, and Windows NUL via [shellIsHarmlessDevicePath])
+// are exempt so routine redirections never fire.
 func shellIsSystemOrRawDevicePath(absPath string) bool {
 	if absPath == "" {
 		return false
@@ -651,7 +676,7 @@ func shellIsSystemOrRawDevicePath(absPath string) bool {
 	for _, prefix := range posixSystemPathPrefixes {
 		if posix == prefix || strings.HasPrefix(posix, prefix+"/") {
 			// /dev is a system tree, but harmless devices are exempt.
-			if prefix == "/dev" && IsHarmlessDevicePath(absPath) {
+			if prefix == "/dev" && shellIsHarmlessDevicePath(absPath) {
 				continue
 			}
 			return true
