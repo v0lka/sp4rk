@@ -12,12 +12,13 @@ require (
 	github.com/philippgille/chromem-go v0.7.0
 	github.com/pkoukk/tiktoken-go v0.1.8
 	github.com/sugarme/tokenizer v0.3.0
+	github.com/v0lka/flowsh v0.1.0
 	github.com/yalue/onnxruntime_go v1.27.0
 	golang.org/x/net v0.57.0
 	golang.org/x/sys v0.47.0
 	golang.org/x/text v0.41.0
 	gopkg.in/yaml.v3 v3.0.1
-	mvdan.cc/sh/v3 v3.7.0
+	mvdan.cc/sh/v3 v3.10.0
 )
 
 require (
@@ -34,6 +35,7 @@ require (
 	github.com/itlightning/dateparse v0.2.1 // indirect
 	github.com/mailru/easyjson v0.7.7 // indirect
 	github.com/mitchellh/colorstring v0.0.0-20190213212951-d06e56a500db // indirect
+	github.com/odvcencio/gotreesitter v0.52.0 // indirect
 	github.com/patrickmn/go-cache v2.1.0+incompatible // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/schollz/progressbar/v2 v2.15.0 // indirect

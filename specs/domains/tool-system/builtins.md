@@ -20,8 +20,8 @@ The SDK ships a catalog of filesystem, search, web, execution, and agent-infrast
 
 | Tool | Category | Default Policy | Untrusted | Description |
 | ---- | -------- | -------------- | --------- | ----------- |
-| `bash_exec` | Execution | `user_confirm` | yes | Shell command execution with timeout, blacklist, and path-containment analysis. |
-| `posh_exec` | Execution | `user_confirm` | yes | Windows PowerShell command execution with timeout, blacklist, and path-containment analysis. |
+| `bash_exec` | Execution | `user_confirm` | yes | Shell command execution with timeout, the host-supplied blocklist (no patterns ship), and the deterministic flowsh criteria C1–C8. |
+| `posh_exec` | Execution | `user_confirm` | yes | Windows PowerShell command execution with timeout, the host-supplied blocklist (no patterns ship), and the deterministic flowsh criteria C1–C8. |
 | `read_file` | File | `always_allow` | yes | Read file contents (streaming, O(1) memory, default 2000-line window). |
 | `write_file` | File | `user_confirm` | no | Create/overwrite a file. |
 | `edit_file` | File | `user_confirm` | no | Apply targeted find-and-replace edits. |
@@ -62,20 +62,21 @@ File tools resolve paths via context helpers (`WorkspacePathFrom`/`TempDirFrom`)
 
 Both shell tools share one safety model, evaluated by their `ToolJudger.Judge` before execution. Every escalation carries a typed `tools.JudgeReasonCode` — the machine-checkable classification delivered to the host as `ConfirmationRequest.JudgeReasonCode` — alongside its prose reason and severity (see [Judge reason codes](#judge-reason-codes)):
 
-1. **Blacklist** — the raw command string is matched against the constructor-supplied regex list (an invalid pattern fails construction). A match returns `allow=false` with the blacklist reason (`command_blacklist`, hard), which **takes precedence** over the containment reason.
-2. **Unresolvable path tokens** (`bash_exec` only) — `tools.UnresolvablePathTokens` flags path-like tokens the resolver cannot assess (`~user`, `${VAR:-/etc/passwd}`), returning `unresolvable_path_token` (hard): input that cannot be assessed at all is never silently let through under auto-approval.
-3. **Path containment** — `tools.PathsOutsideRoots` extracts and resolves shell path tokens (bash and PowerShell grammars; `~`, `$VAR`/`$env:VAR`, and `..` idioms included) and reports those outside the session roots. `tools.ExistingOrAnchoredPaths` then keeps a path when it exists or its nearest existing ancestor directory does, so a write whose leaf does not yet exist but whose parent directory does (e.g. `echo x > /etc/cron.d/newjob`) still escalates with `"command references existing path(s) outside session roots: …"` (`outside_session_roots`, soft). A wholly non-existent subtree is dropped, keeping the false-positive rate low.
+1. **Blocklist** — the raw command string is matched against the constructor-supplied regex list (an invalid pattern fails construction). The list is **host policy**: the engine ships no patterns, and the host decides whether it is empty (c0wrk ships it empty by default and calls it the blocklist). A match returns `allow=false` with the blocklist reason (`command_blacklist`, hard), which **takes precedence** over every criterion.
+2. **Flowsh criteria C1–C8** — the host pre-computes the deterministic analysis once per call (`tools.AnalyzeShellCommandForJudge`) and attaches it to the context (`tools.WithShellAnalysis`); the Judge returns the winning criterion's outcome verbatim via `tools.ShellJudgeOutcome` — hard canonical C1–C5, hard non-canonical C6, soft C7/C8. The Judge never runs the analysis engine itself. When no analysis is attached, the Judge returns an empty outcome and defers to the LLM judges; when the attached one carries an **error** (a failed analyzer/KB load — sticky), it **fails closed** with the hard canonical `command_analysis_unavailable` reason.
 
-**Validated command substitution (assignment form).** The one dynamic-looking binding that does **not** escalate is a name bound **solely** by an assessable command substitution — `VAR=$(...)` whose inner command is fully assessable: it parses, contains no opaque construct and no dynamic binding, every word is statically assessable, and it adds no unresolvable path token (the same pipeline applied recursively). A later `$VAR` reference is **assessable**: it is not reported by `UnresolvablePathTokens` (stage 2) and it does not set the symlink `suspicious` flag, so `PKGS=$(go list ./...); go test $PKGS …` no longer escalates. A **bare `$(...)` in argument position** is not eligible — there is no assignment binding to promote — and stays suspicious; a reference to an unbound name (e.g. `$HOME`) stays suspicious; and the promotion is fail-closed by a **union** over all bindings — any literal, non-assessable, or differently-shaped binding poisons the name back to dynamic. `posh_exec` mirrors the rule in its symlink `suspicious` flag via a static `$NAME = <literal RHS>` binding (the `unresolvable_path_token` stage remains bash-only). See [../../architecture/security-model.md](../../architecture/security-model.md#assignment-form-command-substitutions-are-assessable).
+The former static stages — **unresolvable path tokens** (`unresolvable_path_token`, hard, bash-only) and **shell-path containment** via `PathsOutsideRoots`/`ExistingOrAnchoredPaths` (`outside_session_roots`, soft) — were **removed** by explicit decision: tokens the static walker cannot see through are covered by the C6 unbounded criterion, and out-of-root scope by C4/C8, both of which the flowsh effect IR assesses more precisely than token walking. The extractor functions remain in the package (symlink detection still uses them), and the published `unresolvable_path_token` code is retained for contract stability but is no longer fired.
+
+**Validated command substitution (assignment form).** The one dynamic-looking binding that does **not** raise the symlink `suspicious` flag is a name bound **solely** by an assessable command substitution — `VAR=$(...)` whose inner command is fully assessable: it parses, contains no opaque construct and no dynamic binding, every word is statically assessable, and it adds no unresolvable path token (the same pipeline applied recursively). A later `$VAR` reference is **assessable** — so `PKGS=$(go list ./...); go test $PKGS …` does not stay suspicious. A **bare `$(...)` in argument position** is not eligible — there is no assignment binding to promote — and stays suspicious; a reference to an unbound name (e.g. `$HOME`) stays suspicious; and the promotion is fail-closed by a **union** over all bindings — any literal, non-assessable, or differently-shaped binding poisons the name back to dynamic. `posh_exec` mirrors the rule in its symlink `suspicious` flag via a static `$NAME = <literal RHS>` binding. See [../../architecture/security-model.md](../../architecture/security-model.md#assignment-form-command-substitutions-are-assessable).
 
 **Separator-run tokens are skipped.** A token consisting entirely of separators — a POSIX run of two or more slashes (`//`, `///`) or a two-character drive prefix followed by only separators (`C:\\`) — is a shell-language artifact, not a path: the trailing `//` of a sed address (`sed 's/.*function //'`), a comment marker (`echo "// TODO fix" >> notes.md`), an integer-division operator (`$(( total // count ))`), or an escaped PowerShell drive root. It carries no path component and names no out-of-root location; resolving a bare `//` would clean it to the filesystem root `/` and force a false-positive confirmation of an entirely in-root command. The skip lives in `tools.isPureSeparatorRunToken`, applied in `ResolveShellPathTokens` and mirrored in the JSON-input extractor `tools.ExtractPaths` behind `AllPathsInSessionRoots` (where a phantom root previously defeated the fast-path's *all paths in-root* auto-allow).
 
 Guarantees the skip preserves (regression-tested in `tools/shellpaths_test.go` and `tools/judge_test.go`):
 
-- `cat /etc/passwd`, `echo x > /etc/cron.d/newjob`, and `rm -rf /.` still report out-of-root — their tokens carry real path components.
+- `cat /etc/passwd`, `echo x > /etc/cron.d/newjob`, and `rm -rf /.` still escalate — their tokens carry real path components, and structurally the flowsh C3/C4/C8 criteria key on effect targets, not extracted tokens.
 - `cat //etc/passwd` still reports: `//etc/passwd` carries the `etc/passwd` components, so it is not a pure separator run.
 - `Get-Content C:\` (single separator — the drive root) and `Get-Content C:\\Windows\win.ini` are still extracted; only the pure `C:\\` run is skipped.
-- The blacklist fires on the raw command string **before** path analysis, so `rm -rf /` is still escalated by an `rm -rf` pattern regardless of the skip — and its separator-run spelling `rm -rf //` (whose `//` token the skip removes from path extraction, exactly as the bare `/` never matched) is covered by the same blacklist, which remains the authoritative backstop for bare-root deletions.
+- The blocklist fires on the raw command string **before** any analysis, so `rm -rf /` is still escalated by a host-supplied `rm -rf` pattern regardless of the skip — and with an empty host blocklist it escalates structurally: the flowsh FSWrite target for the filesystem root is outside every session root, so C4 (irreversible class-E destructive write out-of-roots) fires; its separator-run spelling `rm -rf //` is covered identically because the criteria `path.Clean` POSIX-absolute targets (`//` → `/`).
 - A separator-run artifact cannot mask a real escape (`sed 's/.*function //'` alongside `/etc/passwd` still fails containment — tokens are extracted independently), and alongside only in-root paths it no longer injects a phantom root, so judge fast-path auto-approval behaves correctly.
 
 ### Judge reason codes
@@ -84,9 +85,17 @@ Every built-in `ToolJudger` escalation classifies its reason with a typed `tools
 
 | Code | Severity | Emitted by |
 | ---- | -------- | ---------- |
-| `command_blacklist` | hard | `bash_exec`, `posh_exec` — the raw command string matched a blacklist pattern |
-| `unresolvable_path_token` | hard | `bash_exec` — path-like tokens the resolver cannot assess (`~user`, `${VAR:-/etc/passwd}`) |
-| `outside_session_roots` | soft | `bash_exec`, `posh_exec`, file tools — a fully assessed path resolved outside the session roots |
+| `command_blacklist` | hard | `bash_exec`, `posh_exec` — the raw command string matched a host-supplied blocklist pattern (checked first; wins over every criterion) |
+| `command_exfil_flow` | hard | `bash_exec`, `posh_exec` — flowsh C1: exfiltration pair (secret read → tainted network egress); canonical |
+| `command_privilege_escalation` | hard | `bash_exec`, `posh_exec` — flowsh C2: privilege-escalation effect (e.g. SUID install); canonical |
+| `command_system_write` | hard | `bash_exec`, `posh_exec` — flowsh C3: direct write/metadata on a system path (POSIX `/etc`, `/usr`, `/boot`, `/bin`, `/sbin`; Windows `c:\windows`, `c:\program files`, `c:\program files (x86)`, component-boundary) or non-harmless raw device; canonical |
+| `command_destructive_outside_roots` | hard | `bash_exec`, `posh_exec` — flowsh C4: irreversible destructive (KB class D/E) write outside the session roots; canonical |
+| `command_download_cradle` | hard | `bash_exec`, `posh_exec` — flowsh C5: analyzer ⊤/conservative with network egress (download-cradle shape); canonical |
+| `command_unbounded_analysis` | hard | `bash_exec`, `posh_exec` — flowsh C6: analyzer ⊤/conservative without network egress, or an irreversible write whose target could not be resolved (⊤ target, e.g. abbreviated PowerShell parameters); **non-canonical** — an analysis limitation a strict judge may clear |
+| `credential_access` | soft | `bash_exec`, `posh_exec` — flowsh C7: credential access without an exfil pair |
+| `command_analysis_unavailable` | hard | `bash_exec`, `posh_exec` — the deterministic analysis could not be produced (flowsh analyzer/KB init failure): the Judge **fails closed**; canonical |
+| `unresolvable_path_token` | hard | retained for contract stability — no built-in judge fires it since the static unresolvable-token stage was removed (flowsh C6 supersedes it) |
+| `outside_session_roots` | soft | `bash_exec`, `posh_exec` (flowsh C8: direct FS effect outside the session roots — writes/metadata on a non-system path, and reads even of a system path), file tools — a fully assessed path resolved outside the session roots |
 | `unassessable_path` | hard | file tools — the target path could not be determined at all |
 | `git_internal_path` | hard | file tools — the mutating target contains a ".git" path component at or below the workspace root (repository object database, refs, config, hooks; nested repos and worktrees included) |
 | `unassessable_url` | hard | `web_fetch` — the target URL could not be determined at all |
@@ -118,7 +127,7 @@ Blackboard-backed tools (`read_step_output`, `list_step_outputs`, `read_final_re
 
 - **Tool not found**: `ToolRegistry.Execute` returns an `IsError` `ToolResult` (does not panic).
 - **Parse failure**: idiomatically returned via `tools.ParseInputError` — an `IsError` result, nil Go error (clean message, not an infrastructure failure).
-- **Bash blacklist / timeout**: `IsError: true` with a descriptive message; timeout messages include the configured value.
+- **Shell blocklist match / timeout**: `IsError: true` with a descriptive message; timeout messages include the configured value.
 - **ripgrep exit 1**: not an error (no matches); exit ≥ 2 produces `IsError` with stderr.
 - **Optional tool absence**: a missing dependency (e.g. no search API key) silently skips registration — no error at registration time.
 
@@ -128,7 +137,7 @@ Blackboard-backed tools (`read_step_output`, `list_step_outputs`, `read_final_re
 - `batch` is intercepted at the executor level before reaching the registry; its own `Execute()` returns an error.
 - Blackboard-backed tools read only error-free completed steps; outputs are listed in deterministic step-ID order.
 - `read_skill_resource` resolves paths via `skills.SafeResolvePath` (path-traversal safe).
-- Shell path extraction skips pure separator-run tokens (`//`, `C:\\`) as shell-language artifacts; tokens carrying real components (`/etc/passwd`, `//etc/passwd`, `C:\`, `C:\\Windows\win.ini`), anchored out-of-root writes, and the raw-command-string blacklist are unaffected.
+- Shell path extraction skips pure separator-run tokens (`//`, `C:\\`) as shell-language artifacts; tokens carrying real components (`/etc/passwd`, `//etc/passwd`, `C:\`, `C:\\Windows\win.ini`), anchored out-of-root writes, the raw-command-string blocklist, and the flowsh write criteria (keyed on effect targets, not extracted tokens) are unaffected.
 - Every built-in judge escalation carries a `JudgeReasonCode` matching its escalation branch; allowed outcomes and plain `PolicyUserConfirm` gates carry none.
 - Untrusted-output tools always set `Untrusted: true` and are wrapped when injection defense is enabled.
 - `glob` and `ripgrep` share a single ignore authority (`IgnoreChecker` from context); a `nil` checker means no filtering (the opt-in, no-regression default).

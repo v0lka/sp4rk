@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"os/exec"
 	"regexp"
-	"strings"
 	"syscall"
 	"time"
 
@@ -69,15 +68,29 @@ type bashInput struct {
 }
 
 // Judge evaluates whether a bash command is safe to execute.
-// It checks the command against compiled blacklist patterns first (the more
-// specific reason), then performs path-containment analysis: any shell token
-// resolving to an absolute path outside the session roots escalates the call to
-// user confirmation, mirroring how read_file/list_directory Judges behave. With
-// no session roots configured containment is a no-op (no crash, no reason).
 //
-// Severity: a blacklist match is hard — a security control fired and the
-// reason must never be weakened. Path-containment escalations are soft — the
-// operation may be legitimate, only its scope is in question.
+// Deterministic pipeline, in order:
+//
+//  1. Blacklist match — hard, ReasonCodeCommandBlacklist, reason "command
+//     matches blacklist pattern: ...". The blacklist is operator policy and
+//     always wins; the reason must never be weakened.
+//  2. Flowsh criteria — the host pre-computes the deterministic analysis
+//     ([tools.AnalyzeShellCommandForJudge]; criteria C1–C8 in
+//     tools/shellanalysis.go) and attaches it to ctx via
+//     [tools.WithShellAnalysis]; the Judge reads it through
+//     [tools.ShellJudgeOutcome] and returns its winning outcome verbatim
+//     (hard canonical C1–C5, hard non-canonical C6, soft C7/C8). The Judge
+//     never runs the analysis engine itself — no recomputation.
+//
+// The former static checks — unresolvable path tokens (hard) and shell-path
+// containment (soft) — were removed by explicit decision: tokens the static
+// walker cannot see through are covered by the C6 unbounded criterion, and
+// out-of-root scope by C4/C8, both of which the flowsh effect IR assesses
+// more precisely than token walking.
+//
+// When no analysis is attached, or the attached one carries an error (e.g. a
+// knowledge-base load failure — logged), the Judge returns an empty outcome
+// and defers to the advisory judges (see [tools.ShellJudgeOutcome]).
 func (t *BashExecTool) Judge(ctx context.Context, input json.RawMessage) tools.JudgeOutcome {
 	var params bashInput
 	if err := json.Unmarshal(input, &params); err != nil {
@@ -94,42 +107,7 @@ func (t *BashExecTool) Judge(ctx context.Context, input json.RawMessage) tools.J
 		}
 	}
 
-	// Unresolvable path-like tokens ("~user", "${VAR:-/etc/passwd}", and
-	// "$NAME" references to names rebound by constructs the static walker
-	// cannot see through — "read D", "source cfg", "eval", "printf -v D",
-	// "mapfile D", "unset D", for/select loop iteration, …) reference
-	// locations or values the resolver cannot assess. Escalate as HARD: an
-	// input that cannot be assessed at all must never be silently let through
-	// under auto-approval (see JudgeSeverityHard).
-	if unresolved := tools.UnresolvablePathTokens(params.Command, tools.ShellBash); len(unresolved) > 0 {
-		return tools.JudgeOutcome{
-			Reason:     "command contains unresolvable path-like token(s): " + strings.Join(unresolved, ", "),
-			Severity:   tools.JudgeSeverityHard,
-			ReasonCode: tools.ReasonCodeUnresolvablePathToken,
-		}
-	}
-
-	// Path-containment analysis: out-of-root paths escalate to confirmation
-	// even under always_allow, closing the documented-invariant gap. The Judge
-	// runs before auto-approval, so a non-empty reason here forces a prompt.
-	//
-	// A path is escalated when it, or its nearest existing ancestor directory,
-	// exists and is outside the session roots. This retains write/create
-	// targets whose leaf does not yet exist but whose parent directory does
-	// (e.g. "echo ... > /etc/cron.d/newjob"), so a prompt-injection-driven
-	// write into an existing out-of-root directory still triggers a prompt
-	// under auto-approval. A wholly non-existent subtree (a fabricated token
-	// with no real anchor) is dropped, keeping the false-positive rate low.
-	outside := tools.PathsOutsideRoots(ctx, params.Command, tools.ShellBash, params.WorkingDirectory)
-	if outside = tools.ExistingOrAnchoredPaths(outside); len(outside) > 0 {
-		return tools.JudgeOutcome{
-			Reason:     "command references existing path(s) outside session roots: " + strings.Join(outside, ", "),
-			Severity:   tools.JudgeSeveritySoft,
-			ReasonCode: tools.ReasonCodeOutsideSessionRoots,
-		}
-	}
-
-	return tools.JudgeOutcome{} // No concern to report; workspace auto-approval semantics apply.
+	return tools.ShellJudgeOutcome(ctx, "bash_exec")
 }
 
 // Execute runs the bash command and returns the result.

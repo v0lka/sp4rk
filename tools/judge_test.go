@@ -57,20 +57,20 @@ func (m *mockLLMProvider) snapshot() []llm.ChatRequest {
 
 func TestJudgeCacheKey(t *testing.T) {
 	// Same tool name, input, and roots should produce same key
-	key1 := judgeCacheKey("bash", json.RawMessage(`{"command":"ls"}`), nil)
-	key2 := judgeCacheKey("bash", json.RawMessage(`{"command":"ls"}`), nil)
+	key1 := judgeCacheKey("bash", json.RawMessage(`{"command":"ls"}`), nil, "")
+	key2 := judgeCacheKey("bash", json.RawMessage(`{"command":"ls"}`), nil, "")
 	if key1 != key2 {
 		t.Errorf("expected same keys, got %q and %q", key1, key2)
 	}
 
 	// Different tool name should produce different key
-	key3 := judgeCacheKey("file_write", json.RawMessage(`{"command":"ls"}`), nil)
+	key3 := judgeCacheKey("file_write", json.RawMessage(`{"command":"ls"}`), nil, "")
 	if key1 == key3 {
 		t.Errorf("expected different keys for different tool names, got same key %q", key1)
 	}
 
 	// Different input should produce different key
-	key4 := judgeCacheKey("bash", json.RawMessage(`{"command":"rm -rf /"}`), nil)
+	key4 := judgeCacheKey("bash", json.RawMessage(`{"command":"rm -rf /"}`), nil, "")
 	if key1 == key4 {
 		t.Errorf("expected different keys for different inputs, got same key %q", key1)
 	}
@@ -78,13 +78,25 @@ func TestJudgeCacheKey(t *testing.T) {
 	// Different session roots must produce different keys: the judge prompt
 	// lists the roots, so the same tool+input is a different safety question
 	// in a session with another directory scope.
-	key5 := judgeCacheKey("bash", json.RawMessage(`{"command":"ls"}`), []string{"/ws/a"})
+	key5 := judgeCacheKey("bash", json.RawMessage(`{"command":"ls"}`), []string{"/ws/a"}, "")
 	if key1 == key5 {
 		t.Errorf("expected different keys for different session roots, got same key %q", key1)
 	}
-	key6 := judgeCacheKey("bash", json.RawMessage(`{"command":"ls"}`), []string{"/ws/b"})
+	key6 := judgeCacheKey("bash", json.RawMessage(`{"command":"ls"}`), []string{"/ws/b"}, "")
 	if key5 == key6 {
 		t.Errorf("expected different keys for different session roots, got same key %q", key5)
+	}
+
+	// A rendered static-analysis block must produce a different key: the
+	// block changes the judge prompt, so a verdict computed with a digest
+	// attached must not be reused for a digest-less evaluation.
+	key7 := judgeCacheKey("bash", json.RawMessage(`{"command":"ls"}`), nil, "## Static Analysis Report\n{x}")
+	if key1 == key7 {
+		t.Errorf("expected different keys with a static-analysis block, got same key %q", key1)
+	}
+	key8 := judgeCacheKey("bash", json.RawMessage(`{"command":"ls"}`), nil, "## Static Analysis Report\n{y}")
+	if key7 == key8 {
+		t.Errorf("expected different keys for different analysis blocks, got same key %q", key7)
 	}
 }
 
@@ -1688,6 +1700,152 @@ func TestJudge_WithoutSessionRoots(t *testing.T) {
 	}
 }
 
+// TestJudgeEvaluate_WithShellAnalysisBlock verifies that the advisory judge
+// appends the host-attached static-analysis digest to the user prompt as a
+// "## Static Analysis Report" block: the digest JSON wrapped in exactly one
+// untrusted-content boundary, after the session-directories block.
+func TestJudgeEvaluate_WithShellAnalysisBlock(t *testing.T) {
+	mockProvider := &mockLLMProvider{
+		response: &llm.ChatResponse{
+			Message: llm.Message{Content: "VERDICT: ALLOW\nREASON: Safe operation"},
+		},
+	}
+	judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+
+	ctx := WithWorkspacePath(context.Background(), "/home/user/project")
+	ctx = WithAllowedRoots(ctx, []string{"/aux/repo"})
+	analysis := &ShellAnalysis{
+		Digest: ShellAnalysisDigest{
+			SchemaVersion: ShellDigestSchemaVersion,
+			Lang:          "bash",
+			Effects:       []ShellEffectDigest{{Kind: "FSRead", Targets: []string{"/aux/repo/notes.md"}}},
+			Score:         ShellScoreDigest{Grade: "None"},
+			Criteria:      []ShellCriterion{{Fired: ReasonCodeOutsideSessionRoots, Severity: JudgeSeveritySoft}},
+		},
+		Outcome:   JudgeOutcome{Allow: false, ReasonCode: ReasonCodeOutsideSessionRoots, Severity: JudgeSeveritySoft},
+		Canonical: false,
+	}
+	ctx = WithShellAnalysis(ctx, analysis, nil)
+
+	input := json.RawMessage(`{"command":"cat /aux/repo/notes.md"}`)
+	if _, _, err := judge.Judge(ctx, "bash_exec", input, "read notes"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if mockProvider.lastRequest == nil {
+		t.Fatal("last request was not captured")
+	}
+	var userPrompt string
+	for _, msg := range mockProvider.lastRequest.Messages {
+		if msg.Role == "user" {
+			userPrompt = msg.Content
+		}
+	}
+	if !contains(userPrompt, "## Static Analysis Report") {
+		t.Error("expected static-analysis block in judge user prompt")
+	}
+	if !contains(userPrompt, `"schemaVersion":"`+ShellDigestSchemaVersion+`"`) {
+		t.Error("expected digest schema version in judge user prompt")
+	}
+	if !contains(userPrompt, `"fired":"outside_session_roots"`) {
+		t.Error("expected fired criterion in judge user prompt")
+	}
+	if !contains(userPrompt, "<untrusted-content source=\"shell_analysis\">") {
+		t.Error("expected digest wrapped in a shell_analysis untrusted-content boundary")
+	}
+	// The block carries exactly one boundary: the payload must not be able
+	// to close it early, and no other field may open a second one.
+	if n := strings.Count(userPrompt, "</untrusted-content>"); n < 1 {
+		t.Error("expected a closing untrusted-content boundary tag")
+	}
+	analysisIdx := strings.Index(userPrompt, "## Static Analysis Report")
+	rootsIdx := strings.Index(userPrompt, "## Session Directories")
+	if rootsIdx >= 0 && analysisIdx < rootsIdx {
+		t.Error("expected static-analysis block after the session-directories block")
+	}
+}
+
+// TestJudge_WithoutShellAnalysis verifies the advisory user prompt is
+// unchanged when no digest applies: no attachment, an attached analysis
+// error, or a non-shell tool evaluated with a stray attachment all produce
+// no static-analysis block.
+func TestJudge_WithoutShellAnalysis(t *testing.T) {
+	analysis := &ShellAnalysis{
+		Digest: ShellAnalysisDigest{
+			SchemaVersion: ShellDigestSchemaVersion,
+			Lang:          "bash",
+			Criteria:      []ShellCriterion{{Fired: ReasonCodeOutsideSessionRoots, Severity: JudgeSeveritySoft}},
+		},
+	}
+	input := json.RawMessage(`{"command":"ls"}`)
+
+	tests := []struct {
+		name     string
+		ctx      context.Context
+		toolName string
+	}{
+		{name: "no attachment", ctx: context.Background(), toolName: "bash_exec"},
+		{name: "attached analysis error", ctx: WithShellAnalysis(context.Background(), nil, errors.New("kb load failed")), toolName: "bash_exec"},
+		{name: "non-shell tool with stray attachment", ctx: WithShellAnalysis(context.Background(), analysis, nil), toolName: "write_file"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockProvider := &mockLLMProvider{
+				response: &llm.ChatResponse{Message: llm.Message{Content: "VERDICT: ALLOW\nREASON: Safe operation"}},
+			}
+			judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+			// A non-shell tool with no absolute paths in its input would be
+			// fast-path allowed; embed a path so the call always reaches the
+			// LLM and the prompt is observable.
+			toolInput := input
+			if tt.toolName != "bash_exec" {
+				toolInput = json.RawMessage(`{"path":"/outside/root/file.txt"}`)
+			}
+			if _, _, err := judge.Judge(tt.ctx, tt.toolName, toolInput, "list files"); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if mockProvider.lastRequest == nil {
+				t.Fatal("last request was not captured")
+			}
+			for _, msg := range mockProvider.lastRequest.Messages {
+				if msg.Role == "user" && contains(msg.Content, "## Static Analysis Report") {
+					t.Error("expected NO static-analysis block for this evaluation")
+				}
+			}
+		})
+	}
+}
+
+// TestJudge_CacheSeparatedByAnalysisBlock verifies that identical tool+input
+// in the same directory scope produces two LLM calls when one evaluation
+// carries a digest and the other does not (no cross-attachment cache reuse).
+func TestJudge_CacheSeparatedByAnalysisBlock(t *testing.T) {
+	mockProvider := &mockLLMProvider{
+		response: &llm.ChatResponse{Message: llm.Message{Content: "VERDICT: ALLOW\nREASON: Safe operation"}},
+	}
+	judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+
+	input := json.RawMessage(`{"command":"ls"}`)
+	if _, _, err := judge.Judge(context.Background(), "bash_exec", input, "list files"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	analysis := &ShellAnalysis{
+		Digest: ShellAnalysisDigest{
+			SchemaVersion: ShellDigestSchemaVersion,
+			Lang:          "bash",
+			Criteria:      []ShellCriterion{{Fired: ReasonCodeOutsideSessionRoots, Severity: JudgeSeveritySoft}},
+		},
+	}
+	ctx := WithShellAnalysis(context.Background(), analysis, nil)
+	if _, _, err := judge.Judge(ctx, "bash_exec", input, "list files"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if got := len(mockProvider.snapshot()); got != 2 {
+		t.Fatalf("expected isolated LLM evaluations, got %d calls", got)
+	}
+}
+
 // TestJudge_CacheSeparatedBySessionRoots verifies that identical tool+input
 // evaluated in two different directory scopes produces two LLM calls (no
 // cross-scope cache reuse).
@@ -2335,8 +2493,19 @@ func TestJudgeReasonCode_Vocabulary(t *testing.T) {
 		ReasonCodeSymlinkEscape:         "symlink_escape",
 		ReasonCodeSymlinkSuspicious:     "symlink_suspicious",
 		ReasonCodeGitInternal:           "git_internal_path",
+		// The flowsh shell-analysis criteria (C1–C8) and the fail-closed
+		// analysis-unavailable reason: published cross-repo contract codes
+		// serialized into confirmations and read by non-Go hosts.
+		ReasonCodeCommandExfilFlow:               "command_exfil_flow",
+		ReasonCodeCommandPrivilegeEscalation:     "command_privilege_escalation",
+		ReasonCodeCommandSystemWrite:             "command_system_write",
+		ReasonCodeCommandDestructiveOutsideRoots: "command_destructive_outside_roots",
+		ReasonCodeCommandDownloadCradle:          "command_download_cradle",
+		ReasonCodeCommandUnboundedAnalysis:       "command_unbounded_analysis",
+		ReasonCodeCredentialAccess:               "credential_access",
+		ReasonCodeCommandAnalysisUnavailable:     "command_analysis_unavailable",
 	}
-	const wantPublished = 10
+	const wantPublished = 18
 	if len(published) != wantPublished {
 		t.Fatalf("vocabulary size = %d, want %d — update this pin when publishing or retiring a code", len(published), wantPublished)
 	}

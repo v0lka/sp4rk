@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"os/exec"
 	"regexp"
-	"strings"
 	"syscall"
 	"time"
 
@@ -81,10 +80,28 @@ type poshInput struct {
 }
 
 // Judge evaluates whether a PowerShell command is safe to execute.
-// It checks the command against compiled blacklist patterns.
 //
-// Severity mirrors BashExecTool.Judge: a blacklist match is hard, a
-// path-containment escalation is soft.
+// Deterministic pipeline, in order:
+//
+//  1. Blacklist match — hard, ReasonCodeCommandBlacklist, reason "command
+//     matches blacklist pattern: ...". The blacklist is operator policy and
+//     always wins; the reason must never be weakened.
+//  2. Flowsh criteria — the host pre-computes the deterministic analysis
+//     ([tools.AnalyzeShellCommandForJudge]; criteria C1–C8 in
+//     tools/shellanalysis.go, PowerShell dialect) and attaches it to ctx
+//     via [tools.WithShellAnalysis]; the Judge reads it through
+//     [tools.ShellJudgeOutcome] and returns its winning outcome verbatim
+//     (hard canonical C1–C5, hard non-canonical C6, soft C7/C8). The Judge
+//     never runs the analysis engine itself — no recomputation.
+//
+// The former static shell-path containment check (soft) was removed by
+// explicit decision: out-of-root scope is assessed by the C4/C8 criteria
+// over the flowsh effect IR, which understands PowerShell syntax more
+// precisely than token walking.
+//
+// When no analysis is attached, or the attached one carries an error (e.g. a
+// knowledge-base load failure — logged), the Judge returns an empty outcome
+// and defers to the advisory judges (see [tools.ShellJudgeOutcome]).
 func (t *PoshExecTool) Judge(ctx context.Context, input json.RawMessage) tools.JudgeOutcome {
 	var params poshInput
 	if err := json.Unmarshal(input, &params); err != nil {
@@ -101,26 +118,7 @@ func (t *PoshExecTool) Judge(ctx context.Context, input json.RawMessage) tools.J
 		}
 	}
 
-	// Containment check: reject commands that reference filesystem paths
-	// outside the configured session roots (workspace + auxiliary roots).
-	// Mirrors BashExecTool.Judge exactly, differing only in ShellKind
-	// (ShellPosh) so PowerShell env syntax like "$env:VAR" is recognized.
-	// A path is escalated when it, or its nearest existing ancestor directory,
-	// exists and is outside the roots — retaining write/create targets whose
-	// leaf does not yet exist but whose parent directory does, so a write
-	// into an existing out-of-root directory still triggers a prompt under
-	// auto-approval. A wholly non-existent subtree (a fabricated token with
-	// no real anchor) is dropped.
-	outside := tools.PathsOutsideRoots(ctx, params.Command, tools.ShellPosh, params.WorkingDirectory)
-	if outside = tools.ExistingOrAnchoredPaths(outside); len(outside) > 0 {
-		return tools.JudgeOutcome{
-			Reason:     "command references existing path(s) outside session roots: " + strings.Join(outside, ", "),
-			Severity:   tools.JudgeSeveritySoft,
-			ReasonCode: tools.ReasonCodeOutsideSessionRoots,
-		}
-	}
-
-	return tools.JudgeOutcome{} // No concern to report; workspace auto-approval semantics apply.
+	return tools.ShellJudgeOutcome(ctx, "posh_exec")
 }
 
 // Execute runs the PowerShell command and returns the result.

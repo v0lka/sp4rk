@@ -46,7 +46,8 @@ const (
 
 // Optional per-tool safety heuristic. JudgeOutcome carries Allow, Reason,
 // Severity, and ReasonCode: JudgeSeverityHard (the zero value — fail-closed)
-// marks a fired security control (blacklist pattern, SSRF); JudgeSeveritySoft
+// marks a fired security control (blocklist pattern, a flowsh criterion,
+// SSRF); JudgeSeveritySoft
 // marks a scope question (path containment). ReasonCode is the typed, stable
 // classification of the reason delivered to the host as
 // ConfirmationRequest.JudgeReasonCode. Allow=false with an empty Reason means

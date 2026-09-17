@@ -128,6 +128,48 @@ const (
 	// (hard severity, mirroring ReasonCodeSymlinkEscape): the call escalates
 	// to user confirmation and hosts must never auto-override it.
 	ReasonCodeGitInternal JudgeReasonCode = "git_internal_path"
+	// ReasonCodeCommandExfilFlow marks a shell command whose flowsh analysis
+	// found a credential-exfiltration pairing — a secret read (CredAccess or
+	// FSRead of a secret-bearing path) reaching a tainted network egress
+	// (criterion C1). Fired control, hard and canonical: never weaken it.
+	ReasonCodeCommandExfilFlow JudgeReasonCode = "command_exfil_flow"
+	// ReasonCodeCommandPrivilegeEscalation marks a shell command whose flowsh
+	// analysis found a privilege-escalation effect — sudo, setuid installs,
+	// and their kin (criterion C2). Fired control, hard and canonical.
+	ReasonCodeCommandPrivilegeEscalation JudgeReasonCode = "command_privilege_escalation"
+	// ReasonCodeCommandSystemWrite marks a shell command whose flowsh analysis
+	// found a filesystem write/metadata effect landing on a system path
+	// (/etc, /usr, /boot, /bin, /sbin, Windows System32 / Program Files) or a
+	// non-harmless raw device (criterion C3). Fired control, hard and
+	// canonical.
+	ReasonCodeCommandSystemWrite JudgeReasonCode = "command_system_write"
+	// ReasonCodeCommandDestructiveOutsideRoots marks a shell command combining
+	// a destructive knowledge-base flag of class D/E, irreversibility, and a
+	// concrete filesystem-write target outside the session roots (criterion
+	// C4). Fired control, hard and canonical.
+	ReasonCodeCommandDestructiveOutsideRoots JudgeReasonCode = "command_destructive_outside_roots"
+	// ReasonCodeCommandDownloadCradle marks a shell command the analyser could
+	// not bound (⊤/conservative) that performs network egress — the shape of a
+	// download-and-execute cradle (criterion C5). Fired control, hard and
+	// canonical.
+	ReasonCodeCommandDownloadCradle JudgeReasonCode = "command_download_cradle"
+	// ReasonCodeCommandUnboundedAnalysis marks a shell command the analyser
+	// could not bound (⊤/conservative) with no network egress (criterion C6).
+	// Hard but NON-canonical: it is an analysis limitation, not a confirmed
+	// control — an advisory judge may clear it on closer reading.
+	ReasonCodeCommandUnboundedAnalysis JudgeReasonCode = "command_unbounded_analysis"
+	// ReasonCodeCredentialAccess marks a shell command whose flowsh analysis
+	// found credential/secret material accessed without a paired egress
+	// (criterion C7). Advisory scope concern, soft.
+	ReasonCodeCredentialAccess JudgeReasonCode = "credential_access"
+	// ReasonCodeCommandAnalysisUnavailable marks a shell command whose
+	// deterministic analysis could not be produced at all — the flowsh
+	// analyzer or its embedded knowledge base failed to initialise. The
+	// deterministic floor (criteria C1–C8) is unavailable for the call, so it
+	// fails CLOSED: a fired control-like reason, hard and canonical, never
+	// auto-overridable, so the call still escalates under an `allow` policy
+	// and blocks under verify-on-edit's unattended path.
+	ReasonCodeCommandAnalysisUnavailable JudgeReasonCode = "command_analysis_unavailable"
 )
 
 // JudgeOutcome is the result of a tool-local safety judge: whether the call is

