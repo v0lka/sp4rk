@@ -145,6 +145,19 @@ Strict mode differs from advisory `Judge` in three security-relevant ways:
 
 Strict mode remains advisory to the host: it returns an allow/confirm/deny recommendation and never bypasses `PolicyAlwaysDeny`, a hard `JudgeSeverity`, or registry confirmation policy by itself.
 
+### Loop judge (step-limit boundaries)
+
+`ToolJudge.JudgeStepLimit(ctx, StepLimitJudgeRequest)` is the LLM primitive for **unattended** step-limit decisions: when a run hits its step budget or a circuit-breaker abort and no human is available, the host consults the loop judge instead of `HITLHandler.OnStepLimit`. The request carries the task, a plan-progress snapshot, the boundary trigger (`budget` or `circuit_breaker` — an unrecognized/empty category normalizes to the stricter `circuit_breaker`), the host's breaker reason, a digest of recent steps, and cumulative quality metrics.
+
+Security properties, mirroring strict mode:
+
+1. One uncached LLM call per boundary — each decision is judged against its own trajectory.
+2. Every value that may quote untrusted content (task, plan snapshot, breaker reason, step digests with tool args/results) is line-sanitized and wrapped in an `untrusted-content` boundary inside the prompt envelope.
+3. The verdict parses only from an explicit token (`VERDICT:` line value, JSON field, or bare token — at most `ALLOW` plus one qualifier); prose that merely contains a verdict word is a parse failure, so negative prose can never grant `ALLOW_ALWAYS`.
+4. Fail-closed: missing provider, provider error, timeout, nil response, and unparseable output all return `LoopVerdictDeny` (stop) with a nil error, and provider error text is excluded from logs.
+
+The verdict (`deny`/`allow_once`/`allow_more`/`allow_always`) is a recommendation the host maps onto its step-limit response handling; it never grants budget by itself. See [../contracts/tools.md](../contracts/tools.md).
+
 <a id="shell-command-analysis"></a>
 ## Shell Command Analysis (flowsh criteria)
 
@@ -315,6 +328,7 @@ File-based defaults, session roots, and blacklist regexes are host-application c
 - An MCP tool registration can never overwrite an existing non-MCP tool.
 - The LLM-powered advisory `ToolJudge` cache key incorporates session roots and partitions cached verdicts by directory scope; its prompt carries the same wrapped scope data.
 - `ToolJudge.JudgeStrict` performs an uncached, no-fast-path LLM evaluation per invocation and maps every construction/provider/timeout/parse failure to `VerdictConfirm` without logging potentially sensitive provider diagnostics.
+- `ToolJudge.JudgeStepLimit` (loop judge) is likewise uncached, parses verdicts only from explicit tokens (prose containing a verdict word is a parse failure), wraps the task, plan snapshot, breaker reason, and trajectory in untrusted-content boundaries, and maps every provider/timeout/parse failure to `LoopVerdictDeny` without logging provider diagnostics.
 - The LLM-powered `ToolJudge` verdict parser fails **safe** to `VerdictConfirm` on any unrecognized or ambiguous verdict: verdict tokens are matched whole-token (case-insensitive), so negations of allow-words (e.g. `DISALLOW`, `DISAPPROVE`) are never misclassified as `VerdictAllow` — they map to the deliberate-rejection `VerdictDeny`. An LLM error likewise yields `VerdictConfirm`. See [../contracts/tools.md](../contracts/tools.md) for the verdict vocabulary.
 
 ## Anti-Patterns

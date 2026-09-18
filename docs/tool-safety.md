@@ -16,6 +16,7 @@ Beyond the [`Tool` interface](tools.md) and the [policy/Judger enforcement](tool
   - [JudgeConfig and NewToolJudgeFromConfig](#judgeconfig-and-newtooljudgefromconfig)
   - [How advisory judgment works](#how-advisory-judgment-works)
   - [Strict gate resolution](#strict-gate-resolution)
+  - [Step-limit (loop) judgment](#step-limit-loop-judgment)
 - [Shell command analysis (flowsh)](#shell-command-analysis-flowsh)
 - [File coherence](#file-coherence)
   - [FileCoherenceChecker](#filecoherencechecker)
@@ -181,6 +182,68 @@ if err != nil || verdict != tools.VerdictAllow {
 ```
 
 > **Migration note:** use `Judge` for advisory auto-approval where its documented fast paths and cache are acceptable. Use `JudgeStrict` only after a tool/policy has already requested confirmation and only when the escalation severity is soft.
+
+### Step-limit (loop) judgment
+
+`JudgeStepLimit` is the autonomous counterpart to the human-facing `HITLHandler.OnStepLimit` ([hitl.md](hitl.md)): when an unattended run hits a step-budget or circuit-breaker boundary and there is no human to ask, the host can ask the loop judge instead:
+
+```go
+type StepLimitJudgeRequest struct {
+    TaskContext   string                 // task description (tools.TaskContextFrom(ctx))
+    PlanSnapshot  string                 // compact host-rendered plan/checklist progress ("" when no plan)
+    CurrentStep   int                    // boundary position
+    MaxSteps      int                    // effective budget (the step already granted)
+    AbortCategory string                 // LoopBoundaryBudget or LoopBoundaryCircuitBreaker
+    AbortReason   string                 // host's breaker-trigger description ("" for budget boundaries)
+    RecentSteps   []StepLimitStepDigest  // last N steps, oldest first; Args/Result pre-truncated by the host
+    Metrics       StepLimitMetrics        // cumulative quality counters (steps, calls, errors, aborts, ...)
+}
+
+func (j *ToolJudge) JudgeStepLimit(
+    ctx context.Context,
+    request StepLimitJudgeRequest,
+) (LoopVerdict, string, error)
+```
+
+The verdict scale mirrors the HITL `StepLimitResponse` options:
+
+| `LoopVerdict` | Meaning |
+|---|---|
+| `LoopVerdictDeny` | stop the run at the boundary — the **zero value**: an uninitialized, unknown, or unparseable decision never grants more work |
+| `LoopVerdictAllowOnce` | grant exactly one more iteration |
+| `LoopVerdictAllowMore` | grant a full additional step budget — budget trigger only; at a circuit-breaker boundary the executor treats it as a single reprieve (no extra budget), so prefer `AllowOnce` there |
+| `LoopVerdictAllowAlways` | remove the step limit for the rest of the run |
+
+Contract guarantees:
+
+- **fail-closed**: a nil provider, provider error/timeout, nil response, or an unparseable response all return `LoopVerdictDeny` with an explanatory reasoning and a **nil** error — the caller stops the run without inventing a transport error;
+- **never cached**: every boundary is evaluated against its own trajectory (same no-cache rule as `JudgeStrict`);
+- **exact-token parsing**: the verdict is read from the mandated two-line `VERDICT:`/`REASON:` response, an embedded JSON object, or a bare token; prose that merely *contains* a verdict word is a parse failure and fails closed — only an explicit token may grant work;
+- **untrusted-content envelope**: the task, plan snapshot, breaker reason, and recent-step digest are line-sanitized and wrapped in untrusted-content boundaries before entering the prompt, so instruction-like text in quoted tool data is read as data, not policy;
+- provider errors are not logged because they may echo the request's tool arguments (same policy as `JudgeStrict`);
+- the judge call is bounded by a 2-minute timeout and uses deterministic (`CallPurposeRouting`) sampling.
+
+An unrecognized or empty `AbortCategory` is normalized to `LoopBoundaryCircuitBreaker`, so a host that forgets to classify a boundary biases the judge toward the stricter breaker semantics.
+
+```go
+verdict, reason, err := judge.JudgeStepLimit(ctx, tools.StepLimitJudgeRequest{
+    TaskContext:   currentTask,
+    PlanSnapshot:  planProgress,
+    CurrentStep:   step,
+    MaxSteps:      budget,
+    AbortCategory: tools.LoopBoundaryCircuitBreaker,
+    AbortReason:   breaker.TriggerReason,
+    RecentSteps:   digestWindow,
+    Metrics:       runMetrics,
+})
+if err != nil || verdict == tools.LoopVerdictDeny {
+    // stop the run; reason explains the boundary decision.
+}
+// LoopVerdictAllowOnce/More/Always map onto the host's step-limit response
+// handling exactly like the corresponding StepLimitResponse values.
+```
+
+> **Migration note:** `JudgeStepLimit` does not replace `HITLHandler.OnStepLimit` — a host with a human in the loop should keep using the HITL handler. The loop judge exists for unattended runs and is typically wired as the fallback when no handler (or no human) is available.
 
 ---
 
