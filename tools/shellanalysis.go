@@ -609,6 +609,12 @@ func shellResolveTarget(target, base string) (string, bool) {
 	}
 }
 
+// isASCIILetter reports whether b is an ASCII letter: the drive run of a
+// Windows drive-letter path is a single letter, case-insensitively.
+func isASCIILetter(b byte) bool {
+	return 'a' <= b && b <= 'z' || 'A' <= b && b <= 'Z'
+}
+
 // shellIsWindowsAbsPath reports whether s is an absolute Windows path: a
 // drive-letter form ("C:\x", "C:/x") or a UNC path ("\\server\share").
 func shellIsWindowsAbsPath(s string) bool {

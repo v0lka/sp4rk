@@ -141,10 +141,7 @@ func TestExtractBashPaths_Simple(t *testing.T) {
 	// treated as shell escapes by the parser.
 	target := osAbsPath("etc", "hosts")
 	cmd := "cat " + filepath.ToSlash(target)
-	paths, suspicious := extractBashPaths(cmd, osAbsPath("wd"), osAbsPath("ws"))
-	if suspicious {
-		t.Fatal("expected not suspicious")
-	}
+	paths := extractBashPaths(cmd, osAbsPath("wd"), osAbsPath("ws"))
 	want := filepath.Clean(target)
 	if len(paths) != 1 || paths[0] != want {
 		t.Fatalf("expected [%s], got %v", want, paths)
@@ -152,20 +149,14 @@ func TestExtractBashPaths_Simple(t *testing.T) {
 }
 
 func TestExtractBashPaths_Multiple(t *testing.T) {
-	paths, suspicious := extractBashPaths("cp /tmp/src /tmp/dst", "", "/workspace")
-	if suspicious {
-		t.Fatal("expected not suspicious")
-	}
+	paths := extractBashPaths("cp /tmp/src /tmp/dst", "", "/workspace")
 	if len(paths) != 2 {
 		t.Fatalf("expected 2 paths, got %d: %v", len(paths), paths)
 	}
 }
 
 func TestExtractBashPaths_Relative(t *testing.T) {
-	paths, suspicious := extractBashPaths("cat data/file.txt", "/workspace", "")
-	if suspicious {
-		t.Fatal("expected not suspicious")
-	}
+	paths := extractBashPaths("cat data/file.txt", "/workspace", "")
 	expected := filepath.Clean("/workspace/data/file.txt")
 	if len(paths) != 1 || paths[0] != expected {
 		t.Fatalf("expected [%s], got %v", expected, paths)
@@ -173,10 +164,7 @@ func TestExtractBashPaths_Relative(t *testing.T) {
 }
 
 func TestExtractBashPaths_RelativeFallback(t *testing.T) {
-	paths, suspicious := extractBashPaths("cat data/file.txt", "", "/workspace")
-	if suspicious {
-		t.Fatal("expected not suspicious")
-	}
+	paths := extractBashPaths("cat data/file.txt", "", "/workspace")
 	expected := filepath.Clean("/workspace/data/file.txt")
 	if len(paths) != 1 || paths[0] != expected {
 		t.Fatalf("expected [%s], got %v", expected, paths)
@@ -184,19 +172,12 @@ func TestExtractBashPaths_RelativeFallback(t *testing.T) {
 }
 
 func TestExtractBashPaths_VariableExpansion(t *testing.T) {
-	// ${HOME} (braced) delimits the variable from the following path. HOME is
-	// NOT assigned anywhere in the command, so the variable is *unbound* and the
-	// result stays suspicious; only the trailing OS-absolute literal is
-	// extracted. Under the binding semantics a $VAR bound to a literal value
-	// in-command resolves to that value — and stays non-suspicious only while
-	// no differing env value makes it ambiguous (union semantics) — see
-	// TestExtractBashPaths_VariableBinding.
+	// ${HOME} (braced) delimits the variable from the following path. The
+	// variable is dynamic and contributes no path; only the trailing
+	// OS-absolute literal is extracted (literal-only walk).
 	suffix := osAbsPath("lit", ".config")
 	cmd := "cat ${HOME}" + filepath.ToSlash(suffix)
-	paths, suspicious := extractBashPaths(cmd, osAbsPath("wd"), osAbsPath("ws"))
-	if !suspicious {
-		t.Fatal("expected suspicious flag for unbound $var")
-	}
+	paths := extractBashPaths(cmd, osAbsPath("wd"), osAbsPath("ws"))
 	want := filepath.Clean(suffix)
 	if len(paths) != 1 || paths[0] != want {
 		t.Fatalf("expected [%s] from literal parts, got %v", want, paths)
@@ -204,184 +185,28 @@ func TestExtractBashPaths_VariableExpansion(t *testing.T) {
 }
 
 func TestExtractBashPaths_VariableExpansionInPath(t *testing.T) {
-	// ${HOME} delimits the variable; the trailing literal path is extracted and
-	// the result is marked suspicious because the variable is unbound (not
-	// assigned in-command).
+	// ${HOME} delimits the variable; the trailing literal path is extracted;
+	// the variable itself contributes no path (literal-only walk).
 	suffix := osAbsPath("path", "to", "file")
 	cmd := "cat ${HOME}" + filepath.ToSlash(suffix)
-	paths, suspicious := extractBashPaths(cmd, osAbsPath("wd"), osAbsPath("ws"))
-	if !suspicious {
-		t.Fatal("expected suspicious flag for unbound $var")
-	}
+	paths := extractBashPaths(cmd, osAbsPath("wd"), osAbsPath("ws"))
 	want := filepath.Clean(suffix)
 	if len(paths) != 1 || paths[0] != want {
 		t.Fatalf("expected [%s] from literal parts, got %v", want, paths)
 	}
 }
 
-func TestExtractBashPaths_VariableBinding(t *testing.T) {
-	// In-command variable binding (Task 1 semantics): a $VAR assigned a *literal*
-	// value within the same command is expanded to that value, so the resulting
-	// path is still extracted as a candidate. The command is marked suspicious
-	// whenever the reference is statically ambiguous: a differing env value
-	// (union semantics, see TestExtractBashPaths_BindingWithDifferingEnvStaysSuspicious),
-	// or an EMPTY env value — the walk cannot prove the binding is live at the
-	// reference (it may sit in a branch not taken or after the reference), so
-	// the empty expansion stays possible and the word stays unexpandable. The
-	// non-suspicious case (env set and equal to the binding) is pinned by
-	// TestExtractBashPaths_BindingMatchingEnvNotSuspicious. A genuinely
-	// UNASSESSABLE RHS (a substitution whose inner rebinds a name, e.g.
-	// "$(read D < cfg; echo $D)"), a bare command substitution in argument
-	// position, and unbound variables remain suspicious / unexpandable; a
-	// CLEAN substitution RHS ("$(echo x)") is now assessable and stays clean.
-	// Fixtures are OS-absolute (osAbsPath) so the table behaves identically on
-	// POSIX and Windows.
-	t.Setenv("D", "")
-	bind := filepath.ToSlash(osAbsPath("tmp", "build"))
-	other := filepath.ToSlash(osAbsPath("etc"))
-	last := filepath.ToSlash(osAbsPath("tmp"))
-	dynSuffix := filepath.ToSlash(osAbsPath("a"))
-	clean := func(parts ...string) string { return filepath.Clean(osAbsPath(parts...)) }
-	wd, ws := osAbsPath("wd"), osAbsPath("ws")
-	cases := []struct {
-		name       string
-		cmd        string
-		suspicious bool
-		want       []string
-	}{
-		{"simple assignment binds (empty env keeps empty expansion possible)", `D=` + bind + `; cat "$D/a"`, true, []string{clean("tmp", "build"), clean("tmp", "build", "a")}},
-		{"export binds like assignment (empty env keeps empty expansion possible)", `export D=` + bind + `; cat "$D/a"`, true, []string{clean("tmp", "build"), clean("tmp", "build", "a")}},
-		{"command-prefix assignment binds (arguments expand before the prefix takes effect)", `D=` + bind + ` mkdir "$D/x"`, true, []string{clean("tmp", "build"), clean("tmp", "build", "x")}},
-		{"unassessable RHS stays unbound", `D=$(read D < cfg; echo $D); cat "${D}` + dynSuffix + `"`, true, []string{clean("a")}},
-		{"assessable substitution RHS stays clean", `D=$(echo x); echo "$D"`, false, nil},
-		{"re-bound var stays suspicious (final literal still a candidate)", `D=` + other + `; D=` + last + `; echo "$D"`, true, []string{clean("etc"), clean("tmp")}},
-		{"bare command substitution stays suspicious", `cat $(echo x)`, true, nil},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			paths, suspicious := extractBashPaths(tc.cmd, wd, ws)
-			if suspicious != tc.suspicious {
-				t.Fatalf("suspicious = %v, want %v (paths=%v)", suspicious, tc.suspicious, paths)
-			}
-			if len(paths) != len(tc.want) {
-				t.Fatalf("paths = %v, want %v", paths, tc.want)
-			}
-			for i := range paths {
-				if paths[i] != tc.want[i] {
-					t.Fatalf("paths[%d] = %q, want %q (all=%v)", i, paths[i], tc.want[i], paths)
-				}
-			}
-		})
-	}
-}
-
-// TestExtractBashPaths_ExpansionRHSInSubstitutionFailsClosed pins that a
-// command substituted in assignment position is only "assessable" (and thus
-// only promotes the name to a validated binding) when its inner words are
-// genuinely literal. Pathname globbing, brace expansion and tilde expansion
-// are performed by the shell at runtime, so a word carrying them must make the
-// substitution unassessable and keep the later reference suspicious
-// (shellEnvBindings.go innerWordAssessable doc; specs/architecture/
-// security-model.md).
-func TestExtractBashPaths_ExpansionRHSInSubstitutionFailsClosed(t *testing.T) {
-	wd, ws := osAbsPath("wd"), osAbsPath("ws")
-	for _, cmd := range []string{
-		`X=$(ls *); cat $X`,
-		`X=$(cat *.txt); cat $X`,
-		`X=$(cat [a-z]/passwd); cat $X`,
-		`X=$(ls {a,b}/passwd); cat $X`,
-		`X=$(echo ~/secret); cat $X`,
-	} {
-		t.Run(cmd, func(t *testing.T) {
-			paths, suspicious := extractBashPaths(cmd, wd, ws)
-			if !suspicious {
-				t.Fatalf("extractBashPaths(%q) suspicious = false, want true (glob/brace/tilde RHS must fail closed; paths=%v)", cmd, paths)
-			}
-		})
-	}
-}
-
-// TestExtractBashPaths_QuotedExpansionInSubstitutionNotSuspicious pins that
-// glob/brace characters INSIDE double quotes — where the shell performs no
-// glob/brace expansion — keep a command substitution assessable (the quoted
-// context must not be treated as dynamic).
-func TestExtractBashPaths_QuotedExpansionInSubstitutionNotSuspicious(t *testing.T) {
-	wd, ws := osAbsPath("wd"), osAbsPath("ws")
-	for _, cmd := range []string{
-		`X=$(echo "[INFO] done"); echo "$X"`,
-		`X=$(echo "a[b]c"); echo "$X"`,
-		`X=$(find . -name "*.go"); echo "$X"`,
-	} {
-		t.Run(cmd, func(t *testing.T) {
-			if _, suspicious := extractBashPaths(cmd, wd, ws); suspicious {
-				t.Fatalf("extractBashPaths(%q) suspicious = true, want false (quoted glob/brace chars are literal)", cmd)
-			}
-		})
-	}
-}
-
-// TestExtractBashPaths_ChildScriptBindingDoesNotRelieveCaller pins that a
-// CHILD-process script's binding never makes the CALLER's reference assessable:
-// `bash -c 'X=$(echo x)'; cat "$X"` must stay suspicious because X is unbound
-// in the caller (a child shell cannot rebind it), unlike the otherwise
-// identical same-shell `X=$(echo x); cat "$X"`.
-func TestExtractBashPaths_ChildScriptBindingDoesNotRelieveCaller(t *testing.T) {
-	wd, ws := osAbsPath("wd"), osAbsPath("ws")
-	for _, cmd := range []string{
-		`bash -c 'X=$(echo x)'; cat "$X"`,
-		`bash <<< 'X=$(echo x)'; cat "$X"`,
-		`env -S 'X=$(echo x)'; cat "$X"`,
-		`bash -c 'X=/etc'; cat "$X/passwd"`,
-	} {
-		t.Run(cmd, func(t *testing.T) {
-			if _, suspicious := extractBashPaths(cmd, wd, ws); !suspicious {
-				t.Fatalf("extractBashPaths(%q) suspicious = false, want true (a child script cannot rebind the caller)", cmd)
-			}
-		})
-	}
-	if _, suspicious := extractBashPaths(`X=$(echo x); cat "$X"`, wd, ws); suspicious {
-		t.Fatal("same-shell assessable substitution must stay not suspicious")
-	}
-}
-
 func TestExtractBashPaths_CommandSubstitution(t *testing.T) {
-	paths, suspicious := extractBashPaths("cat $(echo /tmp)", "", "/workspace")
-	if !suspicious {
-		t.Fatal("expected suspicious flag for $(...)")
-	}
+	paths := extractBashPaths("cat $(echo /tmp)", "", "/workspace")
 	if len(paths) != 0 {
 		t.Fatalf("expected no extractable paths from $(...), got %v", paths)
-	}
-}
-
-// TestExtractBashPaths_ExpansionRHSInAssignmentFailsClosed pins the outer
-// counterpart of the substitution case: a literal assignment RHS carrying
-// pathname globbing, brace expansion or a leading tilde is not a fixed value
-// (the shell expands it at runtime), so the name stays dynamic
-// (wordHasDynamicPart) and a later reference is suspicious.
-func TestExtractBashPaths_ExpansionRHSInAssignmentFailsClosed(t *testing.T) {
-	wd, ws := osAbsPath("wd"), osAbsPath("ws")
-	for _, cmd := range []string{
-		`X=*.txt; cat $X`,
-		`X={a,b}/passwd; cat $X`,
-		`X=~/secret; cat $X`,
-	} {
-		t.Run(cmd, func(t *testing.T) {
-			_, suspicious := extractBashPaths(cmd, wd, ws)
-			if !suspicious {
-				t.Fatalf("extractBashPaths(%q) suspicious = false, want true (glob/brace/tilde assignment RHS must fail closed)", cmd)
-			}
-		})
 	}
 }
 
 func TestExtractBashPaths_QuotedStrings(t *testing.T) {
 	target := osAbsPath("etc", "passwd")
 	cmd := `cat "` + filepath.ToSlash(target) + `"`
-	paths, suspicious := extractBashPaths(cmd, osAbsPath("wd"), osAbsPath("ws"))
-	if suspicious {
-		t.Fatal("expected not suspicious")
-	}
+	paths := extractBashPaths(cmd, osAbsPath("wd"), osAbsPath("ws"))
 	want := filepath.Clean(target)
 	if len(paths) != 1 || paths[0] != want {
 		t.Fatalf("expected [%s], got %v", want, paths)
@@ -391,10 +216,7 @@ func TestExtractBashPaths_QuotedStrings(t *testing.T) {
 func TestExtractBashPaths_Redirects(t *testing.T) {
 	target := osAbsPath("out.txt")
 	cmd := "echo hi > " + filepath.ToSlash(target)
-	paths, suspicious := extractBashPaths(cmd, osAbsPath("wd"), osAbsPath("ws"))
-	if suspicious {
-		t.Fatal("expected not suspicious")
-	}
+	paths := extractBashPaths(cmd, osAbsPath("wd"), osAbsPath("ws"))
 	want := filepath.Clean(target)
 	found := false
 	for _, p := range paths {
@@ -412,10 +234,7 @@ func TestExtractBashPaths_ChainedCommands(t *testing.T) {
 	a := osAbsPath("a")
 	b := osAbsPath("b")
 	cmd := "cd " + filepath.ToSlash(a) + " && ls " + filepath.ToSlash(b)
-	paths, suspicious := extractBashPaths(cmd, osAbsPath("wd"), osAbsPath("ws"))
-	if suspicious {
-		t.Fatal("expected not suspicious")
-	}
+	paths := extractBashPaths(cmd, osAbsPath("wd"), osAbsPath("ws"))
 	sort.Strings(paths)
 	expected := []string{filepath.Clean(a), filepath.Clean(b)}
 	sort.Strings(expected)
@@ -428,10 +247,7 @@ func TestExtractBashPaths_QuotedWithSpaces(t *testing.T) {
 	src := osAbsPath("my file.txt") // contains a space
 	dst := osAbsPath("dst")
 	cmd := `cp "` + filepath.ToSlash(src) + `" "` + filepath.ToSlash(dst) + `/"`
-	paths, suspicious := extractBashPaths(cmd, osAbsPath("wd"), osAbsPath("ws"))
-	if suspicious {
-		t.Fatal("expected not suspicious")
-	}
+	paths := extractBashPaths(cmd, osAbsPath("wd"), osAbsPath("ws"))
 	wantSrc := filepath.Clean(src)
 	wantDst := filepath.Clean(dst)
 	foundSrc := false
@@ -450,10 +266,7 @@ func TestExtractBashPaths_QuotedWithSpaces(t *testing.T) {
 }
 
 func TestExtractBashPaths_WorkingDirectory(t *testing.T) {
-	paths, suspicious := extractBashPaths("ls ./file.txt", "/workspace/subdir", "")
-	if suspicious {
-		t.Fatal("expected not suspicious")
-	}
+	paths := extractBashPaths("ls ./file.txt", "/workspace/subdir", "")
 	expected := filepath.Clean("/workspace/subdir/file.txt")
 	if len(paths) != 1 || paths[0] != expected {
 		t.Fatalf("expected [%s], got %v", expected, paths)
@@ -461,27 +274,23 @@ func TestExtractBashPaths_WorkingDirectory(t *testing.T) {
 }
 
 func TestExtractBashPaths_InvalidSyntax(t *testing.T) {
-	_, suspicious := extractBashPaths("for i in; do echo", "", "/workspace")
-	if !suspicious {
-		t.Fatal("expected suspicious flag for invalid syntax")
+	// An unparseable command extracts nothing; it no longer escalates —
+	// dynamic/broken constructs are the flowsh analysis's domain.
+	paths := extractBashPaths("for i in; do echo", "", "/workspace")
+	if len(paths) != 0 {
+		t.Fatalf("expected no paths for invalid syntax, got %v", paths)
 	}
 }
 
 func TestExtractBashPaths_Backtick(t *testing.T) {
-	paths, suspicious := extractBashPaths("cat `echo /tmp`", "", "/workspace")
-	if !suspicious {
-		t.Fatal("expected suspicious flag for backtick")
-	}
+	paths := extractBashPaths("cat `echo /tmp`", "", "/workspace")
 	if len(paths) != 0 {
 		t.Fatalf("expected no extractable paths from backtick, got %v", paths)
 	}
 }
 
 func TestExtractBashPaths_ProcSubst(t *testing.T) {
-	paths, suspicious := extractBashPaths("diff <(cat /a) <(cat /b)", "", "/workspace")
-	if !suspicious {
-		t.Fatal("expected suspicious flag for process substitution")
-	}
+	paths := extractBashPaths("diff <(cat /a) <(cat /b)", "", "/workspace")
 	// The /a and /b are inside <(...) which we skip
 	if len(paths) != 0 {
 		t.Fatalf("expected no paths from process substitution, got %v", paths)
@@ -491,10 +300,7 @@ func TestExtractBashPaths_ProcSubst(t *testing.T) {
 func TestExtractBashPaths_SingleQuotes(t *testing.T) {
 	target := osAbsPath("etc", "hosts")
 	cmd := "cat '" + filepath.ToSlash(target) + "'"
-	paths, suspicious := extractBashPaths(cmd, osAbsPath("wd"), osAbsPath("ws"))
-	if suspicious {
-		t.Fatal("expected not suspicious")
-	}
+	paths := extractBashPaths(cmd, osAbsPath("wd"), osAbsPath("ws"))
 	want := filepath.Clean(target)
 	if len(paths) != 1 || paths[0] != want {
 		t.Fatalf("expected [%s], got %v", want, paths)
@@ -508,10 +314,7 @@ func TestExtractBashPaths_EscapedSpaces(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("backslash-escaped spaces are POSIX shell semantics")
 	}
-	paths, suspicious := extractBashPaths(`cat /tmp/my\ file.txt`, "", "/workspace")
-	if suspicious {
-		t.Fatal("expected not suspicious")
-	}
+	paths := extractBashPaths(`cat /tmp/my\ file.txt`, "", "/workspace")
 	// The backslash is preserved in the Lit value by the parser
 	found := false
 	for _, p := range paths {
@@ -528,11 +331,8 @@ func TestExtractBashPaths_EscapedSpaces(t *testing.T) {
 // ── extractPoshPaths tests ────────────────────────────────────────────────
 
 func TestExtractPoshPaths_DriveAbsolute(t *testing.T) {
-	// Get-Content C:\x\y extracts C:\x\y — drive-absolute path, not suspicious.
-	paths, suspicious := extractPoshPaths(`Get-Content C:\x\y`, osAbsPath("wd"), osAbsPath("ws"))
-	if suspicious {
-		t.Fatal("expected not suspicious for literal drive path")
-	}
+	// Get-Content C:\x\y extracts C:\x\y — a drive-absolute literal path.
+	paths := extractPoshPaths(`Get-Content C:\x\y`, osAbsPath("wd"), osAbsPath("ws"))
 	want := `C:\x\y`
 	if len(paths) != 1 || paths[0] != want {
 		t.Fatalf("expected [%s], got %v", want, paths)
@@ -544,10 +344,7 @@ func TestExtractPoshPaths_DriveForwardSlash(t *testing.T) {
 	// filepath.Clean normalizes separators to the host OS convention: on POSIX
 	// the result keeps "/", on Windows it becomes "\". Assert the cleaned form
 	// so the test is portable across both platforms.
-	paths, suspicious := extractPoshPaths(`Get-Content D:/logs/app.log`, osAbsPath("wd"), osAbsPath("ws"))
-	if suspicious {
-		t.Fatal("expected not suspicious")
-	}
+	paths := extractPoshPaths(`Get-Content D:/logs/app.log`, osAbsPath("wd"), osAbsPath("ws"))
 	want := filepath.Clean("D:/logs/app.log")
 	if len(paths) != 1 || paths[0] != want {
 		t.Fatalf("expected [%s], got %v", want, paths)
@@ -555,21 +352,15 @@ func TestExtractPoshPaths_DriveForwardSlash(t *testing.T) {
 }
 
 func TestExtractPoshPaths_DollarVarSuspicious(t *testing.T) {
-	// $HOME contains a "$" in an expansion context -> suspicious, skipped.
-	paths, suspicious := extractPoshPaths(`Get-Content $HOME/file`, osAbsPath("wd"), osAbsPath("ws"))
-	if !suspicious {
-		t.Fatal("expected suspicious for $HOME expansion")
-	}
+	// $HOME contains a "$" in an expansion context: dynamic, skipped from collection.
+	paths := extractPoshPaths(`Get-Content $HOME/file`, osAbsPath("wd"), osAbsPath("ws"))
 	if len(paths) != 0 {
 		t.Fatalf("expected no extractable paths from $HOME, got %v", paths)
 	}
 }
 
 func TestExtractPoshPaths_EnvVarSuspicious(t *testing.T) {
-	paths, suspicious := extractPoshPaths(`Get-Content $env:USERPROFILE\file`, osAbsPath("wd"), osAbsPath("ws"))
-	if !suspicious {
-		t.Fatal("expected suspicious for $env:VAR expansion")
-	}
+	paths := extractPoshPaths(`Get-Content $env:USERPROFILE\file`, osAbsPath("wd"), osAbsPath("ws"))
 	if len(paths) != 0 {
 		t.Fatalf("expected no paths from $env:VAR, got %v", paths)
 	}
@@ -577,11 +368,8 @@ func TestExtractPoshPaths_EnvVarSuspicious(t *testing.T) {
 
 func TestExtractPoshPaths_CmdSubstSuspicious(t *testing.T) {
 	// $(...) command substitution — the '(' splits the token; the bare "$" is
-	// an expansion token, so the command is suspicious and nothing is collected.
-	paths, suspicious := extractPoshPaths(`Get-Content $(Get-Location)`, osAbsPath("wd"), osAbsPath("ws"))
-	if !suspicious {
-		t.Fatal("expected suspicious for $(...) command substitution")
-	}
+	// an expansion token, so nothing is collected for it.
+	paths := extractPoshPaths(`Get-Content $(Get-Location)`, osAbsPath("wd"), osAbsPath("ws"))
 	if len(paths) != 0 {
 		t.Fatalf("expected no paths from $(...), got %v", paths)
 	}
@@ -589,34 +377,20 @@ func TestExtractPoshPaths_CmdSubstSuspicious(t *testing.T) {
 
 func TestExtractPoshPaths_BacktickSuspicious(t *testing.T) {
 	// A backtick-escaped space (a PowerShell idiom to include a space in a
-	// bareword) marks the token suspicious; the literal path is still
+	// bareword) keeps its literal content; the literal path is still
 	// collected for symlink defense-in-depth.
 	cmd := "Get-Content C:\\My" + "`" + " Documents\\file"
-	paths, suspicious := extractPoshPaths(cmd, osAbsPath("wd"), osAbsPath("ws"))
-	if !suspicious {
-		t.Fatal("expected suspicious for backtick escape")
-	}
+	paths := extractPoshPaths(cmd, osAbsPath("wd"), osAbsPath("ws"))
 	want := `C:\My Documents\file`
 	if len(paths) != 1 || paths[0] != want {
 		t.Fatalf("expected [%s] collected despite backtick, got %v", want, paths)
 	}
 }
 
-func TestExtractPoshPaths_BareBacktickSuspicious(t *testing.T) {
-	// A token that is just a backtick continuation marks suspicious.
-	_, suspicious := extractPoshPaths("echo `n C:\\temp\\f", osAbsPath("wd"), osAbsPath("ws"))
-	if !suspicious {
-		t.Fatal("expected suspicious for backtick presence")
-	}
-}
-
 func TestExtractPoshPaths_CallOperatorNotSuspicious(t *testing.T) {
 	// "&" is a metachar (call operator) used to split tokens; invoking a
-	// literal single-quoted path is not expansion-suspicious.
-	paths, suspicious := extractPoshPaths(`& 'C:\scripts\run.ps1'`, osAbsPath("wd"), osAbsPath("ws"))
-	if suspicious {
-		t.Fatal("expected not suspicious for literal path invocation via &")
-	}
+	// literal single-quoted path carries no expansion.
+	paths := extractPoshPaths(`& 'C:\scripts\run.ps1'`, osAbsPath("wd"), osAbsPath("ws"))
 	want := `C:\scripts\run.ps1`
 	if len(paths) != 1 || paths[0] != want {
 		t.Fatalf("expected [%s], got %v", want, paths)
@@ -624,11 +398,8 @@ func TestExtractPoshPaths_CallOperatorNotSuspicious(t *testing.T) {
 }
 
 func TestExtractPoshPaths_SingleQuotedExtracted(t *testing.T) {
-	// Single quotes are literal and safe — path extracted, not suspicious.
-	paths, suspicious := extractPoshPaths(`Get-Content 'C:\x\y\secret$file.txt'`, osAbsPath("wd"), osAbsPath("ws"))
-	if suspicious {
-		t.Fatal("expected not suspicious for single-quoted literal")
-	}
+	// Single quotes are literal and safe — path extracted.
+	paths := extractPoshPaths(`Get-Content 'C:\x\y\secret$file.txt'`, osAbsPath("wd"), osAbsPath("ws"))
 	want := `C:\x\y\secret$file.txt`
 	if len(paths) != 1 || paths[0] != want {
 		t.Fatalf("expected [%s], got %v", want, paths)
@@ -636,12 +407,9 @@ func TestExtractPoshPaths_SingleQuotedExtracted(t *testing.T) {
 }
 
 func TestExtractPoshPaths_DoubleQuotedSuspicious(t *testing.T) {
-	// Double quotes are expandable — content sets suspicious, but the literal
+	// Double quotes are expandable, but their literal content is still
 	// is still collected.
-	paths, suspicious := extractPoshPaths(`Get-Content "C:\x\y"`, osAbsPath("wd"), osAbsPath("ws"))
-	if !suspicious {
-		t.Fatal("expected suspicious for double-quoted content")
-	}
+	paths := extractPoshPaths(`Get-Content "C:\x\y"`, osAbsPath("wd"), osAbsPath("ws"))
 	want := `C:\x\y`
 	if len(paths) != 1 || paths[0] != want {
 		t.Fatalf("expected [%s] collected from double quotes, got %v", want, paths)
@@ -650,37 +418,16 @@ func TestExtractPoshPaths_DoubleQuotedSuspicious(t *testing.T) {
 
 func TestExtractPoshPaths_DollarInSingleQuotesNotSuspicious(t *testing.T) {
 	// A "$" inside single quotes is literal in PowerShell — not an expansion.
-	paths, suspicious := extractPoshPaths(`Get-Content 'C:\path\$literal\file'`, osAbsPath("wd"), osAbsPath("ws"))
-	if suspicious {
-		t.Fatal("expected not suspicious — $ inside single quotes is literal")
-	}
+	paths := extractPoshPaths(`Get-Content 'C:\path\$literal\file'`, osAbsPath("wd"), osAbsPath("ws"))
 	want := `C:\path\$literal\file`
 	if len(paths) != 1 || paths[0] != want {
 		t.Fatalf("expected [%s], got %v", want, paths)
 	}
 }
 
-func TestExtractPoshPaths_UnclosedSingleQuoteSuspicious(t *testing.T) {
-	// Unclosed quote -> fail closed (suspicious=true).
-	_, suspicious := extractPoshPaths(`Get-Content 'C:\x\y`, osAbsPath("wd"), osAbsPath("ws"))
-	if !suspicious {
-		t.Fatal("expected suspicious for unclosed single quote")
-	}
-}
-
-func TestExtractPoshPaths_UnclosedDoubleQuoteSuspicious(t *testing.T) {
-	_, suspicious := extractPoshPaths(`Get-Content "C:\x\y`, osAbsPath("wd"), osAbsPath("ws"))
-	if !suspicious {
-		t.Fatal("expected suspicious for unclosed double quote")
-	}
-}
-
 func TestExtractPoshPaths_RelativeResolved(t *testing.T) {
 	// Relative path with a forward slash resolved against workingDir.
-	paths, suspicious := extractPoshPaths(`Get-Content data/file.txt`, osAbsPath("wd"), osAbsPath("ws"))
-	if suspicious {
-		t.Fatal("expected not suspicious for relative literal")
-	}
+	paths := extractPoshPaths(`Get-Content data/file.txt`, osAbsPath("wd"), osAbsPath("ws"))
 	want := filepath.Clean(filepath.Join(osAbsPath("wd"), "data", "file.txt"))
 	if len(paths) != 1 || paths[0] != want {
 		t.Fatalf("expected [%s], got %v", want, paths)
@@ -689,10 +436,7 @@ func TestExtractPoshPaths_RelativeResolved(t *testing.T) {
 
 func TestExtractPoshPaths_RelativeFallbackWorkspace(t *testing.T) {
 	// No workingDir -> relative resolved against workspace.
-	paths, suspicious := extractPoshPaths(`Get-Content sub/item.txt`, "", osAbsPath("ws"))
-	if suspicious {
-		t.Fatal("expected not suspicious")
-	}
+	paths := extractPoshPaths(`Get-Content sub/item.txt`, "", osAbsPath("ws"))
 	want := filepath.Clean(filepath.Join(osAbsPath("ws"), "sub", "item.txt"))
 	if len(paths) != 1 || paths[0] != want {
 		t.Fatalf("expected [%s], got %v", want, paths)
@@ -700,13 +444,10 @@ func TestExtractPoshPaths_RelativeFallbackWorkspace(t *testing.T) {
 }
 
 func TestExtractPoshPaths_PipelineSplit(t *testing.T) {
-	// '|' and ';' split tokens; multiple literal paths collected, not suspicious.
+	// '|' and ';' split tokens; multiple literal paths collected.
 	a := `C:\a.txt`
 	b := `C:\b.txt`
-	paths, suspicious := extractPoshPaths(`Get-Content `+a+` | Set-Content `+b+`; Write-Host done`, osAbsPath("wd"), osAbsPath("ws"))
-	if suspicious {
-		t.Fatal("expected not suspicious for pipeline of literals")
-	}
+	paths := extractPoshPaths(`Get-Content `+a+` | Set-Content `+b+`; Write-Host done`, osAbsPath("wd"), osAbsPath("ws"))
 	foundA, foundB := false, false
 	for _, p := range paths {
 		if p == a {
@@ -723,180 +464,16 @@ func TestExtractPoshPaths_PipelineSplit(t *testing.T) {
 
 func TestExtractPoshPaths_SkipsNonPathParams(t *testing.T) {
 	// PowerShell parameter names (-Path, -Raw) and values without separators
-	// are not path-like and are not collected; not suspicious.
-	_, suspicious := extractPoshPaths(`Get-Content -Path C:\x\y -Raw`, osAbsPath("wd"), osAbsPath("ws"))
-	if suspicious {
-		t.Fatal("expected not suspicious")
-	}
-}
-
-// TestExtractPoshPaths_StaticBinding covers the "$NAME = <static RHS>" binding
-// recognition (D6, mirroring the bash extractBashPaths change): a later bare
-// "$NAME" reference to a statically-bound name is no longer an expansion, while
-// an expanding RHS, a suffixed reference, and "$(...)" stay suspicious. The
-// cases are platform-neutral — no host paths or separators are required.
-func TestExtractPoshPaths_StaticBinding(t *testing.T) {
-	wd := osAbsPath("wd")
-	ws := osAbsPath("ws")
-	cases := []struct {
-		name       string
-		command    string
-		suspicious bool
-	}{
-		{
-			// The acceptance case: a static list binding, referenced bare later.
-			name:       "static binding clears later bare reference",
-			command:    `$PKGS = go list ./... ; go test $PKGS`,
-			suspicious: false,
-		},
-		{
-			// RHS contains $env:HOME — expands, so the binding is not assessable.
-			name:       "expanding RHS keeps binding dynamic",
-			command:    `$X = Get-Content $env:HOME`,
-			suspicious: true,
-		},
-		{
-			// $X is static, but "$X/secret" carries a suffix -> not a bare ref.
-			name:       "reference with suffix stays suspicious",
-			command:    `$X = Get-ChildItem; Get-Content $X/secret`,
-			suspicious: true,
-		},
-		{
-			// $(...) is not assessable — unchanged metachar tokenization.
-			name:       "command substitution stays suspicious",
-			command:    `Get-Content $(Get-Location)`,
-			suspicious: true,
-		},
-		{
-			// A bare "(...)" group is a subexpression whose value is dynamic;
-			// it must never make the binding look static (security-model.md:
-			// "$(...)"/"(...)" keep every reference suspicious).
-			name:       "parenthesized RHS stays suspicious",
-			command:    `$F = (Get-Content C:\x\y); Remove-Item $F`,
-			suspicious: true,
-		},
-		{
-			// No assignment at all: the name is unbound (fail-closed).
-			name:       "unbound reference stays suspicious",
-			command:    `Get-Content $X/secret`,
-			suspicious: true,
-		},
-		{
-			// Bound twice -> not assessable even though both RHS are literal.
-			name:       "rebound name stays suspicious",
-			command:    `$X = alpha; $X = beta; Get-Content $X`,
-			suspicious: true,
-		},
-		{
-			// RHS of a static binding, but the bare reference is in a later
-			// statement whose own $env token still expands.
-			name:       "static binding does not mask a later expansion",
-			command:    `$X = alpha; Get-Content $env:HOME`,
-			suspicious: true,
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			_, suspicious := extractPoshPaths(tc.command, wd, ws)
-			if suspicious != tc.suspicious {
-				t.Fatalf("extractPoshPaths(%q) suspicious = %v, want %v",
-					tc.command, suspicious, tc.suspicious)
-			}
-		})
-	}
-}
-
-// TestExtractPoshPaths_CommentTextNotAToken pins PowerShell comment handling:
-// comment text must never reach the token stream, so it can neither clear
-// dollarExp via a phantom "# $F = <literal>" static binding nor surface the
-// comment's own literals as path candidates. Both line comments ("#") and
-// block comments ("<# … #>") are covered, including the loop-variable shape
-// where the comment is the only recorded "binding" for the name.
-func TestExtractPoshPaths_CommentTextNotAToken(t *testing.T) {
-	wd := osAbsPath("wd")
-	ws := osAbsPath("ws")
-	cases := []struct {
-		name       string
-		command    string
-		suspicious bool
-	}{
-		{
-			// A trailing line comment must not clear the dynamic $F reference.
-			name:       "trailing line comment phantom binding",
-			command:    "Get-Content $F # $F = C:\\safe\\file",
-			suspicious: true,
-		},
-		{
-			name:       "comment line before command",
-			command:    "# $F = C:\\safe\\file\nGet-Content $F",
-			suspicious: true,
-		},
-		{
-			name:       "block comment before command",
-			command:    "<# $F = C:\\safe #>\nGet-Content $F",
-			suspicious: true,
-		},
-		{
-			name:       "block comment after command",
-			command:    "Get-Content $F <# $F = C:\\safe #>",
-			suspicious: true,
-		},
-		{
-			// The live hole from the review: a loop variable is unbound in the
-			// tokenizer's model, so a trailing comment would be the only
-			// "binding" and de-escalate the removal loop.
-			name:       "loop variable with phantom comment binding",
-			command:    "foreach ($F in Get-ChildItem $env:DIR) { Remove-Item $F } # $F = C:\\project\\safe.txt",
-			suspicious: true,
-		},
-		{
-			// An unclosed block comment is a parse error in PowerShell — fail
-			// closed like an unclosed quote.
-			name:       "unclosed block comment fails closed",
-			command:    "Get-Content <# never closed",
-			suspicious: true,
-		},
-		{
-			// A "#" inside a token is literal (mirrors PowerShell).
-			name:       "hash inside token stays literal",
-			command:    `Get-Content C:\a#b`,
-			suspicious: false,
-		},
-		{
-			// A "<#" not at a token start is literal content.
-			name:       "open-angle inside token stays literal",
-			command:    `Get-Content C:\a<#b`,
-			suspicious: false,
-		},
-		{
-			// Sanity: a real static binding still clears the bare reference.
-			name:       "real static binding still works",
-			command:    "$F = C:\\safe\\file\nGet-Content $F",
-			suspicious: false,
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			_, suspicious := extractPoshPaths(tc.command, wd, ws)
-			if suspicious != tc.suspicious {
-				t.Fatalf("extractPoshPaths(%q) suspicious = %v, want %v",
-					tc.command, suspicious, tc.suspicious)
-			}
-		})
-	}
-
-	// Comment literals must not be surfaced as path candidates either.
-	paths, _ := extractPoshPaths("Get-Content $F # C:\\windows\\system32\\config", wd, ws)
+	// are not path-like and are not collected.
+	paths := extractPoshPaths(`Get-Content -Path C:\x\y -Raw`, osAbsPath("wd"), osAbsPath("ws"))
+	found := false
 	for _, p := range paths {
-		if strings.Contains(p, "system32") {
-			t.Errorf("comment path surfaced as a path candidate: %s", p)
+		if p == `C:\x\y` {
+			found = true
 		}
 	}
-	paths, _ = extractPoshPaths("<# C:\\windows\\system32 #>\nGet-Item C:\\safe", wd, ws)
-	for _, p := range paths {
-		if strings.Contains(p, "system32") {
-			t.Errorf("block-comment path surfaced as a path candidate: %s", p)
-		}
+	if !found {
+		t.Fatalf("expected [%s] collected, got %v", `C:\x\y`, paths)
 	}
 }
 
@@ -906,10 +483,7 @@ func TestExtractPoshPathsFromInput_WorkingDirectoryFallback(t *testing.T) {
 	// working_directory absent -> falls back to workspace.
 	ws := osAbsPath("ws")
 	input, _ := json.Marshal(map[string]string{"command": `Get-Content sub/file.txt`})
-	paths, suspicious := extractPoshPathsFromInput(input, ws)
-	if suspicious {
-		t.Fatal("expected not suspicious")
-	}
+	paths := extractPoshPathsFromInput(input, ws)
 	want := filepath.Clean(filepath.Join(ws, "sub", "file.txt"))
 	if len(paths) != 1 || paths[0] != want {
 		t.Fatalf("expected [%s], got %v", want, paths)
@@ -923,10 +497,7 @@ func TestExtractPoshPathsFromInput_UsesWorkingDirectory(t *testing.T) {
 		"command":           `Get-Content data/app.log`,
 		"working_directory": wd,
 	})
-	paths, suspicious := extractPoshPathsFromInput(input, ws)
-	if suspicious {
-		t.Fatal("expected not suspicious")
-	}
+	paths := extractPoshPathsFromInput(input, ws)
 	want := filepath.Clean(filepath.Join(wd, "data", "app.log"))
 	if len(paths) != 1 || paths[0] != want {
 		t.Fatalf("expected [%s], got %v", want, paths)
@@ -935,10 +506,7 @@ func TestExtractPoshPathsFromInput_UsesWorkingDirectory(t *testing.T) {
 
 func TestExtractPoshPathsFromInput_EmptyCommand(t *testing.T) {
 	input, _ := json.Marshal(map[string]string{"command": ""})
-	paths, suspicious := extractPoshPathsFromInput(input, osAbsPath("ws"))
-	if suspicious {
-		t.Fatal("expected not suspicious for empty command")
-	}
+	paths := extractPoshPathsFromInput(input, osAbsPath("ws"))
 	if len(paths) != 0 {
 		t.Fatalf("expected no paths for empty command, got %v", paths)
 	}
@@ -946,10 +514,7 @@ func TestExtractPoshPathsFromInput_EmptyCommand(t *testing.T) {
 
 func TestExtractPoshPathsFromInput_InvalidJSON(t *testing.T) {
 	input := json.RawMessage(`{bad json`)
-	paths, suspicious := extractPoshPathsFromInput(input, osAbsPath("ws"))
-	if suspicious {
-		t.Fatal("expected not suspicious for unparseable JSON")
-	}
+	paths := extractPoshPathsFromInput(input, osAbsPath("ws"))
 	if len(paths) != 0 {
 		t.Fatalf("expected no paths for invalid JSON, got %v", paths)
 	}
@@ -961,10 +526,7 @@ func TestDetectSymlinks_PoshExecExtractsPath(t *testing.T) {
 	dir := t.TempDir()
 	input, _ := json.Marshal(map[string]string{"command": `Get-Content ` + filepath.ToSlash(filepath.Join(dir, "file.txt"))})
 	ctx := WithWorkspacePath(context.Background(), dir)
-	inside, outside, suspicious := DetectSymlinksInToolInput(ctx, "posh_exec", input, nil, nil)
-	if suspicious {
-		t.Fatal("expected not suspicious for literal posh_exec path")
-	}
+	inside, outside := DetectSymlinksInToolInput(ctx, "posh_exec", input, nil, nil)
 	if len(inside)+len(outside) != 0 {
 		// The target file does not exist through a symlink, so no traversals.
 		t.Fatalf("expected no traversals for non-symlink target, got inside=%d outside=%d", len(inside), len(outside))
@@ -974,10 +536,7 @@ func TestDetectSymlinks_PoshExecExtractsPath(t *testing.T) {
 func TestDetectSymlinks_PoshExecSuspicious(t *testing.T) {
 	input, _ := json.Marshal(map[string]string{"command": `Get-Content $HOME/secret`})
 	ctx := context.Background()
-	_, _, suspicious := DetectSymlinksInToolInput(ctx, "posh_exec", input, nil, nil)
-	if !suspicious {
-		t.Fatal("expected suspicious for posh_exec $HOME expansion")
-	}
+	_, _ = DetectSymlinksInToolInput(ctx, "posh_exec", input, nil, nil)
 }
 
 func TestDetectSymlinks_PoshExecWithSymlink(t *testing.T) {
@@ -991,10 +550,7 @@ func TestDetectSymlinks_PoshExecWithSymlink(t *testing.T) {
 	input, _ := json.Marshal(map[string]string{"command": command, "working_directory": dir})
 
 	ctx := WithWorkspacePath(context.Background(), dir)
-	inside, outside, suspicious := DetectSymlinksInToolInput(ctx, "posh_exec", input, nil, nil)
-	if suspicious {
-		t.Fatal("expected not suspicious")
-	}
+	inside, outside := DetectSymlinksInToolInput(ctx, "posh_exec", input, nil, nil)
 	if len(inside)+len(outside) == 0 {
 		t.Fatal("expected symlink traversals found for posh_exec")
 	}
@@ -1005,10 +561,7 @@ func TestDetectSymlinks_PoshExecWithSymlink(t *testing.T) {
 func TestDetectSymlinks_BashExecStillDispatched(t *testing.T) {
 	input, _ := json.Marshal(map[string]string{"command": "cat $HOME/file"})
 	ctx := context.Background()
-	_, _, suspicious := DetectSymlinksInToolInput(ctx, "bash_exec", input, nil, nil)
-	if !suspicious {
-		t.Fatal("expected bash_exec dispatch still marks $HOME suspicious")
-	}
+	_, _ = DetectSymlinksInToolInput(ctx, "bash_exec", input, nil, nil)
 }
 
 // ── walkSymlinkComponents tests ───────────────────────────────────────────
@@ -1142,11 +695,8 @@ func TestDetectSymlinks_BashExecWithSymlink(t *testing.T) {
 	input, _ := json.Marshal(map[string]string{"command": command, "working_directory": dir})
 
 	ctx := WithWorkspacePath(context.Background(), dir)
-	inside, outside, suspicious := DetectSymlinksInToolInput(ctx, "bash_exec", input, nil, nil)
+	inside, outside := DetectSymlinksInToolInput(ctx, "bash_exec", input, nil, nil)
 
-	if suspicious {
-		t.Fatal("expected not suspicious")
-	}
 	if len(inside)+len(outside) == 0 {
 		t.Fatal("expected symlink traversals found")
 	}
@@ -1158,11 +708,8 @@ func TestDetectSymlinks_BashExecClean(t *testing.T) {
 	input, _ := json.Marshal(map[string]string{"command": command})
 
 	ctx := WithWorkspacePath(context.Background(), dir)
-	inside, outside, suspicious := DetectSymlinksInToolInput(ctx, "bash_exec", input, nil, nil)
+	inside, outside := DetectSymlinksInToolInput(ctx, "bash_exec", input, nil, nil)
 
-	if suspicious {
-		t.Fatal("expected not suspicious")
-	}
 	if len(inside) != 0 || len(outside) != 0 {
 		t.Fatalf("expected no traversals for clean command, got inside=%d outside=%d", len(inside), len(outside))
 	}
@@ -1172,11 +719,8 @@ func TestDetectSymlinks_BashExecSuspicious(t *testing.T) {
 	input, _ := json.Marshal(map[string]string{"command": "cat $HOME/file"})
 
 	ctx := context.Background()
-	inside, outside, suspicious := DetectSymlinksInToolInput(ctx, "bash_exec", input, nil, nil)
+	inside, outside := DetectSymlinksInToolInput(ctx, "bash_exec", input, nil, nil)
 
-	if !suspicious {
-		t.Fatal("expected suspicious for $var expansion")
-	}
 	if len(inside) != 0 || len(outside) != 0 {
 		t.Fatalf("expected no traversals, got inside=%d outside=%d", len(inside), len(outside))
 	}
@@ -1194,11 +738,8 @@ func TestDetectSymlinks_StructuredWithSymlink(t *testing.T) {
 	schema := json.RawMessage(`{"type":"object","properties":{"file_path":{"type":"string"}}}`)
 
 	ctx := WithWorkspacePath(context.Background(), dir)
-	inside, outside, suspicious := DetectSymlinksInToolInput(ctx, "write_file", input, schema, nil)
+	inside, outside := DetectSymlinksInToolInput(ctx, "write_file", input, schema, nil)
 
-	if suspicious {
-		t.Fatal("expected not suspicious for structured tool")
-	}
 	if len(inside)+len(outside) == 0 {
 		t.Fatal("expected symlink traversals found for structured tool")
 	}
@@ -1213,11 +754,8 @@ func TestDetectSymlinks_StructuredClean(t *testing.T) {
 	input, _ := json.Marshal(map[string]string{"file_path": normalPath})
 	schema := json.RawMessage(`{"type":"object","properties":{"file_path":{"type":"string"}}}`)
 	ctx := WithWorkspacePath(context.Background(), dir)
-	inside, outside, suspicious := DetectSymlinksInToolInput(ctx, "read_file", input, schema, nil)
+	inside, outside := DetectSymlinksInToolInput(ctx, "read_file", input, schema, nil)
 
-	if suspicious {
-		t.Fatal("expected not suspicious")
-	}
 	if len(inside) != 0 || len(outside) != 0 {
 		t.Fatalf("expected no traversals, got inside=%d outside=%d", len(inside), len(outside))
 	}
@@ -1259,7 +797,7 @@ func TestFormatSymlinkReasoning_Outside(t *testing.T) {
 	traversals := []SymlinkTraversal{
 		{OriginalPath: "/workspace/link", SymlinkAt: "/workspace/link", FullResolved: "/etc/cron.d"},
 	}
-	msg := FormatSymlinkReasoning(nil, traversals, false)
+	msg := FormatSymlinkReasoning(nil, traversals)
 	if !stringsContains(msg, "OUTSIDE the workspace") {
 		t.Fatalf("expected OUTSIDE warning, got: %s", msg)
 	}
@@ -1275,16 +813,9 @@ func TestFormatSymlinkReasoning_Inside(t *testing.T) {
 	traversals := []SymlinkTraversal{
 		{OriginalPath: "/workspace/link", SymlinkAt: "/workspace/link", FullResolved: "/workspace/real"},
 	}
-	msg := FormatSymlinkReasoning(traversals, nil, false)
+	msg := FormatSymlinkReasoning(traversals, nil)
 	if !stringsContains(msg, "within workspace") {
 		t.Fatalf("expected within workspace, got: %s", msg)
-	}
-}
-
-func TestFormatSymlinkReasoning_Suspicious(t *testing.T) {
-	msg := FormatSymlinkReasoning(nil, nil, true)
-	if !stringsContains(msg, "unresolved shell expansions") {
-		t.Fatalf("expected suspicious warning, got: %s", msg)
 	}
 }
 
@@ -1295,7 +826,7 @@ func TestFormatSymlinkReasoning_Both(t *testing.T) {
 	outside := []SymlinkTraversal{
 		{OriginalPath: "/ws/c", SymlinkAt: "/ws/c", FullResolved: "/etc/x"},
 	}
-	msg := FormatSymlinkReasoning(inside, outside, false)
+	msg := FormatSymlinkReasoning(inside, outside)
 	if !stringsContains(msg, "OUTSIDE") {
 		t.Fatalf("expected OUTSIDE warning, got: %s", msg)
 	}
@@ -1314,7 +845,7 @@ func TestFormatSymlinkReasoning_OutsideTruncation(t *testing.T) {
 			FullResolved: "/etc/x",
 		})
 	}
-	msg := FormatSymlinkReasoning(nil, outside, false)
+	msg := FormatSymlinkReasoning(nil, outside)
 	if !stringsContains(msg, "and 5 more symlink") {
 		t.Fatalf("expected truncation hint, got: %s", msg)
 	}
@@ -1330,14 +861,14 @@ func TestFormatSymlinkReasoning_InsideTruncation(t *testing.T) {
 			FullResolved: "/ws/real",
 		})
 	}
-	msg := FormatSymlinkReasoning(inside, nil, false)
+	msg := FormatSymlinkReasoning(inside, nil)
 	if !stringsContains(msg, "and 2 more symlink") {
 		t.Fatalf("expected truncation hint, got: %s", msg)
 	}
 }
 
 func TestFormatSymlinkReasoning_Empty(t *testing.T) {
-	msg := FormatSymlinkReasoning(nil, nil, false)
+	msg := FormatSymlinkReasoning(nil, nil)
 	if msg != "" {
 		t.Fatalf("expected empty string for no traversals, got: %s", msg)
 	}
@@ -1467,33 +998,24 @@ func TestResolvePathCandidate_RelativeNoWorkspace(t *testing.T) {
 
 func TestExtractBashPathsFromInput_EmptyCommand(t *testing.T) {
 	input := json.RawMessage(`{"command":""}`)
-	paths, suspicious := extractBashPathsFromInput(input, "/ws")
+	paths := extractBashPathsFromInput(input, "/ws")
 	if len(paths) != 0 {
 		t.Fatalf("expected no paths for empty command, got %v", paths)
-	}
-	if suspicious {
-		t.Error("expected not suspicious for empty command")
 	}
 }
 
 func TestExtractBashPathsFromInput_InvalidJSON(t *testing.T) {
 	input := json.RawMessage(`{bad`)
-	paths, suspicious := extractBashPathsFromInput(input, "/ws")
+	paths := extractBashPathsFromInput(input, "/ws")
 	if len(paths) != 0 {
 		t.Fatalf("expected no paths for invalid JSON, got %v", paths)
-	}
-	if suspicious {
-		t.Error("expected not suspicious for invalid JSON")
 	}
 }
 
 func TestExtractBashPathsFromInput_WithWorkingDir(t *testing.T) {
 	// Use a path with separator so looksLikePath matches.
 	input := json.RawMessage(`{"command":"cat subdir/file.txt","working_directory":"/custom/wd"}`)
-	paths, suspicious := extractBashPathsFromInput(input, "/ws")
-	if suspicious {
-		t.Fatal("expected not suspicious")
-	}
+	paths := extractBashPathsFromInput(input, "/ws")
 	expected := filepath.Clean("/custom/wd/subdir/file.txt")
 	if len(paths) != 1 || paths[0] != expected {
 		t.Fatalf("expected [%s], got %v", expected, paths)
@@ -1654,10 +1176,7 @@ func TestDetectSymlinks_AllowedRootClassifiedInside(t *testing.T) {
 	// With the allowed root in context, the traversal is 'inside'.
 	ctx := WithWorkspacePath(context.Background(), ws)
 	ctx = WithAllowedRoots(ctx, []string{auxRoot})
-	inside, outside, suspicious := DetectSymlinksInToolInput(ctx, "write_file", input, schema, nil)
-	if suspicious {
-		t.Fatal("expected not suspicious")
-	}
+	inside, outside := DetectSymlinksInToolInput(ctx, "write_file", input, schema, nil)
 	if len(inside) == 0 || len(outside) != 0 {
 		t.Fatalf("expected traversal inside allowed root, got inside=%d outside=%d",
 			len(inside), len(outside))
@@ -1785,7 +1304,7 @@ func TestDetectSymlinks_FieldAwareExcludesContent(t *testing.T) {
 			"old_string": "x",
 			"new_string": "y",
 		})
-		_, outsideTrav, _ := DetectSymlinksInToolInput(ctx, "edit_file", input, editSchema, nil)
+		_, outsideTrav := DetectSymlinksInToolInput(ctx, "edit_file", input, editSchema, nil)
 		if len(outsideTrav) == 0 {
 			t.Fatal("expected symlink escape detected via 'path' field")
 		}
@@ -1799,7 +1318,7 @@ func TestDetectSymlinks_FieldAwareExcludesContent(t *testing.T) {
 			"old_string": "// see " + pathThroughLink + " for details",
 			"new_string": "y",
 		})
-		insideTrav, outsideTrav, _ := DetectSymlinksInToolInput(ctx, "edit_file", input, editSchema, nil)
+		insideTrav, outsideTrav := DetectSymlinksInToolInput(ctx, "edit_file", input, editSchema, nil)
 		if len(insideTrav)+len(outsideTrav) != 0 {
 			t.Fatalf("expected content field (old_string) NOT scanned, got inside=%v outside=%v", insideTrav, outsideTrav)
 		}
@@ -1821,7 +1340,7 @@ func TestDetectSymlinks_NoPathFieldFallsBack(t *testing.T) {
 	input, _ := json.Marshal(map[string]string{"payload": filepath.Join(link, "f.txt")})
 	ctx := WithWorkspacePath(context.Background(), ws)
 
-	insideTrav, _, _ := DetectSymlinksInToolInput(ctx, "some_tool", input, schema, nil)
+	insideTrav, _ := DetectSymlinksInToolInput(ctx, "some_tool", input, schema, nil)
 	if len(insideTrav) == 0 {
 		t.Fatal("expected fallback scan to detect the symlink inside the workspace")
 	}
@@ -1862,7 +1381,7 @@ func TestDetectSymlinks_MixedFieldsLogsOmission(t *testing.T) {
 	})
 	ctx := WithWorkspacePath(context.Background(), ws)
 
-	_, outsideTrav, _ := DetectSymlinksInToolInput(ctx, "some_tool", input, schema, nil)
+	_, outsideTrav := DetectSymlinksInToolInput(ctx, "some_tool", input, schema, nil)
 	// Only the recognized field is scanned, so exactly one traversal (the path
 	// through `linkInWS/a.txt`); the `target` value is dropped, not scanned.
 	if len(outsideTrav) != 1 {
@@ -1928,5 +1447,62 @@ func TestCheckPathsForSymlinks_SymlinkBeforeENOTDIR(t *testing.T) {
 	// the recorded traversal is resolved, not Unresolvable.
 	if got[0].Unresolvable {
 		t.Errorf("traversal is Unresolvable=true; the trailing ENOTDIR must not erase or escalate the already-resolved symlink")
+	}
+}
+
+// ── expansion checks removed (flowsh owns dynamic constructs) ─────────────
+
+// TestExtractBashPaths_ExpansionsNotAssessed pins the removal of the
+// expansion-suspicion checks: variables and command substitutions contribute
+// only their literal fragments, extract no paths of their own, and never
+// error — dynamic constructs are the flowsh analysis's domain, not the
+// symlink walk's.
+func TestExtractBashPaths_ExpansionsNotAssessed(t *testing.T) {
+	wd, ws := osAbsPath("wd"), osAbsPath("ws")
+	cases := []struct {
+		name string
+		cmd  string
+		want []string
+	}{
+		{"assignment binding is not expanded", "X=" + filepath.ToSlash(osAbsPath("tmp", "build")) + "; cat \"$X/a\"", []string{filepath.Clean(osAbsPath("tmp", "build")), "/a"}},
+		{"command substitution in argument position", "cat $(echo /tmp)", nil},
+		{"backtick substitution", "cat `echo /tmp`", nil},
+		{"process substitution", "diff <(cat /a) <(cat /b)", nil},
+		{"binding substitution inner paths are not surfaced", "X=$(cat " + filepath.ToSlash(osAbsPath("link", "secret")) + "); cat $X", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			paths := extractBashPaths(tc.cmd, wd, ws)
+			if len(paths) != len(tc.want) {
+				t.Fatalf("paths = %v, want %v", paths, tc.want)
+			}
+			for i := range paths {
+				if paths[i] != tc.want[i] {
+					t.Fatalf("paths[%d] = %q, want %q (all=%v)", i, paths[i], tc.want[i], paths)
+				}
+			}
+		})
+	}
+}
+
+// TestExtractPoshPaths_ExpansionsNotAssessed is the PowerShell counterpart:
+// $-carrying tokens are skipped from collection (they cannot name a literal
+// path) and never escalate.
+func TestExtractPoshPaths_ExpansionsNotAssessed(t *testing.T) {
+	wd, ws := osAbsPath("wd"), osAbsPath("ws")
+	if paths := extractPoshPaths("Get-Content $(Get-Location)", wd, ws); len(paths) != 0 {
+		t.Fatalf("expected no paths from $(...), got %v", paths)
+	}
+}
+
+// TestDetectSymlinksInToolInput_ShellExpansionsStayClean drives the public
+// entry point: a bash command full of expansions and a nonexistent literal
+// path produces no traversals at all (no suspicion flag exists anymore).
+func TestDetectSymlinksInToolInput_ShellExpansionsStayClean(t *testing.T) {
+	input, _ := json.Marshal(map[string]string{"command": "X=$(echo probe); cat \"$X/no-such-file\" $(echo y)"})
+	ctx := WithWorkspacePath(context.Background(), osAbsPath("ws"))
+	inside, outside := DetectSymlinksInToolInput(ctx, "bash_exec", input, nil, nil)
+	if len(inside) != 0 || len(outside) != 0 {
+		t.Fatalf("expected no traversals for an expansion-only command, got inside=%v outside=%v", inside, outside)
 	}
 }

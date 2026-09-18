@@ -426,7 +426,6 @@ type SymlinkTraversal struct {
 func DetectSymlinksInToolInput(ctx context.Context, toolName string, input, schema json.RawMessage, logger *slog.Logger) (
     inside []SymlinkTraversal,
     outside []SymlinkTraversal,
-    suspicious bool,
 )
 ```
 
@@ -436,7 +435,7 @@ Extracts path-like tokens from the tool input (via the [path extraction helpers]
 
 **Path-field naming convention.** A property is treated as a path field when it is string-typed (or untyped) and its name matches an exact name (`path`, `file`, `dir`, `directory`, `filepath`, `filename`, `cwd`, `root`, `working_directory`, `workdir`, `dest`, `destination`) or ends with a suffix (`_path`, `_dir`, `_directory`, `_file`, `_filepath`, `_root`). When a schema declares a recognized path field alongside *other* string-typed fields whose names do not follow the convention, those non-path fields are excluded from scanning and the omission is logged via `logger` (Warn level); if `logger` is `nil`, `slog.Default()` is used, so the omission is observable rather than silent. To ensure a path-carrying parameter is scanned, name it with one of the recognized names/suffixes.
 
-`suspicious` is set for `bash_exec` and `posh_exec` commands containing **unresolved** shell expansions (`$var`, `$(cmd)`, `` `cmd` ``, process substitution; `$env:...` and backtick escapes) that may hide additional paths; for other tools it is always `false`. One expansion shape is **resolved**, not unresolved, and therefore does **not** set the flag: a **validated assignment-form command substitution** — a pure `VAR=$(...)` whose inner command is fully assessable. "Fully assessable" reuses the same pipeline recursively: the inner parses, declares no opaque construct and no dynamic binding, every inner word is statically assessable, and it adds no unresolvable path token. When that holds, a later `$VAR` reference is assessable, and the substitution's **inner literal paths are still surfaced** (merged into the extracted set), so a symlink reachable only through the substitution is still detected. The exception is fail-closed by a **union** over all bindings — any literal, non-assessable, or differently-shaped binding poisons the name back to dynamic — and a **bare `$(...)` in argument position** or an unbound reference such as `$HOME` stays suspicious. PowerShell mirrors this with a static `$NAME = <literal RHS>` binding. See [Assignment-Form Command Substitutions Are Assessable](../specs/architecture/security-model.md#assignment-form-command-substitutions-are-assessable).
+Shell-exec commands (`bash_exec`, `posh_exec`) contribute only their **literal** paths: the bash branch parses with `mvdan.cc/sh` and extracts literal word fragments, the PowerShell branch tokenizes with quote-state tracking and comment skipping (a `$` outside single quotes makes the token dynamic, and dynamic tokens are skipped — they cannot name a literal path). Expansion-driven **suspicion is deliberately not assessed** here: dynamic constructs (`$var`, `$(cmd)`, backticks) are the domain of the deterministic [shell command analysis](#shell-command-analysis-flowsh), whose criteria fire on the same call. The former `suspicious` return value and its `symlink_suspicious` escalation were removed (see [decision 006](../specs/decisions/006-symlink-walk-literal-paths-only.md)).
 
 **Candidate filtering.** The path-extraction helpers apply `looksLikePath`, which rejects strings that are obviously content rather than paths: strings containing control characters (bytes below `0x20` or `0x7f`, which never appear in a real path) and strings longer than `maxPathCandidateLen` (4096, a conservative `PATH_MAX` bound). URLs with a scheme (`http://`, `file://`, …) are also filtered. During the component walk, invalid-path errors (`ENAMETOOLONG`, `ENOTDIR`, `EINVAL` — e.g. a code blob longer than `NAME_MAX` mistakenly joined onto the workspace) stop the walk **without** escalating, since such a candidate cannot be a symlink. Permission errors (`EACCES`) and symlink loops (`ELOOP`) still escalate.
 
@@ -454,10 +453,10 @@ func IsOSLevelSymlink(symlinkPath string, roots ...string) bool
 ### FormatSymlinkReasoning
 
 ```go
-func FormatSymlinkReasoning(inside, outside []SymlinkTraversal, suspicious bool) string
+func FormatSymlinkReasoning(inside, outside []SymlinkTraversal) string
 ```
 
-Turns the partitioned traversals into a single human-readable string for the confirmation prompt (e.g. `"This call traverses a symlink resolving outside the workspace: /ws/link → /etc/secrets"`). `suspicious` flags results the caller considers worth highlighting.
+Turns the partitioned traversals into a single human-readable string for the confirmation prompt (e.g. `"This call traverses a symlink resolving outside the workspace: /ws/link → /etc/secrets"`).
 
 ---
 
@@ -469,18 +468,14 @@ The judge fast-paths and the symlink detector both need to pull path-like tokens
 func ExtractPaths(s string) []string
 func ExtractJSONStrings(data any) []string
 func HasRelativeEscape(s string) bool
-func UnresolvablePathTokens(command string, shell ShellKind) []string
-func ExistingOrAnchoredPaths(paths []string) []string
 func AllPathsInDir(ctx context.Context, input json.RawMessage, dir string) bool
 func AllPathsInWorkspace(ctx context.Context, input json.RawMessage) bool
 func AllPathsInSessionRoots(ctx context.Context, input json.RawMessage) bool
 ```
 
-- `ExtractPaths` — finds absolute POSIX-style and Windows drive-letter paths (`/usr/bin`, `C:\foo\bar`) in a string via a regex. A `/` that follows a path-component character is treated as a **separator inside a relative path** (e.g. the `/src` in `frontend/src/main.tsx`), not the start of an absolute one — so embedded relative paths are not misread as absolute escapes. Windows drive-letter alternatives (`C:\…`) start with a letter and are unaffected.
+- `ExtractPaths` — finds absolute POSIX-style and Windows drive-letter paths (`/usr/bin`, `C:\foo\bar`) in a string via a regex. A `/` that follows a path-component character is treated as a **separator inside a relative path** (e.g. the `/src` in `frontend/src/main.tsx`), not the start of an absolute one — so embedded relative paths are not misread as absolute escapes. Windows drive-letter alternatives (`C:\…`) start with a letter and are unaffected. Tokens that consist entirely of separators (`//`, `C:\\`) are skipped as shell-language artifacts.
 - `ExtractJSONStrings` — recursively collects every string value from a `json.Unmarshal` result (maps, slices, strings).
 - `HasRelativeEscape` — detects a `..` path segment inside relative text (`../foo`, `a/../../etc`), while ignoring ellipses and names such as `..config`. Containment checks fail closed when it returns true instead of letting relative escapes disappear from absolute-path extraction.
-- `UnresolvablePathTokens` — returns shell path expressions that conservative resolution cannot safely expand, notably Bash `~user` and path-bearing `${VAR<operator>...}` forms. It complements `ResolveShellPathTokens` for security assessment; PowerShell's supported forms are resolved directly and yield no such tokens.
-- `ExistingOrAnchoredPaths` — retains paths that exist or whose nearest existing ancestor is below the filesystem root (including new write targets in a real directory). Wholly fabricated subtrees anchored only at the volume root are dropped; permission/unknown errors are retained fail-safe.
 - `AllPathsInDir` — returns `true` only if the input contains **at least one** absolute path **and every** such path is within `dir` (via `pathutil.IsWithinPath`). Empty/`""` when there are no paths. Harmless special-device paths (`/dev/null`, `/dev/full`; `NUL` on Windows) are exempted via `IsHarmlessDevicePath` so they do not force a confirmation when they appear alongside in-root paths.
 - `AllPathsInWorkspace` — `AllPathsInDir` bound to the workspace path from context.
 - `AllPathsInSessionRoots` — the canonical containment check consulted by the judge fast-path: returns `true` only if the input contains at least one absolute path and every such path is within at least one session root (`SessionRoots(ctx)`, the union of workspace + temp directory + `WithAllowedRoots` roots). Harmless special-device paths are exempted via `IsHarmlessDevicePath`, so `/dev/null`/`/dev/full`/`NUL` do not force a confirmation.

@@ -113,10 +113,15 @@ const (
 	// detection over tool input (e.g. c0wrk's registry gate), since the
 	// sp4rk walker reports traversals rather than a JudgeOutcome.
 	ReasonCodeSymlinkEscape JudgeReasonCode = "symlink_escape"
-	// ReasonCodeSymlinkSuspicious marks symlink input that could not be
-	// fully resolved (target unknown) without a confirmed escape. Set by
-	// hosts alongside ReasonCodeSymlinkEscape; unassessable-shaped but
-	// without a fired control, so hosts may let a strict judge clear it.
+	// ReasonCodeSymlinkSuspicious is retained for contract stability but is
+	// no longer fired: it classified symlink input that could not be fully
+	// resolved (unresolved shell expansions) without a confirmed escape.
+	// The expansion-suspicion checks were removed from the symlink walk —
+	// dynamic constructs are the deterministic flowsh analysis's domain —
+	// so no built-in path sets this code anymore. Published codes are never
+	// renamed or reused; a host that still maps it treats it as
+	// unassessable-shaped without a fired control (clearable by a strict
+	// judge).
 	ReasonCodeSymlinkSuspicious JudgeReasonCode = "symlink_suspicious"
 	// ReasonCodeGitInternal marks a mutating operation whose target path
 	// contains a ".git" path component (case-insensitively) at or below the

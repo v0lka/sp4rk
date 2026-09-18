@@ -681,9 +681,9 @@ func ExtractJSONStrings(data any) []string {
 // ExtractPaths extracts absolute path-like substrings from a string value.
 // A "/" that follows a path-component character is treated as a separator
 // inside a relative path (e.g. the "/src" in "frontend/src/main.tsx"), not the
-// start of an absolute one — mirroring ResolveShellPathTokens so the shell and
-// JSON-input extractors agree on what counts as a path. Windows drive-letter
-// alternatives ("C:\...") start with a letter and are unaffected.
+// start of an absolute one, so shell and JSON-input extraction agree on what
+// counts as a path. Windows drive-letter alternatives ("C:\...") start with
+// a letter and are unaffected.
 // Tokens that consist entirely of separators — a bare "//" run (POSIX) or a
 // drive prefix followed by only separators ("C:\\") — are likewise skipped:
 // they are shell-language artifacts (the "//" of a sed address
@@ -705,6 +705,48 @@ func ExtractPaths(s string) []string {
 		out = append(out, tok)
 	}
 	return out
+}
+
+// pathComponentChars lists the characters that may occur inside a filesystem
+// path component (filename). pathRegex's absolute-path alternative can match a
+// "/" that follows such a character — the separator inside a relative path —
+// so a preceding path-component character marks a "/" as part of a relative
+// path rather than the start of an absolute one.
+const pathComponentChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-~"
+
+// isPathComponentChar reports whether b may occur inside a filesystem path
+// component (filename), i.e. it is one of [pathComponentChars].
+func isPathComponentChar(b byte) bool {
+	return strings.IndexByte(pathComponentChars, b) >= 0
+}
+
+// isPureSeparatorRunToken reports whether tok consists entirely of separator
+// characters: a POSIX run of two or more slashes ("//", "///", ...) or, after
+// a two-character drive prefix, a run of two or more separators with no path
+// component ("C:\\"). Such tokens are artifacts of the shell language, not
+// filesystem paths — the trailing "//" of a sed address ("sed 's/.*function
+// //'"), a comment marker ("echo \"// TODO fix\" >> notes.md"), an
+// integer-division operator ("echo $(( total // count ))") or an escaped
+// PowerShell drive root ("C:\\"). They carry no path component and therefore
+// name no out-of-root location; resolving them anyway (a bare "//" cleans to
+// the filesystem root "/") only produced false-positive escalations.
+//
+// Detection is not weakened by the skip: a bare "/" never matches [pathRegex]
+// (it requires at least one character after the leading separator), so the
+// POSIX form only skips runs of TWO or more slashes, and "cat //etc/passwd" —
+// whose token still carries the "etc/passwd" components — keeps being
+// reported. On the drive form a single trailing separator is a drive root
+// ("C:\") and a token with a component ("C:\\Windows") is a real path; both
+// remain tokens — only the pure separator run of two or more ("C:\\") is
+// skipped.
+func isPureSeparatorRunToken(tok string) bool {
+	// Drive form: two-character drive prefix ("X:"), then only separators.
+	if len(tok) > 2 && tok[1] == ':' {
+		rest := tok[2:]
+		return len(rest) >= 2 && strings.Trim(rest, "/\\") == ""
+	}
+	// POSIX form: a run of two or more slashes and nothing else.
+	return len(tok) >= 2 && strings.TrimLeft(tok, "/") == ""
 }
 
 // parentRefRe matches a ".." parent-directory reference that is a full path
