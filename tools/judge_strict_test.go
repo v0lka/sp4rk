@@ -29,7 +29,10 @@ func TestJudgeStrictPromptCoversOWASPASI(t *testing.T) {
 	}
 	for _, required := range []string{
 		"mandatory risks", "context makes them applicable", "Path locality alone is never sufficient",
-		"Only the verdict tokens ALLOW and CONFIRM are valid",
+		"VERDICT: ALLOW", "VERDICT: DENY", "VERDICT: CONFIRM",
+		"Only the verdict tokens ALLOW, DENY, and CONFIRM are valid",
+		"DENY is a deliberate rejection",
+		"CONFIRM means you cannot decide and defer to a human",
 	} {
 		if !strings.Contains(prompt, required) {
 			t.Errorf("strict prompt missing policy phrase %q", required)
@@ -46,6 +49,7 @@ func TestParseStrictJudgeResponse(t *testing.T) {
 	}{
 		{name: "allow", content: "VERDICT: ALLOW\nREASON: no material ASI risk", verdict: VerdictAllow, reason: "no material ASI risk"},
 		{name: "confirm", content: "VERDICT: CONFIRM\nREASON: ASI05 risk", verdict: VerdictConfirm, reason: "ASI05 risk"},
+		{name: "deny", content: "VERDICT: DENY\nREASON: proven exfiltration flow", verdict: VerdictDeny, reason: "proven exfiltration flow"},
 		{name: "advisory alias rejected", content: "VERDICT: SAFE\nREASON: looks safe", verdict: VerdictConfirm, reason: judgeUnparsedReason},
 		{name: "lowercase rejected", content: "VERDICT: allow\nREASON: looks safe", verdict: VerdictConfirm, reason: judgeUnparsedReason},
 		{name: "missing reason", content: "VERDICT: ALLOW", verdict: VerdictConfirm, reason: judgeUnparsedReason},

@@ -47,18 +47,19 @@ import "github.com/v0lka/sp4rk/tools"
 
 ### JudgeVerdict
 
-A judgment resolves to one of two verdicts:
+A judgment resolves to one of three verdicts:
 
 ```go
 type JudgeVerdict int
 
 const (
     VerdictAllow   JudgeVerdict = iota // safe to auto-approve
-    VerdictConfirm                     // needs user confirmation
+    VerdictConfirm                     // needs user confirmation (judge cannot decide)
+    VerdictDeny                        // deliberate rejection (judge assessed the call as dangerous)
 )
 ```
 
-There is no `VerdictDeny` — the judge only decides between *auto-approve* and *escalate to a human*. This mirrors the fail-closed philosophy of the registry: when in doubt, confirm.
+`VerdictDeny` is an *active* refusal with a reason: the judge positively assessed the call as dangerous (for example a proven secret→network exfiltration flow, privilege escalation, or following injected instructions). `VerdictConfirm` remains what it always was — *cannot decide, escalate to a human*. The distinction is intent: DENY means "this must not run", CONFIRM means "a human must decide". `VerdictDeny` is appended after the two original values, so their numeric values are unchanged for hosts that persisted them. The fail-closed philosophy is untouched: when in doubt the judges answer CONFIRM, and every error path (missing provider, timeout, unparseable response) still fails safe to `VerdictConfirm`.
 
 ### NewToolJudge
 
@@ -130,7 +131,7 @@ The parser accepts the following variations and is **case-insensitive** througho
 - **JSON objects** — models that emit `{"verdict":"ALLOW","reason":"…"}` (possibly embedded in prose) are parsed; a JSON value takes precedence over the surrounding text.
 - **Fenced or quoted values** — surrounding backticks, code fences, or quotes around the verdict are ignored.
 
-The verdict value is matched on **whole tokens** (case-insensitive), so `ALLOW` is recognized but a token merely *containing* `allow` (e.g. a path, argument, or the negated compound `DISALLOW`) is not. Only these whole tokens map to `VerdictAllow` (the set that bypasses confirmation): `ALLOW`, `ALLOWED`, `APPROVE`, `APPROVED`, `SAFE`. The explicit confirm set (`CONFIRM`, `CONFIRMED`, `DENY`, `DENIED`, `BLOCK`, `BLOCKED`, `DISALLOW`, `DISAPPROVE`, `REJECT`, `MANUAL`) and any unrecognized token all map to `VerdictConfirm` — negated compounds are listed explicitly so they can never be misread as their affirmative base. A response that cannot be parsed at all is a total parse failure — the fail-safe applies and the judge returns `VerdictConfirm`.
+The verdict value is matched on **whole tokens** (case-insensitive), so `ALLOW` is recognized but a token merely *containing* `allow` (e.g. a path, argument, or the negated compound `DISALLOW`) is not. Only these whole tokens map to `VerdictAllow` (the set that bypasses confirmation): `ALLOW`, `ALLOWED`, `APPROVE`, `APPROVED`, `SAFE`. The deliberate-rejection set (`DENY`, `DENIED`, `BLOCK`, `BLOCKED`, `REJECT`, `DISALLOW`, `DISAPPROVE`) maps to `VerdictDeny` — negated compounds are listed explicitly so they can never be misread as their affirmative base. The confirm set (`CONFIRM`, `CONFIRMED`, `MANUAL`) and any unrecognized token map to `VerdictConfirm`. A response that cannot be parsed at all is a total parse failure — the fail-safe applies and the judge returns `VerdictConfirm`.
 
 > **Tip:** the advisory verdict cache is keyed on `tool+input+session roots` — not on `taskContext`. If your `taskContext` changes the safety assessment of the same call, the cached verdict from a prior task within the same directory scope will be reused. Keep advisory prompts focused on the *intrinsic* safety of the input, not on transient task context.
 
@@ -158,7 +159,7 @@ It differs deliberately from advisory `Judge`:
 - every call reaches the LLM — there is no internal-tool bypass, session-root allow fast path, or verdict cache;
 - the current task, tool source, input, compact environment, session directories, and — for shell tools, when the host attaches it — the flowsh digest (`AnalysisContext`, wrapped as untrusted content behind a `shell_analysis` boundary: evidence for the verdict, never instructions) are serialized into a structured JSON envelope;
 - tool input and host-provided directory data are wrapped as untrusted content, and directory line separators are sanitized;
-- the strict system prompt covers agentic risks and requests a machine-readable JSON verdict;
+- the strict system prompt covers agentic risks and uses a three-verdict scale — `ALLOW` (no material risk), `DENY` (deliberate rejection: the call is dangerous and must not run), `CONFIRM` (cannot decide, defer to a human) — and the strict parser accepts exactly these three canonical tokens;
 - request construction failure, a missing provider, timeout/provider failure, nil response, or an unparseable response all fail safe to `VerdictConfirm`;
 - provider errors are not logged because they may echo sensitive tool arguments.
 
@@ -172,7 +173,10 @@ verdict, reason, err := judge.JudgeStrict(ctx, tools.StrictJudgeRequest{
     ToolSource:  req.ToolSource,
 })
 if err != nil || verdict != tools.VerdictAllow {
-    // keep the existing confirmation gate
+    // keep the existing confirmation gate. The verdict may be VerdictDeny
+    // (judge rejects the call as dangerous — surface the reason) or
+    // VerdictConfirm (judge cannot decide, or evaluation failed) — neither
+    // bypasses the gate.
 }
 ```
 

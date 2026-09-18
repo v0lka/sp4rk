@@ -59,6 +59,13 @@ const (
 	VerdictAllow JudgeVerdict = iota
 	// VerdictConfirm indicates the tool call needs user confirmation.
 	VerdictConfirm
+	// VerdictDeny indicates the judge deliberately rejects the tool call as
+	// unsafe: it positively assessed the call as dangerous rather than
+	// merely lacking enough context to decide (which is VerdictConfirm —
+	// "cannot decide, a human must review"). VerdictDeny is appended after
+	// the existing verdicts so the numeric values of VerdictAllow and
+	// VerdictConfirm are unchanged for any host that persisted them.
+	VerdictDeny
 )
 
 // StrictJudgeRequest contains all decision-relevant context for strict
@@ -600,9 +607,11 @@ func (j *ToolJudge) JudgeStrict(ctx context.Context, request StrictJudgeRequest)
 	return verdict, reasoning, nil
 }
 
-// parseStrictJudgeResponse accepts only the strict prompt's two canonical
-// verdict tokens. The advisory parser intentionally remains more tolerant for
-// the on-demand Ask Agent flow.
+// parseStrictJudgeResponse accepts only the strict prompt's three canonical
+// verdict tokens. DENY is the judge's deliberate rejection of a call it
+// positively assessed as dangerous; it is returned verbatim so a host can
+// distinguish rejection from the fail-safe CONFIRM. The advisory parser
+// intentionally remains more tolerant for the on-demand Ask Agent flow.
 func parseStrictJudgeResponse(content string) (verdict JudgeVerdict, reasoning string) {
 	lines := strings.Split(strings.TrimSpace(content), "\n")
 	if len(lines) != 2 {
@@ -623,6 +632,8 @@ func parseStrictJudgeResponse(content string) (verdict JudgeVerdict, reasoning s
 	switch verdictText {
 	case "ALLOW":
 		return VerdictAllow, reasoning
+	case "DENY":
+		return VerdictDeny, reasoning
 	case "CONFIRM":
 		return VerdictConfirm, reasoning
 	default:
@@ -934,12 +945,13 @@ func splitInlineReason(val string) (verdictPart, reasonPart string, ok bool) {
 	return verdictPart, reasonPart, true
 }
 
-// judgeAllowTokens and judgeConfirmTokens are the exact verdict spellings the
-// parser recognizes. Matching is whole-token (case-insensitive) rather than
-// substring so that negated compounds such as "DISALLOW" and "DISAPPROVE" —
-// which contain "ALLOW"/"APPROVE" as substrings but express the opposite
-// intent — are never misclassified as ALLOW, which would silently bypass the
-// confirmation gate. Such negations instead fail-safe to CONFIRM.
+// judgeAllowTokens, judgeConfirmTokens, and judgeDenyTokens are the exact
+// verdict spellings the parser recognizes. Matching is whole-token
+// (case-insensitive) rather than substring so that negated compounds such as
+// "DISALLOW" and "DISAPPROVE" — which contain "ALLOW"/"APPROVE" as substrings
+// but express the opposite intent — are never misclassified as ALLOW, which
+// would silently bypass the confirmation gate. Such negations instead map to
+// the deliberate-rejection verdict VerdictDeny.
 var judgeAllowTokens = map[string]struct{}{
 	"ALLOW":    {},
 	"ALLOWED":  {},
@@ -948,22 +960,30 @@ var judgeAllowTokens = map[string]struct{}{
 	"SAFE":     {},
 }
 
+// judgeConfirmTokens are the escalation spellings: the judge cannot decide
+// and defers the call to a human.
 var judgeConfirmTokens = map[string]struct{}{
-	"CONFIRM":    {},
-	"CONFIRMED":  {},
+	"CONFIRM":   {},
+	"CONFIRMED": {},
+	"MANUAL":    {},
+}
+
+// judgeDenyTokens are the deliberate-rejection spellings: the judge
+// positively assessed the call as dangerous and refuses it — as opposed to
+// CONFIRM, which merely defers to a human because the judge cannot decide.
+var judgeDenyTokens = map[string]struct{}{
 	"DENY":       {},
 	"DENIED":     {},
 	"BLOCK":      {},
 	"BLOCKED":    {},
+	"REJECT":     {},
 	"DISALLOW":   {},
 	"DISAPPROVE": {},
-	"REJECT":     {},
-	"MANUAL":     {},
 }
 
-// matchVerdict classifies a verdict token as ALLOW or CONFIRM. Returns
-// ok=false when the token is not recognizable (the caller keeps the safe
-// default verdict in that case).
+// matchVerdict classifies a verdict token as ALLOW, DENY, or CONFIRM.
+// Returns ok=false when the token is not recognizable (the caller keeps the
+// safe default verdict in that case).
 func matchVerdict(val string) (JudgeVerdict, bool) {
 	v := strings.ToUpper(strings.TrimSpace(trimEmphasis(val)))
 	// Consider only the first whitespace/punctuation-delimited token so inline
@@ -974,6 +994,9 @@ func matchVerdict(val string) (JudgeVerdict, bool) {
 	v = strings.TrimRight(v, ".:!?")
 	if _, ok := judgeAllowTokens[v]; ok {
 		return VerdictAllow, true
+	}
+	if _, ok := judgeDenyTokens[v]; ok {
+		return VerdictDeny, true
 	}
 	if _, ok := judgeConfirmTokens[v]; ok {
 		return VerdictConfirm, true
@@ -1083,6 +1106,8 @@ func verdictString(v JudgeVerdict) string {
 		return "ALLOW"
 	case VerdictConfirm:
 		return "CONFIRM"
+	case VerdictDeny:
+		return "DENY"
 	default:
 		return "UNKNOWN"
 	}

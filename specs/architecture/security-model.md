@@ -141,9 +141,9 @@ Strict mode differs from advisory `Judge` in three security-relevant ways:
 
 1. It performs one LLM call for every invocation. Internal-tool and in-session path fast paths are disabled, and no verdict cache is read or written.
 2. It serializes a JSON envelope rather than interpolating the tool arguments into instructions. Raw input, host-supplied session-directory values, and the host's judge reasoning (host-generated, but it may quote fragments of the untrusted command, e.g. an unresolvable path-like token) are wrapped in `untrusted-content` boundaries and line-sanitized before serialization.
-3. It accepts only the strict `VERDICT`/`REASON` response contract. Missing provider, request construction failure, provider error, cancellation/timeout, nil response, and unparseable output all return `VerdictConfirm`. Provider error text is excluded from strict logs because it may echo sensitive tool input.
+3. It accepts only the strict `VERDICT`/`REASON` response contract — a three-verdict scale in which `DENY` is a deliberate rejection (the judge positively assessed the call as dangerous; the call must not run) and `CONFIRM` means the judge cannot decide and defers to a human. Missing provider, request construction failure, provider error, cancellation/timeout, nil response, and unparseable output all return `VerdictConfirm`. Provider error text is excluded from strict logs because it may echo sensitive tool input.
 
-Strict mode remains advisory to the host: it returns an allow/confirm recommendation and never bypasses `PolicyAlwaysDeny`, a hard `JudgeSeverity`, or registry confirmation policy by itself.
+Strict mode remains advisory to the host: it returns an allow/confirm/deny recommendation and never bypasses `PolicyAlwaysDeny`, a hard `JudgeSeverity`, or registry confirmation policy by itself.
 
 <a id="shell-command-analysis"></a>
 ## Shell Command Analysis (flowsh criteria)
@@ -315,7 +315,7 @@ File-based defaults, session roots, and blacklist regexes are host-application c
 - An MCP tool registration can never overwrite an existing non-MCP tool.
 - The LLM-powered advisory `ToolJudge` cache key incorporates session roots and partitions cached verdicts by directory scope; its prompt carries the same wrapped scope data.
 - `ToolJudge.JudgeStrict` performs an uncached, no-fast-path LLM evaluation per invocation and maps every construction/provider/timeout/parse failure to `VerdictConfirm` without logging potentially sensitive provider diagnostics.
-- The LLM-powered `ToolJudge` verdict parser fails **safe** to `VerdictConfirm` on any unrecognized or ambiguous verdict: verdict tokens are matched whole-token (case-insensitive), so negations of allow-words (e.g. `DISALLOW`, `DISAPPROVE`) are never misclassified as `VerdictAllow`. An LLM error likewise yields `VerdictConfirm`. See [../contracts/tools.md](../contracts/tools.md) for the verdict vocabulary.
+- The LLM-powered `ToolJudge` verdict parser fails **safe** to `VerdictConfirm` on any unrecognized or ambiguous verdict: verdict tokens are matched whole-token (case-insensitive), so negations of allow-words (e.g. `DISALLOW`, `DISAPPROVE`) are never misclassified as `VerdictAllow` — they map to the deliberate-rejection `VerdictDeny`. An LLM error likewise yields `VerdictConfirm`. See [../contracts/tools.md](../contracts/tools.md) for the verdict vocabulary.
 
 ## Anti-Patterns
 

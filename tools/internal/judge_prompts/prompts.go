@@ -13,3 +13,10 @@ var JudgeSystem string
 //
 //go:embed judge_strict_system.md
 var JudgeStrictSystem string
+
+// StepLimitSystem is the embedded system prompt for the loop judge, which
+// decides at a step-budget or circuit-breaker boundary whether an autonomous
+// agent continues (allow once/more/always) or stops (deny).
+//
+//go:embed step_limit_system.md
+var StepLimitSystem string

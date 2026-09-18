@@ -2059,6 +2059,9 @@ func TestVerdictString(t *testing.T) {
 	if s := verdictString(VerdictConfirm); s != "CONFIRM" {
 		t.Errorf("expected 'CONFIRM', got %q", s)
 	}
+	if s := verdictString(VerdictDeny); s != "DENY" {
+		t.Errorf("expected 'DENY', got %q", s)
+	}
 	// Test the default/unknown branch.
 	if s := verdictString(JudgeVerdict(999)); s != "UNKNOWN" {
 		t.Errorf("expected 'UNKNOWN' for invalid verdict, got %q", s)
@@ -2280,7 +2283,7 @@ func TestParseJudgeResponse_EmphasisInKeyRegionOnly(t *testing.T) {
 // Negated compounds such as "DISALLOW" and "DISAPPROVE" contain "ALLOW" and
 // "APPROVE" as substrings; a substring matcher misclassifies them as ALLOW,
 // silently bypassing the confirmation gate for a destructive call. They must
-// instead fail-safe to CONFIRM.
+// instead map to the deliberate-rejection verdict VerdictDeny.
 func TestParseJudgeResponse_NegationIsNotAllow(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -2293,8 +2296,8 @@ func TestParseJudgeResponse_NegationIsNotAllow(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			verdict, reason := parseJudgeResponse(tc.content)
-			if verdict != VerdictConfirm {
-				t.Errorf("negation must fail-safe to VerdictConfirm, got %d (ALLOW would bypass the gate)", verdict)
+			if verdict != VerdictDeny {
+				t.Errorf("negation must map to VerdictDeny, got %d (ALLOW would bypass the gate)", verdict)
 			}
 			if reason == "" {
 				t.Errorf("expected the stated reason to be preserved, got empty")
@@ -2304,14 +2307,29 @@ func TestParseJudgeResponse_NegationIsNotAllow(t *testing.T) {
 }
 
 // TestParseJudgeResponse_ConfirmTokens confirms the exact confirm-vocabulary
-// spellings are recognized (whole-token match), including aliases added when
-// switching from substring to exact-token matching.
+// spellings are recognized (whole-token match) and stay escalations: CONFIRM
+// means the judge cannot decide and defers to a human.
 func TestParseJudgeResponse_ConfirmTokens(t *testing.T) {
-	for _, tok := range []string{"CONFIRM", "CONFIRMED", "DENY", "DENIED", "BLOCK", "BLOCKED", "REJECT", "MANUAL"} {
+	for _, tok := range []string{"CONFIRM", "CONFIRMED", "MANUAL"} {
 		t.Run(tok, func(t *testing.T) {
 			verdict, _ := parseJudgeResponse("VERDICT: " + tok + "\nREASON: needs approval")
 			if verdict != VerdictConfirm {
 				t.Errorf("expected VerdictConfirm for %q, got %d", tok, verdict)
+			}
+		})
+	}
+}
+
+// TestParseJudgeResponse_DenyTokens confirms the deliberate-rejection
+// spellings map to VerdictDeny (whole-token match), including the negated
+// compounds that were folded into the confirm vocabulary before DENY became
+// a distinct verdict.
+func TestParseJudgeResponse_DenyTokens(t *testing.T) {
+	for _, tok := range []string{"DENY", "DENIED", "BLOCK", "BLOCKED", "REJECT", "DISALLOW", "DISAPPROVE"} {
+		t.Run(tok, func(t *testing.T) {
+			verdict, _ := parseJudgeResponse("VERDICT: " + tok + "\nREASON: destructive write")
+			if verdict != VerdictDeny {
+				t.Errorf("expected VerdictDeny for %q, got %d", tok, verdict)
 			}
 		})
 	}
