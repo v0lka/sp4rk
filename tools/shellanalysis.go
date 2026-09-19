@@ -16,9 +16,11 @@
 //     criterion is recorded in the digest, and the highest-priority one
 //     becomes the JudgeOutcome.
 //   - Canonicality: C1–C5 are hard AND canonical (hosts must never
-//     auto-override them). C6 is hard but NON-canonical — an analysis
-//     limitation the advisory judge may clear. C7/C8 are soft scope
-//     questions.
+//     auto-override them); C5 additionally demands cradle evidence — a
+//     concrete NetEgress target or a non-empty exfil pairing — and degrades
+//     to C6 without it, so a canonical verdict never contradicts the digest
+//     it ships in. C6 is hard but NON-canonical — an analysis limitation the
+//     advisory judge may clear. C7/C8 are soft scope questions.
 //   - The flowsh score/grade are carried in the digest for context but are
 //     deliberately NOT used as decision thresholds — the criteria fire off
 //     structural facts (effect kinds, targets, KB classes), not scores.
@@ -36,6 +38,8 @@ import (
 	"log/slog"
 	"path"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"sync"
 
@@ -43,9 +47,10 @@ import (
 	"github.com/v0lka/flowsh/engine"
 )
 
-// ShellDigestSchemaVersion tags the shell-analysis digest contract ("sp4rk-shell-analysis/v1").
-// Bump it whenever the digest gains, loses or reshapes a field.
-const ShellDigestSchemaVersion = "sp4rk-shell-analysis/v1"
+// ShellDigestSchemaVersion tags the shell-analysis digest contract
+// ("sp4rk-shell-analysis/v2"). Bump it whenever the digest gains, loses or
+// reshapes a field. v2 added the WorkspaceScopedVerification marker.
+const ShellDigestSchemaVersion = "sp4rk-shell-analysis/v2"
 
 // ─────────────────────────────────────────────────────────────────────────
 // Process-global analyzer
@@ -153,6 +158,27 @@ type ShellAnalysisDigest struct {
 	ExfilPairs    []ShellExfilPairDigest   `json:"exfilPairs"`
 	Destructive   []ShellDestructiveDigest `json:"destructive"`
 	Criteria      []ShellCriterion         `json:"criteria"`
+	// WorkspaceScopedVerification is the deterministic workspace-scoped
+	// verification marker (v2): every resolved binary in the command is a
+	// catalogued verification driver or benign plumbing utility, at least one
+	// is a driver, every file operand and write redirection resolves inside
+	// the session roots, environment prefixes come from a safe set, there is
+	// no network effect, no dependency-manifest write and no unresolved
+	// expansion. It is positive EVIDENCE for the judges — it never suppresses
+	// a fired criterion (C6 keeps escalating so the judge stays in the loop;
+	// see the judge prompt's Static Analysis Report rules).
+	WorkspaceScopedVerification bool `json:"workspaceScopedVerification"`
+	// Signature is the deterministic effect signature of the analysed
+	// command: the catalogued verification drivers it invokes, its canonical
+	// effect set, the codes of the fired criteria and the verification
+	// marker, rendered as one stable string (see [shellEffectSignature] for
+	// the exact components and format). Two commands that differ in form but
+	// not in effect — a blocked call retried through an equivalent spelling —
+	// carry the same signature, so a host can recognize a re-escalation of an
+	// already-adjudicated effect instead of re-trying it from scratch. The
+	// signature is EVIDENCE for memoizing verdicts; it never suppresses a
+	// criterion and never overrides canonicality.
+	Signature string `json:"signature"`
 }
 
 // ShellAnalysis is the full result of the deterministic shell analysis: the
@@ -183,6 +209,13 @@ type ShellAnalysis struct {
 // digest plus the winning judge outcome. Session roots for the containment
 // criteria (C4/C8) come from ctx exactly as they did for the former shell-path
 // containment check; with no roots attached those criteria cannot fire.
+// Host-known variable bindings attached via [WithShellVarBindings] are
+// forwarded to the analyzer (flowsh Options.Vars): every binding behaves as
+// though the script had assigned it a literal value before its first
+// statement, so a $name read resolves to the concrete value instead of
+// degrading its word — and every path derived from it — to ⊤. An in-script
+// assignment overrides the seeded binding; an empty table (or none) analyses
+// exactly as before.
 //
 // A tool name outside the shell-exec pair, an unparsable input, or a failed
 // knowledge-base load is an error — callers fail closed on it.
@@ -202,8 +235,8 @@ func AnalyzeShellCommandForJudge(ctx context.Context, toolName string, input jso
 	if err != nil {
 		return nil, fmt.Errorf("shell analysis: flowsh analyzer init: %w", err)
 	}
-	report := analyzer.Analyze(lang, params.Command)
-	return evaluateShellReport(ctx, params.WorkingDirectory, report), nil
+	report := analyzer.AnalyzeWith(lang, params.Command, api.Options{Vars: ShellVarBindingsFrom(ctx)})
+	return evaluateShellReport(ctx, params.WorkingDirectory, params.Command, report), nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -242,6 +275,44 @@ func ShellAnalysisFrom(ctx context.Context) (*ShellAnalysis, error) {
 	return nil, nil
 }
 
+// shellVarBindingsKey is the context key carrying the host-known shell
+// variable bindings for the imminent bash_exec/posh_exec analysis.
+type shellVarBindingsKey struct{}
+
+// WithShellVarBindings attaches the variable bindings the HOST knows from its
+// own session context — a session temp directory, a workspace path, a run
+// identifier — to ctx for the imminent bash_exec/posh_exec analysis.
+// [AnalyzeShellCommandForJudge] forwards them into the analyzer (flowsh
+// Options.Vars), where each binding behaves exactly as though the script had
+// assigned it a literal value before its first statement: a later $name read
+// resolves to the concrete value instead of degrading its word (and every
+// path derived from it) to ⊤. The bindings model host-known intent, not a
+// persistent shell: they resolve the cross-command expansions the script text
+// alone does not determine. The map is copied defensively; nil and empty maps
+// are equivalent to no attachment (analysis unchanged). The attachment is
+// per-call, read by the analysis entry point only — it does not reach the
+// executed process environment.
+func WithShellVarBindings(ctx context.Context, vars map[string]string) context.Context {
+	if len(vars) == 0 {
+		return ctx
+	}
+	cp := make(map[string]string, len(vars))
+	for k, v := range vars {
+		cp[k] = v
+	}
+	return context.WithValue(ctx, shellVarBindingsKey{}, cp)
+}
+
+// ShellVarBindingsFrom extracts the host-attached variable bindings, if any.
+// Returns nil when nothing is attached. Callers must treat the returned map
+// as read-only.
+func ShellVarBindingsFrom(ctx context.Context) map[string]string {
+	if v, ok := ctx.Value(shellVarBindingsKey{}).(map[string]string); ok {
+		return v
+	}
+	return nil
+}
+
 // ShellJudgeOutcome is the deterministic outcome the bash_exec/posh_exec
 // Judges report for an analysis attached via [WithShellAnalysis]: the
 // analysis's winning [ShellAnalysis.Outcome] verbatim (Allow=true when no
@@ -278,19 +349,29 @@ func ShellJudgeOutcome(ctx context.Context, toolName string) JudgeOutcome {
 // evaluateShellReport applies the fixed-priority criteria C1–C8 to a flowsh
 // report and assembles the digest + winning outcome. It never fails: a report
 // is always assessable (flowsh itself degrades to ⊤/conservative, which C5/C6
-// handle).
-func evaluateShellReport(ctx context.Context, workDir string, report *api.Report) *ShellAnalysis {
+// handle). command is the raw tool-input command text — used only to verify
+// environment-prefix values for the workspace-scoped verification marker; it
+// never reaches the digest (the no-input-echo contract).
+func evaluateShellReport(ctx context.Context, workDir, command string, report *api.Report) *ShellAnalysis {
 	var criteria []ShellCriterion
 	fire := func(code JudgeReasonCode, severity JudgeSeverity, canonical bool) {
 		criteria = append(criteria, ShellCriterion{Fired: code, Severity: severity, Canonical: canonical})
 	}
 
 	hasNetEgress := shellHasEffectKind(report, engine.KindNetEgress)
+	hasValidatedNetEgress := shellHasValidatedNetEgress(report)
 	hasPrivEsc := shellHasEffectKind(report, engine.KindPrivEsc)
 	hasCredAccess := shellHasEffectKind(report, engine.KindCredAccess)
 	hasExfilPair := len(report.Score.ExfilPairs) > 0
 	unbounded := report.Top || report.Conservative
 	unboundedWrite := shellHasUnboundedWrite(report)
+	// The C5 evidence rule: a canonical cradle verdict must be backed by a
+	// pointable destination — a NetEgress effect whose target the analyzer
+	// pinned to a concrete host/URL, or an exfil pairing that found a real
+	// secret→sink flow (whose sink is itself a NetEgress effect). An
+	// unbounded command whose only egress is unresolved (⊤) names no
+	// destination the verdict could point at, so C5 degrades to C6.
+	cradleEvidence := hasValidatedNetEgress || hasExfilPair
 
 	// C1 — exfiltration flow: a secret read paired with tainted egress.
 	if hasExfilPair {
@@ -311,15 +392,21 @@ func evaluateShellReport(ctx context.Context, workDir string, report *api.Report
 			fire(ReasonCodeCommandDestructiveOutsideRoots, JudgeSeverityHard, true)
 		}
 	}
-	// C5 — unbounded analysis with network egress: download-cradle shape.
-	if unbounded && hasNetEgress {
+	// C5 — unbounded analysis with network egress AND the evidence to pin
+	// that egress to a destination (a concrete NetEgress target or a real
+	// exfil pairing): the download-cradle shape. Without the evidence the
+	// verdict would contradict the digest (a canonical cradle deny with no
+	// target to point at — the silent-audit 968848 shape), so it degrades to
+	// C6 below.
+	if unbounded && hasNetEgress && cradleEvidence {
 		fire(ReasonCodeCommandDownloadCradle, JudgeSeverityHard, true)
 	}
 	// C6 — the analyzer could not bound the command (⊤/conservative) without
 	// network egress, OR an irreversible write's target could not be resolved
-	// (⊤): hard but NON-canonical, an analysis limitation the advisory judge
-	// may clear.
-	if (unbounded || unboundedWrite) && !hasNetEgress {
+	// (⊤), OR the unbounded command's egress could not be pinned to a
+	// destination (the degraded C5): hard but NON-canonical, an analysis
+	// limitation the advisory judge may clear.
+	if (unbounded || unboundedWrite) && !hasNetEgress || unbounded && hasNetEgress && !cradleEvidence {
 		fire(ReasonCodeCommandUnboundedAnalysis, JudgeSeverityHard, false)
 	}
 	// C7 — credential access without an exfil pairing.
@@ -332,7 +419,7 @@ func evaluateShellReport(ctx context.Context, workDir string, report *api.Report
 		fire(ReasonCodeOutsideSessionRoots, JudgeSeveritySoft, false)
 	}
 
-	result := &ShellAnalysis{Digest: newShellAnalysisDigest(report, criteria)}
+	result := &ShellAnalysis{Digest: newShellAnalysisDigest(ctx, workDir, command, report, criteria)}
 	if len(criteria) > 0 {
 		winner := criteria[0]
 		result.Outcome = JudgeOutcome{
@@ -365,7 +452,7 @@ func shellCriterionReason(code JudgeReasonCode) string {
 	case ReasonCodeCommandDownloadCradle:
 		return "Shell analysis: unbounded command with network egress (possible download cradle)"
 	case ReasonCodeCommandUnboundedAnalysis:
-		return "Shell analysis: command could not be bounded by static analysis (top/conservative), no network egress found"
+		return "Shell analysis: command could not be bounded by static analysis (top/conservative), with no network egress or an egress that could not be pinned to a destination"
 	case ReasonCodeCredentialAccess:
 		return "Shell analysis: credential/secret material accessed without a paired egress"
 	case ReasonCodeOutsideSessionRoots:
@@ -379,6 +466,25 @@ func shellCriterionReason(code JudgeReasonCode) string {
 func shellHasEffectKind(report *api.Report, kind engine.EffectKind) bool {
 	for _, e := range report.Effects {
 		if e.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// shellHasValidatedNetEgress reports whether the report carries a network
+// egress effect whose destination the analyzer could pin to a concrete
+// target — a literal host/URL that survived the binding layer's host-shape
+// gate. ⊤ (unresolved: `$URL`, an unknown command's operands) and ⊥ (payload
+// egress with no destination slot) do not count: neither names a destination
+// a cradle verdict could point at. This is the evidence half of the C5
+// consistency rule; the exfil pairing is the other half.
+func shellHasValidatedNetEgress(report *api.Report) bool {
+	for _, e := range report.Effects {
+		if e.Kind != engine.KindNetEgress || e.Target.IsTop() {
+			continue
+		}
+		if len(e.Target.Targets()) > 0 {
 			return true
 		}
 	}
@@ -710,7 +816,10 @@ func shellIsSystemOrRawDevicePath(absPath string) bool {
 
 // newShellAnalysisDigest projects a flowsh report plus the fired criteria
 // onto the compact digest: bounded facts only, no input echo, no why-traces.
-func newShellAnalysisDigest(report *api.Report, criteria []ShellCriterion) ShellAnalysisDigest {
+// The workspace-scoped verification marker is computed here (it shares the
+// criteria engine's session roots and resolution base) and stamped into the
+// v2 digest.
+func newShellAnalysisDigest(ctx context.Context, workDir, command string, report *api.Report, criteria []ShellCriterion) ShellAnalysisDigest {
 	effects := make([]ShellEffectDigest, 0, len(report.Effects))
 	for _, e := range report.Effects {
 		targets := e.Target.Targets()
@@ -737,6 +846,7 @@ func newShellAnalysisDigest(report *api.Report, criteria []ShellCriterion) Shell
 	if criteria == nil {
 		criteria = []ShellCriterion{}
 	}
+	marker := shellWorkspaceScopedVerification(ctx, workDir, command, report)
 	return ShellAnalysisDigest{
 		SchemaVersion: ShellDigestSchemaVersion,
 		Lang:          report.Lang,
@@ -760,8 +870,534 @@ func newShellAnalysisDigest(report *api.Report, criteria []ShellCriterion) Shell
 			Reversible:      report.Score.Reversible,
 			Grade:           report.Score.Grade.String(),
 		},
-		ExfilPairs:  pairs,
-		Destructive: destructive,
-		Criteria:    criteria,
+		ExfilPairs:                  pairs,
+		Destructive:                 destructive,
+		Criteria:                    criteria,
+		WorkspaceScopedVerification: marker,
+		Signature:                   shellEffectSignature(report, criteria, marker),
 	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Effect signature (digest v2)
+// ─────────────────────────────────────────────────────────────────────────
+//
+// The signature is the comparable identity of a command's EFFECT, not of its
+// text (silent-mode recommendations §3, Track D): verdict memoization keyed on
+// it must survive a retry through an equivalent spelling while still
+// separating genuinely different commands. It is a union of four components:
+//
+//   - the catalogued verification DRIVERS the command invokes (binary plus
+//     subcommand for subcommand-scoped drivers). Drivers are the one binary
+//     family whose canonical form collapses to the same target-less effect
+//     regardless of identity (a ⊤ CodeExec / bare ProcSpawn), so their names
+//     are the only signal separating e.g. tsc from vitest. Conversely, the
+//     transport and inspection utilities that legitimately differ between
+//     equivalent retry forms (mv folding a staged write, wc versus grep on a
+//     trailing check) are deliberately NOT part of the binary component —
+//     their contribution is already carried, concretely, by the canonical
+//     effects. This is what keeps the audited retry pairs identical:
+//     963134/963140 (npx tsc versus ./node_modules/.bin/tsc) and
+//     968120/968126 (sed > staging && mv versus sed -i).
+//   - the CANONICAL effect set (flowsh v2 Canonical): each effect rendered as
+//     its stable key "Kind|Mode|[targets]" plus reversibility ("|R"/"|I"),
+//     staging-folded and stripped of non-path operand targets.
+//   - the codes of the fired criteria (C1–C8), sorted.
+//   - the workspace-scoped verification marker (B).
+//
+// Every component is sorted and deduplicated, so the rendering is a pure
+// function of the analysis: identical input yields the identical signature.
+// "sig1" is the format tag; bump it when the component set changes.
+
+// shellEffectSignature renders the deterministic effect signature for one
+// flowsh report plus its fired criteria and verification marker.
+func shellEffectSignature(report *api.Report, criteria []ShellCriterion, marker bool) string {
+	var bins []string
+	seenBins := make(map[string]bool, len(report.CommandCalls))
+	for _, call := range report.CommandCalls {
+		allowedSubs, driver := shellVerificationDrivers[call.Resolved]
+		if !driver || call.Resolved == "" {
+			continue
+		}
+		token := call.Resolved
+		// Subcommand-scoped drivers (go test/build/get, npm test/run, …)
+		// share one binary name with materially different behaviours, so the
+		// first non-flag operand disambiguates them the same way the marker
+		// catalog's allowlists do.
+		if allowedSubs != nil {
+			if sub, ok := shellFirstFlagFreeOperand(call.Args); ok {
+				token += ":" + sub
+			}
+		}
+		if seenBins[token] {
+			continue
+		}
+		seenBins[token] = true
+		bins = append(bins, token)
+	}
+	sort.Strings(bins)
+
+	var fx []string
+	seenFx := make(map[string]bool)
+	if report.Canonical != nil {
+		for _, e := range report.Canonical.Effects {
+			k := e.Key()
+			if e.Reversible {
+				k += "|R"
+			} else {
+				k += "|I"
+			}
+			if seenFx[k] {
+				continue
+			}
+			seenFx[k] = true
+			fx = append(fx, k)
+		}
+	}
+	sort.Strings(fx)
+
+	seenCodes := make(map[string]bool, len(criteria))
+	var codes []string
+	for _, c := range criteria {
+		code := string(c.Fired)
+		if seenCodes[code] {
+			continue
+		}
+		seenCodes[code] = true
+		codes = append(codes, code)
+	}
+	sort.Strings(codes)
+
+	return strings.Join([]string{
+		"sig1",
+		"bins=" + strings.Join(bins, ","),
+		"fx=" + strings.Join(fx, ";"),
+		"crit=" + strings.Join(codes, ","),
+		fmt.Sprintf("B=%t", marker),
+	}, "|")
+}
+
+// shellFirstFlagFreeOperand returns the first non-empty, non-flag operand of
+// args — the subcommand position for subcommand-scoped drivers.
+func shellFirstFlagFreeOperand(args []string) (string, bool) {
+	for _, a := range args {
+		if a == "" || strings.HasPrefix(a, "-") {
+			continue
+		}
+		return a, true
+	}
+	return "", false
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Workspace-scoped verification marker (digest v2, Track B)
+// ─────────────────────────────────────────────────────────────────────────
+//
+// The marker is the deterministic evidence the strict judge needs for its
+// "positive establishment" doctrine on the C6 (command_unbounded_analysis)
+// escalation: a verification driver run over the session's own roots is the
+// one command family that is unbounded ONLY because the analyzer cannot see
+// inside the driver (vitest/gofmt/… are unknown binaries whose sole report
+// contribution is a ⊤ CodeExec effect), never because it does anything the
+// criteria could point at. The marker is computed from the same flowsh
+// report the criteria use; it NEVER suppresses a criterion — C6 keeps firing
+// (non-canonical, hard) so the call still escalates to the judge, which then
+// clears it on the marker (defense in depth; the judge stays in the loop).
+//
+// Conditions (ALL must hold — any miss keeps the marker off, fail-closed):
+//
+//   - session roots are attached (an empty root set establishes nothing);
+//   - the report is not ⊤ and every command statement is accounted for:
+//     len(CommandCalls) == Commands. Sinks (bash -c, python3, node, docker,
+//     awk, …), code-executing builtins (eval/source), shell-only builtins
+//     (true/:/exit), user functions and dynamically-named commands never
+//     reach the binder, so any hidden statement breaks the count — those are
+//     exactly the forms whose effects the analyzer cannot see at all;
+//   - every resolved binary is catalogued: at least one VERIFICATION DRIVER
+//     (go test/vet/build/fmt…, gofmt, golangci-lint, tsc, vitest, eslint,
+//     jest, rg, npm test/run) plus any number of benign PLUMBING utilities
+//     (cd/echo/tail/grep/…), each passing its argument screens (find may not
+//     -exec/-delete, rg may not --pre, go rejects -mod=mod and non-verify
+//     subcommands, …). npx and node_modules/.bin wrappers normalize to the
+//     driven binary (flowsh's CommandCall.Resolved);
+//   - every path-shaped file operand — effect targets, call arguments and
+//     write-redirection targets — resolves inside a session root (the raw
+//     device tree is exempt via the harmless-device check);
+//   - every environment assignment (EnvWrite) names a safe variable and
+//     carries a safe value from the command text (CI=1, NO_COLOR,
+//     GOFLAGS=-mod=readonly, GOPROXY=off, GOWORK=off, TERM=dumb);
+//   - no network effect of any kind (NetEgress/NetIngress) — which also
+//     excludes `go get`-style fetch subcommands via their KB effects;
+//   - no write (effect or redirection) names a dependency-manifest file
+//     (go.mod/go.work/package.json/…);
+//   - no unresolved expansion survives: a ⊤ target is tolerated ONLY on a
+//     CodeExec effect — the unknown-driver signature. Any other ⊤ effect
+//     (a $VAR the binding layer could not resolve) keeps the marker off.
+//
+// The marker encodes the operator-trust premise "the session roots are
+// trusted" (the same premise as workspace auto-approval); see ADR-052.
+
+// shellVerificationDrivers catalogues the verification-driver binaries. The
+// map value is the allowed first-operand (subcommand) allowlist; nil means
+// every subcommand is accepted (the binary's own semantics are the trust
+// premise). Resolution is by the NORMALIZED binary (flowsh CommandCall.
+// Resolved): basename with node_modules/.bin stripped and package runners
+// (npx) consumed, so npx tsc, ./node_modules/.bin/tsc and /usr/bin/tsc all
+// resolve to tsc. Extend this catalog (and the plumbing set below) when a
+// new driver earns its place — never widen an existing entry's screens.
+var shellVerificationDrivers = map[string][]string{
+	"go":            {"test", "vet", "build", "fmt", "list", "env", "version", "doc"},
+	"gofmt":         nil,
+	"gofumpt":       nil,
+	"golangci-lint": {"run", "fmt", "version"},
+	"tsc":           nil,
+	"vitest":        nil,
+	"jest":          nil,
+	"eslint":        nil,
+	"prettier":      nil,
+	"rg":            nil,
+	"ripgrep":       nil,
+	"npm":           {"test", "run"},
+}
+
+// shellVerificationPlumbing catalogues the benign utilities that may appear
+// alongside a driver without breaking the marker: directory navigation,
+// output shaping and read-only inspection. None can execute code by itself
+// (the code executors — bash/python/node/awk/… — are flowsh sinks and fail
+// the call-coverage condition long before this table is consulted); the
+// argument screens below close their remaining edges (find -exec, …).
+var shellVerificationPlumbing = map[string]struct{}{
+	"cd": {}, "pwd": {}, "echo": {}, "printf": {}, "ls": {}, "cat": {},
+	"head": {}, "tail": {}, "grep": {}, "egrep": {}, "fgrep": {}, "sed": {},
+	"find": {}, "wc": {}, "file": {}, "which": {}, "jq": {}, "sort": {},
+	"uniq": {}, "cut": {}, "tr": {}, "column": {}, "basename": {},
+	"dirname": {}, "realpath": {}, "date": {}, "sleep": {}, "true": {},
+	"false": {}, "test": {}, "[": {},
+}
+
+// shellDriverForbiddenFlags maps a resolved binary onto argument tokens that
+// break its driver/plumbing status outright. Screened as exact tokens or
+// --long= prefixes ("--pre" covers "--pre cmd" and "--pre=cmd").
+var shellDriverForbiddenFlags = map[string][]string{
+	"rg":      {"--pre", "--pre-exec"}, // --pre executes a preprocessor command
+	"ripgrep": {"--pre", "--pre-exec"},
+	// find's action flags execute commands or delete; a verification find is
+	// a pure search (-name/-type/…).
+	"find": {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprintf", "-fls"},
+	// go's -mod=mod rewrites go.mod/go.sum during the run (a manifest write).
+	"go": {"-mod=mod"},
+}
+
+// shellVerificationSafeEnv is the safe environment table: variable name →
+// allowed values. An EnvWrite to any other name keeps the marker off; an
+// allowed name must carry one of these values in EVERY textual
+// NAME=VALUE occurrence of the command (the value must be statically
+// verifiable — a dynamically built value fails the lookup, fail-closed).
+var shellVerificationSafeEnv = map[string]map[string]bool{
+	"CI":       {"1": true, "true": true, "false": true, "": true},
+	"NO_COLOR": {"1": true, "true": true, "": true},
+	"TERM":     {"dumb": true},
+	"GOFLAGS":  {"-mod=readonly": true, "-mod=vendor": true},
+	"GOPROXY":  {"off": true},
+	"GOWORK":   {"off": true},
+}
+
+// shellDependencyManifests lists dependency/module-manifest basenames whose
+// write (effect target or redirection) breaks the marker: rewriting the
+// module graph is a supply-chain control, not verification plumbing.
+var shellDependencyManifests = map[string]struct{}{
+	"go.mod": {}, "go.sum": {}, "go.work": {}, "go.work.sum": {},
+	"package.json": {}, "package-lock.json": {}, "npm-shrinkwrap.json": {},
+	"yarn.lock": {}, "pnpm-lock.yaml": {}, "bun.lockb": {},
+	"Cargo.toml": {}, "Cargo.lock": {},
+	"requirements.txt": {}, "pyproject.toml": {}, "Pipfile": {}, "Pipfile.lock": {}, "poetry.lock": {},
+	"composer.json": {}, "composer.lock": {}, "Gemfile": {}, "Gemfile.lock": {},
+}
+
+// shellEnvAssignRe matches a NAME=VALUE assignment word in the raw command
+// text (prefix assignments, export statements, bare assignments). Values may
+// be quoted; surrounding double quotes are trimmed before the safe-value
+// lookup.
+var shellEnvAssignRe = regexp.MustCompile(`(?:^|[^A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)=([^\s;&|()<>]+)`)
+
+// shellWorkspaceScopedVerification computes the workspace-scoped verification
+// marker for one report (see the section comment for the full conditions).
+func shellWorkspaceScopedVerification(ctx context.Context, workDir, command string, report *api.Report) bool {
+	if report == nil || report.Top || len(report.CommandCalls) == 0 {
+		return false
+	}
+	roots := SessionRoots(ctx)
+	if len(roots) == 0 {
+		return false
+	}
+	// Every command statement must be a visible, catalogued call. Sinks,
+	// eval-family builtins, shell-only builtins, functions and dynamic names
+	// never produce a binder call, so a count mismatch means something ran
+	// that the report cannot account for.
+	if len(report.CommandCalls) != report.Commands {
+		return false
+	}
+	if !shellMarkerEffectsSafe(ctx, workDir, report) {
+		return false
+	}
+	return shellMarkerCallsSafe(ctx, workDir, report) &&
+		shellMarkerEnvSafe(command, report)
+}
+
+// shellMarkerEffectsSafe enforces the effect-level conditions: no network,
+// no non-CodeExec ⊤ (unresolved expansion), every path-shaped filesystem/
+// process target inside a session root, and no dependency-manifest write.
+func shellMarkerEffectsSafe(ctx context.Context, workDir string, report *api.Report) bool {
+	for _, e := range report.Effects {
+		if e.Kind == engine.KindNetEgress || e.Kind == engine.KindNetIngress {
+			return false
+		}
+		if e.Target.IsTop() {
+			// The unknown-driver signature is a target-less ⊤ CodeExec.
+			// Any other ⊤ is an unresolved expansion (or an unbounded
+			// write) the marker must not paper over.
+			if e.Kind != engine.KindCodeExec {
+				return false
+			}
+			continue
+		}
+		var pathKinds bool
+		switch e.Kind {
+		case engine.KindFSRead, engine.KindFSWrite, engine.KindFSMeta, engine.KindProcSpawn, engine.KindCodeExec:
+			pathKinds = true
+		default:
+			// Stdio/Env* targets are literal words/variable names, not file
+			// operands; no containment signal to enforce.
+		}
+		if !pathKinds {
+			continue
+		}
+		manifestWrite := e.Kind == engine.KindFSWrite || e.Kind == engine.KindFSMeta
+		for _, t := range e.Target.Targets() {
+			if !shellPathLikeTarget(t) {
+				continue
+			}
+			if manifestWrite && shellIsDependencyManifest(t) {
+				return false
+			}
+			if !shellMarkerTargetInRoots(ctx, workDir, t) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// shellMarkerTargetInRoots resolves one path-shaped marker operand against
+// the resolution base and reports whether it lands inside a session root.
+// Harmless bit-bucket devices (/dev/null, /dev/full) are always in scope.
+func shellMarkerTargetInRoots(ctx context.Context, base, target string) bool {
+	abs, ok := shellResolveTarget(target, base)
+	if !ok {
+		// Relative with no base: the root set is non-empty by construction,
+		// so an unanchorable operand cannot be established as in-root.
+		return false
+	}
+	if shellIsHarmlessDevicePath(abs) {
+		return true
+	}
+	for _, root := range SessionRoots(ctx) {
+		if IsWithinRoot(ctx, root, abs) {
+			return true
+		}
+	}
+	return false
+}
+
+// shellIsDependencyManifest reports whether a path-shaped operand names a
+// dependency/module-manifest file (basename match, case-insensitive).
+func shellIsDependencyManifest(target string) bool {
+	if target == "" {
+		return false
+	}
+	name := strings.ToLower(path.Base(filepath.ToSlash(strings.TrimPrefix(strings.TrimPrefix(target, "\\"), "/"))))
+	// The raw basename suffices for every catalogued form; a trailing slash
+	// (directory operand) is not a manifest.
+	_, ok := shellDependencyManifests[name]
+	return ok
+}
+
+// shellMarkerCallsSafe enforces the per-call conditions: catalogued binaries
+// (≥1 driver), per-driver argument screens, operand containment (arguments
+// and redirection targets), and the manifest/network-device redirect rules.
+func shellMarkerCallsSafe(ctx context.Context, workDir string, report *api.Report) bool {
+	base := workDir
+	if base == "" {
+		base = WorkspacePathFrom(ctx)
+	}
+	hasDriver := false
+	for _, call := range report.CommandCalls {
+		allowedSubs, driver := shellVerificationDrivers[call.Resolved]
+		if !driver {
+			if _, plumbing := shellVerificationPlumbing[call.Resolved]; !plumbing {
+				return false
+			}
+		} else {
+			// A driver outside its subcommand allowlist (go get, npm install)
+			// is not the catalogued verification form.
+			if !shellFirstOperand(call.Args, allowedSubs) {
+				return false
+			}
+			hasDriver = true
+		}
+		if !shellDriverArgsScreened(call.Resolved, call.Args) {
+			return false
+		}
+		if !shellCallOperandsInRoots(ctx, base, call) {
+			return false
+		}
+	}
+	return hasDriver
+}
+
+// shellDriverArgsScreened applies the per-binary forbidden-argument tokens
+// (exact or --long=value form).
+func shellDriverArgsScreened(resolved string, args []string) bool {
+	forbidden := shellDriverForbiddenFlags[resolved]
+	for _, a := range args {
+		for _, f := range forbidden {
+			if a == f || (strings.HasPrefix(f, "--") && strings.HasPrefix(a, f+"=")) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// shellFirstOperand reports whether the first non-flag operand of args is in
+// the allowlist (nil allowlist accepts everything).
+func shellFirstOperand(args, allowed []string) bool {
+	if allowed == nil {
+		return true
+	}
+	for _, a := range args {
+		if a == "" || strings.HasPrefix(a, "-") {
+			continue
+		}
+		for _, ok := range allowed {
+			if a == ok {
+				return true
+			}
+		}
+		return false
+	}
+	// No operand at all (e.g. bare `go`): nothing to screen against.
+	return true
+}
+
+// shellCallOperandsInRoots containment-checks one call's path-shaped
+// operands: positional arguments and redirection targets. Flag values glued
+// with "=" are checked for their absolute-path value part; bare flags are
+// skipped. fd-duplication targets ("1", "2", "&1") are not paths.
+func shellCallOperandsInRoots(ctx context.Context, base string, call api.CommandCall) bool {
+	for _, a := range call.Args {
+		operand := a
+		if strings.HasPrefix(a, "-") {
+			if eq := strings.Index(a, "="); eq >= 0 {
+				operand = a[eq+1:]
+				if operand == "" || !strings.HasPrefix(operand, "/") && !shellIsWindowsAbsPath(operand) {
+					continue // --flag=value with a non-path value
+				}
+			} else {
+				continue // bare flag
+			}
+		}
+		if shellIsFdTarget(operand) || !shellPathLikeTarget(operand) {
+			continue
+		}
+		if !shellMarkerTargetInRoots(ctx, base, operand) {
+			return false
+		}
+	}
+	for _, r := range call.Redirs {
+		if !shellRedirectMarkerSafe(ctx, base, r) {
+			return false
+		}
+	}
+	return true
+}
+
+// shellIsFdTarget reports whether a redirection target names a file
+// descriptor ("1", "2", "&1") rather than a path.
+func shellIsFdTarget(t string) bool {
+	if t == "" {
+		return false
+	}
+	rest := strings.TrimPrefix(t, "&")
+	for _, c := range rest {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// shellRedirectMarkerSafe checks one resolved redirection: /dev/tcp and
+// /dev/udp are network pseudo-devices (marker off), write redirections must
+// land inside a session root and must not target a dependency manifest.
+func shellRedirectMarkerSafe(ctx context.Context, base string, r api.CallRedirect) bool {
+	if !r.Known || r.Target == "" {
+		return false // an unknown redirect target is an unresolved operand
+	}
+	posix := path.Clean(filepath.ToSlash(r.Target))
+	if posix == "/dev/tcp" || posix == "/dev/udp" || strings.HasPrefix(posix, "/dev/tcp/") || strings.HasPrefix(posix, "/dev/udp/") {
+		return false
+	}
+	if shellIsFdTarget(r.Target) || !shellPathLikeTarget(r.Target) {
+		return true
+	}
+	write := strings.Contains(r.Op, ">") && r.Op != "<"
+	if write && shellIsDependencyManifest(r.Target) {
+		return false
+	}
+	if !shellMarkerTargetInRoots(ctx, base, r.Target) {
+		return false
+	}
+	return true
+}
+
+// shellMarkerEnvSafe enforces the environment conditions: every EnvWrite
+// name is in the safe table and every textual NAME=VALUE occurrence of that
+// name carries a safe value (dynamically-built or decoy-unsafe values fail;
+// an EnvWrite with no textual occurrence — value produced at run time —
+// fails closed too).
+func shellMarkerEnvSafe(command string, report *api.Report) bool {
+	var envNames []string
+	for _, e := range report.Effects {
+		if e.Kind != engine.KindEnvWrite || e.Target.IsTop() {
+			continue
+		}
+		envNames = append(envNames, e.Target.Targets()...)
+	}
+	if len(envNames) == 0 {
+		return true
+	}
+	values := map[string][]string{}
+	for _, m := range shellEnvAssignRe.FindAllStringSubmatch(command, -1) {
+		name, value := m[1], strings.Trim(m[2], `"`)
+		values[name] = append(values[name], value)
+	}
+	for _, name := range envNames {
+		allowed, ok := shellVerificationSafeEnv[name]
+		if !ok {
+			return false
+		}
+		seen, ok := values[name]
+		if !ok || len(seen) == 0 {
+			// The value is not statically visible (read/export -n tricks):
+			// cannot establish safety — fail closed.
+			return false
+		}
+		for _, v := range seen {
+			if !allowed[v] {
+				return false
+			}
+		}
+	}
+	return true
 }

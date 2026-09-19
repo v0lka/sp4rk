@@ -33,6 +33,33 @@ const (
 	strictJudgeFailureReason = "Strict judge evaluation failed; requiring manual confirmation for safety"
 )
 
+// strictJudgeRetryFeedback is appended to the system prompt when the model's
+// first strict-judge response cannot be parsed: the evaluation is re-asked
+// once with the response format restated emphatically. An unparseable
+// response is a format failure, not a danger signal, so one retry happens
+// before the fail-safe CONFIRM (which a silent-mode host resolves as deny).
+// The feedback deliberately does not quote the unparseable response (raw
+// model output may echo untrusted tool arguments) and deliberately keeps the
+// [system, user] message shape — some providers (Gemini) reject consecutive
+// same-role messages.
+const strictJudgeRetryFeedback = "\n\nIMPORTANT: Your previous response could not be parsed. " +
+	"Answer again, strictly as exactly two lines and nothing else:\n" +
+	"VERDICT: ALLOW, DENY or CONFIRM\n" +
+	"REASON: one short sentence"
+
+// judgeSamplingPin returns the deterministic sampling temperature pinned onto
+// every judge LLM call for the given model: verdicts must be reproducible on
+// identical input, so the judge runs on the deterministic sampling profile.
+// The judge calls the provider directly (bypassing the router's
+// applyDefaultSampling), so the profile is reconstructed here from the model
+// id: DetectFamily maps it onto its family and DeterministicTemperature
+// returns the family-safe deterministic value — a flat 0.0 would be rejected
+// outright by endpoints that pin temperature (kimi/google), turning every
+// judge call into a fail-safe CONFIRM.
+func judgeSamplingPin(model string) *float64 {
+	return llm.DeterministicTemperature(string(llm.DetectFamily(model)))
+}
+
 // The following regexes make parseJudgeResponse tolerant of the formatting
 // variations LLMs commonly produce despite the requested two-line format.
 var (
@@ -465,8 +492,11 @@ func (j *ToolJudge) Judge(ctx context.Context, toolName string, input json.RawMe
 		MaxTokens: 100, // Need more tokens for verdict + reason
 		// Verdict JSON: deterministic sampling class (routing). The judge
 		// calls the provider directly, bypassing the router — the purpose is
-		// declared for consistency and future consumers.
+		// declared for consistency and future consumers, and the
+		// deterministic sampling profile is pinned explicitly
+		// (see [judgeSamplingPin]).
 		CallPurpose: llm.CallPurposeRouting,
+		Temperature: judgeSamplingPin(j.model),
 	}
 
 	// Create a dedicated context for the judge LLM call with its own timeout.
@@ -584,14 +614,12 @@ func (j *ToolJudge) JudgeStrict(ctx context.Context, request StrictJudgeRequest)
 		MaxTokens: 100,
 		// Verdict JSON: deterministic sampling class (routing).
 		CallPurpose: llm.CallPurposeRouting,
+		// Pinned deterministic sampling — see [judgeSamplingPin].
+		Temperature: judgeSamplingPin(j.model),
 	}
 
-	judgeCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
-
-	var resp *llm.ChatResponse
-	resp, err = j.provider.ChatCompletion(judgeCtx, req)
-	if err != nil || resp == nil {
+	resp, callErr := j.judgeStrictChat(ctx, req)
+	if callErr != nil || resp == nil {
 		if log != nil {
 			// Do not log the provider error: provider diagnostics can echo the
 			// request and therefore sensitive tool arguments.
@@ -601,10 +629,40 @@ func (j *ToolJudge) JudgeStrict(ctx context.Context, request StrictJudgeRequest)
 	}
 
 	verdict, reasoning := parseStrictJudgeResponse(strings.TrimSpace(resp.Message.Content))
+	if reasoning == judgeUnparsedReason {
+		if log != nil {
+			log.Debug("strict judge: response unparseable, retrying once with format feedback", "tool", request.ToolName)
+		}
+		retryReq := req
+		retryReq.Messages = []llm.Message{
+			{Role: "system", Content: judge_prompts.JudgeStrictSystem + strictJudgeRetryFeedback},
+			{Role: "user", Content: string(prompt)},
+		}
+		resp2, retryErr := j.judgeStrictChat(ctx, retryReq)
+		switch {
+		case retryErr != nil || resp2 == nil:
+			if log != nil {
+				log.Warn("strict judge: retry LLM call failed, fail-safe to CONFIRM", "tool", request.ToolName)
+			}
+			verdict, reasoning = VerdictConfirm, strictJudgeFailureReason
+		default:
+			verdict, reasoning = parseStrictJudgeResponse(strings.TrimSpace(resp2.Message.Content))
+		}
+	}
 	if log != nil {
 		log.Debug("strict judge: LLM verdict", "tool", request.ToolName, "verdict", verdictString(verdict))
 	}
 	return verdict, reasoning, nil
+}
+
+// judgeStrictChat performs one strict-judge LLM call under its own 2-minute
+// budget derived from ctx. Each attempt (including the parse-failure retry)
+// gets a fresh deadline rather than whatever remains of a previous call's
+// budget. Uses the parent context so application shutdown is respected.
+func (j *ToolJudge) judgeStrictChat(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
+	judgeCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	return j.provider.ChatCompletion(judgeCtx, req)
 }
 
 // parseStrictJudgeResponse accepts only the strict prompt's three canonical

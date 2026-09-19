@@ -138,8 +138,10 @@ func (j *ToolJudge) JudgeStepLimit(ctx context.Context, req StepLimitJudgeReques
 		},
 		MaxTokens: 200,
 		// Deterministic sampling class — the judge calls the provider directly,
-		// bypassing the router; the purpose is declared for consistency.
+		// bypassing the router; the purpose is declared for consistency and the
+		// deterministic profile is pinned explicitly (see [judgeSamplingPin]).
 		CallPurpose: llm.CallPurposeRouting,
+		Temperature: judgeSamplingPin(j.model),
 	}
 
 	// Bound the judge call so a slow/hung provider cannot stall the run at the

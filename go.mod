@@ -12,7 +12,7 @@ require (
 	github.com/philippgille/chromem-go v0.7.0
 	github.com/pkoukk/tiktoken-go v0.1.8
 	github.com/sugarme/tokenizer v0.3.0
-	github.com/v0lka/flowsh v0.1.0
+	github.com/v0lka/flowsh v0.2.0
 	github.com/yalue/onnxruntime_go v1.27.0
 	golang.org/x/net v0.57.0
 	golang.org/x/sys v0.47.0
