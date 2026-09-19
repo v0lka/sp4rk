@@ -33,10 +33,12 @@ type SymlinkTraversal struct {
 //
 // Shell-exec commands (bash_exec, posh_exec) contribute only their LITERAL
 // paths: shell expansions ($var, $(cmd), backticks, $env:...) are not
-// statically resolvable and are deliberately not assessed for suspicion
-// here — the deterministic flowsh analysis
-// ([AnalyzeShellCommandForJudge], criteria C1–C8) covers dynamic constructs,
-// so the symlink walk stays a pure literal-path extractor.
+// statically resolvable and are deliberately not assessed for suspicion here —
+// dynamic constructs are the domain of the deterministic flowsh analysis
+// ([AnalyzeShellCommandForJudge], criteria C1–C8), which the host pre-computes
+// once per call and attaches with [WithShellAnalysis]. This walk never runs
+// that analysis itself: with nothing attached it stays a pure literal-path
+// extractor and does not escalate for dynamic constructs.
 //
 // schema is the tool's JSON input schema, used to identify which properties
 // carry filesystem paths. When path fields are recognizable, only those fields
@@ -413,8 +415,9 @@ func extractBashPathsFromInput(input json.RawMessage, workspace string) []string
 // Words containing shell expansions ($var, $(cmd), `cmd`, process
 // substitution) contribute only their literal fragments: the dynamic parts
 // are not statically resolvable, and expansion-driven suspicion is
-// deliberately NOT assessed here — the deterministic flowsh analysis covers
-// dynamic constructs, so the symlink walk stays a literal-path extractor.
+// deliberately NOT assessed here — dynamic constructs are covered by the
+// host-attached flowsh analysis (see [DetectSymlinksInToolInput]), not by this
+// literal-path walk.
 func extractBashPaths(command, workingDirectory, workspace string) []string {
 	parser := syntax.NewParser()
 	file, err := parser.Parse(strings.NewReader(command), "")
@@ -516,9 +519,9 @@ func extractPoshPathsFromInput(input json.RawMessage, workspace string) []string
 //     literal path;
 //   - else if it is path-like, the literal is resolved and collected.
 //
-// Expansion-driven suspicion is deliberately NOT assessed here — the
-// deterministic flowsh analysis covers dynamic constructs, so the symlink
-// walk stays a pure literal-path extractor.
+// Expansion-driven suspicion is deliberately NOT assessed here — dynamic
+// constructs are covered by the host-attached flowsh analysis (see
+// [DetectSymlinksInToolInput]), not by this literal-path walk.
 func extractPoshPaths(command, workingDir, workspace string) []string {
 	tokens := poshTokenize(command)
 
@@ -527,7 +530,7 @@ func extractPoshPaths(command, workingDir, workspace string) []string {
 	for _, tok := range tokens {
 		// A "$" outside single quotes means the value is dynamic: it cannot
 		// name a literal path, so skip collection. (Suspicion is not assessed
-		// — flowsh covers dynamic constructs.)
+		// — the host-attached flowsh analysis covers dynamic constructs.)
 		if tok.dollarExp {
 			continue
 		}

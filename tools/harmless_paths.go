@@ -46,7 +46,7 @@ var harmlessPOSIXDevices = map[string]bool{
 //
 // Such paths are excluded from path-locality determination (the file-operation
 // judge fast-path, the file-tool read/write judges, and the shell-exec
-// containment check [PathsOutsideRoots]) so they never force a
+// containment check) so they never force a
 // user-confirmation prompt on their own. For example `read_file /dev/null`,
 // `write_file /dev/null`, and `cat file > /dev/null` are not treated as
 // out-of-workspace operations.

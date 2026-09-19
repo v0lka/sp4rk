@@ -655,8 +655,8 @@ func TestJudge_WorkspacePreCheck_RelativePaths(t *testing.T) {
 // "frontend/src/main.tsx" had its embedded "/src/main.tsx" extracted as a
 // spurious POSIX absolute path. After the fix a "/" that follows a
 // path-component character is treated as a separator inside a relative path and
-// is not extracted — keeping shell and JSON-input extraction in agreement on
-// what counts as a path.
+// is not extracted, so a relative path embedded in a larger string is not
+// misread as an absolute escape.
 func TestExtractPaths_RelativePathNotExtracted(t *testing.T) {
 	tests := []struct {
 		name string
@@ -715,8 +715,8 @@ func TestExtractPaths_RelativePathNotExtracted(t *testing.T) {
 // was treated as referencing the filesystem root (filepath.Clean("//") == "/")
 // and forced a confirmation. The drive-letter form of the skip is covered too:
 // "C:\\" (an escaped PowerShell drive root) is skipped, while the drive root
-// "C:\" and a component path "C:\\Windows" remain tokens — keeping shell and
-// JSON-input extraction in agreement on what counts as a path.
+// "C:\" and a component path "C:\\Windows" remain tokens — the skip never
+// hides a token that carries a path component.
 func TestExtractPaths_SeparatorRunNotExtracted(t *testing.T) {
 	tests := []struct {
 		name string

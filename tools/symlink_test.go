@@ -351,7 +351,7 @@ func TestExtractPoshPaths_DriveForwardSlash(t *testing.T) {
 	}
 }
 
-func TestExtractPoshPaths_DollarVarSuspicious(t *testing.T) {
+func TestExtractPoshPaths_DollarVarSkipped(t *testing.T) {
 	// $HOME contains a "$" in an expansion context: dynamic, skipped from collection.
 	paths := extractPoshPaths(`Get-Content $HOME/file`, osAbsPath("wd"), osAbsPath("ws"))
 	if len(paths) != 0 {
@@ -359,14 +359,14 @@ func TestExtractPoshPaths_DollarVarSuspicious(t *testing.T) {
 	}
 }
 
-func TestExtractPoshPaths_EnvVarSuspicious(t *testing.T) {
+func TestExtractPoshPaths_EnvVarSkipped(t *testing.T) {
 	paths := extractPoshPaths(`Get-Content $env:USERPROFILE\file`, osAbsPath("wd"), osAbsPath("ws"))
 	if len(paths) != 0 {
 		t.Fatalf("expected no paths from $env:VAR, got %v", paths)
 	}
 }
 
-func TestExtractPoshPaths_CmdSubstSuspicious(t *testing.T) {
+func TestExtractPoshPaths_CmdSubstSkipped(t *testing.T) {
 	// $(...) command substitution — the '(' splits the token; the bare "$" is
 	// an expansion token, so nothing is collected for it.
 	paths := extractPoshPaths(`Get-Content $(Get-Location)`, osAbsPath("wd"), osAbsPath("ws"))
@@ -375,7 +375,7 @@ func TestExtractPoshPaths_CmdSubstSuspicious(t *testing.T) {
 	}
 }
 
-func TestExtractPoshPaths_BacktickSuspicious(t *testing.T) {
+func TestExtractPoshPaths_BacktickEscapedSpaceCollected(t *testing.T) {
 	// A backtick-escaped space (a PowerShell idiom to include a space in a
 	// bareword) keeps its literal content; the literal path is still
 	// collected for symlink defense-in-depth.
@@ -387,7 +387,7 @@ func TestExtractPoshPaths_BacktickSuspicious(t *testing.T) {
 	}
 }
 
-func TestExtractPoshPaths_CallOperatorNotSuspicious(t *testing.T) {
+func TestExtractPoshPaths_CallOperatorLiteralCollected(t *testing.T) {
 	// "&" is a metachar (call operator) used to split tokens; invoking a
 	// literal single-quoted path carries no expansion.
 	paths := extractPoshPaths(`& 'C:\scripts\run.ps1'`, osAbsPath("wd"), osAbsPath("ws"))
@@ -406,9 +406,9 @@ func TestExtractPoshPaths_SingleQuotedExtracted(t *testing.T) {
 	}
 }
 
-func TestExtractPoshPaths_DoubleQuotedSuspicious(t *testing.T) {
+func TestExtractPoshPaths_DoubleQuotedLiteralCollected(t *testing.T) {
 	// Double quotes are expandable, but their literal content is still
-	// is still collected.
+	// collected.
 	paths := extractPoshPaths(`Get-Content "C:\x\y"`, osAbsPath("wd"), osAbsPath("ws"))
 	want := `C:\x\y`
 	if len(paths) != 1 || paths[0] != want {
@@ -416,7 +416,7 @@ func TestExtractPoshPaths_DoubleQuotedSuspicious(t *testing.T) {
 	}
 }
 
-func TestExtractPoshPaths_DollarInSingleQuotesNotSuspicious(t *testing.T) {
+func TestExtractPoshPaths_DollarInSingleQuotesLiteral(t *testing.T) {
 	// A "$" inside single quotes is literal in PowerShell — not an expansion.
 	paths := extractPoshPaths(`Get-Content 'C:\path\$literal\file'`, osAbsPath("wd"), osAbsPath("ws"))
 	want := `C:\path\$literal\file`
@@ -533,10 +533,16 @@ func TestDetectSymlinks_PoshExecExtractsPath(t *testing.T) {
 	}
 }
 
-func TestDetectSymlinks_PoshExecSuspicious(t *testing.T) {
+func TestDetectSymlinks_PoshExecDynamicTokenSkipped(t *testing.T) {
+	// A "$"-carrying token is dynamic (it cannot name a literal path), so the
+	// walk extracts nothing from it: a dynamic-only command contributes no
+	// traversals and never escalates.
 	input, _ := json.Marshal(map[string]string{"command": `Get-Content $HOME/secret`})
 	ctx := context.Background()
-	_, _ = DetectSymlinksInToolInput(ctx, "posh_exec", input, nil, nil)
+	inside, outside := DetectSymlinksInToolInput(ctx, "posh_exec", input, nil, nil)
+	if len(inside)+len(outside) != 0 {
+		t.Fatalf("expected no traversals for a dynamic-only command, got inside=%d outside=%d", len(inside), len(outside))
+	}
 }
 
 func TestDetectSymlinks_PoshExecWithSymlink(t *testing.T) {
@@ -554,14 +560,6 @@ func TestDetectSymlinks_PoshExecWithSymlink(t *testing.T) {
 	if len(inside)+len(outside) == 0 {
 		t.Fatal("expected symlink traversals found for posh_exec")
 	}
-}
-
-// TestDetectSymlinks_BashExecStillDispatched confirms the switch rewiring did
-// not break the existing bash_exec path.
-func TestDetectSymlinks_BashExecStillDispatched(t *testing.T) {
-	input, _ := json.Marshal(map[string]string{"command": "cat $HOME/file"})
-	ctx := context.Background()
-	_, _ = DetectSymlinksInToolInput(ctx, "bash_exec", input, nil, nil)
 }
 
 // ── walkSymlinkComponents tests ───────────────────────────────────────────
@@ -715,7 +713,7 @@ func TestDetectSymlinks_BashExecClean(t *testing.T) {
 	}
 }
 
-func TestDetectSymlinks_BashExecSuspicious(t *testing.T) {
+func TestDetectSymlinks_BashExecDynamicTokenSkipped(t *testing.T) {
 	input, _ := json.Marshal(map[string]string{"command": "cat $HOME/file"})
 
 	ctx := context.Background()
@@ -1464,7 +1462,12 @@ func TestExtractBashPaths_ExpansionsNotAssessed(t *testing.T) {
 		cmd  string
 		want []string
 	}{
-		{"assignment binding is not expanded", "X=" + filepath.ToSlash(osAbsPath("tmp", "build")) + "; cat \"$X/a\"", []string{filepath.Clean(osAbsPath("tmp", "build")), "/a"}},
+		// The literal suffix after the dynamic "$X" is a genuine OS-absolute
+		// path: the "${...}" delimiter keeps a Windows drive letter from being
+		// absorbed into the variable name ("$XC:" would parse as the variable
+		// "XC"), and osAbsPath makes the expectation portable across platforms,
+		// mirroring the first element.
+		{"assignment binding is not expanded", "X=" + filepath.ToSlash(osAbsPath("tmp", "build")) + "; cat \"${X}" + filepath.ToSlash(osAbsPath("a")) + "\"", []string{filepath.Clean(osAbsPath("tmp", "build")), filepath.Clean(osAbsPath("a"))}},
 		{"command substitution in argument position", "cat $(echo /tmp)", nil},
 		{"backtick substitution", "cat `echo /tmp`", nil},
 		{"process substitution", "diff <(cat /a) <(cat /b)", nil},

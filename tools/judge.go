@@ -681,9 +681,9 @@ func ExtractJSONStrings(data any) []string {
 // ExtractPaths extracts absolute path-like substrings from a string value.
 // A "/" that follows a path-component character is treated as a separator
 // inside a relative path (e.g. the "/src" in "frontend/src/main.tsx"), not the
-// start of an absolute one, so shell and JSON-input extraction agree on what
-// counts as a path. Windows drive-letter alternatives ("C:\...") start with
-// a letter and are unaffected.
+// start of an absolute one, so a relative path embedded in a larger string is
+// not misread as an absolute escape. Windows drive-letter alternatives
+// ("C:\...") start with a letter and are unaffected.
 // Tokens that consist entirely of separators — a bare "//" run (POSIX) or a
 // drive prefix followed by only separators ("C:\\") — are likewise skipped:
 // they are shell-language artifacts (the "//" of a sed address

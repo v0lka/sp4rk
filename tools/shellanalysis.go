@@ -25,7 +25,7 @@
 //   - Containment (C4/C8) consults only FS* effects whose concrete targets
 //     are path-shaped; CLI noise ("-30", "s/foo/bar/g", "+x") is discarded by
 //     a path-shape check before resolution. Empty session roots disable
-//     containment entirely, mirroring [PathsOutsideRoots].
+//     containment entirely, as the former shell-path containment check did.
 
 package tools
 
@@ -181,8 +181,8 @@ type ShellAnalysis struct {
 // "posh_exec", which selects the dialect) and the tool's raw JSON input
 // ({command, working_directory}); the returned ShellAnalysis carries the
 // digest plus the winning judge outcome. Session roots for the containment
-// criteria (C4/C8) come from ctx exactly as they do for
-// [PathsOutsideRoots]; with no roots attached those criteria cannot fire.
+// criteria (C4/C8) come from ctx exactly as they did for the former shell-path
+// containment check; with no roots attached those criteria cannot fire.
 //
 // A tool name outside the shell-exec pair, an unparsable input, or a failed
 // knowledge-base load is an error — callers fail closed on it.
@@ -470,7 +470,7 @@ type shellOutsideTarget struct {
 // one of kinds; when directOnly is set they must additionally be performed
 // directly (Mode == Direct), as the C8 scope criterion requires. With no
 // session roots attached — or no resolvable base for relative targets — it
-// returns nil, mirroring [PathsOutsideRoots].
+// returns nil, as the former shell-path containment check did.
 func shellOutsideRoots(ctx context.Context, report *api.Report, workDir string, kinds []engine.EffectKind, directOnly bool) []shellOutsideTarget {
 	roots := SessionRoots(ctx)
 	if len(roots) == 0 {
@@ -518,7 +518,8 @@ func shellOutsideRoots(ctx context.Context, report *api.Report, workDir string, 
 // control. Reads of system *files* are deliberately NOT excluded: no
 // higher-priority criterion covers them, and an out-of-root read of a system
 // (or credential) file is exactly the scope question C8 exists to raise —
-// leaving it silent would reopen the gap [PathsOutsideRoots] used to close.
+// leaving it silent would reopen the gap the former shell-path containment
+// check used to close.
 // Raw-device reads (/dev/urandom, /dev/zero, …) ARE excluded — they are
 // routine inputs, not a scope concern, and a raw device is "system" only as
 // a write target. Harmless devices (/dev/null, /dev/full) are exempt via

@@ -102,7 +102,8 @@ func shellDangerousCorpus() []shellCorpusCase {
 			wantFired: ReasonCodeCredentialAccess, wantSev: JudgeSeveritySoft, wantCanon: false},
 		// Out-of-root READS of system / credential files must raise the scope
 		// reason (C8, soft): they are not writes, so C3 does not own them, and
-		// leaving them silent would reopen the gap PathsOutsideRoots closed.
+		// leaving them silent would reopen the gap the former shell-path
+		// containment check closed.
 		{name: "read etc passwd", tool: "bash_exec", cmd: "cat /etc/passwd",
 			wantFired: ReasonCodeOutsideSessionRoots, wantSev: JudgeSeveritySoft, wantCanon: false},
 		{name: "read etc shadow", tool: "bash_exec", cmd: "cat /etc/shadow",
@@ -240,8 +241,9 @@ func TestAnalyzeShellCommandForJudge_PriorityOrder(t *testing.T) {
 }
 
 // TestAnalyzeShellCommandForJudge_EmptyRootsDisableContainment mirrors the
-// PathsOutsideRoots contract: with no session roots attached, the containment
-// criteria (C4/C8) cannot fire — the destructive home wipe stays allowed.
+// former shell-path containment contract: with no session roots attached, the
+// containment criteria (C4/C8) cannot fire — the destructive home wipe stays
+// allowed.
 func TestAnalyzeShellCommandForJudge_EmptyRootsDisableContainment(t *testing.T) {
 	got, err := AnalyzeShellCommandForJudge(context.Background(), "bash_exec", shellCorpusInput(t, "rm -rf $HOME/"))
 	if err != nil {

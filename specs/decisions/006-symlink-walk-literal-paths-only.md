@@ -24,7 +24,7 @@ The symlink walk is a **pure literal-path extractor**:
 ## Consequences
 
 - Fewer false-positive escalations for ordinary shell idioms; host LLM judges stop spending tokens on expansion noise.
-- A symlink reachable only *through* a variable (`X=$(cat link/secret); cat $X`) is no longer surfaced by the walk — accepted residual: the flowsh criteria assess the command holistically and never depended on symlink-walk coverage of dynamic constructs.
+- A symlink reachable only *through* a variable (`X=$(cat link/secret); cat $X`) is no longer surfaced by the walk — accepted residual: the flowsh criteria assess the command holistically and never depended on symlink-walk coverage of dynamic constructs. The criteria cover dynamic constructs only when the **host** pre-computes the analysis per call and attaches it (`AnalyzeShellCommandForJudge` + `WithShellAnalysis`); the walk neither runs nor requires it, so a host that attaches nothing gets literal-path extraction alone.
 - The `tools` package shrinks by ~3300 lines and its test surface accordingly.
 - Hosts that keyed policy off `symlink_suspicious` still parse the retained code; nothing fires it.
 
