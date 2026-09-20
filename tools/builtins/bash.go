@@ -28,7 +28,17 @@ type BashExecTool struct {
 	blacklist []string
 	compiled  []*regexp.Regexp
 	timeouts  BashTimeouts
+	// invocation is the (default or operator-overridden) launch shape. The
+	// agent's command always travels as a single argv element (see
+	// tools.ShellInvocation); Kind declares the shell the command text is
+	// written in and drives the description, the analysis dialect, and — on
+	// the posh side — the UTF-8 bootstrap.
+	invocation tools.ShellInvocation
 }
+
+// DeclaredShellKind reports the shell the command text is written in
+// (tools.ShellAnalysisLangForTool consumes this to pick the flowsh dialect).
+func (t *BashExecTool) DeclaredShellKind() tools.ShellKind { return t.invocation.Kind }
 
 // NewBashExecTool creates a new BashExecTool with the given blacklist.
 func NewBashExecTool(blacklist []string) (*BashExecTool, error) {
@@ -37,6 +47,21 @@ func NewBashExecTool(blacklist []string) (*BashExecTool, error) {
 
 // NewBashExecToolWithTimeouts creates a new BashExecTool with the given blacklist and timeouts.
 func NewBashExecToolWithTimeouts(blacklist []string, timeouts BashTimeouts) (*BashExecTool, error) {
+	return NewBashExecToolWithInvocation(blacklist, timeouts, tools.DefaultBashInvocation())
+}
+
+// NewBashExecToolWithInvocation creates a new BashExecTool with the given
+// blacklist, timeouts, and shell invocation. The invocation may be the
+// tools.DefaultBashInvocation() or an operator-configured override (see
+// tools.ShellInvocation — the agent's command is passed as a single argv
+// element through the {command} placeholder). An override also rewrites the
+// tool description to name the actual launch command and the declared shell,
+// so every agent that can call the tool learns the real invocation and the
+// command syntax it must write.
+func NewBashExecToolWithInvocation(blacklist []string, timeouts BashTimeouts, invocation tools.ShellInvocation) (*BashExecTool, error) {
+	if err := invocation.Validate(); err != nil {
+		return nil, err
+	}
 	compiled := make([]*regexp.Regexp, 0, len(blacklist))
 	for _, pattern := range blacklist {
 		re, err := regexp.Compile(pattern)
@@ -49,14 +74,15 @@ func NewBashExecToolWithTimeouts(blacklist []string, timeouts BashTimeouts) (*Ba
 		BaseTool: &tools.BaseTool{
 			ToolName:        "bash_exec",
 			ToolGroup:       tools.GroupExecute,
-			ToolDescription: toolBashDescription,
+			ToolDescription: composeShellDescription(toolBashDescription, invocation, tools.DefaultBashInvocation()),
 			Schema:          json.RawMessage(`{"type": "object", "properties": {"command": {"type": "string", "description": "The bash command to execute. Supports pipes, redirects, and chained commands."}, "timeout": {"type": "string", "description": "Optional timeout as a quoted JSON string with a unit suffix, e.g. \"30s\" or \"2m\". The value MUST be a string in double quotes: write \"timeout\": \"30s\" - an unquoted bare token like 30s is invalid JSON and the call is rejected. Default: \"60s\"; maximum: \"120s\"."}, "working_directory": {"type": "string", "description": "Absolute path to use as the working directory for command execution. If omitted, defaults to the workspace root when available."}}, "required": ["command"]}`),
 			Policy:          tools.PolicyUserConfirm,
 			Untrusted:       true,
 		},
-		blacklist: blacklist,
-		compiled:  compiled,
-		timeouts:  timeouts,
+		blacklist:  blacklist,
+		compiled:   compiled,
+		timeouts:   timeouts,
+		invocation: invocation,
 	}, nil
 }
 
@@ -75,21 +101,21 @@ type bashInput struct {
 //     matches blacklist pattern: ...". The blacklist is operator policy and
 //     always wins; the reason must never be weakened.
 //  2. Flowsh criteria — the host pre-computes the deterministic analysis
-//     ([tools.AnalyzeShellCommandForJudge]; criteria C1–C8 in
+//     ([tools.AnalyzeShellCommandForJudge]; criteria C1–C9 in
 //     tools/shellanalysis.go) and attaches it to ctx via
 //     [tools.WithShellAnalysis]; the Judge reads it through
 //     [tools.ShellJudgeOutcome] and returns its winning outcome verbatim
-//     (hard canonical C1–C5, hard non-canonical C6, soft C7/C8). The Judge
+//     (hard canonical C1–C5, hard non-canonical C6/C7, soft C8/C9). The Judge
 //     never runs the analysis engine itself — no recomputation.
 //
 // The former static checks — unresolvable path tokens (hard) and shell-path
 // containment (soft) — were removed by explicit decision: tokens the static
 // walker cannot see through are covered by the C6 unbounded criterion, and
-// out-of-root scope by C4/C8, both of which the flowsh effect IR assesses
+// out-of-root scope by C4/C9, both of which the flowsh effect IR assesses
 // more precisely than token walking.
 //
 // When NOTHING is attached the Judge returns an empty outcome and defers to
-// the advisory judges — the deterministic floor (C1–C8) is then absent for
+// the advisory judges — the deterministic floor (C1–C9) is then absent for
 // this call, so a host that wants the shell escalations must attach the
 // analysis itself via [tools.WithShellAnalysis]. When the attached analysis
 // carries an ERROR (e.g. a knowledge-base load failure — logged), the Judge
@@ -147,8 +173,10 @@ func (t *BashExecTool) Execute(ctx context.Context, input json.RawMessage) (tool
 	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	// Create command
-	cmd := exec.CommandContext(timeoutCtx, "bash", "-c", command)
+	// Create command from the (default or operator-overridden) invocation.
+	// The agent's command travels as a single argv element via the
+	// {command} placeholder — no shell, no quoting, no splice.
+	cmd := exec.CommandContext(timeoutCtx, t.invocation.Binary, t.invocation.Argv(command)...)
 
 	// Put the command and all children in a new process group so we can
 	// kill the entire tree on timeout (exec.CommandContext only kills the

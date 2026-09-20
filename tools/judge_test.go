@@ -2512,7 +2512,7 @@ func TestJudgeReasonCode_Vocabulary(t *testing.T) {
 		ReasonCodeSymlinkEscape:         "symlink_escape",
 		ReasonCodeSymlinkSuspicious:     "symlink_suspicious",
 		ReasonCodeGitInternal:           "git_internal_path",
-		// The flowsh shell-analysis criteria (C1–C8) and the fail-closed
+		// The flowsh shell-analysis criteria (C1–C9) and the fail-closed
 		// analysis-unavailable reason: published cross-repo contract codes
 		// serialized into confirmations and read by non-Go hosts.
 		ReasonCodeCommandExfilFlow:               "command_exfil_flow",
@@ -2521,10 +2521,11 @@ func TestJudgeReasonCode_Vocabulary(t *testing.T) {
 		ReasonCodeCommandDestructiveOutsideRoots: "command_destructive_outside_roots",
 		ReasonCodeCommandDownloadCradle:          "command_download_cradle",
 		ReasonCodeCommandUnboundedAnalysis:       "command_unbounded_analysis",
+		ReasonCodeCommandExternalContentIngest:   "command_external_content_ingest",
 		ReasonCodeCredentialAccess:               "credential_access",
 		ReasonCodeCommandAnalysisUnavailable:     "command_analysis_unavailable",
 	}
-	const wantPublished = 18
+	const wantPublished = 19
 	if len(published) != wantPublished {
 		t.Fatalf("vocabulary size = %d, want %d — update this pin when publishing or retiring a code", len(published), wantPublished)
 	}

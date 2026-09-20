@@ -200,7 +200,7 @@ func TestShellWorkspaceScopedVerification_PowerShellExcluded(t *testing.T) {
 	}
 }
 
-// TestShellWorkspaceScopedVerification_DigestField pins the v2 field
+// TestShellWorkspaceScopedVerification_DigestField pins the v3 field
 // spelling and position in the serialized digest.
 func TestShellWorkspaceScopedVerification_DigestField(t *testing.T) {
 	got := markerAnalyze(t, markerCase{command: "gofmt -l ."})
@@ -208,8 +208,8 @@ func TestShellWorkspaceScopedVerification_DigestField(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal digest: %v", err)
 	}
-	if !strings.Contains(string(raw), `"schemaVersion":"sp4rk-shell-analysis/v2"`) {
-		t.Errorf("digest schema version not v2: %s", string(raw))
+	if !strings.Contains(string(raw), `"schemaVersion":"sp4rk-shell-analysis/v3"`) {
+		t.Errorf("digest schema version not v3: %s", string(raw))
 	}
 	if !strings.Contains(string(raw), `"workspaceScopedVerification":true`) {
 		t.Errorf("digest missing workspaceScopedVerification:true: %s", string(raw))

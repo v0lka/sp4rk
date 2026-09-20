@@ -33,6 +33,37 @@ type PoshExecTool struct {
 	blacklist []string
 	compiled  []*regexp.Regexp
 	timeouts  BashTimeouts
+	// invocation is the (default or operator-overridden) launch shape; see
+	// BashExecTool.invocation. The PowerShell-only UTF-8 output bootstrap is
+	// applied only when the declared shell kind really is a PowerShell host.
+	invocation tools.ShellInvocation
+}
+
+// DeclaredShellKind reports the shell the command text is written in
+// (tools.ShellAnalysisLangForTool consumes this to pick the flowsh dialect).
+func (t *PoshExecTool) DeclaredShellKind() tools.ShellKind { return t.invocation.Kind }
+
+// utf8Bootstrap sets BOM-less UTF-8 as the console encoding before the user
+// command. powershell.exe encodes redirected console output — and decodes
+// native commands' output — with the legacy OEM code page of its hidden
+// console, which cannot represent most non-ASCII text: Unicode degrades to
+// '?' before it ever reaches decodePowerShellOutput. Assigning a BOM-less
+// UTF8Encoding makes both PowerShell's own output and native tool output
+// round-trip as UTF-8. Best-effort: with no console attached the assignment
+// throws, which we swallow — decodePowerShellOutput still handles BOM'd
+// UTF-16 and any UTF-8 BOM a different encoding object might emit.
+const utf8Bootstrap = `try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false); $OutputEncoding = [Console]::OutputEncoding } catch { }`
+
+// commandText composes the text passed to the shell as the {command} argv
+// element. PowerShell-family hosts receive the UTF-8 bootstrap followed by
+// the user command; any other declared shell receives the command verbatim —
+// the bootstrap is PowerShell code and would corrupt a non-PowerShell
+// wrapper's command.
+func (t *PoshExecTool) commandText(command string) string {
+	if t.invocation.Kind.Family() == tools.ShellFamilyPowerShell {
+		return utf8Bootstrap + "; " + command
+	}
+	return command
 }
 
 // createNewProcessGroup is the Windows process creation flag (0x00000200)
@@ -49,6 +80,21 @@ func NewPoshExecTool(blacklist []string) (*PoshExecTool, error) {
 // NewPoshExecToolWithTimeouts creates a new PoshExecTool with the given
 // blacklist and timeouts.
 func NewPoshExecToolWithTimeouts(blacklist []string, timeouts BashTimeouts) (*PoshExecTool, error) {
+	return NewPoshExecToolWithInvocation(blacklist, timeouts, tools.DefaultPoshInvocation())
+}
+
+// NewPoshExecToolWithInvocation creates a new PoshExecTool with the given
+// blacklist, timeouts, and shell invocation. The invocation may be the
+// tools.DefaultPoshInvocation() or an operator-configured override (see
+// tools.ShellInvocation). An override rewrites the tool description to name
+// the actual launch command and the declared shell. The PowerShell UTF-8
+// output bootstrap is applied only when the declared kind belongs to the
+// PowerShell family — a non-PowerShell wrapper (e.g. a pwsh-family or an
+// exotic shell the host allowed) must not receive PowerShell statements.
+func NewPoshExecToolWithInvocation(blacklist []string, timeouts BashTimeouts, invocation tools.ShellInvocation) (*PoshExecTool, error) {
+	if err := invocation.Validate(); err != nil {
+		return nil, err
+	}
 	compiled := make([]*regexp.Regexp, 0, len(blacklist))
 	for _, pattern := range blacklist {
 		re, err := regexp.Compile(pattern)
@@ -61,14 +107,15 @@ func NewPoshExecToolWithTimeouts(blacklist []string, timeouts BashTimeouts) (*Po
 		BaseTool: &tools.BaseTool{
 			ToolName:        "posh_exec",
 			ToolGroup:       tools.GroupExecute,
-			ToolDescription: toolPoshDescription,
+			ToolDescription: composeShellDescription(toolPoshDescription, invocation, tools.DefaultPoshInvocation()),
 			Schema:          json.RawMessage(`{"type": "object", "properties": {"command": {"type": "string", "description": "The PowerShell command to execute. Supports pipes, redirects, and chained commands."}, "timeout": {"type": "string", "description": "Optional timeout as a quoted JSON string with a unit suffix, e.g. \"30s\" or \"2m\". The value MUST be a string in double quotes: write \"timeout\": \"30s\" - an unquoted bare token like 30s is invalid JSON and the call is rejected. Default: \"60s\"; maximum: \"120s\"."}, "working_directory": {"type": "string", "description": "Absolute path to use as the working directory for command execution. If omitted, defaults to the workspace root when available."}}, "required": ["command"]}`),
 			Policy:          tools.PolicyUserConfirm,
 			Untrusted:       true,
 		},
-		blacklist: blacklist,
-		compiled:  compiled,
-		timeouts:  timeouts,
+		blacklist:  blacklist,
+		compiled:   compiled,
+		timeouts:   timeouts,
+		invocation: invocation,
 	}, nil
 }
 
@@ -87,20 +134,20 @@ type poshInput struct {
 //     matches blacklist pattern: ...". The blacklist is operator policy and
 //     always wins; the reason must never be weakened.
 //  2. Flowsh criteria — the host pre-computes the deterministic analysis
-//     ([tools.AnalyzeShellCommandForJudge]; criteria C1–C8 in
+//     ([tools.AnalyzeShellCommandForJudge]; criteria C1–C9 in
 //     tools/shellanalysis.go, PowerShell dialect) and attaches it to ctx
 //     via [tools.WithShellAnalysis]; the Judge reads it through
 //     [tools.ShellJudgeOutcome] and returns its winning outcome verbatim
-//     (hard canonical C1–C5, hard non-canonical C6, soft C7/C8). The Judge
+//     (hard canonical C1–C5, hard non-canonical C6/C7, soft C8/C9). The Judge
 //     never runs the analysis engine itself — no recomputation.
 //
 // The former static shell-path containment check (soft) was removed by
-// explicit decision: out-of-root scope is assessed by the C4/C8 criteria
+// explicit decision: out-of-root scope is assessed by the C4/C9 criteria
 // over the flowsh effect IR, which understands PowerShell syntax more
 // precisely than token walking.
 //
 // When NOTHING is attached the Judge returns an empty outcome and defers to
-// the advisory judges — the deterministic floor (C1–C8) is then absent for
+// the advisory judges — the deterministic floor (C1–C9) is then absent for
 // this call, so a host that wants the shell escalations must attach the
 // analysis itself via [tools.WithShellAnalysis]. When the attached analysis
 // carries an ERROR (e.g. a knowledge-base load failure — logged), the Judge
@@ -158,20 +205,14 @@ func (t *PoshExecTool) Execute(ctx context.Context, input json.RawMessage) (tool
 	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	// Bootstrap the session with BOM-less UTF-8 before the user command.
-	// powershell.exe encodes redirected console output — and decodes native
-	// commands' output — with the legacy OEM code page of its hidden console,
-	// which cannot represent most non-ASCII text: Unicode degrades to '?'
-	// before it ever reaches decodePowerShellOutput. Assigning a BOM-less
-	// UTF8Encoding makes both PowerShell's own output and native tool output
-	// round-trip as UTF-8. Best-effort: with no console attached the
-	// assignment throws, which we swallow — decodePowerShellOutput still
-	// handles BOM'd UTF-16 and any UTF-8 BOM a different encoding object
-	// might emit.
-	const utf8Bootstrap = `try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false); $OutputEncoding = [Console]::OutputEncoding } catch { }`
-
-	// Create command: Windows PowerShell, no profile, non-interactive.
-	cmd := exec.CommandContext(timeoutCtx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", utf8Bootstrap+"; "+command)
+	// Bootstrap the session with BOM-less UTF-8 before the user command —
+	// but only when the declared shell really is a PowerShell host. The
+	// bootstrap is PowerShell code; prepending it to a non-PowerShell
+	// wrapper's command (an operator-configured invocation with, say, a
+	// zsh-kind declaration) would corrupt the command. The legacy default
+	// invocation (powershell.exe …) is a PowerShell host, so its behavior is
+	// unchanged. See commandText.
+	cmd := exec.CommandContext(timeoutCtx, t.invocation.Binary, t.invocation.Argv(t.commandText(command))...)
 
 	// Place the command in a new process group so cmd.Cancel can target
 	// powershell.exe in isolation (CREATE_NEW_PROCESS_GROUP). The full process

@@ -159,19 +159,30 @@ const (
 	// concrete filesystem-write target outside the session roots (criterion
 	// C4). Fired control, hard and canonical.
 	ReasonCodeCommandDestructiveOutsideRoots JudgeReasonCode = "command_destructive_outside_roots"
-	// ReasonCodeCommandDownloadCradle marks a shell command the analyser could
-	// not bound (⊤/conservative) that performs network egress — the shape of a
-	// download-and-execute cradle (criterion C5). Fired control, hard and
-	// canonical.
+	// ReasonCodeCommandDownloadCradle marks a shell command whose flowsh
+	// analysis established a network→code-execution FLOW — fetched network
+	// content reaching a shell/interpreter (a pipe to sh, a sourced or
+	// process-substituted fetch, a command-substitution sink): the
+	// download-cradle shape (criterion C5). Fired control, hard and canonical —
+	// keyed on the proven flow, so a canonical verdict is always backed by the
+	// flow it ships in the digest.
 	ReasonCodeCommandDownloadCradle JudgeReasonCode = "command_download_cradle"
 	// ReasonCodeCommandUnboundedAnalysis marks a shell command the analyser
-	// could not bound (⊤/conservative) — criterion C6. It fires when the
-	// unbounded command has no network egress, or an egress it could not pin to
-	// a destination (the degraded C5), or when an irreversible write's target
-	// could not be resolved (⊤ target, e.g. abbreviated PowerShell parameters).
-	// Hard but NON-canonical: it is an analysis limitation, not a confirmed
-	// control — an advisory judge may clear it on closer reading.
+	// could not bound (⊤/conservative) without a cradle flow, or an
+	// irreversible write whose target it could not resolve (⊤ target, e.g.
+	// abbreviated PowerShell parameters) — criterion C6. Hard but
+	// NON-canonical: it is an analysis limitation, not a confirmed control — an
+	// advisory judge may clear it on closer reading.
 	ReasonCodeCommandUnboundedAnalysis JudgeReasonCode = "command_unbounded_analysis"
+	// ReasonCodeCommandExternalContentIngest marks a shell command whose flowsh
+	// analysis established a network→filesystem FLOW — a download client
+	// (curl -o/-O, wget -O/default) wrote content it fetched over the network to
+	// a file (criterion C7). Hard but NON-canonical: persistent external-content
+	// ingest is a real attack shape (staging a payload for later use, or
+	// writing out data), but it is also routine benign behaviour (fetching a
+	// document or an archive), so the advisory judge may clear it on closer
+	// reading. A fetch to stdout is not an ingest and never fires it.
+	ReasonCodeCommandExternalContentIngest JudgeReasonCode = "command_external_content_ingest"
 	// ReasonCodeCredentialAccess marks a shell command whose flowsh analysis
 	// found credential/secret material accessed without a paired egress
 	// (criterion C7). Advisory scope concern, soft.
@@ -179,7 +190,7 @@ const (
 	// ReasonCodeCommandAnalysisUnavailable marks a shell command whose
 	// deterministic analysis could not be produced at all — the flowsh
 	// analyzer or its embedded knowledge base failed to initialise. The
-	// deterministic floor (criteria C1–C8) is unavailable for the call, so it
+	// deterministic floor (criteria C1–C9) is unavailable for the call, so it
 	// fails CLOSED: a fired control-like reason, hard and canonical, never
 	// auto-overridable, so the call still escalates under an `allow` policy
 	// and blocks under verify-on-edit's unattended path.

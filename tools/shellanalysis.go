@@ -4,7 +4,7 @@
 // on top of github.com/v0lka/flowsh. flowsh parses a bash/PowerShell command
 // into a frozen effect IR (filesystem/network/process/credential effects, an
 // exfiltration-pairing taint analysis, and a destructive-flags knowledge
-// base); this file turns that report into the fixed-priority criteria C1–C8
+// base); this file turns that report into the fixed-priority criteria C1–C9
 // that shell-exec judges (and the advisory on-demand judge) consume.
 //
 // Design contract:
@@ -12,19 +12,21 @@
 //   - The blocklist match stays in the tool's own Judge (bash_exec/posh_exec);
 //     it is NOT re-implemented here. This engine covers everything the
 //     effect IR can see.
-//   - Criteria are evaluated in the fixed priority C1…C8; every fired
+//   - Criteria are evaluated in the fixed priority C1…C9; every fired
 //     criterion is recorded in the digest, and the highest-priority one
 //     becomes the JudgeOutcome.
 //   - Canonicality: C1–C5 are hard AND canonical (hosts must never
-//     auto-override them); C5 additionally demands cradle evidence — a
-//     concrete NetEgress target or a non-empty exfil pairing — and degrades
-//     to C6 without it, so a canonical verdict never contradicts the digest
-//     it ships in. C6 is hard but NON-canonical — an analysis limitation the
-//     advisory judge may clear. C7/C8 are soft scope questions.
+//     auto-override them). C5 fires only on an established cradle FLOW —
+//     the network→code-execution flow the analysis proved (fetched content
+//     reaching a shell/interpreter) — never a bare NetEgress/CodeExec
+//     co-occurrence, so a canonical verdict is always backed by a real flow.
+//     C6 (unbounded analysis) and C7 (external-content ingest) are hard but
+//     NON-canonical — an analysis limitation and a flow the advisory judge
+//     may clear. C8/C9 are soft scope questions.
 //   - The flowsh score/grade are carried in the digest for context but are
 //     deliberately NOT used as decision thresholds — the criteria fire off
 //     structural facts (effect kinds, targets, KB classes), not scores.
-//   - Containment (C4/C8) consults only FS* effects whose concrete targets
+//   - Containment (C4/C9) consults only FS* effects whose concrete targets
 //     are path-shaped; CLI noise ("-30", "s/foo/bar/g", "+x") is discarded by
 //     a path-shape check before resolution. Empty session roots disable
 //     containment entirely, as the former shell-path containment check did.
@@ -48,9 +50,11 @@ import (
 )
 
 // ShellDigestSchemaVersion tags the shell-analysis digest contract
-// ("sp4rk-shell-analysis/v2"). Bump it whenever the digest gains, loses or
-// reshapes a field. v2 added the WorkspaceScopedVerification marker.
-const ShellDigestSchemaVersion = "sp4rk-shell-analysis/v2"
+// ("sp4rk-shell-analysis/v3"). Bump it whenever the digest gains, loses or
+// reshapes a field. v2 added the WorkspaceScopedVerification marker; v3 adds
+// the network data-flow keys (cradleFlows/ingestFlows) and the flow-based
+// criteria (C5 download-cradle flow, C7 external-content ingest).
+const ShellDigestSchemaVersion = "sp4rk-shell-analysis/v3"
 
 // ─────────────────────────────────────────────────────────────────────────
 // Process-global analyzer
@@ -119,6 +123,17 @@ type ShellExfilPairDigest struct {
 	Sink   string `json:"sink"`
 }
 
+// ShellFlowPairDigest identifies one established network data-flow — a cradle
+// (network→code-execution) or an ingest (network→filesystem) — by the stable
+// keys of its source and sink effects (Effect.Key() form,
+// "Kind|Mode|[targets]"). It is the flow evidence behind criteria C5/C7, and
+// surfaces the flows themselves so a judge can see what the analyzer proved
+// rather than a bare NetEgress/CodeExec co-occurrence.
+type ShellFlowPairDigest struct {
+	Source string `json:"source"`
+	Sink   string `json:"sink"`
+}
+
 // ShellDestructiveDigest is one matched destructive-flags KB entry, without
 // the reason prose.
 type ShellDestructiveDigest struct {
@@ -146,18 +161,27 @@ type ShellCriterion struct {
 // the bounded facts of the flowsh report plus the fired criteria — no
 // why-traces and no echo of the raw input command.
 type ShellAnalysisDigest struct {
-	SchemaVersion string                   `json:"schemaVersion"`
-	Lang          string                   `json:"lang"`
-	Top           bool                     `json:"top"`
-	Conservative  bool                     `json:"conservative"`
-	Reason        string                   `json:"reason,omitempty"`
-	Commands      int                      `json:"commands"`
-	Resolution    ShellResolutionDigest    `json:"resolution"`
-	Effects       []ShellEffectDigest      `json:"effects"`
-	Score         ShellScoreDigest         `json:"score"`
-	ExfilPairs    []ShellExfilPairDigest   `json:"exfilPairs"`
-	Destructive   []ShellDestructiveDigest `json:"destructive"`
-	Criteria      []ShellCriterion         `json:"criteria"`
+	SchemaVersion string                 `json:"schemaVersion"`
+	Lang          string                 `json:"lang"`
+	Top           bool                   `json:"top"`
+	Conservative  bool                   `json:"conservative"`
+	Reason        string                 `json:"reason,omitempty"`
+	Commands      int                    `json:"commands"`
+	Resolution    ShellResolutionDigest  `json:"resolution"`
+	Effects       []ShellEffectDigest    `json:"effects"`
+	Score         ShellScoreDigest       `json:"score"`
+	ExfilPairs    []ShellExfilPairDigest `json:"exfilPairs"`
+	// CradleFlows lists the established network→code-execution flows (the
+	// download-cradle shape behind criterion C5): fetched content the analysis
+	// proved reaches a shell/interpreter. Empty when no such flow exists.
+	CradleFlows []ShellFlowPairDigest `json:"cradleFlows"`
+	// IngestFlows lists the established network→filesystem flows (behind
+	// criterion C7): a download client wrote content it fetched over the
+	// network to a file (curl -o/-O, wget default/-O). A stdout fetch is not
+	// an ingest and yields none. Empty when no such flow exists.
+	IngestFlows []ShellFlowPairDigest    `json:"ingestFlows"`
+	Destructive []ShellDestructiveDigest `json:"destructive"`
+	Criteria    []ShellCriterion         `json:"criteria"`
 	// WorkspaceScopedVerification is the deterministic workspace-scoped
 	// verification marker (v2): every resolved binary in the command is a
 	// catalogued verification driver or benign plumbing utility, at least one
@@ -192,8 +216,9 @@ type ShellAnalysis struct {
 	Outcome JudgeOutcome
 	// Canonical reports whether the winning reason is canonical — a hard
 	// security control a host must never auto-override. False for soft
-	// reasons and for the non-canonical hard reason
-	// ReasonCodeCommandUnboundedAnalysis.
+	// reasons and for the non-canonical hard reasons
+	// ReasonCodeCommandUnboundedAnalysis and
+	// ReasonCodeCommandExternalContentIngest.
 	Canonical bool
 }
 
@@ -202,12 +227,12 @@ type ShellAnalysis struct {
 // ─────────────────────────────────────────────────────────────────────────
 
 // AnalyzeShellCommandForJudge runs the flowsh-based deterministic analysis of
-// one shell-exec tool input and maps it onto the C1–C8 criteria. It is the
+// one shell-exec tool input and maps it onto the C1–C9 criteria. It is the
 // advisory-path helper: callers feed it the tool name ("bash_exec" or
 // "posh_exec", which selects the dialect) and the tool's raw JSON input
 // ({command, working_directory}); the returned ShellAnalysis carries the
 // digest plus the winning judge outcome. Session roots for the containment
-// criteria (C4/C8) come from ctx exactly as they did for the former shell-path
+// criteria (C4/C9) come from ctx exactly as they did for the former shell-path
 // containment check; with no roots attached those criteria cannot fire.
 // Host-known variable bindings attached via [WithShellVarBindings] are
 // forwarded to the analyzer (flowsh Options.Vars): every binding behaves as
@@ -219,17 +244,36 @@ type ShellAnalysis struct {
 //
 // A tool name outside the shell-exec pair, an unparsable input, or a failed
 // knowledge-base load is an error — callers fail closed on it.
+//
+// For hosts whose shell tool carries an operator-configured invocation
+// override, use [ShellAnalysisLangForTool] (or [ShellAnalysisLangForKind]) to
+// resolve the dialect from the DECLARED shell kind and call
+// [AnalyzeShellCommandForJudgeWithDialect] instead — the tool name no longer
+// implies the syntax when the launch wrapper is user-configured.
 func AnalyzeShellCommandForJudge(ctx context.Context, toolName string, input json.RawMessage) (*ShellAnalysis, error) {
 	lang, ok := shellToolLangs[toolName]
 	if !ok {
 		return nil, fmt.Errorf("shell analysis: unsupported tool %q (want bash_exec or posh_exec)", toolName)
+	}
+	return AnalyzeShellCommandForJudgeWithDialect(ctx, lang, input)
+}
+
+// AnalyzeShellCommandForJudgeWithDialect is [AnalyzeShellCommandForJudge] with
+// an explicit flowsh dialect. Hosts whose shell-exec tool accepts an
+// operator-configured invocation override derive the dialect from the
+// DECLARED shell kind (ShellKindToAnalysisLang) rather than the tool
+// name, because the tool name no longer implies the command syntax. An
+// unsupported lang is an error — callers fail closed on it.
+func AnalyzeShellCommandForJudgeWithDialect(ctx context.Context, lang api.Lang, input json.RawMessage) (*ShellAnalysis, error) {
+	if lang != api.LangBash && lang != api.LangPowerShell {
+		return nil, fmt.Errorf("shell analysis: unsupported dialect %q (want bash or powershell)", string(lang))
 	}
 	var params struct {
 		Command          string `json:"command"`
 		WorkingDirectory string `json:"working_directory"`
 	}
 	if err := json.Unmarshal(input, &params); err != nil {
-		return nil, fmt.Errorf("shell analysis: parse %s input: %w", toolName, err)
+		return nil, fmt.Errorf("shell analysis: parse shell tool input: %w", err)
 	}
 	analyzer, err := shellFlowshAnalyzer()
 	if err != nil {
@@ -237,6 +281,32 @@ func AnalyzeShellCommandForJudge(ctx context.Context, toolName string, input jso
 	}
 	report := analyzer.AnalyzeWith(lang, params.Command, api.Options{Vars: ShellVarBindingsFrom(ctx)})
 	return evaluateShellReport(ctx, params.WorkingDirectory, params.Command, report), nil
+}
+
+// DeclaredShellKinder is implemented by shell-exec tools that carry a
+// (default or operator-overridden) declared shell kind. Both built-in shell
+// tools implement it; hosts use it to resolve the analysis dialect of a
+// registered tool via [ShellAnalysisLangForTool].
+type DeclaredShellKinder interface {
+	DeclaredShellKind() ShellKind
+}
+
+// ShellAnalysisLangForTool resolves the flowsh analysis dialect for a
+// registered shell-exec tool instance: the dialect of its DECLARED shell kind
+// when the tool implements [DeclaredShellKinder], else the legacy tool-name
+// mapping (bash_exec → bash, posh_exec → powershell). ok is false for tools
+// that are not shell-exec tools (callers must not attach an analysis for
+// them). The tool is typed `any` on purpose — resolution only needs
+// DeclaredShellKind, and hosts hold the registered instance behind varying
+// interfaces.
+func ShellAnalysisLangForTool(tool any, toolName string) (api.Lang, bool) {
+	if k, ok := tool.(DeclaredShellKinder); ok {
+		if lang, ok2 := ShellKindToAnalysisLang(k.DeclaredShellKind()); ok2 {
+			return lang, true
+		}
+	}
+	lang, ok := shellToolLangs[toolName]
+	return lang, ok
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -319,7 +389,7 @@ func ShellVarBindingsFrom(ctx context.Context) map[string]string {
 // criterion fired). When nothing is attached it returns the empty outcome,
 // deferring the call to the advisory judges. When the attachment carries an
 // error — the analyzer or its embedded knowledge base failed to initialise,
-// so the deterministic floor (C1–C8) is unavailable for this call — it FAILS
+// so the deterministic floor (C1–C9) is unavailable for this call — it FAILS
 // CLOSED: a hard canonical [ReasonCodeCommandAnalysisUnavailable] outcome, so
 // the call still escalates under an `allow` policy and blocks under
 // verify-on-edit's unattended path, instead of running with no floor at all.
@@ -327,7 +397,7 @@ func ShellVarBindingsFrom(ctx context.Context) map[string]string {
 //
 // IMPORTANT for hosts upgrading from a version whose built-in shell tools ran
 // their own static containment/unresolvable-token checks: those checks moved
-// into the flowsh analysis (criteria C4/C6/C8), and the SDK never attaches the
+// into the flowsh analysis (criteria C4/C6/C9), and the SDK never attaches the
 // analysis on its own. A host that does not call [AnalyzeShellCommandForJudge]
 // and [WithShellAnalysis] therefore gets NO deterministic shell escalation for
 // a shell call — only the advisory LLM judge (ToolJudge.Judge) remains — so
@@ -354,9 +424,9 @@ func ShellJudgeOutcome(ctx context.Context, toolName string) JudgeOutcome {
 // Criteria engine
 // ─────────────────────────────────────────────────────────────────────────
 
-// evaluateShellReport applies the fixed-priority criteria C1–C8 to a flowsh
+// evaluateShellReport applies the fixed-priority criteria C1–C9 to a flowsh
 // report and assembles the digest + winning outcome. It never fails: a report
-// is always assessable (flowsh itself degrades to ⊤/conservative, which C5/C6
+// is always assessable (flowsh itself degrades to ⊤/conservative, which C6/C7
 // handle). command is the raw tool-input command text — used only to verify
 // environment-prefix values for the workspace-scoped verification marker; it
 // never reaches the digest (the no-input-echo contract).
@@ -366,20 +436,19 @@ func evaluateShellReport(ctx context.Context, workDir, command string, report *a
 		criteria = append(criteria, ShellCriterion{Fired: code, Severity: severity, Canonical: canonical})
 	}
 
-	hasNetEgress := shellHasEffectKind(report, engine.KindNetEgress)
-	hasValidatedNetEgress := shellHasValidatedNetEgress(report)
 	hasPrivEsc := shellHasEffectKind(report, engine.KindPrivEsc)
 	hasCredAccess := shellHasEffectKind(report, engine.KindCredAccess)
 	hasExfilPair := len(report.Score.ExfilPairs) > 0
 	unbounded := report.Top || report.Conservative
 	unboundedWrite := shellHasUnboundedWrite(report)
-	// The C5 evidence rule: a canonical cradle verdict must be backed by a
-	// pointable destination — a NetEgress effect whose target the analyzer
-	// pinned to a concrete host/URL, or an exfil pairing that found a real
-	// secret→sink flow (whose sink is itself a NetEgress effect). An
-	// unbounded command whose only egress is unresolved (⊤) names no
-	// destination the verdict could point at, so C5 degrades to C6.
-	cradleEvidence := hasValidatedNetEgress || hasExfilPair
+	// The network data-flows the analyzer established: a cradle is a proven
+	// network→code-execution flow (fetched content reaching a shell or
+	// interpreter), an ingest a proven network→filesystem flow (a download
+	// client writing fetched content to a file). C5 keys on the cradle FLOW —
+	// not on a NetEgress/CodeExec co-occurrence — so a canonical cradle verdict
+	// is always backed by the evidence it ships.
+	hasCradleFlow := len(report.Score.CradleFlows) > 0
+	hasIngestFlow := len(report.Score.IngestFlows) > 0
 
 	// C1 — exfiltration flow: a secret read paired with tainted egress.
 	if hasExfilPair {
@@ -400,33 +469,41 @@ func evaluateShellReport(ctx context.Context, workDir, command string, report *a
 			fire(ReasonCodeCommandDestructiveOutsideRoots, JudgeSeverityHard, true)
 		}
 	}
-	// C5 — unbounded analysis with network egress AND the evidence to pin
-	// that egress to a destination (a concrete NetEgress target or a real
-	// exfil pairing): the download-cradle shape. Without the evidence the
-	// verdict would contradict the digest (a canonical cradle deny with no
-	// target to point at — the silent-audit 968848 shape), so it degrades to
-	// C6 below.
-	if unbounded && hasNetEgress && cradleEvidence {
+	// C5 — a download cradle: the analysis established a network→code-execution
+	// flow (fetched content reaching a shell/interpreter). Keyed on the FLOW,
+	// not on a NetEgress/CodeExec co-occurrence: a canonical cradle verdict is
+	// therefore always backed by the flow it ships in the digest, whether or
+	// not the egress target itself resolved to a literal host. Hard canonical.
+	if hasCradleFlow {
 		fire(ReasonCodeCommandDownloadCradle, JudgeSeverityHard, true)
 	}
-	// C6 — the analyzer could not bound the command (⊤/conservative) without
-	// network egress, OR an irreversible write's target could not be resolved
-	// (⊤), OR the unbounded command's egress could not be pinned to a
-	// destination (the degraded C5): hard but NON-canonical, an analysis
-	// limitation the advisory judge may clear. The unboundedWrite disjunct is
-	// deliberately independent of egress: an unresolved irreversible write is
-	// destructive wherever it lands, so it fires even when the command also
-	// carries network egress. (Safe to use !cradleEvidence for the unbounded
-	// disjunct: cradleEvidence implies hasNetEgress, and C5 already covers the
-	// unbounded-with-pinned-egress shape.)
-	if unboundedWrite || (unbounded && !cradleEvidence) {
+	// C6 — the analyzer could not bound the command (⊤/conservative) without a
+	// cradle flow, OR an irreversible write's target could not be resolved
+	// (⊤): hard but NON-canonical, an analysis limitation the advisory judge
+	// may clear. The unboundedWrite disjunct is deliberately independent of
+	// egress: an unresolved irreversible write is destructive wherever it
+	// lands, so it fires even when the command also carries network egress.
+	// Keying the unbounded disjunct on !hasCradleFlow (rather than on a
+	// resolved egress target) keeps a genuinely unbounded egress escalating —
+	// an unresolved download, or a dialect whose pipe the analysis could not
+	// follow into a cradle — instead of passing silently; C5 already owns the
+	// established-cradle shape.
+	if unboundedWrite || (unbounded && !hasCradleFlow) {
 		fire(ReasonCodeCommandUnboundedAnalysis, JudgeSeverityHard, false)
 	}
-	// C7 — credential access without an exfil pairing.
+	// C7 — persistent external-content ingest: the analysis established a
+	// network→filesystem flow (a download client wrote content it fetched over
+	// the network to a file). A fetch to stdout is not an ingest. Hard but
+	// NON-canonical: the download may be a legitimate document or archive, so
+	// the advisory judge may clear it on closer reading.
+	if hasIngestFlow {
+		fire(ReasonCodeCommandExternalContentIngest, JudgeSeverityHard, false)
+	}
+	// C8 — credential access without an exfil pairing.
 	if hasCredAccess && !hasExfilPair {
 		fire(ReasonCodeCredentialAccess, JudgeSeveritySoft, false)
 	}
-	// C8 — direct FS* effect outside the session roots on a non-system
+	// C9 — direct FS* effect outside the session roots on a non-system
 	// path: the scope question, reusing the outside_session_roots code.
 	if len(shellOutsideRootDirectNonSystemTargets(ctx, report, workDir)) > 0 {
 		fire(ReasonCodeOutsideSessionRoots, JudgeSeveritySoft, false)
@@ -463,9 +540,11 @@ func shellCriterionReason(code JudgeReasonCode) string {
 	case ReasonCodeCommandDestructiveOutsideRoots:
 		return "Shell analysis: irreversible destructive command writing outside the session roots"
 	case ReasonCodeCommandDownloadCradle:
-		return "Shell analysis: unbounded command with network egress (possible download cradle)"
+		return "Shell analysis: downloaded network content reaches code execution (download cradle)"
 	case ReasonCodeCommandUnboundedAnalysis:
-		return "Shell analysis: command could not be bounded by static analysis (top/conservative), with no network egress or an egress that could not be pinned to a destination"
+		return "Shell analysis: command could not be bounded by static analysis (top/conservative) and no download-cradle flow was established"
+	case ReasonCodeCommandExternalContentIngest:
+		return "Shell analysis: download client wrote fetched external content to a file (external-content ingest)"
 	case ReasonCodeCredentialAccess:
 		return "Shell analysis: credential/secret material accessed without a paired egress"
 	case ReasonCodeOutsideSessionRoots:
@@ -479,25 +558,6 @@ func shellCriterionReason(code JudgeReasonCode) string {
 func shellHasEffectKind(report *api.Report, kind engine.EffectKind) bool {
 	for _, e := range report.Effects {
 		if e.Kind == kind {
-			return true
-		}
-	}
-	return false
-}
-
-// shellHasValidatedNetEgress reports whether the report carries a network
-// egress effect whose destination the analyzer could pin to a concrete
-// target — a literal host/URL that survived the binding layer's host-shape
-// gate. ⊤ (unresolved: `$URL`, an unknown command's operands) and ⊥ (payload
-// egress with no destination slot) do not count: neither names a destination
-// a cradle verdict could point at. This is the evidence half of the C5
-// consistency rule; the exfil pairing is the other half.
-func shellHasValidatedNetEgress(report *api.Report) bool {
-	for _, e := range report.Effects {
-		if e.Kind != engine.KindNetEgress || e.Target.IsTop() {
-			continue
-		}
-		if len(e.Target.Targets()) > 0 {
 			return true
 		}
 	}
@@ -575,7 +635,7 @@ func shellSystemOrDeviceTargets(report *api.Report) []string {
 }
 
 // shellOutsideTarget is one out-of-root containment hit: the resolved
-// absolute path plus the effect kind that produced it. C8 needs the kind to
+// absolute path plus the effect kind that produced it. C9 needs the kind to
 // tell C3-owned writes/metadata (system paths) apart from reads, which no
 // higher-priority criterion covers.
 type shellOutsideTarget struct {
@@ -587,7 +647,7 @@ type shellOutsideTarget struct {
 // effects against the session roots and returns those that fall outside
 // every root, each tagged with its effect kind. Matching effects must carry
 // one of kinds; when directOnly is set they must additionally be performed
-// directly (Mode == Direct), as the C8 scope criterion requires. With no
+// directly (Mode == Direct), as the C9 scope criterion requires. With no
 // session roots attached — or no resolvable base for relative targets — it
 // returns nil, as the former shell-path containment check did.
 func shellOutsideRoots(ctx context.Context, report *api.Report, workDir string, kinds []engine.EffectKind, directOnly bool) []shellOutsideTarget {
@@ -630,13 +690,13 @@ func shellOutsideRoots(ctx context.Context, report *api.Report, workDir string, 
 	return outside
 }
 
-// shellOutsideRootDirectNonSystemTargets returns the C8 targets: directly
+// shellOutsideRootDirectNonSystemTargets returns the C9 targets: directly
 // performed FS* effects whose path-shaped, resolvable targets fall outside
 // every session root. Direct writes/metadata on a system path or raw device
 // are excluded — C3 owns those, at a higher priority and as a hard canonical
 // control. Reads of system *files* are deliberately NOT excluded: no
 // higher-priority criterion covers them, and an out-of-root read of a system
-// (or credential) file is exactly the scope question C8 exists to raise —
+// (or credential) file is exactly the scope question C9 exists to raise —
 // leaving it silent would reopen the gap the former shell-path containment
 // check used to close.
 // Raw-device reads (/dev/urandom, /dev/zero, …) ARE excluded — they are
@@ -857,6 +917,14 @@ func newShellAnalysisDigest(ctx context.Context, workDir, command string, report
 	for _, p := range report.Score.ExfilPairs {
 		pairs = append(pairs, ShellExfilPairDigest{Source: p.Source.Key(), Sink: p.Sink.Key()})
 	}
+	cradles := make([]ShellFlowPairDigest, 0, len(report.Score.CradleFlows))
+	for _, f := range report.Score.CradleFlows {
+		cradles = append(cradles, ShellFlowPairDigest{Source: f.Source.Key(), Sink: f.Sink.Key()})
+	}
+	ingests := make([]ShellFlowPairDigest, 0, len(report.Score.IngestFlows))
+	for _, f := range report.Score.IngestFlows {
+		ingests = append(ingests, ShellFlowPairDigest{Source: f.Source.Key(), Sink: f.Sink.Key()})
+	}
 	destructive := make([]ShellDestructiveDigest, 0, len(report.Destructive))
 	for _, d := range report.Destructive {
 		destructive = append(destructive, ShellDestructiveDigest{Command: d.Command, Spec: d.Spec, Class: d.Class})
@@ -889,6 +957,8 @@ func newShellAnalysisDigest(ctx context.Context, workDir, command string, report
 			Grade:           report.Score.Grade.String(),
 		},
 		ExfilPairs:                  pairs,
+		CradleFlows:                 cradles,
+		IngestFlows:                 ingests,
 		Destructive:                 destructive,
 		Criteria:                    criteria,
 		WorkspaceScopedVerification: marker,
@@ -920,7 +990,7 @@ func newShellAnalysisDigest(ctx context.Context, workDir, command string, report
 //   - the CANONICAL effect set (flowsh v2 Canonical): each effect rendered as
 //     its stable key "Kind|Mode|[targets]" plus reversibility ("|R"/"|I"),
 //     staging-folded and stripped of non-path operand targets.
-//   - the codes of the fired criteria (C1–C8), sorted.
+//   - the codes of the fired criteria (C1–C9), sorted.
 //   - the workspace-scoped verification marker (B).
 //
 // Every component is sorted and deduplicated, so the rendering is a pure

@@ -27,3 +27,12 @@ examples/04-human-in-the-loop/04-human-in-the-loop
 examples/05-mcp-integration/05-mcp-integration
 examples/06-plan-and-reflect/06-plan-and-reflect
 examples/07-full-power/07-full-power
+
+# =============================================================================
+# Cross-repo development workspace (never committed)
+# =============================================================================
+# go.work wires this module to a local checkout of github.com/v0lka/flowsh
+# during a cross-repo development cycle; the module still pins the published
+# flowsh commit in go.mod. Keep it untracked (see c0wrk ADR-031).
+go.work
+go.work.sum

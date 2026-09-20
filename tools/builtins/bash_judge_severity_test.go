@@ -110,8 +110,9 @@ func TestBashExecTool_Judge_FlowshCriteriaCorpus(t *testing.T) {
 		// confirmation, and the advisory judge may clear it.
 		{name: "local build script", command: "./scripts/build.sh",
 			wantFired: tools.ReasonCodeCommandUnboundedAnalysis, wantSev: tools.JudgeSeverityHard},
-		{name: "aws s3 ls", command: "aws s3 ls",
-			wantFired: tools.ReasonCodeCommandUnboundedAnalysis, wantSev: tools.JudgeSeverityHard},
+		// aws is now a catalogued command (flowsh KB), so it is bounded: no
+		// criterion fires.
+		{name: "aws s3 ls", command: "aws s3 ls"},
 		// Dangerous: hard canonical criteria.
 		{name: "wipe home", command: "rm -rf $HOME/",
 			wantFired: tools.ReasonCodeCommandDestructiveOutsideRoots, wantSev: tools.JudgeSeverityHard},
@@ -282,7 +283,7 @@ func TestBashExecTool_ReasonCodes(t *testing.T) {
 		},
 		{
 			name:     "unbounded analysis is hard command_unbounded_analysis",
-			command:  "aws s3 ls",
+			command:  "./scripts/build.sh",
 			wantSev:  tools.JudgeSeverityHard,
 			wantCode: tools.ReasonCodeCommandUnboundedAnalysis,
 		},
