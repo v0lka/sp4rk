@@ -9,8 +9,10 @@ import "time"
 // sub-agent goroutine invokes emitter methods concurrently. Implementations
 // MUST be safe for concurrent use (e.g. guard shared state with a mutex).
 //
-// BREAKING CHANGE (v0.x): Finishing(stepNum int, summary string) was added,
-// as was SubAgentPaused(stepID string, duration time.Duration).
+// BREAKING CHANGE (v0.x): Finishing(stepNum int, summary string) was added;
+// SubAgentPaused(stepID string, duration time.Duration) was added; and
+// SubAgentComplete gained an errMsg argument, becoming
+// SubAgentComplete(stepID string, success bool, duration time.Duration, errMsg string).
 // All implementations of Events (and orchestration.Events, which embeds it)
 // MUST implement these methods or fail to compile. A no-op stub is provided by
 // NoopEvents for struct embedding convenience.
@@ -23,8 +25,8 @@ type Events interface {
 	SubAgentLaunch(stepID, description string)
 	// SubAgentComplete is emitted when a sub-agent finishes (or fails). success
 	// reports whether the executor finished without error, and errMsg carries
-	// the failure reason ("" on success), mirroring the OrchestrationEvents
-	// StepComplete error argument.
+	// the failure reason ("" on success) — the sub-agent counterpart of the
+	// failure reason a host surfaces for a step that did not succeed.
 	SubAgentComplete(stepID string, success bool, duration time.Duration, errMsg string)
 	// SubAgentPaused is emitted instead of SubAgentComplete when the sub-agent
 	// stopped via a cooperative pause checkpoint (executor.ErrPaused) rather

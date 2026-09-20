@@ -173,6 +173,17 @@ type Embedder struct {
 	// runner pins every ONNX Runtime call to one OS thread; nil for the CPU
 	// provider, which does not need the pinning. See ortRunner.
 	runner *ortRunner
+	// deviceID and intraOpThreads retain the config NewEmbedder used to build
+	// session options, so a later session-creation failure can rebuild them on
+	// the CPU provider (see degradeToCPU).
+	deviceID       int
+	intraOpThreads int
+	// cudaFallbackPending is true while inference runs on a CUDA provider that
+	// an "auto" request selected. A lazily created session that cannot be built
+	// on the GPU then degrades the embedder to the CPU provider once and retries
+	// (see newSessionWithFallback), mirroring the eager-session fallback in
+	// NewEmbedder.
+	cudaFallbackPending bool
 }
 
 // runOnORTThread executes fn on r's dedicated thread, or inline when r is nil.
@@ -352,7 +363,11 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 	}
 	// From here on sessOpts is owned by the embedder-to-be; cleanup(sessOpts)
 	// releases it on failure. A successful CUDA attempt also resolves "auto"
-	// to its winner.
+	// to its winner — but the eager-session block below still needs to know
+	// whether this was an "auto" request that landed on CUDA, so it can retry
+	// on the CPU provider when the GPU session itself cannot be built. Once
+	// resolved, `effective` is never "auto" again, so capture the auto-ness here.
+	autoOnCUDA := effective == ExecutionProviderAuto
 	if effective == ExecutionProviderAuto {
 		effective = ExecutionProviderCUDA
 	}
@@ -389,7 +404,7 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 		sessionStarted = time.Now()
 		sess, err = newSess()
 		if err != nil {
-			if effective != ExecutionProviderAuto {
+			if !autoOnCUDA {
 				cleanup(sessOpts)
 				return nil, fmt.Errorf("creating persistent ONNX session: %w", err)
 			}
@@ -453,6 +468,12 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 		sessOpts:          sessOpts,
 		executionProvider: effective,
 		runner:            runner,
+		deviceID:          cfg.DeviceID,
+		intraOpThreads:    cfg.IntraOpThreads,
+		// Only an auto request that is still (or again) on CUDA can degrade to
+		// the CPU from a later lazy session-creation failure. If the eager-session
+		// fallback above already ran, effective is CPU and this stays false.
+		cudaFallbackPending: autoOnCUDA && effective == ExecutionProviderCUDA,
 	}, nil
 }
 
@@ -647,6 +668,84 @@ func (e *Embedder) embedLengthBuckets(ctx context.Context, inputIDs, attentionMa
 	return results, nil
 }
 
+// newSession builds one persistent ONNX session on the embedder's current
+// provider. The caller must hold e.mu.
+func (e *Embedder) newSession(batchSize, seqLen int) (*onnxSession, error) {
+	var (
+		sess *onnxSession
+		err  error
+	)
+	e.onORTThread(func() {
+		sess, err = newONNXSession(e.modelPath, batchSize, seqLen, e.hiddenDim, e.sessOpts, e.telemetry)
+	})
+	return sess, err
+}
+
+// newSessionWithFallback builds a persistent ONNX session, honouring the "auto"
+// contract for the lazily created sessions (length buckets and the batch
+// session), not just the eager one: when the session cannot be built on the
+// CUDA provider an "auto" request selected, the embedder degrades to the CPU
+// provider once and retries — the same CUDA->CPU degrade the eager session
+// performs inside NewEmbedder. An explicit "cuda" request still fails loudly
+// (cudaFallbackPending is false for it). The caller must hold e.mu.
+func (e *Embedder) newSessionWithFallback(batchSize, seqLen int) (*onnxSession, error) {
+	sess, err := e.newSession(batchSize, seqLen)
+	if err == nil || !e.canDegradeToCPU() {
+		return sess, err
+	}
+	cudaErr := err
+	if fbErr := e.degradeToCPU(cudaErr); fbErr != nil {
+		return nil, fmt.Errorf("creating persistent ONNX session on CUDA failed (%w); CPU fallback also failed: %w", cudaErr, fbErr)
+	}
+	sess, err = e.newSession(batchSize, seqLen)
+	if err != nil {
+		return nil, fmt.Errorf("creating persistent ONNX session after CUDA->CPU fallback (original CUDA error: %w): %w", cudaErr, err)
+	}
+	return sess, nil
+}
+
+// canDegradeToCPU reports whether the embedder can safely retry session creation
+// on the CPU provider: the request was an "auto" one now running on CUDA, and no
+// CUDA-backed session is live yet — a live session needs the dedicated ONNX
+// thread the fallback stops, so degrading mid-flight would strand it. In
+// practice this is the first session creation in length-bucket mode, which is
+// exactly the path the eager fallback does not cover.
+func (e *Embedder) canDegradeToCPU() bool {
+	return e.cudaFallbackPending && e.sess == nil && e.batchSess == nil && len(e.bucketSessions) == 0
+}
+
+// degradeToCPU rebuilds the session options on the CPU provider, stops the
+// dedicated ONNX thread, and records that inference now runs on the CPU. It is
+// called when a session could not be built on a CUDA provider chosen by an
+// "auto" request. The caller must hold e.mu, must have verified
+// canDegradeToCPU, and must retry session creation afterwards.
+func (e *Embedder) degradeToCPU(cause error) error {
+	e.logger.Warn("CUDA execution provider unavailable, falling back to CPU",
+		"error", cause.Error(), "deviceID", e.deviceID)
+	var (
+		opts *ort.SessionOptions
+		err  error
+	)
+	e.onORTThread(func() {
+		if e.sessOpts != nil {
+			_ = e.sessOpts.Destroy()
+			e.sessOpts = nil
+		}
+		opts, err = buildSessionOptions(ExecutionProviderCPU, e.deviceID, e.intraOpThreads)
+	})
+	if err != nil {
+		return fmt.Errorf("building ONNX session options: %w", err)
+	}
+	if e.runner != nil {
+		e.runner.stop()
+		e.runner = nil
+	}
+	e.sessOpts = opts
+	e.executionProvider = ExecutionProviderCPU
+	e.cudaFallbackPending = false
+	return nil
+}
+
 // ensureBucketSession lazily creates and caches one session per sequence bucket.
 // The caller must hold e.mu.
 func (e *Embedder) ensureBucketSession(seqLen int) (*onnxSession, error) {
@@ -655,13 +754,7 @@ func (e *Embedder) ensureBucketSession(seqLen int) (*onnxSession, error) {
 		return sess, nil
 	}
 	started := time.Now()
-	var (
-		sess *onnxSession
-		err  error
-	)
-	e.onORTThread(func() {
-		sess, err = newONNXSession(e.modelPath, e.batchSize, seqLen, e.hiddenDim, e.sessOpts, e.telemetry)
-	})
+	sess, err := e.newSessionWithFallback(e.batchSize, seqLen)
 	if err != nil {
 		return nil, fmt.Errorf("creating persistent ONNX session for length bucket %d: %w", seqLen, err)
 	}
@@ -679,13 +772,7 @@ func (e *Embedder) ensureBatchSession() error {
 	e.logger.Info("creating persistent batch ONNX session (one-time init; loading the model takes a few seconds)",
 		"batchSize", e.batchSize, "seqLen", e.maxSeqLen)
 	started := time.Now()
-	var (
-		sess *onnxSession
-		err  error
-	)
-	e.onORTThread(func() {
-		sess, err = newONNXSession(e.modelPath, e.batchSize, e.maxSeqLen, e.hiddenDim, e.sessOpts, e.telemetry)
-	})
+	sess, err := e.newSessionWithFallback(e.batchSize, e.maxSeqLen)
 	if err != nil {
 		return fmt.Errorf("creating persistent batch ONNX session: %w", err)
 	}

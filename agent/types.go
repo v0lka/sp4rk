@@ -72,6 +72,12 @@ type SubAgentResult struct {
 	Output string `json:"output"`
 	Error  error  `json:"-"`
 	Steps  []Step `json:"steps,omitempty"` // actual executor steps (tool calls + observations)
+	// Summary carries the model's own final text when the subagent terminated
+	// on a host-designated stop tool (see Executor.SetStopTools) rather than the
+	// inline finish tool. Output then holds only the stop tool's short
+	// confirmation; Summary preserves the turn's modeled output. Empty for runs
+	// that did not end on a stop tool. Mirrors ExecutorResult.Summary.
+	Summary string `json:"summary,omitempty"`
 }
 
 // FillCheck represents the result of a context window fill check.

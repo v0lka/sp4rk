@@ -44,7 +44,7 @@ func NewStoreFactTool() *StoreFactTool {
 		"type": "object",
 		"properties": {
 			"keywords": {
-				"type": "array",
+				"type": ["array", "string"],
 				"items": {"type": "string"},
 				"minItems": 3,
 				"maxItems": 10,
@@ -181,7 +181,7 @@ func NewSearchFactsTool() *SearchFactsTool {
 		"type": "object",
 		"properties": {
 			"keywords": {
-				"type": "array",
+				"type": ["array", "string"],
 				"items": {"type": "string"},
 				"minItems": 1,
 				"maxItems": 5,

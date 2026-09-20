@@ -324,6 +324,14 @@ func ShellVarBindingsFrom(ctx context.Context) map[string]string {
 // the call still escalates under an `allow` policy and blocks under
 // verify-on-edit's unattended path, instead of running with no floor at all.
 // The error is logged to [slog.Default] as well.
+//
+// IMPORTANT for hosts upgrading from a version whose built-in shell tools ran
+// their own static containment/unresolvable-token checks: those checks moved
+// into the flowsh analysis (criteria C4/C6/C8), and the SDK never attaches the
+// analysis on its own. A host that does not call [AnalyzeShellCommandForJudge]
+// and [WithShellAnalysis] therefore gets NO deterministic shell escalation for
+// a shell call — only the advisory LLM judge (ToolJudge.Judge) remains — so
+// wiring the analysis is required to preserve the previous deterministic floor.
 func ShellJudgeOutcome(ctx context.Context, toolName string) JudgeOutcome {
 	analysis, err := ShellAnalysisFrom(ctx)
 	if err != nil {
@@ -405,8 +413,13 @@ func evaluateShellReport(ctx context.Context, workDir, command string, report *a
 	// network egress, OR an irreversible write's target could not be resolved
 	// (⊤), OR the unbounded command's egress could not be pinned to a
 	// destination (the degraded C5): hard but NON-canonical, an analysis
-	// limitation the advisory judge may clear.
-	if (unbounded || unboundedWrite) && !hasNetEgress || unbounded && hasNetEgress && !cradleEvidence {
+	// limitation the advisory judge may clear. The unboundedWrite disjunct is
+	// deliberately independent of egress: an unresolved irreversible write is
+	// destructive wherever it lands, so it fires even when the command also
+	// carries network egress. (Safe to use !cradleEvidence for the unbounded
+	// disjunct: cradleEvidence implies hasNetEgress, and C5 already covers the
+	// unbounded-with-pinned-egress shape.)
+	if unboundedWrite || (unbounded && !cradleEvidence) {
 		fire(ReasonCodeCommandUnboundedAnalysis, JudgeSeverityHard, false)
 	}
 	// C7 — credential access without an exfil pairing.
@@ -758,7 +771,7 @@ var windowsSystemPathPrefixes = []string{
 // which act on the real host filesystem, where "/dev/null" on a Windows host is
 // an ordinary out-of-root path — this is the shell-analysis view: it classifies
 // command semantics, not host files. A POSIX-rooted target stays "/dev/null" on
-// every host ([resolveShellToken] keeps it forward-slashed and absolute), and
+// every host ([shellResolveTarget] keeps it forward-slashed and absolute), and
 // in the dialect that produced it the path IS the bit bucket, so the criteria
 // must exempt it regardless of where the analyzer itself runs — otherwise the
 // same command reaches a different verdict on a Windows CI host than on POSIX.
@@ -798,7 +811,12 @@ func shellIsSystemOrRawDevicePath(absPath string) bool {
 	// Windows side: case-folded, back-slashed prefix check at a component
 	// boundary (verbatim long-path prefixes are stripped first) — the same
 	// guard the POSIX branch applies, so a prefix-adjacent non-system name
-	// ("c:\program filesold") is not misclassified.
+	// ("c:\program filesold") is not misclassified. Skipped for a POSIX-rooted
+	// target: a POSIX "/windows/x" must not be re-read as a Windows system path
+	// by the drive-less prefix table.
+	if strings.HasPrefix(absPath, "/") {
+		return false
+	}
 	win := strings.ToLower(filepath.ToSlash(absPath))
 	win = strings.ReplaceAll(win, "/", `\`)
 	win = strings.TrimPrefix(win, `\\?\`)

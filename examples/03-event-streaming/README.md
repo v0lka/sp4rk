@@ -62,6 +62,7 @@ type Events interface {
     StepComplete(stepNum int, duration time.Duration)
     SubAgentLaunch(stepID, description string)
     SubAgentComplete(stepID string, success bool, duration time.Duration, errMsg string)
+    SubAgentPaused(stepID string, duration time.Duration)
     AssistantChunk(content string)
     AssistantDone(content string, inputTokens, outputTokens int)
     ContextFill(fillPercent float64, usedTokens, maxTokens int, status string, stepID string)
@@ -73,11 +74,11 @@ type Events interface {
 
 ### 2. Embed NoopEvents
 
-Implementing all 13 methods is tedious. The SDK provides `agent.NoopEvents` with no-op stubs for every method. Embed it and override only what you need:
+Implementing all 14 methods is tedious. The SDK provides `agent.NoopEvents` with no-op stubs for every method. Embed it and override only what you need:
 
 ```go
 type PrintingEvents struct {
-    agent.NoopEvents  // provides no-op stubs for all 13 methods
+    agent.NoopEvents  // provides no-op stubs for all 14 methods
 }
 
 func (e *PrintingEvents) StepStart(stepNum int) {
@@ -105,6 +106,7 @@ This is the **recommended pattern** for custom event sinks. It also future-proof
 | `ExecutorDiagnostic`| Internal nudges, circuit breakers         | `event`, `details`                 |
 | `SubAgentLaunch`   | A delegated sub-agent starts               | `stepID`, `description`            |
 | `SubAgentComplete` | A delegated sub-agent finishes             | `success`, `duration`, `errMsg`    |
+| `SubAgentPaused`   | A delegated sub-agent pauses (resumable)   | `stepID`, `duration`               |
 
 ### 4. Context fill status
 

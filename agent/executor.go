@@ -49,17 +49,22 @@ var jsonToolCallArgKeys = [...]string{"arguments", "args", "parameters", "input"
 //   - a fenced code block whose language tag looks like a sp4rk tool name
 //     (e.g. ```bash_exec, ```read_file);
 //   - a JSON tool-call envelope printed as the whole response — the finish
-//     tool's arguments ({"answer": "..."}), or a name/arguments pair
-//     ({"name": "read_file", "arguments": {...}}, {"tool": "...", "args":
-//     {...}}, an OpenAI-style {"function": {"name": ..., "arguments": ...}}),
-//     optionally wrapped in a single ```json fence.
+//     tool's arguments ({"answer": "..."}), or an EXACT two-key name/arguments
+//     envelope ({"name": "read_file", "arguments": {...}}, {"tool": "...",
+//     "args": {...}}, an OpenAI-style {"function": {"name": ..., "arguments":
+//     ...}}), optionally wrapped in a single ```json fence.
 //
 // Callers use this to avoid treating such output as a legitimate "implicit
 // finish" (which would surface the raw tool-call text as the final answer).
 // The JSON check is deliberately strict — the ENTIRE trimmed content must be a
 // single JSON object in one of those shapes — so a genuine answer that merely
 // embeds a JSON snippet, or a JSON answer whose shape is not tool-call-like, is
-// not misclassified.
+// not misclassified. The residual trade-off is deliberate: a lone two-key
+// {"name":…,"arguments":…} object cannot be told apart from a genuine
+// tool-schema/API-payload answer without the registered tool list, so it is
+// treated as a leak. The shape must therefore consist of exactly those two
+// keys (a name string and an argument container); a multi-field answer that
+// merely contains such keys is not flagged.
 func DetectToolCallSyntaxInContent(content string) bool {
 	if toolCallSyntaxRe.MatchString(content) {
 		return true
@@ -85,9 +90,33 @@ func looksLikeJSONToolCall(content string) bool {
 			return json.Unmarshal(raw, &answer) == nil
 		}
 	}
-	// Generic tool-call envelope: a tool-name key paired with an arguments key.
-	if hasAnyKey(obj, jsonToolCallNameKeys[:]) && hasAnyKey(obj, jsonToolCallArgKeys[:]) {
-		return true
+	// Generic tool-call envelope: exactly a tool-name key paired with an
+	// argument-container key — no other keys, the name a string. Requiring the
+	// EXACT two-key envelope (rather than "any object that happens to contain
+	// both") keeps a legitimate multi-field JSON answer such as
+	// {"name":"report","summary":"…","parameters":…} from being mistaken for
+	// a leaked call. A lone {"name":…,"arguments":…} object is still
+	// indistinguishable from a genuine tool-schema/API-payload answer without
+	// consulting the registered tool list, so it stays classified as a leak —
+	// the deliberate trade-off documented on DetectToolCallSyntaxInContent.
+	if len(obj) == 2 {
+		var nameVal, argVal json.RawMessage
+		for _, k := range jsonToolCallNameKeys {
+			if v, ok := obj[k]; ok {
+				nameVal = v
+			}
+		}
+		for _, k := range jsonToolCallArgKeys {
+			if v, ok := obj[k]; ok {
+				argVal = v
+			}
+		}
+		if nameVal != nil && argVal != nil {
+			var name string
+			if json.Unmarshal(nameVal, &name) == nil {
+				return true
+			}
+		}
 	}
 	// OpenAI-style nesting: {"function": {"name": ..., "arguments": ...}}.
 	if raw, ok := obj["function"]; ok {
@@ -111,20 +140,36 @@ func hasAnyKey(obj map[string]json.RawMessage, keys []string) bool {
 
 // stripSingleCodeFence removes one leading/trailing Markdown code fence
 // (e.g. ```json … ```) and returns the trimmed inner text. Non-fenced input is
-// returned unchanged (still trimmed).
+// returned unchanged (still trimmed). Both the multi-line form and the
+// single-line form (```json {…}```) are unwrapped, so a one-line fenced JSON
+// tool-call leak is not missed.
 func stripSingleCodeFence(s string) string {
 	if !strings.HasPrefix(s, "```") {
 		return s
 	}
-	nl := strings.IndexByte(s, '\n')
-	if nl < 0 {
-		return s
+	body := strings.TrimPrefix(s, "```")
+	if nl := strings.IndexByte(body, '\n'); nl >= 0 {
+		body = body[nl+1:]
+	} else {
+		// Single-line fence: drop the optional language tag (a leading run of
+		// tag characters) so the body is whatever follows it.
+		i := 0
+		for i < len(body) && isFenceTagByte(body[i]) {
+			i++
+		}
+		body = body[i:]
 	}
-	body := s[nl+1:]
 	if idx := strings.LastIndex(body, "```"); idx >= 0 {
 		body = body[:idx]
 	}
 	return strings.TrimSpace(body)
+}
+
+// isFenceTagByte reports whether b may appear in a Markdown fence language tag
+// (e.g. "json", "go", "c++"), so a single-line fence's tag can be skipped.
+func isFenceTagByte(b byte) bool {
+	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' ||
+		b == '_' || b == '-' || b == '+' || b == '#' || b == '.'
 }
 
 // defaultNonCacheableTools is the set of sp4rk-provided tool names whose results
@@ -685,10 +730,13 @@ func (e *Executor) SetFinishGuard(fn func(ctx context.Context) error) { e.finish
 // SetStopTools marks ordinary tool names that terminate the ReAct loop when
 // they execute successfully (see the stopTools field). A successful call to any
 // listed tool ends the run with Finished=true, using the call's observation as
-// the run output — the same terminal semantics as an explicit finish, but driven
-// by a host-registered tool rather than the inline finish tool. A failed call to
-// a stop tool does not terminate the run. Passing no names (or only empty
-// strings) clears the set and restores the default behavior.
+// the run output — a terminal boundary driven by a host-registered tool rather
+// than the inline finish tool. The installed finish guard (SetFinishGuard) is
+// consulted exactly as it is for finish; the mutation and checklist gates are
+// NOT applied on this path, because a stop tool is a host-declared turn
+// terminator rather than a model-authored finish. A failed call to a stop tool
+// does not terminate the run. Passing no names (or only empty strings) clears
+// the set and restores the default behavior.
 func (e *Executor) SetStopTools(names ...string) {
 	m := make(map[string]struct{}, len(names))
 	for _, n := range names {

@@ -38,6 +38,15 @@ func RunSubAgent(ctx context.Context, stepID string, executor *Executor, cm Cont
 		defer close(ch)
 		startTime := time.Now()
 
+		// Log through the executor's configured logger rather than the
+		// process-global slog, matching the SDK-wide logger convention. The
+		// executor is non-nil on every real path; the discard fallback keeps the
+		// panic handler from itself panicking on a hypothetical nil executor.
+		logger := slog.New(slog.DiscardHandler)
+		if executor != nil {
+			logger = executor.log()
+		}
+
 		// A panic anywhere in sub-agent execution must not tear down the host
 		// process. Execution runs on this goroutine, so the host cannot wrap it
 		// with its own recover — guard here, log the stack, emit a failed
@@ -45,7 +54,7 @@ func RunSubAgent(ctx context.Context, stepID string, executor *Executor, cm Cont
 		// isolation and execution continues.
 		defer func() {
 			if r := recover(); r != nil {
-				slog.Error("subagent execution panicked",
+				logger.Error("subagent execution panicked",
 					"step_id", stepID,
 					"panic", r,
 					"stack", string(debug.Stack()),
@@ -132,14 +141,15 @@ func RunSubAgent(ctx context.Context, stepID string, executor *Executor, cm Cont
 		// Treat incomplete execution (no proper finish) as a step failure,
 		// reusing the reason computed above as the error message.
 		if !result.Finished {
-			ch <- SubAgentResult{StepID: stepID, Output: result.Output, Steps: result.Steps, Error: errors.New(errMsg)}
+			ch <- SubAgentResult{StepID: stepID, Output: result.Output, Steps: result.Steps, Summary: result.Summary, Error: errors.New(errMsg)}
 			return
 		}
 
 		ch <- SubAgentResult{
-			StepID: stepID,
-			Output: result.Output,
-			Steps:  result.Steps,
+			StepID:  stepID,
+			Output:  result.Output,
+			Steps:   result.Steps,
+			Summary: result.Summary,
 		}
 	}()
 
@@ -157,11 +167,12 @@ type runSubAgentsParallelConfig struct {
 }
 
 // WithMaxParallelSubagents caps the number of subagents that execute
-// concurrently. When n <= 0 the fan-out is unbounded (the historical
-// behavior). A positive n bounds peak concurrency — and therefore the peak
-// rate of subagent lifecycle events — without changing the result set or its
-// input order: subagents beyond the cap are queued and started as running
-// slots free up.
+// concurrently within a single RunSubAgentsParallel invocation. When n <= 0 the
+// fan-out is unbounded (the historical behavior). A positive n bounds peak
+// concurrency — and therefore the peak rate of subagent lifecycle events —
+// without changing the result set or its input order: subagents beyond the cap
+// are queued and started as running slots free up. The cap is per-invocation
+// (see the RunSubAgentsParallel note); it is not a process-wide limit.
 func WithMaxParallelSubagents(n int) RunSubAgentsParallelOption {
 	return func(c *runSubAgentsParallelConfig) { c.maxConcurrency = n }
 }
@@ -171,9 +182,11 @@ func WithMaxParallelSubagents(n int) RunSubAgentsParallelOption {
 // all subsequent results from being returned.
 //
 // By default every subagent is launched at once (unbounded fan-out). Pass
-// WithMaxParallelSubagents to cap how many run concurrently; the cap is a
-// single chokepoint shared by every caller (e.g. a host's delegate tool and
-// plan-wave dispatcher), so the limit holds across all of them.
+// WithMaxParallelSubagents to cap how many run concurrently within THIS
+// invocation. The cap is per-call, not process-wide: a host that fires several
+// RunSubAgentsParallel calls (e.g. a delegate tool and a plan-wave dispatcher
+// in the same turn) or nests a delegation must enforce any global limit itself,
+// because each call resolves its own semaphore from its own option.
 func RunSubAgentsParallel(ctx context.Context, agents []SubAgentTask, opts ...RunSubAgentsParallelOption) (results []SubAgentResult) {
 	if len(agents) == 0 {
 		return nil

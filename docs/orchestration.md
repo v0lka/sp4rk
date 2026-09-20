@@ -97,6 +97,7 @@ type ConductorConfig struct {
     VerifyOnEdit agent.EditVerifyRunner
     VerifyOnEditMaxOutputChars int
     NonCacheableTools []string
+    StopTools []string
     ConversationHistory []llm.Message
     ResumeSteps []agent.Step
     ContentBlocks []llm.ContentBlock
@@ -128,6 +129,7 @@ type ConductorConfig struct {
 | `VerifyOnEdit` | Trusted, user-configured `agent.EditVerifyRunner`. Runs once after each LLM response group containing a successful `write_file`/`edit_file`; nil disables verification. |
 | `VerifyOnEditMaxOutputChars` | Rune-safe cap for the injected `[verify_on_edit]` output. `<= 0` selects `agent.DefaultVerifyOnEditCap` (4000). |
 | `NonCacheableTools` | Additional tool names whose results must not be cached (e.g. meta-tools whose output is inherently volatile). Extends the SDK-provided defaults. |
+| `StopTools` | Ordinary tool names that **terminate the run** when they execute successfully (see `agent.Executor.SetStopTools`): the run ends with `Finished=true`, the call's observation as `Output`, and the model's final text in `ExecutionResult.Summary`. The finish guard still applies; the mutation/checklist gates do not. |
 | `ConversationHistory` | Prior user/assistant exchanges from the session. When non-empty, the Conductor injects it into the `ContextManager` so the LLM sees the dialogue leading up to the current message. Without this, a follow-up like "implement variant a" has no referent. |
 | `ResumeSteps` | Prior ReAct steps to resume from a checkpoint instead of starting fresh. When non-empty, `Run` seeds the `ContextManager` (via its `StepSeedable` capability) and the `Executor` (via `agent.WithResumeSteps`) with a defensive copy, so the step counter continues from `len(steps)+1` and the full trajectory syncs to the `TrajectoryStore`. The steps count against `MaxSteps`, not in addition to it. Requires a `StepSeedable` `ContextManager`; `Run` fails fast otherwise. Nil/empty (the default) is fully backward-compatible. |
 | `ContentBlocks` | Optional text/image blocks for a multimodal task. When non-empty, requires the optional `BlockTaskAware` path; providers render blocks ahead of plain content. |
@@ -663,6 +665,7 @@ type ExecutionResult struct {
     Reflections  []Reflection    `json:"reflections,omitempty"`
     Status       ExecutionStatus `json:"status,omitempty"`
     FailedSteps  int             `json:"failed_steps,omitempty"`
+    Summary      string          `json:"summary,omitempty"`
 }
 ```
 
@@ -675,6 +678,7 @@ type ExecutionResult struct {
 | `Reflections` | Reflections recorded during execution. |
 | `Status` | Terminal status — see [ExecutionStatus](#executionstatus). |
 | `FailedSteps` | Steps that finished with an error in the final attempt. |
+| `Summary` | The model's own final text when the run terminated on a host-designated stop tool rather than the inline `finish` tool (`Output` is then just the tool's confirmation). Empty otherwise. |
 
 ### ErrExecutionIncomplete
 

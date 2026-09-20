@@ -96,6 +96,7 @@ type ExecutionResult struct {
     Reflections  []Reflection
     Status       ExecutionStatus
     FailedSteps  int
+    Summary      string
 }
 ```
 

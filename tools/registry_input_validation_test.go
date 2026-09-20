@@ -221,3 +221,51 @@ func TestRegistryExecute_NotFound_NoValidation(t *testing.T) {
 		t.Errorf("unexpected result for unknown tool: %+v", res)
 	}
 }
+
+// TestRegistryExecute_MCPTool_AbsentAdditionalPropertiesIsOpen verifies the
+// MCP-proxied-tool exemption: a server schema that omits additionalProperties
+// is treated as the JSON Schema default (open), so an extra argument the
+// server would accept is not hard-rejected by pre-dispatch validation.
+func TestRegistryExecute_MCPTool_AbsentAdditionalPropertiesIsOpen(t *testing.T) {
+	reg := NewToolRegistry()
+	flags := &registryDispatchFlags{}
+	tool := newRegistryValidationTool("mcp_fetch", PolicyAlwaysAllow)
+	flags.instrumentTool(tool)
+	if err := reg.RegisterWithSourceCategory(tool, "server-a", SourceCategoryMCP); err != nil {
+		t.Fatalf("register MCP tool: %v", err)
+	}
+
+	res, err := reg.Execute(context.Background(), "mcp_fetch", json.RawMessage(`{"path":"/ws/file.txt","server_extra":true}`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("MCP tool with no additionalProperties must accept unknown keys, got %+v", res)
+	}
+	if !flags.execCalled {
+		t.Error("MCP call with an extra key must reach tool.Execute")
+	}
+}
+
+// TestRegistryExecute_BuiltinTool_AbsentAdditionalPropertiesIsClosed verifies
+// the built-in default is unchanged: a core tool whose schema omits
+// additionalProperties rejects unknown keys, so mis-typed built-in parameters
+// are still caught before dispatch.
+func TestRegistryExecute_BuiltinTool_AbsentAdditionalPropertiesIsClosed(t *testing.T) {
+	reg := NewToolRegistry()
+	flags := &registryDispatchFlags{}
+	tool := newRegistryValidationTool("core_reader", PolicyAlwaysAllow)
+	flags.instrumentTool(tool)
+	reg.Register(tool) // SourceCategoryCore
+
+	res, err := reg.Execute(context.Background(), "core_reader", json.RawMessage(`{"path":"/ws/file.txt","bogus":1}`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res.IsError || !strings.Contains(res.Content, `unknown parameter "bogus"`) {
+		t.Fatalf("built-in tool must reject unknown keys, got %+v", res)
+	}
+	if flags.execCalled {
+		t.Error("tool.Execute must not be called for a rejected unknown key")
+	}
+}

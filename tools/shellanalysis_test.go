@@ -134,6 +134,14 @@ func shellDangerousCorpus() []shellCorpusCase {
 		// not pass in silence.
 		{name: "rm -rf unresolved variable", tool: "bash_exec", cmd: "rm -rf $DIR",
 			wantFired: ReasonCodeCommandUnboundedAnalysis, wantSev: JudgeSeverityHard, wantCanon: false},
+		// A network egress must not mask an unresolved irreversible write: the
+		// ⊤ FSWrite still fires C6 even though the command also carries a
+		// concrete egress target. (The pre-fix `&&`-over-`||` precedence let
+		// this shape pass silently under an allow policy.)
+		{name: "unresolved delete plus clone", tool: "bash_exec", cmd: "rm -rf $DIR; git clone https://github.com/org/repo",
+			wantFired: ReasonCodeCommandUnboundedAnalysis, wantSev: JudgeSeverityHard, wantCanon: false},
+		{name: "abbreviated remove-item plus iwr", tool: "posh_exec", cmd: `Remove-Item -r -f $x; iwr https://example.com`,
+			wantFired: ReasonCodeCommandUnboundedAnalysis, wantSev: JudgeSeverityHard, wantCanon: false},
 	}
 }
 

@@ -81,11 +81,29 @@ func (e *InputValidationError) Error() string {
 // nil/empty, which is treated as an empty object (so any required parameter
 // fails, while schemas without required parameters pass).
 //
+// A schema level that omits (or nulls) additionalProperties is treated as a
+// CLOSED set — hand-written built-in schemas declare every parameter, so an
+// unknown key is a model mistake worth rejecting with an actionable message.
+// ValidateToolInput is therefore the strict built-in variant; the registry
+// calls validateToolInput directly with the open default for MCP-proxied
+// tools, whose server-supplied schemas frequently omit the keyword.
+//
 // The schema argument comes FIRST and the raw input arguments SECOND — both
 // are json.RawMessage, so a silent swap parses the input as the schema and
 // disables validation (no top-level properties → early nil). Host Execute
 // wrappers call it before dispatch.
 func ValidateToolInput(tool string, schema, input json.RawMessage) error {
+	return validateToolInput(tool, schema, input, true)
+}
+
+// validateToolInput is the implementation behind ValidateToolInput.
+// closedByDefault controls how an object level that omits (or nulls)
+// additionalProperties is treated: true means a closed set (unknown keys are
+// rejected), false means the JSON Schema spec default of an open set. The
+// registry passes false for MCP-proxied tools, because an external server
+// schema frequently omits additionalProperties while still accepting extra
+// arguments that json.Unmarshal would silently ignore.
+func validateToolInput(tool string, schema, input json.RawMessage, closedByDefault bool) error {
 	var node schemaNode
 	if err := json.Unmarshal(schema, &node); err != nil {
 		return nil //nolint:nilerr // unparseable schema: fail-open by design
@@ -103,7 +121,7 @@ func ValidateToolInput(tool string, schema, input json.RawMessage) error {
 	} else if err := json.Unmarshal(input, &obj); err != nil {
 		return &InputValidationError{Tool: tool, Reason: "input must be a JSON object", ValidParams: propertyNames(node.Properties)}
 	}
-	return validateSchemaObject(tool, "", node, obj, 0)
+	return validateSchemaObject(tool, "", node, obj, 0, closedByDefault)
 }
 
 // schemaNode is the subset of JSON Schema the validator models for one
@@ -122,7 +140,7 @@ type schemaNode struct {
 // property set, then each declared property's value (type check plus
 // recursion) via validateSchemaValue. depth is the nesting depth of the
 // object being validated (the input root is 0).
-func validateSchemaObject(tool, path string, node schemaNode, obj map[string]json.RawMessage, depth int) error {
+func validateSchemaObject(tool, path string, node schemaNode, obj map[string]json.RawMessage, depth int, closedByDefault bool) error {
 	names := propertyNames(node.Properties)
 	nameSet := make(map[string]struct{}, len(node.Properties))
 	for k := range node.Properties {
@@ -142,7 +160,7 @@ func validateSchemaObject(tool, path string, node schemaNode, obj map[string]jso
 	}
 
 	// Unknown keys are rejected when the schema level is a closed set.
-	additionalAllowed := additionalPropertiesAllowed(node.AdditionalProperties)
+	additionalAllowed := additionalPropertiesAllowed(node.AdditionalProperties, closedByDefault)
 	argNames := make([]string, 0, len(obj))
 	for k := range obj {
 		argNames = append(argNames, k)
@@ -165,7 +183,7 @@ func validateSchemaObject(tool, path string, node schemaNode, obj map[string]jso
 		if !ok {
 			continue
 		}
-		if err := validateSchemaValue(tool, k, joinPath(path, k), prop, obj[k], names, depth+1); err != nil {
+		if err := validateSchemaValue(tool, k, joinPath(path, k), prop, obj[k], names, depth+1, closedByDefault); err != nil {
 			return err
 		}
 	}
@@ -179,7 +197,7 @@ func validateSchemaObject(tool, path string, node schemaNode, obj map[string]jso
 // path is its full path; validParams lists the enclosing schema level's
 // declared property names for error messages. depth is the value's nesting
 // depth below the input root (top-level properties are 1).
-func validateSchemaValue(tool, name, path string, schemaRaw, value json.RawMessage, validParams []string, depth int) error {
+func validateSchemaValue(tool, name, path string, schemaRaw, value json.RawMessage, validParams []string, depth int, closedByDefault bool) error {
 	if depth > maxValidationDepth {
 		return nil // deeper than the cap: subtree skipped fail-open
 	}
@@ -225,7 +243,7 @@ func validateSchemaValue(tool, name, path string, schemaRaw, value json.RawMessa
 		if err := json.Unmarshal(value, &obj); err != nil {
 			return nil //nolint:nilerr // not a parseable object: skip fail-open
 		}
-		return validateSchemaObject(tool, path, node, obj, depth)
+		return validateSchemaObject(tool, path, node, obj, depth, closedByDefault)
 	}
 	if kind == "array" && len(node.Items) > 0 {
 		var arr []json.RawMessage
@@ -234,7 +252,7 @@ func validateSchemaValue(tool, name, path string, schemaRaw, value json.RawMessa
 		}
 		for i, elem := range arr {
 			elemPath := fmt.Sprintf("%s[%d]", path, i)
-			if err := validateSchemaValue(tool, elemPath, elemPath, node.Items, elem, nil, depth+1); err != nil {
+			if err := validateSchemaValue(tool, elemPath, elemPath, node.Items, elem, nil, depth+1, closedByDefault); err != nil {
 				return err
 			}
 		}
@@ -252,15 +270,19 @@ func joinPath(path, key string) string {
 }
 
 // additionalPropertiesAllowed reports whether a schema level accepts keys
-// beyond its declared properties: absent or an explicit JSON null (a null
-// keyword is ignored, i.e. equivalent to absent — decoding null into a bool
-// would be a silent no-op, so it is checked explicitly) means a closed set
-// (tool schemas declare every parameter), a boolean is taken at face value,
-// and the object form (a schema for the extra keys) allows them.
-func additionalPropertiesAllowed(raw json.RawMessage) bool {
+// beyond its declared properties: an explicit boolean is taken at face value,
+// and the object form (a schema for the extra keys) allows them. An absent —
+// or explicit JSON null (a null keyword is ignored, i.e. equivalent to
+// absent — decoding null into a bool would be a silent no-op, so it is
+// checked explicitly) — keyword falls back to the level's default,
+// closedByDefault. Built-in schemas use closedByDefault=true (they declare
+// every parameter, so an unknown key is a mistake); MCP-proxied server
+// schemas use false, the JSON Schema spec default, because they frequently
+// omit the keyword while still accepting extra arguments.
+func additionalPropertiesAllowed(raw json.RawMessage, closedByDefault bool) bool {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
-		return false
+		return !closedByDefault
 	}
 	var asBool bool
 	if err := json.Unmarshal(raw, &asBool); err == nil {

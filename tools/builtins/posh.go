@@ -99,9 +99,13 @@ type poshInput struct {
 // over the flowsh effect IR, which understands PowerShell syntax more
 // precisely than token walking.
 //
-// When no analysis is attached, or the attached one carries an error (e.g. a
-// knowledge-base load failure — logged), the Judge returns an empty outcome
-// and defers to the advisory judges (see [tools.ShellJudgeOutcome]).
+// When NOTHING is attached the Judge returns an empty outcome and defers to
+// the advisory judges — the deterministic floor (C1–C8) is then absent for
+// this call, so a host that wants the shell escalations must attach the
+// analysis itself via [tools.WithShellAnalysis]. When the attached analysis
+// carries an ERROR (e.g. a knowledge-base load failure — logged), the Judge
+// instead FAILS CLOSED with the hard canonical command_analysis_unavailable
+// reason (see [tools.ShellJudgeOutcome]).
 func (t *PoshExecTool) Judge(ctx context.Context, input json.RawMessage) tools.JudgeOutcome {
 	var params poshInput
 	if err := json.Unmarshal(input, &params); err != nil {

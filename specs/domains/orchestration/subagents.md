@@ -116,7 +116,7 @@ Profile application is an execution-layer concern: `RunSubAgent`/`RunSubAgentsPa
 - Each `SubAgentTask` has its own `Executor` and `ContextManager` — sharing a single `Executor` across concurrent tasks violates the executor's single-execution invariant.
 - The result channel is always closed; exactly one `SubAgentResult` is sent.
 - A subagent never shares its `ContextManager` with its launcher or with other subagents.
-- `SubAgentLaunch` always fires before the executor runs; `SubAgentComplete` always fires after, even on failure or cancellation, and carries the failure reason in its `errMsg` argument (`""` on success).
+- `SubAgentLaunch` always fires before the executor runs. `SubAgentComplete` fires after on completion, failure, or cancellation, carrying the failure reason in its `errMsg` argument (`""` on success) — **except** on the cooperative-pause path, where `SubAgentPaused` fires instead (a pause is a recoverable checkpoint, not a termination).
 - `success` requires `result.Finished && !DetectToolCallSyntaxInContent(result.Output)`.
 
 ## Related Specs

@@ -188,6 +188,17 @@ registry.SetPolicyOverride("bash_exec", tools.PolicyAlwaysAllow) // deliberate o
 
 Hosts that implement their own enforcement layer (e.g. a wrapping registry that shadows `Execute` and calls `tool.Execute` directly after its own checks) are unaffected — the SDK-level enforcement only applies to calls routed through `ToolRegistry.Execute`.
 
+### Input validation in Execute (fail-open, default-on)
+
+Before any policy or override is consulted, `Execute` validates the raw input against the tool's JSON Schema (`ValidateToolInput`): structurally invalid input — a missing required parameter, a wrong JSON type, or an unknown parameter — is rejected with an actionable `ToolResult` (`IsError=true`, no Go error) naming the offending parameter and the valid ones, so the model can fix the arguments and retry without reaching the confirmation flow or the tool itself.
+
+Two properties matter when enabling it:
+
+- **Default-on and cross-cutting.** It runs for *every* tool call routed through `Execute`, including MCP-proxied tools and meta-tool envelopes. Disable it per registry with `registry.SetInputValidationEnabled(false)` to restore the pre-validation behavior.
+- **Fail-open.** Anything the validator does not model passes through: schemas with no `properties`, unparseable schemas, `$ref` subtrees, values nested beyond the depth cap, and — for a schema level that omits `additionalProperties` — the treated default. Built-in schemas use a **closed** default (unknown keys rejected; they declare every parameter), while MCP-proxied tools use the JSON Schema spec default of an **open** set (an external server schema frequently omits `additionalProperties` while still accepting extra arguments). An explicit `additionalProperties: false` closes the set either way.
+
+See [specs/domains/tool-system/README.md](../specs/domains/tool-system/README.md) for the validator's full rule set.
+
 ### MCP shadowing protection
 
 A tool whose source category is MCP may **not** overwrite an already-registered non-MCP tool of the same name. `RegisterWithSourceCategory` returns an error in that case; the legacy `RegisterWithSource` path logs a warning and skips the registration. A built-in tool can always replace an MCP tool (clearing the stale MCP source), and an MCP server re-registering its own tools (reconnect) is allowed.

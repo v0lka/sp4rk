@@ -135,10 +135,11 @@ These are the same helpers used in standalone executor runs (see [Agent Executor
 
 ## Event emission
 
-Subagents emit two events through the provided `Events` sink:
+Subagents emit sub-agent lifecycle events through the provided `Events` sink:
 
 - **`SubAgentLaunch(stepID, description)`** — fired when the goroutine starts, before the executor runs.
 - **`SubAgentComplete(stepID, success, duration, errMsg)`** — fired when the goroutine finishes, with the success flag, wall-clock duration, and the failure reason (`""` on success).
+- **`SubAgentPaused(stepID, duration)`** — fired instead of `SubAgentComplete` when the subagent stopped at a cooperative pause checkpoint (`executor.ErrPaused`). A pause is a recoverable checkpoint, not a failure: the trajectory is preserved in the `SubAgentResult` for a later resume. So `SubAgentComplete` does **not** always fire — do not pair launch/complete counters without accounting for paused runs. The `SubAgentResult` also carries `Summary` (the model's final text when the run ended on a host-designated stop tool).
 
 If `emitter` is `nil`, `RunSubAgent` substitutes `NoopEvents`, so the events are silently dropped. See [Events](events.md#sub-agent-events) for the full method signatures.
 
@@ -161,15 +162,19 @@ if agent.DetectToolCallSyntaxInContent(output) {
 }
 ```
 
+> **Caveat:** the JSON half of the detector is a heuristic on the *shape* of the output, so a genuine answer deliberately shaped like a leaked call — a lone `{"answer": "<text>"}` object, or an exact two-key `{"name": …, "arguments": {…}}` / `{"tool": …, "args": {…}}` envelope — is treated as a leak. A task that instructs the model to emit exactly such an object as its final answer can therefore have its run reported as a failure. Multi-field answers that merely *contain* a `name`/`arguments` pair are not affected.
+
 ## Parallel plan execution
 
 `RunSubAgentsParallel` runs multiple `SubAgentTask`s concurrently and collects all results. It is the convenience entry point for executing independent DAG steps in parallel.
 
 ```go
-func RunSubAgentsParallel(ctx context.Context, agents []SubAgentTask) []SubAgentResult
+func RunSubAgentsParallel(ctx context.Context, agents []SubAgentTask, opts ...RunSubAgentsParallelOption) []SubAgentResult
 ```
 
 Results are collected in input order (not completion order); a slow agent blocks all subsequent results from being returned. The function blocks until all subagents have reported. If `agents` is empty, it returns `nil`.
+
+By default every subagent is launched at once (unbounded fan-out). Pass `agent.WithMaxParallelSubagents(n)` to bound how many run concurrently *within the call* — subagents beyond the cap are queued and started as slots free up, with the result set and its input order unchanged. The cap is **per-invocation**, not process-wide: two concurrent `RunSubAgentsParallel` calls (or a nested delegation) each apply their own limit, so a host that needs a global cap must enforce it itself.
 
 ```go
 tasks := []agent.SubAgentTask{
@@ -192,7 +197,7 @@ for _, r := range results {
 
 ### Manual parallel execution
 
-For finer control (e.g. streaming results as they arrive, or limiting concurrency), launch subagents individually and select on their channels:
+For finer control (e.g. streaming results as they arrive), launch subagents individually and select on their channels:
 
 ```go
 channels := make([]<-chan agent.SubAgentResult, len(tasks))

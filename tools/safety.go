@@ -88,9 +88,15 @@ const (
 	// ReasonCodeCommandBlacklist marks a shell command that matched a
 	// configured blacklist pattern — a fired security control.
 	ReasonCodeCommandBlacklist JudgeReasonCode = "command_blacklist"
-	// ReasonCodeUnresolvablePathToken marks a command containing path-like
-	// tokens the resolver cannot assess ("~user", "${VAR:-/etc/passwd}").
-	// Hard but scope-shaped: a strict judge may positively clear it.
+	// ReasonCodeUnresolvablePathToken is retained for contract stability but is
+	// no longer fired: it classified a command containing path-like tokens the
+	// resolver cannot assess ("~user", "${VAR:-/etc/passwd}") as hard but
+	// scope-shaped. The static shell-path checks were removed — dynamic
+	// constructs are the deterministic flowsh analysis's domain — and an
+	// unresolvable construct now surfaces through C6
+	// (command_unbounded_analysis). Published codes are never renamed or
+	// reused; a host that still maps it treats it as an unassessable-shaped
+	// hard-but-non-canonical reason (clearable by a strict judge).
 	ReasonCodeUnresolvablePathToken JudgeReasonCode = "unresolvable_path_token"
 	// ReasonCodeOutsideSessionRoots marks a fully assessed path (or shell
 	// path reference) that resolved outside the session roots — an advisory
@@ -159,7 +165,10 @@ const (
 	// canonical.
 	ReasonCodeCommandDownloadCradle JudgeReasonCode = "command_download_cradle"
 	// ReasonCodeCommandUnboundedAnalysis marks a shell command the analyser
-	// could not bound (⊤/conservative) with no network egress (criterion C6).
+	// could not bound (⊤/conservative) — criterion C6. It fires when the
+	// unbounded command has no network egress, or an egress it could not pin to
+	// a destination (the degraded C5), or when an irreversible write's target
+	// could not be resolved (⊤ target, e.g. abbreviated PowerShell parameters).
 	// Hard but NON-canonical: it is an analysis limitation, not a confirmed
 	// control — an advisory judge may clear it on closer reading.
 	ReasonCodeCommandUnboundedAnalysis JudgeReasonCode = "command_unbounded_analysis"

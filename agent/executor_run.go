@@ -1088,7 +1088,9 @@ func (e *Executor) processSingleToolCall(
 // pending-async-delegation join gate (that gate exists precisely to stop
 // background work from being silently abandoned — a goal turn that ends on a
 // verdict while subagents are still running would otherwise re-open exactly that
-// failure mode).
+// failure mode). The mutation and checklist gates, by contrast, are NOT applied
+// here: a stop tool is a host-declared turn terminator, not a model-authored
+// finish (see SetStopTools).
 //
 // A FAILED stop-tool call (isError) never terminates the run; the caller returns
 // the error observation to the model as usual.

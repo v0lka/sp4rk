@@ -24,6 +24,7 @@ type Events interface {
     StepComplete(stepNum int, duration time.Duration)
     SubAgentLaunch(stepID, description string)
     SubAgentComplete(stepID string, success bool, duration time.Duration, errMsg string)
+    SubAgentPaused(stepID string, duration time.Duration)
     AssistantChunk(content string)
     AssistantDone(content string, inputTokens, outputTokens int)
     ContextFill(fillPercent float64, usedTokens, maxTokens int, status string, stepID string)
@@ -61,6 +62,7 @@ type Events interface {
 |--------|-------------|
 | `SubAgentLaunch(stepID, description)` | Fired when a sub-agent starts running a plan step in a goroutine. `description` is the task description. |
 | `SubAgentComplete(stepID, success, duration, errMsg)` | Fired when a sub-agent finishes. `success` is `true` only if the executor finished without error; `errMsg` carries the failure reason (`""` on success). See [Subagents](subagents.md). |
+| `SubAgentPaused(stepID, duration)` | Fired **instead of** `SubAgentComplete` when the sub-agent stopped at a cooperative pause checkpoint (`ErrPaused`). A pause is a recoverable checkpoint, not a failure; the trajectory is preserved in the `SubAgentResult` for a later resume. |
 
 #### Streaming
 
@@ -288,6 +290,10 @@ func (e *PrintingEvents) SubAgentComplete(stepID string, success bool, duration 
         return
     }
     fmt.Printf("│ 📥 SubAgent %s %s (%v)\n", stepID, status, duration)
+}
+
+func (e *PrintingEvents) SubAgentPaused(stepID string, duration time.Duration) {
+    fmt.Printf("│ ⏸  SubAgent %s paused (%v) — resumable\n", stepID, duration)
 }
 
 // truncate shortens a string to maxLen characters, appending "…" if truncated.

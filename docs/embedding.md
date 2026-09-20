@@ -57,11 +57,13 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error)
 The initialization sequence is:
 
 1. `initONNXRuntime(libraryPath)` — sets the shared library path and initializes the global ONNX Runtime environment.
-2. `buildSessionOptions(cfg.IntraOpThreads)` — builds `*ort.SessionOptions` that limit intra-op threads when `IntraOpThreads` is positive; returns `nil` for 0/negative to preserve legacy behavior (session created with nil options). Must run after `initONNXRuntime`.
+2. `buildSessionOptions(provider, deviceID, intraOpThreads)` — builds `*ort.SessionOptions` that select the execution provider (CPU, or CUDA with `deviceID`) and limit intra-op threads when `intraOpThreads` is positive; returns `nil` for the legacy CPU default (session created with nil options). Must run after `initONNXRuntime`.
 3. `NewTokenizer(tokenizerPath)` — loads the HuggingFace tokenizer.
-4. `newONNXSession(modelPath, maxSeqLen, hiddenDim, sessOpts)` — creates a persistent ONNX session with pre-allocated tensors for the fast path.
+4. `newONNXSession(modelPath, batchSize, seqLen, hiddenDim, sessOpts, telemetry)` — creates a persistent ONNX session with pre-allocated tensors for the fast path.
 
-The resulting `sessOpts` is reused for both the persistent single-text session and temporary batch sessions. On any failure, the session options and ONNX Runtime environment are cleaned up before returning the error. `sessOpts` is released by `Close()`.
+The resulting `sessOpts` is reused for the persistent single-text session, the batch session, and the per-bucket sessions. `EmbedderConfig.ExecutionProvider` / `DeviceID` select the provider: `"auto"` prefers CUDA and, when the CUDA *options* — or the *session* itself — cannot be built on the GPU, logs a WARN and continues on the CPU (the eager session, and, in length-bucket mode, the first lazily created bucket session). `Embedder.ExecutionProvider()` reports which provider inference actually runs on.
+
+On any failure the session options are cleaned up before returning the error, but the ONNX Runtime **environment is deliberately NOT destroyed**: `initONNXRuntime` is `sync.Once`-guarded per process, so a destroyed environment could never be reinitialized — not for an `"auto"` CPU-fallback retry, and not for a later `NewEmbedder`. Only `Embedder.Close` performs the full teardown. `sessOpts` is released by `Close()`.
 
 ### Process-global singleton limitation
 

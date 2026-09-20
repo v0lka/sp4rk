@@ -265,9 +265,14 @@ func (r *ToolRegistry) Execute(ctx context.Context, name string, input json.RawM
 	// flow or the tool itself.
 	r.mu.RLock()
 	validationEnabled := r.inputValidationEnabled
+	// An MCP-proxied tool's schema comes verbatim from an external server and
+	// frequently omits additionalProperties; treat that as the spec default
+	// (open) so arguments the server would accept are not rejected here.
+	// Built-in schemas stay a closed set (they declare every parameter).
+	closedByDefault := r.categoryForLocked(name) != SourceCategoryMCP
 	r.mu.RUnlock()
 	if validationEnabled {
-		if err := ValidateToolInput(tool.Name(), tool.InputSchema(), input); err != nil {
+		if err := validateToolInput(tool.Name(), tool.InputSchema(), input, closedByDefault); err != nil {
 			return ErrorResult("%v", err), nil
 		}
 	}

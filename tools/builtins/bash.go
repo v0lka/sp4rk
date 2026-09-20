@@ -88,9 +88,13 @@ type bashInput struct {
 // out-of-root scope by C4/C8, both of which the flowsh effect IR assesses
 // more precisely than token walking.
 //
-// When no analysis is attached, or the attached one carries an error (e.g. a
-// knowledge-base load failure — logged), the Judge returns an empty outcome
-// and defers to the advisory judges (see [tools.ShellJudgeOutcome]).
+// When NOTHING is attached the Judge returns an empty outcome and defers to
+// the advisory judges — the deterministic floor (C1–C8) is then absent for
+// this call, so a host that wants the shell escalations must attach the
+// analysis itself via [tools.WithShellAnalysis]. When the attached analysis
+// carries an ERROR (e.g. a knowledge-base load failure — logged), the Judge
+// instead FAILS CLOSED with the hard canonical command_analysis_unavailable
+// reason (see [tools.ShellJudgeOutcome]).
 func (t *BashExecTool) Judge(ctx context.Context, input json.RawMessage) tools.JudgeOutcome {
 	var params bashInput
 	if err := json.Unmarshal(input, &params); err != nil {

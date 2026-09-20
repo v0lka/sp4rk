@@ -215,15 +215,19 @@ The result of `Executor.Run`.
 
 ```go
 type ExecutorResult struct {
-    Output   string
-    Steps    []Step
-    Finished bool
+    Output      string
+    Steps       []Step
+    Finished    bool
+    AbortReason string
+    Summary     string
 }
 ```
 
-- `Output` — the final answer (from the `finish` tool) or, when not finished, the abort reason (e.g. circuit breaker, fruitless abort, max steps).
+- `Output` — the final answer (from the `finish` tool, or a stop tool's observation), or a short abort message when the run did not finish.
 - `Steps` — the full sequence of executed steps.
-- `Finished` — `true` if the agent called `finish`; `false` if the budget was exhausted or a circuit breaker aborted.
+- `Finished` — `true` if the agent terminated on `finish` or a host-designated stop tool; `false` if the budget was exhausted or a circuit breaker aborted.
+- `AbortReason` — a short, structured cause when `Finished` is `false` but `Output` holds a meaningful answer rather than an abort message (e.g. the mutation gate rejecting a finish). Empty when `Output` already carries the abort reason, or when the run finished.
+- `Summary` — the model's own final text when the run terminated on a host-designated stop tool (see `SetStopTools`) rather than the inline `finish` tool; `Output` alone is then just the tool's short confirmation. Always empty for runs that do not end on a stop tool.
 
 ## FillCheck
 

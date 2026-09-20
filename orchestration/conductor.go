@@ -351,8 +351,8 @@ func (c *Conductor) Run(
 		executor.AddNonCacheableTools(c.cfg.NonCacheableTools...)
 	}
 	// Stop-tool terminator: a successful call to any listed tool ends the run
-	// (see ConductorConfig.StopTools). Installed unconditionally so a host can
-	// model a turn boundary at the executor level.
+	// (see ConductorConfig.StopTools). Installed when StopTools is non-empty so
+	// a host can model a turn boundary at the executor level.
 	if len(c.cfg.StopTools) > 0 {
 		executor.SetStopTools(c.cfg.StopTools...)
 	}

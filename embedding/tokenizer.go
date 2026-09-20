@@ -1,6 +1,7 @@
 package embedding
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"unicode"
@@ -8,6 +9,13 @@ import (
 	"github.com/sugarme/tokenizer"
 	"github.com/sugarme/tokenizer/pretrained"
 )
+
+// errTokenizerPanic wraps a panic recovered from the underlying tokenizer
+// library. It is distinguishable from an ordinary EncodeSingle failure so the
+// ASCII-fold retry (a workaround for the library's panic class) fires only for
+// the panic class; a genuine encode error is returned as-is, never silently
+// re-encoded from a coarsened copy that would discard the real failure.
+var errTokenizerPanic = errors.New("tokenizer encode panic")
 
 // CLS token ID (101) and SEP token ID (102) for BERT-family tokenizers.
 const (
@@ -94,9 +102,9 @@ func (t *Tokenizer) EncodeWithLength(text string, maxLen int) (inputIDs, attenti
 				inputIDs, attentionMask, tokenTypeIDs = nil, nil, nil
 				actualLen = 0
 				if rErr, ok := r.(error); ok {
-					panicErr = fmt.Errorf("tokenizer encode panic: %w", rErr)
+					panicErr = fmt.Errorf("%w: %w", errTokenizerPanic, rErr)
 				} else {
-					panicErr = fmt.Errorf("tokenizer encode panic: %v", r)
+					panicErr = fmt.Errorf("%w: %v", errTokenizerPanic, r)
 				}
 			}
 		}()
@@ -150,8 +158,13 @@ func (t *Tokenizer) EncodeWithLength(text string, maxLen int) (inputIDs, attenti
 		// panic deep in NormalizedString.Slice, never entering cleanText's
 		// deletion set. Rather than dropping the document, retry once on an
 		// ASCII-folded copy so a coarsened embedding still reaches the index.
-		if folded := asciiFold(text); folded != text {
-			inputIDs, attentionMask, tokenTypeIDs, err = encodeOnce(folded)
+		// Only the recovered-panic class is retried: a genuine EncodeSingle
+		// error is returned as-is rather than silently re-encoding a coarsened
+		// copy that would discard the real failure.
+		if errors.Is(err, errTokenizerPanic) {
+			if folded := asciiFold(text); folded != text {
+				inputIDs, attentionMask, tokenTypeIDs, err = encodeOnce(folded)
+			}
 		}
 	}
 	if err != nil {
@@ -168,6 +181,12 @@ func (t *Tokenizer) EncodeWithLength(text string, maxLen int) (inputIDs, attenti
 // the library's alignment bookkeeping, so folding to ASCII guarantees an input
 // the normalizer cannot choke on. The result is lossy by design — the document
 // is indexed with a coarsened embedding instead of being discarded.
+//
+// Unlike sanitizeForTokenizer — which deliberately preserves '\t', '\n' and
+// '\r' — the fold keeps only '\n' and rewrites tabs and carriage returns to
+// spaces. The difference is intentional: the fold is a coarse last resort
+// applied after sanitization has already run, and collapsing that whitespace
+// there is harmless.
 func asciiFold(text string) string {
 	ascii := true
 	for i := 0; i < len(text); i++ {
