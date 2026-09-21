@@ -2,7 +2,7 @@
 
 package tools
 
-// Workspace-scoped verification marker tests (digest v2, Track B of the
+// Workspace-scoped verification marker tests (digest v3, Track B of the
 // silent-mode deny-accuracy recommendations §2). The marker is positive
 // evidence for the judge's "positive establishment" doctrine on C6: a
 // catalogued verification driver over the session's own roots. The negative

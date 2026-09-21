@@ -77,10 +77,10 @@ Runs multiple `SubAgentTask`s concurrently and collects all results. Results are
 
 ### Defense-in-depth
 
-`DetectToolCallSyntaxInContent` reports whether content contains tool-call syntax printed as text (a fenced code block with a tool-name language tag, or a lone JSON tool-call envelope such as `{"answer": "..."}` or `{"name": "...", "arguments": {...}}`). `RunSubAgent` applies it as a second guard after the executor's own implicit-finish detector:
+`DetectToolCallSyntaxInContent` reports whether content contains tool-call syntax printed as text (a fenced code block with a tool-name language tag, or a lone JSON tool-call envelope such as `{"answer": "..."}` or `{"name": "...", "arguments": {...}}`, optionally padded with the service keys `id`/`type`/`index`). `RunSubAgent` applies it as a second guard after the executor's own implicit-finish detector, probing both `Output` and `Summary` (`Summary` carries the model's prose on a stop-tool termination, where `Output` is only the stop tool's short confirmation):
 
 ```go
-if success && DetectToolCallSyntaxInContent(result.Output) {
+if success && (DetectToolCallSyntaxInContent(result.Output) || DetectToolCallSyntaxInContent(result.Summary)) {
     success = false
     err = errors.New("model printed tool-call syntax as text instead of using tool_use blocks")
 }
@@ -95,7 +95,7 @@ A subagent may be launched under a named **Subagent Profile** (an `AGENT.md`-dec
 | Profile field | Applied to the subagent as |
 | ------------- | -------------------------- |
 | `Body` | the core directive / system prompt (replaces the generic orchestrator default) |
-| `Tools` (`ToolPreference`) | the tool budget (`nil`=all, `"read-only"`, or a comma-list of tool-group tokens; an invalid field is an error, never silently widened) |
+| `Tools` (`ToolPreference`) | the tool budget (`nil`=all, `"read-only"`, or a comma-list of tool-group tokens). Resolve it with `ToolPreferenceWithError()`, which returns an error for an invalid field; the legacy `ToolPreference() any` silently maps an invalid field to `nil` (the full toolset) and must not be used for security-sensitive resolution |
 | `MaxSteps` | the ReAct iteration cap (0/absent → derived from task complexity) |
 | `Model` | forced per-call via `NewModelOverrideCaller` |
 | `AllowRedelegate` | whether the subagent may launch further subagents |
@@ -117,7 +117,7 @@ Profile application is an execution-layer concern: `RunSubAgent`/`RunSubAgentsPa
 - The result channel is always closed; exactly one `SubAgentResult` is sent.
 - A subagent never shares its `ContextManager` with its launcher or with other subagents.
 - `SubAgentLaunch` always fires before the executor runs. `SubAgentComplete` fires after on completion, failure, or cancellation, carrying the failure reason in its `errMsg` argument (`""` on success) — **except** on the cooperative-pause path, where `SubAgentPaused` fires instead (a pause is a recoverable checkpoint, not a termination).
-- `success` requires `result.Finished && !DetectToolCallSyntaxInContent(result.Output)`.
+- `success` requires `result.Finished` and that neither `result.Output` nor `result.Summary` matches `DetectToolCallSyntaxInContent`.
 
 ## Related Specs
 

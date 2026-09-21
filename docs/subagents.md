@@ -145,10 +145,10 @@ If `emitter` is `nil`, `RunSubAgent` substitutes `NoopEvents`, so the events are
 
 ## Defense-in-depth: DetectToolCallSyntaxInContent
 
-A known LLM failure mode is *printing* a tool invocation as prose — writing a fenced code block with a tool-name language tag (e.g. ` ```bash_exec `), or the JSON form of the call (e.g. `{"answer": "..."}` for the finish tool, or `{"name": "...", "arguments": {...}}`), instead of emitting a proper `tool_use` block. The executor's implicit-finish detector should catch this and abort with `Finished: false`, but `RunSubAgent` adds a second guard as defense-in-depth:
+A known LLM failure mode is *printing* a tool invocation as prose — writing a fenced code block with a tool-name language tag (e.g. ` ```bash_exec `), or the JSON form of the call (e.g. `{"answer": "..."}` for the finish tool, or `{"name": "...", "arguments": {...}}`), instead of emitting a proper `tool_use` block. The executor's implicit-finish detector should catch this and abort with `Finished: false`, but `RunSubAgent` adds a second guard as defense-in-depth. It probes both `Output` (a normal finish) and `Summary` (a stop-tool termination, whose `Output` is only the stop tool's short confirmation while the model's prose is carried in `Summary`):
 
 ```go
-if success && DetectToolCallSyntaxInContent(result.Output) {
+if success && (DetectToolCallSyntaxInContent(result.Output) || DetectToolCallSyntaxInContent(result.Summary)) {
     success = false
     err = errors.New("model printed tool-call syntax as text instead of using tool_use blocks")
 }
@@ -162,7 +162,7 @@ if agent.DetectToolCallSyntaxInContent(output) {
 }
 ```
 
-> **Caveat:** the JSON half of the detector is a heuristic on the *shape* of the output, so a genuine answer deliberately shaped like a leaked call — a lone `{"answer": "<text>"}` object, or an exact two-key `{"name": …, "arguments": {…}}` / `{"tool": …, "args": {…}}` envelope — is treated as a leak. A task that instructs the model to emit exactly such an object as its final answer can therefore have its run reported as a failure. Multi-field answers that merely *contain* a `name`/`arguments` pair are not affected.
+> **Caveat:** the JSON half of the detector is a heuristic on the *shape* of the output, so a genuine answer deliberately shaped like a leaked call — a lone `{"answer": "<text>"}` object, or a `{"name": …, "arguments": {…}}` / `{"tool": …, "args": {…}}` envelope, optionally padded with the service keys `id`/`type`/`index` (e.g. Anthropic's `{"type":"tool_use","id":…,"name":…,"input":{…}}`) — is treated as a leak. A task that instructs the model to emit exactly such an object as its final answer can therefore have its run reported as a failure. A multi-field answer that carries an unrelated extra key (e.g. `{"name":…,"arguments":…,"summary":…}`) is not affected.
 
 ## Parallel plan execution
 
@@ -264,7 +264,7 @@ A subagent may be launched under a named **Subagent Profile** (an `AGENT.md`-dec
 | Profile field | Applied to the subagent as |
 | --- | --- |
 | `Body` | the core directive / system prompt (replaces the generic orchestrator default) |
-| `Tools` (`ToolPreference`) | the tool budget (`nil`=all, `"read-only"`, or a comma-list of tool-group tokens; an invalid field is an error, never silently widened) |
+| `Tools` (`ToolPreference`) | the tool budget (`nil`=all, `"read-only"`, or a comma-list of tool-group tokens). Resolve it with `ToolPreferenceWithError()`, which returns an error for an invalid field; the legacy `ToolPreference() any` silently maps an invalid field to `nil` (the full toolset) and must not be used for security-sensitive resolution |
 | `MaxSteps` | the ReAct iteration cap (0/absent → derived from task complexity) |
 | `Model` | forced per-call via `NewModelOverrideCaller` |
 | `AllowRedelegate` | whether the subagent may launch further subagents |

@@ -19,19 +19,42 @@ import (
 )
 
 // shellDescriptionFallbackMark is the fixed tail both legacy descriptions
-// share; everything from it onward is invocation-independent guidance
-// (usage policy, inputs, outputs, examples). The composed header replaces
-// only the legacy "Purpose: … via <default invocation>" prefix.
+// share. From it onward the text is the tool's usage policy, inputs, outputs
+// and examples — written in the tool's own syntax family (PowerShell on
+// posh_exec, bash on bash_exec), NOT dialect-neutral. The composed header
+// replaces only the legacy "Purpose: … via <default invocation>" prefix, and
+// the tail is reused only when the override keeps the same syntax family.
 const shellDescriptionFallbackMark = " — the fallback for what"
+
+// shellDescriptionNeutralTail is the dialect-neutral guidance appended after
+// the invocation header when an operator override changes the tool's SYNTAX
+// FAMILY (a bash-family binary on posh_exec, e.g. a zsh wrapper, or a
+// PowerShell-family binary on bash_exec). The tool's own legacy tail is
+// written in the other family's syntax, so reusing it would contradict the
+// header (PowerShell examples under a zsh declaration, or vice versa). This
+// tail names the declared shell generically and carries no family-specific
+// examples.
+const shellDescriptionNeutralTail = "— the fallback for what no dedicated tool covers: builds, test runs, package managers, git operations, system tasks.\n" +
+	"Use when: reading (read_file), editing (edit_file), listing (list_directory) and searching (ripgrep, glob) all have dedicated tools — reach for the shell only when they cannot do the job.\n" +
+	"Inputs: command (a statement in the declared shell above; pipelines and redirections as that shell supports them); optional working_directory (absolute path for the execution context); optional timeout, a JSON string with a unit suffix, e.g. \"30s\" or \"2m\" (default \"60s\", capped at the configured max).\n" +
+	"Outputs: combined stdout and stderr; failing exit codes surface as errors carrying the output. Keep output minimal to avoid flooding context."
 
 // composeShellDescription builds the tool description for a possibly
 // overridden shell invocation. The default (built-in) invocation returns the
-// legacy description byte-for-byte; an override replaces only the header with
-// the real launch shape plus the declared shell compatibility, keeping the
-// invocation-independent tail intact.
+// legacy description byte-for-byte; a same-family override replaces only the
+// header with the real launch shape plus the declared shell compatibility,
+// keeping the tool's dialect-appropriate tail intact. A CROSS-family override
+// (the declared kind belongs to the other syntax family, so the legacy tail
+// speaks the wrong dialect) replaces the tail too with the dialect-neutral
+// tail, so the description never mixes syntax families.
 func composeShellDescription(legacy string, invocation, defaultInvocation tools.ShellInvocation) string {
 	if invocation.Equal(defaultInvocation) {
 		return legacy
+	}
+
+	header := shellInvocationHeader(invocation)
+	if invocation.Kind.Family() != defaultInvocation.Kind.Family() {
+		return header + " " + shellDescriptionNeutralTail
 	}
 
 	idx := strings.Index(legacy, shellDescriptionFallbackMark)
@@ -39,11 +62,11 @@ func composeShellDescription(legacy string, invocation, defaultInvocation tools.
 		// Defensive: an unexpected legacy shape falls back to prepending the
 		// invocation facts before the full legacy text rather than dropping
 		// the shell declaration.
-		return shellInvocationHeader(invocation) + "\n\n" + legacy
+		return header + "\n\n" + legacy
 	}
 
 	tail := legacy[idx+1:] // keep the leading "—" separator onward
-	return shellInvocationHeader(invocation) + " " + tail
+	return header + " " + tail
 }
 
 // shellInvocationHeader renders the "Purpose:" header line for an overridden

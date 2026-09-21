@@ -246,7 +246,7 @@ type ShellAnalysis struct {
 // knowledge-base load is an error — callers fail closed on it.
 //
 // For hosts whose shell tool carries an operator-configured invocation
-// override, use [ShellAnalysisLangForTool] (or [ShellAnalysisLangForKind]) to
+// override, use [ShellAnalysisLangForTool] (or [ShellKindToAnalysisLang]) to
 // resolve the dialect from the DECLARED shell kind and call
 // [AnalyzeShellCommandForJudgeWithDialect] instead — the tool name no longer
 // implies the syntax when the launch wrapper is user-configured.
@@ -280,7 +280,7 @@ func AnalyzeShellCommandForJudgeWithDialect(ctx context.Context, lang api.Lang, 
 		return nil, fmt.Errorf("shell analysis: flowsh analyzer init: %w", err)
 	}
 	report := analyzer.AnalyzeWith(lang, params.Command, api.Options{Vars: ShellVarBindingsFrom(ctx)})
-	return evaluateShellReport(ctx, params.WorkingDirectory, params.Command, report), nil
+	return evaluateShellReport(ctx, params.WorkingDirectory, params.Command, lang, report), nil
 }
 
 // DeclaredShellKinder is implemented by shell-exec tools that carry a
@@ -429,8 +429,11 @@ func ShellJudgeOutcome(ctx context.Context, toolName string) JudgeOutcome {
 // is always assessable (flowsh itself degrades to ⊤/conservative, which C6/C7
 // handle). command is the raw tool-input command text — used only to verify
 // environment-prefix values for the workspace-scoped verification marker; it
-// never reaches the digest (the no-input-echo contract).
-func evaluateShellReport(ctx context.Context, workDir, command string, report *api.Report) *ShellAnalysis {
+// never reaches the digest (the no-input-echo contract). lang is the dialect
+// the command was analyzed in: the system-path classifier is dialect-aware,
+// because a forward-slash "/Windows/…" is a system path under PowerShell but
+// an ordinary path under bash.
+func evaluateShellReport(ctx context.Context, workDir, command string, lang api.Lang, report *api.Report) *ShellAnalysis {
 	var criteria []ShellCriterion
 	fire := func(code JudgeReasonCode, severity JudgeSeverity, canonical bool) {
 		criteria = append(criteria, ShellCriterion{Fired: code, Severity: severity, Canonical: canonical})
@@ -459,7 +462,7 @@ func evaluateShellReport(ctx context.Context, workDir, command string, report *a
 		fire(ReasonCodeCommandPrivilegeEscalation, JudgeSeverityHard, true)
 	}
 	// C3 — direct write/metadata effect on a system path or raw device.
-	if len(shellSystemOrDeviceTargets(report)) > 0 {
+	if len(shellSystemOrDeviceTargets(report, lang)) > 0 {
 		fire(ReasonCodeCommandSystemWrite, JudgeSeverityHard, true)
 	}
 	// C4 — irreversible destructive command (KB class D/E) writing outside
@@ -505,7 +508,7 @@ func evaluateShellReport(ctx context.Context, workDir, command string, report *a
 	}
 	// C9 — direct FS* effect outside the session roots on a non-system
 	// path: the scope question, reusing the outside_session_roots code.
-	if len(shellOutsideRootDirectNonSystemTargets(ctx, report, workDir)) > 0 {
+	if len(shellOutsideRootDirectNonSystemTargets(ctx, report, workDir, lang)) > 0 {
 		fire(ReasonCodeOutsideSessionRoots, JudgeSeveritySoft, false)
 	}
 
@@ -542,7 +545,7 @@ func shellCriterionReason(code JudgeReasonCode) string {
 	case ReasonCodeCommandDownloadCradle:
 		return "Shell analysis: downloaded network content reaches code execution (download cradle)"
 	case ReasonCodeCommandUnboundedAnalysis:
-		return "Shell analysis: command could not be bounded by static analysis (top/conservative) and no download-cradle flow was established"
+		return "Shell analysis: command could not be bounded by static analysis — top/conservative without a download-cradle flow, or an irreversible write whose target could not be resolved"
 	case ReasonCodeCommandExternalContentIngest:
 		return "Shell analysis: download client wrote fetched external content to a file (external-content ingest)"
 	case ReasonCodeCredentialAccess:
@@ -616,7 +619,7 @@ func shellEffectKindsHas(kinds []engine.EffectKind, e engine.Effect) bool {
 // path or a non-harmless raw device. Relative targets are skipped (an empty
 // resolution base leaves them unanchored; system paths are absolute by
 // nature).
-func shellSystemOrDeviceTargets(report *api.Report) []string {
+func shellSystemOrDeviceTargets(report *api.Report, lang api.Lang) []string {
 	var out []string
 	for _, e := range report.Effects {
 		if !shellEffectKindsHas([]engine.EffectKind{engine.KindFSWrite, engine.KindFSMeta}, e) || e.Mode != engine.ModeDirect || e.Target.IsTop() {
@@ -626,7 +629,7 @@ func shellSystemOrDeviceTargets(report *api.Report) []string {
 			if !shellPathLikeTarget(t) {
 				continue
 			}
-			if abs, ok := shellResolveTarget(t, ""); ok && shellIsSystemOrRawDevicePath(abs) {
+			if abs, ok := shellResolveTarget(t, ""); ok && shellIsSystemOrRawDevicePath(abs, lang) {
 				out = append(out, abs)
 			}
 		}
@@ -703,12 +706,12 @@ func shellOutsideRoots(ctx context.Context, report *api.Report, workDir string, 
 // routine inputs, not a scope concern, and a raw device is "system" only as
 // a write target. Harmless devices (/dev/null, /dev/full) are exempt via
 // [shellIsHarmlessDevicePath] inside the containment walk.
-func shellOutsideRootDirectNonSystemTargets(ctx context.Context, report *api.Report, workDir string) []string {
+func shellOutsideRootDirectNonSystemTargets(ctx context.Context, report *api.Report, workDir string, lang api.Lang) []string {
 	var out []string
 	for _, t := range shellOutsideRoots(ctx, report, workDir, shellFSAllKinds, true) {
 		if t.kind == engine.KindFSWrite || t.kind == engine.KindFSMeta {
 			// C3 owns writes/metadata on system paths and raw devices.
-			if shellIsSystemOrRawDevicePath(t.path) {
+			if shellIsSystemOrRawDevicePath(t.path, lang) {
 				continue
 			}
 		} else if shellIsRawDeviceTarget(t.path) {
@@ -853,7 +856,15 @@ func shellIsHarmlessDevicePath(absPath string) bool {
 // non-harmless raw device under /dev. Harmless bit-bucket devices
 // (/dev/null, /dev/full, and Windows NUL via [shellIsHarmlessDevicePath])
 // are exempt so routine redirections never fire.
-func shellIsSystemOrRawDevicePath(absPath string) bool {
+//
+// lang is the dialect the command was analyzed in. It makes the Windows
+// branch dialect-aware: a forward-slash "/windows/x" is a POSIX path under
+// bash (where "/" is the only separator, so it must NOT be re-read as a
+// drive-less Windows path) but a system path under PowerShell (where "/" is
+// also a separator, so "Set-Content /Windows/System32/…" is a real write into
+// the OS tree). Only the bash family takes the early return; the PowerShell
+// family falls through to the Windows table.
+func shellIsSystemOrRawDevicePath(absPath string, lang api.Lang) bool {
 	if absPath == "" {
 		return false
 	}
@@ -871,10 +882,12 @@ func shellIsSystemOrRawDevicePath(absPath string) bool {
 	// Windows side: case-folded, back-slashed prefix check at a component
 	// boundary (verbatim long-path prefixes are stripped first) — the same
 	// guard the POSIX branch applies, so a prefix-adjacent non-system name
-	// ("c:\program filesold") is not misclassified. Skipped for a POSIX-rooted
-	// target: a POSIX "/windows/x" must not be re-read as a Windows system path
-	// by the drive-less prefix table.
-	if strings.HasPrefix(absPath, "/") {
+	// ("c:\program filesold") is not misclassified. Skipped for a bash
+	// POSIX-rooted target: under bash a POSIX "/windows/x" is an ordinary
+	// path and must not be re-read as a Windows system path by the drive-less
+	// prefix table. The PowerShell family keeps the table, because there "/"
+	// is a valid separator and "/Windows/System32" is the OS tree.
+	if lang == api.LangBash && strings.HasPrefix(absPath, "/") {
 		return false
 	}
 	win := strings.ToLower(filepath.ToSlash(absPath))
@@ -896,7 +909,7 @@ func shellIsSystemOrRawDevicePath(absPath string) bool {
 // onto the compact digest: bounded facts only, no input echo, no why-traces.
 // The workspace-scoped verification marker is computed here (it shares the
 // criteria engine's session roots and resolution base) and stamped into the
-// v2 digest.
+// v3 digest.
 func newShellAnalysisDigest(ctx context.Context, workDir, command string, report *api.Report, criteria []ShellCriterion) ShellAnalysisDigest {
 	effects := make([]ShellEffectDigest, 0, len(report.Effects))
 	for _, e := range report.Effects {
@@ -967,7 +980,7 @@ func newShellAnalysisDigest(ctx context.Context, workDir, command string, report
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Effect signature (digest v2)
+// Effect signature (digest v3)
 // ─────────────────────────────────────────────────────────────────────────
 //
 // The signature is the comparable identity of a command's EFFECT, not of its
@@ -1078,7 +1091,7 @@ func shellFirstFlagFreeOperand(args []string) (string, bool) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Workspace-scoped verification marker (digest v2, Track B)
+// Workspace-scoped verification marker (digest v3, Track B)
 // ─────────────────────────────────────────────────────────────────────────
 //
 // The marker is the deterministic evidence the strict judge needs for its

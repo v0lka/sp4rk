@@ -20,6 +20,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/v0lka/sp4rk"
 	"github.com/v0lka/sp4rk/agent"
@@ -75,11 +76,12 @@ func run() error {
 	for i := 1; i <= 6; i++ {
 		name := filepath.Join(workspaceDir, fmt.Sprintf("note_%d.md", i))
 		// ~1 KB of content each — enough that reading several fills context.
-		content := fmt.Sprintf("# Note %d\n\n", i)
+		var content strings.Builder
+		fmt.Fprintf(&content, "# Note %d\n\n", i)
 		for j := 0; j < 60; j++ {
-			content += fmt.Sprintf("- Line %d of note %d: reusable context-window filler.\n", j, i)
+			fmt.Fprintf(&content, "- Line %d of note %d: reusable context-window filler.\n", j, i)
 		}
-		if err := os.WriteFile(name, []byte(content), 0o644); err != nil {
+		if err := os.WriteFile(name, []byte(content.String()), 0o644); err != nil {
 			return fmt.Errorf("seed file: %w", err)
 		}
 	}

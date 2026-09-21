@@ -91,8 +91,11 @@ func RunSubAgent(ctx context.Context, stepID string, executor *Executor, cm Cont
 		// failure-mode where the model printed tool-call syntax as text
 		// (instead of emitting a tool_use block) is NOT a success. The
 		// handleImplicitFinish detector should have aborted such cases with
-		// Finished=false, but this guard catches any escape.
-		if success && DetectToolCallSyntaxInContent(result.Output) {
+		// Finished=false, but this guard catches any escape. The model's text
+		// may land in Output (a normal finish) or in Summary (a stop-tool
+		// termination, whose Output holds the tool's short confirmation while
+		// the model's prose is carried in Summary), so probe both.
+		if success && (DetectToolCallSyntaxInContent(result.Output) || DetectToolCallSyntaxInContent(result.Summary)) {
 			success = false
 			if err == nil {
 				err = errors.New("model printed tool-call syntax as text instead of using tool_use blocks")

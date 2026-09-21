@@ -155,7 +155,7 @@ type Embedder struct {
 	lengthBuckets bool
 	logger        *slog.Logger
 	telemetry     *Telemetry
-	mu            sync.Mutex
+	mu            sync.RWMutex
 	closed        bool
 	sess          *onnxSession // legacy fixed-max session for batchSize=1
 	// batchSess is the legacy fixed-max session for multi-text calls. It remains
@@ -484,10 +484,18 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 // a silent CUDA->CPU slide — including the zero-value embedder, which reports
 // "cpu" (the legacy default).
 func (e *Embedder) ExecutionProvider() string {
-	if e.executionProvider == "" {
+	// The provider is written at runtime by the lazy CUDA->CPU fallback
+	// (degradeToCPU, under e.mu), so take the read lock: a concurrent getter
+	// must not race the writer. Embedder is documented "safe for concurrent
+	// use", and the getter is a consumed surface (hosts poll it to detect a
+	// silent slide), so the read is synchronized rather than left unlocked.
+	e.mu.RLock()
+	provider := e.executionProvider
+	e.mu.RUnlock()
+	if provider == "" {
 		return ExecutionProviderCPU
 	}
-	return e.executionProvider
+	return provider
 }
 
 // EmbedDocuments embeds a batch of text documents and returns their embedding vectors.
@@ -726,16 +734,23 @@ func (e *Embedder) degradeToCPU(cause error) error {
 		opts *ort.SessionOptions
 		err  error
 	)
+	// Build the CPU options FIRST, before tearing down the CUDA handle: if
+	// this fails (ort.NewSessionOptions error) the embedder must be left
+	// exactly as it was — still on CUDA with its options intact — never in a
+	// half-degraded state with sessOpts == nil but executionProvider still CUDA.
 	e.onORTThread(func() {
-		if e.sessOpts != nil {
-			_ = e.sessOpts.Destroy()
-			e.sessOpts = nil
-		}
 		opts, err = buildSessionOptions(ExecutionProviderCPU, e.deviceID, e.intraOpThreads)
 	})
 	if err != nil {
 		return fmt.Errorf("building ONNX session options: %w", err)
 	}
+	// The CPU options are in hand; now destroy the CUDA handle and commit the
+	// new state, so every mutation that follows is unconditional.
+	e.onORTThread(func() {
+		if e.sessOpts != nil {
+			_ = e.sessOpts.Destroy()
+		}
+	})
 	if e.runner != nil {
 		e.runner.stop()
 		e.runner = nil

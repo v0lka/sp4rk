@@ -1,6 +1,6 @@
 module sp4rk-examples
 
-go 1.26.3
+go 1.27.1
 
 require github.com/v0lka/sp4rk v0.0.0-00010101000000-000000000000
 
@@ -21,6 +21,7 @@ require (
 	github.com/liushuangls/go-anthropic/v2 v2.17.3 // indirect
 	github.com/mailru/easyjson v0.7.7 // indirect
 	github.com/mark3labs/mcp-go v0.45.0 // indirect
+	github.com/odvcencio/gotreesitter v0.52.0 // indirect
 	github.com/openai/openai-go v1.12.0 // indirect
 	github.com/pkoukk/tiktoken-go v0.1.8 // indirect
 	github.com/spf13/cast v1.7.1 // indirect
@@ -28,13 +29,14 @@ require (
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.1 // indirect
 	github.com/tidwall/sjson v1.2.5 // indirect
+	github.com/v0lka/flowsh v0.3.2 // indirect
 	github.com/wk8/go-ordered-map/v2 v2.1.8 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	golang.org/x/net v0.57.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
-	mvdan.cc/sh/v3 v3.7.0 // indirect
+	mvdan.cc/sh/v3 v3.10.0 // indirect
 )
 
 replace github.com/v0lka/sp4rk => ..

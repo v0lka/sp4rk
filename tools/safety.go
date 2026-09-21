@@ -81,7 +81,8 @@ func (s *JudgeSeverity) UnmarshalJSON(data []byte) error {
 // policy decisions off the code instead of matching prose. A published code
 // must never be renamed or reused; add new codes instead. The empty value
 // means "unclassified" — hosts decide unclassified outcomes by their own
-// fail-closed policy, never by matching the prose.
+// fail-closed policy, never by matching the prose. See [IsCanonicalReasonCode]
+// for the subset of codes a host must never auto-override.
 type JudgeReasonCode string
 
 const (
@@ -185,7 +186,7 @@ const (
 	ReasonCodeCommandExternalContentIngest JudgeReasonCode = "command_external_content_ingest"
 	// ReasonCodeCredentialAccess marks a shell command whose flowsh analysis
 	// found credential/secret material accessed without a paired egress
-	// (criterion C7). Advisory scope concern, soft.
+	// (criterion C8). Advisory scope concern, soft.
 	ReasonCodeCredentialAccess JudgeReasonCode = "credential_access"
 	// ReasonCodeCommandAnalysisUnavailable marks a shell command whose
 	// deterministic analysis could not be produced at all — the flowsh
@@ -196,6 +197,60 @@ const (
 	// and blocks under verify-on-edit's unattended path.
 	ReasonCodeCommandAnalysisUnavailable JudgeReasonCode = "command_analysis_unavailable"
 )
+
+// canonicalReasonCodes is the set of published codes whose fired reason a host
+// must never auto-override — the deterministic backstop a host consults before
+// letting an advisory or strict judge waive an escalation. It covers two
+// classes:
+//
+//   - a hard fired security control: a shell blocklist match, the flowsh
+//     shell-analysis controls the digest marks canonical (exfiltration flow,
+//     privilege escalation, a system-path/raw-device write, an irreversible
+//     destructive write outside the session roots, and a download cradle),
+//     SSRF protection, a symlink escape out of the session roots, and a write
+//     into git internals;
+//   - an input whose safety the judge is structurally unable to assess:
+//     degraded SSRF protection, an undeterminable URL/path, and a
+//     deterministic shell analysis that could not run at all.
+//
+// The two hard-but-clearable shell-analysis codes are deliberately absent:
+// command_unbounded_analysis (the analyzer's ⊤ limitation) and
+// command_external_content_ingest (a download-client ingest flow) are hard but
+// non-canonical, so a strict judge may positively clear them. The soft scope
+// codes are likewise not canonical. This mirrors the set hosts such as c0wrk
+// (its "canonical hard reason" backstop) key deterministic policy off.
+var canonicalReasonCodes = map[JudgeReasonCode]bool{
+	ReasonCodeCommandBlacklist:               true,
+	ReasonCodeCommandExfilFlow:               true,
+	ReasonCodeCommandPrivilegeEscalation:     true,
+	ReasonCodeCommandSystemWrite:             true,
+	ReasonCodeCommandDestructiveOutsideRoots: true,
+	ReasonCodeCommandDownloadCradle:          true,
+	ReasonCodeCommandAnalysisUnavailable:     true,
+	ReasonCodeSSRFPrivateAddress:             true,
+	ReasonCodeSSRFDegraded:                   true,
+	ReasonCodeUnassessableURL:                true,
+	ReasonCodeUnassessablePath:               true,
+	ReasonCodeSymlinkEscape:                  true,
+	ReasonCodeGitInternal:                    true,
+}
+
+// IsCanonicalReasonCode reports whether a JudgeReasonCode is canonical — a hard
+// fired security control (or an unassessable input) that a host must NEVER
+// auto-override, even when an advisory or strict judge returns allow. The
+// remaining hard codes (command_unbounded_analysis, command_external_content_ingest)
+// and the soft scope codes are not canonical: a strict judge may positively
+// clear them. An empty or unknown code reports false.
+//
+// It is a convenience over the per-criterion canonicality the shell-analysis
+// digest carries (ShellCriterion.Canonical and ShellAnalysis.Canonical): a host
+// that keys deterministic policy off ConfirmationRequest.JudgeReasonCode alone
+// can consult this instead of hard-coding the canonical set. Published codes
+// are a cross-repository contract, so this set is part of it — extend it when a
+// new canonical code is added, never by renaming an existing one.
+func IsCanonicalReasonCode(code JudgeReasonCode) bool {
+	return canonicalReasonCodes[code]
+}
 
 // JudgeOutcome is the result of a tool-local safety judge: whether the call is
 // allowed, the reason when it is not, and how severe that reason is.

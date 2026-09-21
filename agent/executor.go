@@ -41,6 +41,13 @@ var jsonToolCallNameKeys = [...]string{"name", "tool"}
 // with one of these is a printed tool call, not an answer.
 var jsonToolCallArgKeys = [...]string{"arguments", "args", "parameters", "input"}
 
+// jsonToolCallServiceKeys are the envelope keys that merely decorate a printed
+// tool call (a call id, a block type, an array index). They are NOT
+// name/argument keys, so they do not by themselves make an object a leak; but
+// when they accompany a name/argument pair, they do not turn it back into a
+// legitimate answer either.
+var jsonToolCallServiceKeys = [...]string{"id", "type", "index"}
+
 // DetectToolCallSyntaxInContent reports whether content contains tool-call
 // syntax printed as text — a failure-mode sign where the model "types" a tool
 // invocation instead of emitting a proper tool_use block. Two shapes are
@@ -49,8 +56,8 @@ var jsonToolCallArgKeys = [...]string{"arguments", "args", "parameters", "input"
 //   - a fenced code block whose language tag looks like a sp4rk tool name
 //     (e.g. ```bash_exec, ```read_file);
 //   - a JSON tool-call envelope printed as the whole response — the finish
-//     tool's arguments ({"answer": "..."}), or an EXACT two-key name/arguments
-//     envelope ({"name": "read_file", "arguments": {...}}, {"tool": "...",
+//     tool's arguments ({"answer": "..."}), or a name/arguments envelope
+//     ({"name": "read_file", "arguments": {...}}, {"tool": "...",
 //     "args": {...}}, an OpenAI-style {"function": {"name": ..., "arguments":
 //     ...}}), optionally wrapped in a single ```json fence.
 //
@@ -62,9 +69,9 @@ var jsonToolCallArgKeys = [...]string{"arguments", "args", "parameters", "input"
 // not misclassified. The residual trade-off is deliberate: a lone two-key
 // {"name":…,"arguments":…} object cannot be told apart from a genuine
 // tool-schema/API-payload answer without the registered tool list, so it is
-// treated as a leak. The shape must therefore consist of exactly those two
-// keys (a name string and an argument container); a multi-field answer that
-// merely contains such keys is not flagged.
+// treated as a leak. The envelope may carry only the name/argument pair plus
+// known service keys (id/type/index); a multi-field answer with any other key
+// that merely contains such a pair is not flagged.
 func DetectToolCallSyntaxInContent(content string) bool {
 	if toolCallSyntaxRe.MatchString(content) {
 		return true
@@ -90,32 +97,32 @@ func looksLikeJSONToolCall(content string) bool {
 			return json.Unmarshal(raw, &answer) == nil
 		}
 	}
-	// Generic tool-call envelope: exactly a tool-name key paired with an
-	// argument-container key — no other keys, the name a string. Requiring the
-	// EXACT two-key envelope (rather than "any object that happens to contain
-	// both") keeps a legitimate multi-field JSON answer such as
-	// {"name":"report","summary":"…","parameters":…} from being mistaken for
-	// a leaked call. A lone {"name":…,"arguments":…} object is still
+	// Generic tool-call envelope: a tool-name key paired with an
+	// argument-container key, the name a string. A lone two-key envelope is
 	// indistinguishable from a genuine tool-schema/API-payload answer without
 	// consulting the registered tool list, so it stays classified as a leak —
-	// the deliberate trade-off documented on DetectToolCallSyntaxInContent.
-	if len(obj) == 2 {
-		var nameVal, argVal json.RawMessage
-		for _, k := range jsonToolCallNameKeys {
-			if v, ok := obj[k]; ok {
-				nameVal = v
-			}
+	// the deliberate trade-off documented on DetectToolCallSyntaxInContent. A
+	// multi-field envelope is ALSO a leak when every key beyond the pair is a
+	// known service key (id/type/index) that merely decorates a printed call —
+	// e.g. Anthropic's {"type":"tool_use","id":"toolu_01","name":"read_file",
+	// "input":{…}} — while any unrelated extra key keeps a legitimate
+	// multi-field answer such as {"name":"report","summary":"…","parameters":…}
+	// from being mistaken for a leaked call.
+	var nameVal, argVal json.RawMessage
+	for _, k := range jsonToolCallNameKeys {
+		if v, ok := obj[k]; ok {
+			nameVal = v
 		}
-		for _, k := range jsonToolCallArgKeys {
-			if v, ok := obj[k]; ok {
-				argVal = v
-			}
+	}
+	for _, k := range jsonToolCallArgKeys {
+		if v, ok := obj[k]; ok {
+			argVal = v
 		}
-		if nameVal != nil && argVal != nil {
-			var name string
-			if json.Unmarshal(nameVal, &name) == nil {
-				return true
-			}
+	}
+	if nameVal != nil && argVal != nil && jsonKeysAllToolCallRelated(obj) {
+		var name string
+		if json.Unmarshal(nameVal, &name) == nil {
+			return true
 		}
 	}
 	// OpenAI-style nesting: {"function": {"name": ..., "arguments": ...}}.
@@ -123,6 +130,42 @@ func looksLikeJSONToolCall(content string) bool {
 		var fn map[string]json.RawMessage
 		if err := json.Unmarshal(raw, &fn); err == nil {
 			return hasAnyKey(fn, []string{"name"}) && hasAnyKey(fn, jsonToolCallArgKeys[:])
+		}
+	}
+	return false
+}
+
+// jsonKeysAllToolCallRelated reports whether every key of obj belongs to a
+// printed tool-call envelope: a tool-name key, an argument-container key, or a
+// known service key. It keeps a legitimate multi-field answer that merely
+// happens to carry a name/argument pair (e.g. {"name":"report","summary":"…"})
+// from being read as a leaked call, while still flagging an envelope padded
+// with service keys (id/type/index).
+func jsonKeysAllToolCallRelated(obj map[string]json.RawMessage) bool {
+	for k := range obj {
+		if !jsonKeyIsToolCallRelated(k) {
+			return false
+		}
+	}
+	return true
+}
+
+// jsonKeyIsToolCallRelated reports whether k is a tool-name, argument-container,
+// or service key of a printed tool-call envelope.
+func jsonKeyIsToolCallRelated(k string) bool {
+	for _, n := range jsonToolCallNameKeys {
+		if k == n {
+			return true
+		}
+	}
+	for _, a := range jsonToolCallArgKeys {
+		if k == a {
+			return true
+		}
+	}
+	for _, svc := range jsonToolCallServiceKeys {
+		if k == svc {
+			return true
 		}
 	}
 	return false

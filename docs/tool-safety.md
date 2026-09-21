@@ -1,8 +1,9 @@
 # Tool Safety & Execution Context
 
-Beyond the [`Tool` interface](tools.md) and the [policy/Judger enforcement](tools.md#toolpolicy) in `ToolRegistry.Execute`, the `tools` package ships a set of **execution-context intelligence** that the runtime layers (executor, planner, reflector) consult while a tool call is being assessed and executed. This document covers the five subsystems that have no other home:
+Beyond the [`Tool` interface](tools.md) and the [policy/Judger enforcement](tools.md#toolpolicy) in `ToolRegistry.Execute`, the `tools` package ships a set of **execution-context intelligence** that the runtime layers (executor, planner, reflector) consult while a tool call is being assessed and executed. This document covers the subsystems that have no other home:
 
 - **LLM-backed `ToolJudge`** — a centralized, cached safety assessor that decides whether a mutating call may auto-approve.
+- **Shell command analysis (flowsh)** — the deterministic effect-IR criteria the shell-exec judges consume; the engine is also specified in the [security model](../specs/architecture/security-model.md#shell-command-analysis).
 - **File coherence** — cross-session conflict detection so two concurrent agents don't silently clobber each other's reads/writes.
 - **Environment info (`EnvInfo`)** — a one-shot snapshot of the host (OS, arch, runtimes) injected into prompts and judge reasoning.
 - **Symlink detection** — defense-in-depth against symlink-escape paths in tool input.
@@ -253,6 +254,8 @@ if err != nil || verdict == tools.LoopVerdictDeny {
 
 ```go
 func AnalyzeShellCommandForJudge(ctx context.Context, toolName string, input json.RawMessage) (*ShellAnalysis, error)
+func AnalyzeShellCommandForJudgeWithDialect(ctx context.Context, lang api.Lang, input json.RawMessage) (*ShellAnalysis, error)
+func ShellAnalysisLangForTool(tool any, toolName string) (api.Lang, bool)
 func WithShellAnalysis(ctx context.Context, analysis *ShellAnalysis, err error) context.Context
 func ShellAnalysisFrom(ctx context.Context) (*ShellAnalysis, error)
 func WithShellVarBindings(ctx context.Context, vars map[string]string) context.Context
@@ -261,6 +264,7 @@ func ShellJudgeOutcome(ctx context.Context, toolName string) JudgeOutcome
 ```
 
 - `AnalyzeShellCommandForJudge` — runs the analysis once (dialect keyed by tool name; `bash_exec` → bash, `posh_exec` → PowerShell; anything else errors, fail-closed). Returns `ShellAnalysis{Digest, Outcome, Canonical}` where `Outcome` carries the winning criterion's `Allow` (true when nothing fired) and `Canonical` its canonicality.
+- **Operator invocation overrides** change the syntax contract: when the host reconfigures a shell tool's launch wrapper, the tool name no longer implies the dialect. Resolve the dialect from the tool's DECLARED shell kind with `ShellAnalysisLangForTool` (the declared kinds come from `ParseShellKind`/`ShellInvocation`, `tools/shell_invocation.go`) and call `AnalyzeShellCommandForJudgeWithDialect` — passing the declared dialect rather than the tool name, so a bash-family wrapper on `posh_exec` (or vice versa) is analyzed in the right grammar.
 - `WithShellAnalysis` / `ShellAnalysisFrom` — context attachment. The **host** precomputes the analysis exactly once per call and attaches it; the built-in shell tools' `Judge` then returns the winning outcome **verbatim** via `ShellJudgeOutcome` — it never recomputes. With nothing attached it degrades to an empty outcome (the Judge defers to the LLM judges); with an **error** attached it **fails closed** with the hard canonical `command_analysis_unavailable` reason.
 - The **digest** (`sp4rk-shell-analysis/v3`: schemaVersion, lang, top/conservative, reason, commands, resolution, effects, score, exfiltration pairs (`exfilPairs`, a top-level array — not part of `score`), network data-flows (`cradleFlows`/`ingestFlows`, top-level arrays of source/sink effect keys), destructive classes, fired criteria, the workspace-scoped verification marker (positive ALLOW evidence for a `command_unbounded_analysis` escalation; never a criteria override), and the effect `signature` — the deterministic identity of the command's effect, used for verdict memoization) is stable JSON with no why-traces and no input echo. It is meant for judge prompts: `StrictJudgeRequest.AnalysisContext` (strict path) and the `## Static Analysis Report` block (advisory path) both render it behind an untrusted `shell_analysis` boundary.
 
@@ -277,6 +281,8 @@ func ShellJudgeOutcome(ctx context.Context, toolName string) JudgeOutcome
 | C7 | an established network→filesystem **ingest flow** — a download client (`curl -o`/`-O`, `wget -O`/default) wrote content it fetched to a file; a stdout fetch is not an ingest | `command_external_content_ingest` | hard | **no** |
 | C8 | credential access without an exfil pair | `credential_access` | soft | — |
 | C9 | direct FS effect outside the session roots — writes/metadata on a non-system path, and reads even of a system path (system writes/metadata are C3's; raw-device reads are exempt) | `outside_session_roots` (reused) | soft | — |
+
+> **Operator note — C7 escalation surface.** C7 (`command_external_content_ingest`) fires on ANY established download→file ingest flow, so a routine `wget https://example.com/report.pdf` or `curl -O https://example.com/report.pdf` now escalates to confirmation (hard but non-canonical) under the default policy. This is deliberate fail-closed behavior on an arbitrary host; a strict judge may positively clear a benign ingest (a document fetched from its canonical publisher or preprint server, an official package registry), and a fetch that lands only on stdout is never an ingest.
 
 Canonical marks reasons a host must never auto-override (hosts keying deterministic policy off `JudgeReasonCode` treat C1–C5 as never-clearable; C6/C7 are an analyzer limitation and a flow the strict judge may clear). The analyzer is process-global (KB loaded once behind a `sync.Once`) and safe for concurrent use; it never executes the analyzed command. Empty session roots disable the containment criteria C4/C9.
 

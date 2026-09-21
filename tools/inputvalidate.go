@@ -84,9 +84,10 @@ func (e *InputValidationError) Error() string {
 // A schema level that omits (or nulls) additionalProperties is treated as a
 // CLOSED set — hand-written built-in schemas declare every parameter, so an
 // unknown key is a model mistake worth rejecting with an actionable message.
-// ValidateToolInput is therefore the strict built-in variant; the registry
-// calls validateToolInput directly with the open default for MCP-proxied
-// tools, whose server-supplied schemas frequently omit the keyword.
+// ValidateToolInput is therefore the strict built-in variant; for the
+// category-dependent default the registry applies (closed for built-ins, OPEN
+// for MCP-proxied tools whose server-supplied schemas frequently omit the
+// keyword), call [ValidateToolInputForCategory].
 //
 // The schema argument comes FIRST and the raw input arguments SECOND — both
 // are json.RawMessage, so a silent swap parses the input as the schema and
@@ -94,6 +95,20 @@ func (e *InputValidationError) Error() string {
 // wrappers call it before dispatch.
 func ValidateToolInput(tool string, schema, input json.RawMessage) error {
 	return validateToolInput(tool, schema, input, true)
+}
+
+// ValidateToolInputForCategory is [ValidateToolInput] with the tool's source
+// category made explicit. It applies the same key-admission default the
+// registry's Execute uses: a level that omits (or nulls) additionalProperties
+// is a CLOSED set for a built-in ([SourceCategoryCore]) tool, but the JSON
+// Schema spec default of an OPEN set for an MCP-proxied
+// ([SourceCategoryMCP]) tool — an external server schema frequently omits the
+// keyword while still accepting extra arguments that json.Unmarshal would
+// silently ignore. Hosts that pre-validate before dispatch and route
+// MCP-proxied tools should call this rather than ValidateToolInput, which
+// always applies the strict built-in (closed) default.
+func ValidateToolInputForCategory(tool string, schema, input json.RawMessage, category ToolSourceCategory) error {
+	return validateToolInput(tool, schema, input, category != SourceCategoryMCP)
 }
 
 // validateToolInput is the implementation behind ValidateToolInput.

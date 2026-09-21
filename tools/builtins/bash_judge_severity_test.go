@@ -129,7 +129,7 @@ func TestBashExecTool_Judge_FlowshCriteriaCorpus(t *testing.T) {
 		// Fork bomb: unbounded without network — hard non-canonical.
 		{name: "fork bomb", command: ":(){ :|:& };:",
 			wantFired: tools.ReasonCodeCommandUnboundedAnalysis, wantSev: tools.JudgeSeverityHard},
-		// Scope question: out-of-root credential read is the soft C8
+		// Scope question: out-of-root credential read is the soft C9
 		// criterion (the bash KB does not classify it as credential access —
 		// that classification lands on the PowerShell Get-Content shape).
 		{name: "read ssh key", command: "cat ~/.ssh/id_rsa",

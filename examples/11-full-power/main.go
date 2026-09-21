@@ -25,6 +25,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -248,7 +249,7 @@ func run() error {
 	}
 	profile, ok := agentMgr.Get("code-researcher")
 	if !ok {
-		return fmt.Errorf("seeded agent profile not discovered")
+		return errors.New("seeded agent profile not discovered")
 	}
 	toolPreference, err := profile.ToolPreferenceWithError()
 	if err != nil {

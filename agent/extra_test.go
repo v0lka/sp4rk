@@ -1062,6 +1062,8 @@ func TestDetectToolCallSyntaxInContent(t *testing.T) {
 		{"json unrelated keys", `{"result":42,"status":"ok"}`, false},
 		{"json name/arguments with a third field is not an envelope", `{"name":"report","arguments":{},"summary":"x"}`, false},
 		{"json name/parameters two-key envelope (deliberate trade-off: shapes like a printed call)", `{"name":"get_weather","parameters":{"type":"object"}}`, true},
+		{"json name/arguments with service-key extras is an envelope", `{"name":"read_file","arguments":{},"id":"call_1"}`, true},
+		{"json anthropic tool_use envelope", `{"type":"tool_use","id":"toolu_01","name":"read_file","input":{}}`, true},
 		{"single-line fenced json finish", "```json {\"answer\": \"done\"}```", true},
 		{"single-line fenced json name/args", "```{\"name\":\"read_file\",\"arguments\":{}}```", true},
 		{"single-line fenced json non-tool object", "```json {\"foo\":1}```", false},

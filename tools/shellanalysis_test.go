@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/v0lka/flowsh/api"
 )
 
 // shellCorpusCtx builds a context whose only session root is the fixed,
@@ -63,7 +65,7 @@ func shellRoutineCorpus() []shellCorpusCase {
 		{name: "posh npm install", tool: "posh_exec", cmd: "npm install",
 			wantFired: ReasonCodeCommandUnboundedAnalysis, wantSev: JudgeSeverityHard, wantCanon: false},
 		// A raw-device READ is a routine input source, not a scope question:
-		// C8 must not fire on it (the device tree is "system" only as a write
+		// C9 must not fire on it (the device tree is "system" only as a write
 		// target).
 		{name: "read urandom device", tool: "bash_exec", cmd: "head -c 16 /dev/urandom"},
 		{name: "dd to bit bucket", tool: "bash_exec", cmd: "dd if=/dev/zero of=/dev/null bs=1M count=1"},
@@ -103,7 +105,7 @@ func shellDangerousCorpus() []shellCorpusCase {
 		{name: "read ssh key posh", tool: "posh_exec", cmd: `Get-Content $HOME\.ssh\id_rsa`,
 			wantFired: ReasonCodeCredentialAccess, wantSev: JudgeSeveritySoft, wantCanon: false},
 		// Out-of-root READS of system / credential files must raise the scope
-		// reason (C8, soft): they are not writes, so C3 does not own them, and
+		// reason (C9, soft): they are not writes, so C3 does not own them, and
 		// leaving them silent would reopen the gap the former shell-path
 		// containment check closed.
 		{name: "read etc passwd", tool: "bash_exec", cmd: "cat /etc/passwd",
@@ -206,7 +208,7 @@ func assertWinner(t *testing.T, tc shellCorpusCase, got *ShellAnalysis) {
 	}
 }
 
-// TestAnalyzeShellCommandForJudge_PriorityOrder verifies the fixed C1…C8
+// TestAnalyzeShellCommandForJudge_PriorityOrder verifies the fixed C1…C9
 // ordering on inputs that fire several criteria at once: the winner is the
 // lowest-numbered criterion, and the digest lists them in priority order.
 func TestAnalyzeShellCommandForJudge_PriorityOrder(t *testing.T) {
@@ -227,7 +229,7 @@ func TestAnalyzeShellCommandForJudge_PriorityOrder(t *testing.T) {
 			wantOrdered: []JudgeReasonCode{ReasonCodeCommandPrivilegeEscalation, ReasonCodeCommandSystemWrite},
 		},
 		{
-			name:        "wipe home fires C4 before C8",
+			name:        "wipe home fires C4 before C9",
 			cmd:         "rm -rf $HOME/",
 			wantOrdered: []JudgeReasonCode{ReasonCodeCommandDestructiveOutsideRoots, ReasonCodeOutsideSessionRoots},
 		},
@@ -252,7 +254,7 @@ func TestAnalyzeShellCommandForJudge_PriorityOrder(t *testing.T) {
 
 // TestAnalyzeShellCommandForJudge_EmptyRootsDisableContainment mirrors the
 // former shell-path containment contract: with no session roots attached, the
-// containment criteria (C4/C8) cannot fire — the destructive home wipe stays
+// containment criteria (C4/C9) cannot fire — the destructive home wipe stays
 // allowed.
 func TestAnalyzeShellCommandForJudge_EmptyRootsDisableContainment(t *testing.T) {
 	got, err := AnalyzeShellCommandForJudge(context.Background(), "bash_exec", shellCorpusInput(t, "rm -rf $HOME/"))
@@ -322,40 +324,52 @@ func TestShellPathLikeTarget(t *testing.T) {
 	}
 }
 
-// TestShellIsSystemOrRawDevicePath pins the C3 target classifier.
+// TestShellIsSystemOrRawDevicePath pins the C3 target classifier. The
+// classifier is dialect-aware: a forward-slash "/windows/x" is an ordinary
+// POSIX path under bash but the OS tree under PowerShell (where "/" is also a
+// separator), so the same target classifies differently per dialect.
 func TestShellIsSystemOrRawDevicePath(t *testing.T) {
 	cases := []struct {
 		path string
+		lang api.Lang
 		want bool
 	}{
-		{"/etc/passwd", true},
-		{"/etc", true},
-		{"/etcetera/report", false}, // prefix must end at a component boundary
-		{"/usr/bin/env", true},
-		{"/boot/vmlinuz", true},
-		{"/bin/sh", true},
-		{"/sbin", true},
-		{"/dev/sda", true},
-		{"/dev/disk0", true},
-		{"/dev/null", false}, // harmless bit bucket
-		{"/dev/full", false}, // harmless error sink
-		{"/var/log/system.log", false},
-		{"/ws/src/main.go", false},
-		{`C:\Windows\System32\cmd.exe`, true},
-		{`C:/Windows/System32`, true},
-		{`C:\Windows`, true},           // the whole install dir, not only System32
-		{`\Windows`, true},             // drive-less absolute
-		{`c:\windowsx`, false},         // component boundary: "c:\windowsx" is not under C:\Windows
-		{`c:\program filesold`, false}, // component boundary on the program-files tree
-		{`c:\program files\app`, true},
-		{`C:\Program Files (x86)\app`, true},
-		{`\Windows\System32`, true}, // drive-less absolute
-		{`C:\Users\me\file.txt`, false},
-		{"", false},
+		{"/etc/passwd", api.LangBash, true},
+		{"/etc", api.LangBash, true},
+		{"/etcetera/report", api.LangBash, false}, // prefix must end at a component boundary
+		{"/usr/bin/env", api.LangBash, true},
+		{"/boot/vmlinuz", api.LangBash, true},
+		{"/bin/sh", api.LangBash, true},
+		{"/sbin", api.LangBash, true},
+		{"/dev/sda", api.LangBash, true},
+		{"/dev/disk0", api.LangBash, true},
+		{"/dev/null", api.LangBash, false}, // harmless bit bucket
+		{"/dev/full", api.LangBash, false}, // harmless error sink
+		{"/var/log/system.log", api.LangBash, false},
+		{"/ws/src/main.go", api.LangBash, false},
+		{`C:\Windows\System32\cmd.exe`, api.LangPowerShell, true},
+		{`C:/Windows/System32`, api.LangPowerShell, true},
+		{`C:\Windows`, api.LangPowerShell, true},           // the whole install dir, not only System32
+		{`\Windows`, api.LangPowerShell, true},             // drive-less absolute
+		{`c:\windowsx`, api.LangPowerShell, false},         // component boundary: "c:\windowsx" is not under C:\Windows
+		{`c:\program filesold`, api.LangPowerShell, false}, // component boundary on the program-files tree
+		{`c:\program files\app`, api.LangPowerShell, true},
+		{`C:\Program Files (x86)\app`, api.LangPowerShell, true},
+		{`\Windows\System32`, api.LangPowerShell, true}, // drive-less absolute
+		{`C:\Users\me\file.txt`, api.LangPowerShell, false},
+		{`C:/Users/me/file.txt`, api.LangPowerShell, false},
+		// Dialect-aware drive-less forward-slash handling. Under PowerShell a
+		// "/Windows/…" target is the OS tree (regression: the former
+		// dialect-blind guard silenced C3 for this shape); under bash it is an
+		// ordinary POSIX path that must NOT be re-read as a Windows system path.
+		{"/Windows/System32/drivers/etc/hosts", api.LangPowerShell, true},
+		{"/Program Files/app", api.LangPowerShell, true},
+		{"/Windows/System32", api.LangBash, false},
+		{"", api.LangBash, false},
 	}
 	for _, tc := range cases {
-		if got := shellIsSystemOrRawDevicePath(tc.path); got != tc.want {
-			t.Errorf("shellIsSystemOrRawDevicePath(%q) = %v, want %v", tc.path, got, tc.want)
+		if got := shellIsSystemOrRawDevicePath(tc.path, tc.lang); got != tc.want {
+			t.Errorf("shellIsSystemOrRawDevicePath(%q, %q) = %v, want %v", tc.path, tc.lang, got, tc.want)
 		}
 	}
 }
@@ -601,7 +615,7 @@ func TestShellAnalysisDigest_GoldenJSON(t *testing.T) {
 // targets, an in-script assignment overrides the seed, an unknown variable
 // without a binding stays ⊤ (fail-closed), and containment keeps reasoning
 // about the RESOLVED path — a binding pointing outside the session roots
-// must not smuggle the write past C8.
+// must not smuggle the write past C9.
 
 // shellDigestTargets returns every concrete target of the directly performed
 // effects of the given kinds (deduplicated, order preserved).

@@ -2,7 +2,7 @@
 
 package tools
 
-// Effect-signature tests (digest v2, Track D of the silent-mode
+// Effect-signature tests (digest v3, Track D of the silent-mode
 // deny-accuracy recommendations §3): the signature is the comparable identity
 // of a command's EFFECT, not of its text. The two audited retry pairs must
 // keep one signature across their equivalent spellings, identical input must

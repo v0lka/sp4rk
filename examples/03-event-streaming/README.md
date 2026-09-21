@@ -22,7 +22,7 @@ result, err := fw.RunF(ctx).
 
 ## What you will learn
 
-- The `Events` interface and its 13 methods
+- The `Events` interface and its 14 methods
 - How to embed `NoopEvents` and override only the methods you need
 - What events fire during a ReAct loop and in what order
 - How to track token usage and context-window fill
