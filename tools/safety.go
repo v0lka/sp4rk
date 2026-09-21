@@ -188,10 +188,24 @@ const (
 	// found credential/secret material accessed without a paired egress
 	// (criterion C8). Advisory scope concern, soft.
 	ReasonCodeCredentialAccess JudgeReasonCode = "credential_access"
+	// ReasonCodeCommandExecOutsideRoots marks a shell command whose flowsh
+	// analysis produced a DIRECT code-execution or process-spawn effect whose
+	// path-shaped target resolves outside every session root — a driver
+	// (test runner, interpreter, build tool) pointed at code that lives
+	// outside the trusted roots (criterion C10). It is the exec sibling of C4
+	// (destructive write outside the roots) and C9 (FS* outside the roots):
+	// the analysis bounds WHAT runs, the roots decide WHERE it may point.
+	// Hard but NON-canonical: executing out-of-root code is a judgment shape,
+	// not a confirmed control — the file may be a scratch script the session
+	// itself wrote to the host temp dir — so the advisory judge may clear it
+	// on closer reading (and the workspace-scoped verification marker stays
+	// off for it by its own containment condition). It only ever fires on a
+	// BOUNDED report: an unbounded call is C6's territory.
+	ReasonCodeCommandExecOutsideRoots JudgeReasonCode = "command_exec_outside_roots"
 	// ReasonCodeCommandAnalysisUnavailable marks a shell command whose
 	// deterministic analysis could not be produced at all — the flowsh
 	// analyzer or its embedded knowledge base failed to initialise. The
-	// deterministic floor (criteria C1–C9) is unavailable for the call, so it
+	// deterministic floor (criteria C1–C10) is unavailable for the call, so it
 	// fails CLOSED: a fired control-like reason, hard and canonical, never
 	// auto-overridable, so the call still escalates under an `allow` policy
 	// and blocks under verify-on-edit's unattended path.

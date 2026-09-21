@@ -153,31 +153,32 @@ func TestShellWorkspaceScopedVerification_RequiresRoots(t *testing.T) {
 	}
 }
 
-// TestShellWorkspaceScopedVerification_DoesNotSuppressC6 pins the
-// defense-in-depth contract: the marker is evidence FOR the judge, never a
-// criteria override. A marked command still escalates on the non-canonical
-// hard C6 so the judge stays in the loop and clears it on the marker.
-func TestShellWorkspaceScopedVerification_DoesNotSuppressC6(t *testing.T) {
-	// vitest is unknown to the analyzer (a target-less ⊤ CodeExec effect), so
-	// the command is conservative and C6 fires — the canonical marker shape.
+// TestShellWorkspaceScopedVerification_MarkedDriverIsDeterministic pins the
+// post-runner-resolution reality for the audited marker shape. The everyday
+// JS verification loop binds through the resolved vitest signature (flowsh
+// bind/runner.go), so the deterministic layer clears it outright: the marker
+// still fires as judge evidence, but no criterion fires and the call no
+// longer escalates on C6.
+//
+// The defense-in-depth contract is unchanged — the marker never removes a
+// criterion — but the C6+marker overlap this file used to pin retired when
+// the binder started resolving the runner: every shape that still fires C6
+// (an unmodelled npx operand, a bash-frontend sink like node/python3, a
+// dynamically named command) breaks the marker's call-coverage condition, so
+// the marker stays off exactly where C6 lives and the judge decides without
+// positive evidence (fail-closed).
+func TestShellWorkspaceScopedVerification_MarkedDriverIsDeterministic(t *testing.T) {
 	got := markerAnalyze(t, markerCase{command: "cd frontend && npx vitest run src/App.test.tsx 2>&1 | tail -15"})
 	if !got.Digest.WorkspaceScopedVerification {
 		t.Fatalf("marker = false, want true")
 	}
-	if got.Outcome.Allow || got.Outcome.ReasonCode != ReasonCodeCommandUnboundedAnalysis {
-		t.Errorf("outcome = {allow=%v code=%s}, want deny on command_unbounded_analysis", got.Outcome.Allow, got.Outcome.ReasonCode)
+	if !got.Outcome.Allow {
+		t.Errorf("outcome = {allow=%v code=%s}, want a criterion-free allow (the resolved vitest signature bounds the call)",
+			got.Outcome.Allow, got.Outcome.ReasonCode)
 	}
-	if got.Canonical {
-		t.Errorf("C6 must stay non-canonical when the marker fires")
-	}
-	fired := false
-	for _, c := range got.Digest.Criteria {
-		if c.Fired == ReasonCodeCommandUnboundedAnalysis {
-			fired = true
-		}
-	}
-	if !fired {
-		t.Errorf("criteria list lost command_unbounded_analysis when the marker fired")
+	if len(got.Digest.Criteria) != 0 {
+		t.Errorf("criteria = %v, want empty — the allow must come from the deterministic layer, not from the marker",
+			got.Digest.Criteria)
 	}
 }
 
@@ -208,8 +209,8 @@ func TestShellWorkspaceScopedVerification_DigestField(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal digest: %v", err)
 	}
-	if !strings.Contains(string(raw), `"schemaVersion":"sp4rk-shell-analysis/v3"`) {
-		t.Errorf("digest schema version not v3: %s", string(raw))
+	if !strings.Contains(string(raw), `"schemaVersion":"sp4rk-shell-analysis/v4"`) {
+		t.Errorf("digest schema version not v4: %s", string(raw))
 	}
 	if !strings.Contains(string(raw), `"workspaceScopedVerification":true`) {
 		t.Errorf("digest missing workspaceScopedVerification:true: %s", string(raw))

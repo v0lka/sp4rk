@@ -4,7 +4,7 @@
 // on top of github.com/v0lka/flowsh. flowsh parses a bash/PowerShell command
 // into a frozen effect IR (filesystem/network/process/credential effects, an
 // exfiltration-pairing taint analysis, and a destructive-flags knowledge
-// base); this file turns that report into the fixed-priority criteria C1–C9
+// base); this file turns that report into the fixed-priority criteria C1–C10
 // that shell-exec judges (and the advisory on-demand judge) consume.
 //
 // Design contract:
@@ -50,11 +50,12 @@ import (
 )
 
 // ShellDigestSchemaVersion tags the shell-analysis digest contract
-// ("sp4rk-shell-analysis/v3"). Bump it whenever the digest gains, loses or
+// ("sp4rk-shell-analysis/v4"). Bump it whenever the digest gains, loses or
 // reshapes a field. v2 added the WorkspaceScopedVerification marker; v3 adds
 // the network data-flow keys (cradleFlows/ingestFlows) and the flow-based
-// criteria (C5 download-cradle flow, C7 external-content ingest).
-const ShellDigestSchemaVersion = "sp4rk-shell-analysis/v3"
+// criteria (C5 download-cradle flow, C7 external-content ingest); v4 adds the
+// C10 exec-scope criterion (command_exec_outside_roots).
+const ShellDigestSchemaVersion = "sp4rk-shell-analysis/v4"
 
 // ─────────────────────────────────────────────────────────────────────────
 // Process-global analyzer
@@ -227,7 +228,7 @@ type ShellAnalysis struct {
 // ─────────────────────────────────────────────────────────────────────────
 
 // AnalyzeShellCommandForJudge runs the flowsh-based deterministic analysis of
-// one shell-exec tool input and maps it onto the C1–C9 criteria. It is the
+// one shell-exec tool input and maps it onto the C1–C10 criteria. It is the
 // advisory-path helper: callers feed it the tool name ("bash_exec" or
 // "posh_exec", which selects the dialect) and the tool's raw JSON input
 // ({command, working_directory}); the returned ShellAnalysis carries the
@@ -389,7 +390,7 @@ func ShellVarBindingsFrom(ctx context.Context) map[string]string {
 // criterion fired). When nothing is attached it returns the empty outcome,
 // deferring the call to the advisory judges. When the attachment carries an
 // error — the analyzer or its embedded knowledge base failed to initialise,
-// so the deterministic floor (C1–C9) is unavailable for this call — it FAILS
+// so the deterministic floor (C1–C10) is unavailable for this call — it FAILS
 // CLOSED: a hard canonical [ReasonCodeCommandAnalysisUnavailable] outcome, so
 // the call still escalates under an `allow` policy and blocks under
 // verify-on-edit's unattended path, instead of running with no floor at all.
@@ -424,7 +425,7 @@ func ShellJudgeOutcome(ctx context.Context, toolName string) JudgeOutcome {
 // Criteria engine
 // ─────────────────────────────────────────────────────────────────────────
 
-// evaluateShellReport applies the fixed-priority criteria C1–C9 to a flowsh
+// evaluateShellReport applies the fixed-priority criteria C1–C10 to a flowsh
 // report and assembles the digest + winning outcome. It never fails: a report
 // is always assessable (flowsh itself degrades to ⊤/conservative, which C6/C7
 // handle). command is the raw tool-input command text — used only to verify
@@ -511,6 +512,18 @@ func evaluateShellReport(ctx context.Context, workDir, command string, lang api.
 	if len(shellOutsideRootDirectNonSystemTargets(ctx, report, workDir, lang)) > 0 {
 		fire(ReasonCodeOutsideSessionRoots, JudgeSeveritySoft, false)
 	}
+	// C10 — direct code-execution/process-spawn effect outside the session
+	// roots: the exec-scope question. Fires only on a bounded report (an
+	// unbounded call is C6's territory) and only where the roots are attached
+	// — the containment walk returns nothing otherwise, so a host that
+	// attaches no roots keeps today's no-criterion behaviour rather than
+	// silently failing open. Hard but NON-canonical: a driver pointed at
+	// out-of-root code is a judgment shape (scratch scripts in the host temp
+	// dir are routine), so the judges may clear it; the verification marker
+	// stays off for it by its own containment condition.
+	if len(shellOutsideRootExecTargets(ctx, report, workDir)) > 0 {
+		fire(ReasonCodeCommandExecOutsideRoots, JudgeSeverityHard, false)
+	}
 
 	result := &ShellAnalysis{Digest: newShellAnalysisDigest(ctx, workDir, command, report, criteria)}
 	if len(criteria) > 0 {
@@ -550,6 +563,8 @@ func shellCriterionReason(code JudgeReasonCode) string {
 		return "Shell analysis: download client wrote fetched external content to a file (external-content ingest)"
 	case ReasonCodeCredentialAccess:
 		return "Shell analysis: credential/secret material accessed without a paired egress"
+	case ReasonCodeCommandExecOutsideRoots:
+		return "Shell analysis: code execution/process spawn outside the session roots"
 	case ReasonCodeOutsideSessionRoots:
 		return "Shell analysis: filesystem effect outside the session roots"
 	default:
@@ -603,6 +618,29 @@ var (
 	shellFSWriteKinds = []engine.EffectKind{engine.KindFSWrite}
 	shellFSAllKinds   = []engine.EffectKind{engine.KindFSRead, engine.KindFSWrite, engine.KindFSMeta}
 )
+
+// shellExecKinds names the effect kinds the C10 exec-scope criterion consults:
+// a direct code-execution or process-spawn effect whose path-shaped target
+// resolves outside every session root (a driver pointed at out-of-root code).
+var shellExecKinds = []engine.EffectKind{engine.KindCodeExec, engine.KindProcSpawn}
+
+// shellOutsideRootExecTargets returns the C10 targets: directly performed
+// code-exec/process-spawn effects whose path-shaped, resolvable targets fall
+// outside every session root. Unlike C9 no system-path exclusion applies — the
+// question is not "is the path system-owned" but "is the executed code inside
+// the trusted roots"; the harmless-device exemption inside the containment
+// walk still applies.
+func shellOutsideRootExecTargets(ctx context.Context, report *api.Report, workDir string) []string {
+	hits := shellOutsideRoots(ctx, report, workDir, shellExecKinds, true)
+	if len(hits) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(hits))
+	for _, t := range hits {
+		out = append(out, t.path)
+	}
+	return out
+}
 
 // shellEffectKindsHas reports whether kinds contains e.Kind.
 func shellEffectKindsHas(kinds []engine.EffectKind, e engine.Effect) bool {
@@ -1003,7 +1041,7 @@ func newShellAnalysisDigest(ctx context.Context, workDir, command string, report
 //   - the CANONICAL effect set (flowsh v2 Canonical): each effect rendered as
 //     its stable key "Kind|Mode|[targets]" plus reversibility ("|R"/"|I"),
 //     staging-folded and stripped of non-path operand targets.
-//   - the codes of the fired criteria (C1–C9), sorted.
+//   - the codes of the fired criteria (C1–C10), sorted.
 //   - the workspace-scoped verification marker (B).
 //
 // Every component is sorted and deduplicated, so the rendering is a pure
@@ -1091,19 +1129,21 @@ func shellFirstFlagFreeOperand(args []string) (string, bool) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Workspace-scoped verification marker (digest v3, Track B)
+// Workspace-scoped verification marker (digest v2 field, Track B)
 // ─────────────────────────────────────────────────────────────────────────
 //
-// The marker is the deterministic evidence the strict judge needs for its
-// "positive establishment" doctrine on the C6 (command_unbounded_analysis)
-// escalation: a verification driver run over the session's own roots is the
-// one command family that is unbounded ONLY because the analyzer cannot see
-// inside the driver (vitest/gofmt/… are unknown binaries whose sole report
-// contribution is a ⊤ CodeExec effect), never because it does anything the
-// criteria could point at. The marker is computed from the same flowsh
-// report the criteria use; it NEVER suppresses a criterion — C6 keeps firing
-// (non-canonical, hard) so the call still escalates to the judge, which then
-// clears it on the marker (defense in depth; the judge stays in the loop).
+// The marker is the deterministic evidence the strict judge weighs when a
+// shell call escalates despite the command being a verification driver run
+// over the session's own roots. Since the binder resolves package runners
+// and node_modules/.bin paths onto the driven binary's knowledge-base
+// signature (flowsh bind/runner.go), the everyday driver families no longer
+// escalate at all — the deterministic layer clears them with zero criteria —
+// and the marker's role is judge evidence and defense in depth, never a
+// criteria override: it NEVER suppresses a criterion. The shapes that still
+// escalate on C6 (an unmodelled npx operand, a bash-frontend sink like
+// node/python3/awk, a dynamically named command) break the call-coverage
+// condition below, so the marker stays OFF exactly where C6 lives — the
+// judge then decides without positive evidence (fail-closed).
 //
 // Conditions (ALL must hold — any miss keeps the marker off, fail-closed):
 //

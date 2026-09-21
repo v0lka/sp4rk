@@ -2512,7 +2512,7 @@ func TestJudgeReasonCode_Vocabulary(t *testing.T) {
 		ReasonCodeSymlinkEscape:         "symlink_escape",
 		ReasonCodeSymlinkSuspicious:     "symlink_suspicious",
 		ReasonCodeGitInternal:           "git_internal_path",
-		// The flowsh shell-analysis criteria (C1–C9) and the fail-closed
+		// The flowsh shell-analysis criteria (C1–C10) and the fail-closed
 		// analysis-unavailable reason: published cross-repo contract codes
 		// serialized into confirmations and read by non-Go hosts.
 		ReasonCodeCommandExfilFlow:               "command_exfil_flow",

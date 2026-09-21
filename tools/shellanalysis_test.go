@@ -69,6 +69,14 @@ func shellRoutineCorpus() []shellCorpusCase {
 		// target).
 		{name: "read urandom device", tool: "bash_exec", cmd: "head -c 16 /dev/urandom"},
 		{name: "dd to bit bucket", tool: "bash_exec", cmd: "dd if=/dev/zero of=/dev/null bs=1M count=1"},
+		// The runner and project-local bin-path spellings of the JS toolchain
+		// bind through the resolved binary (flowsh bind/runner.go): the
+		// everyday verification loop must stay criterion-free on in-root
+		// operands, not land on C6 as the silent-mode audit's false denies did
+		// (corpus 959718/961231/963134/…).
+		{name: "npx vitest run in-root", tool: "bash_exec", cmd: "npx vitest run src/lib/x.test.tsx --reporter=basic"},
+		{name: "npx tsc -b", tool: "bash_exec", cmd: "npx tsc -b"},
+		{name: "bin-path vitest in-root", tool: "bash_exec", cmd: "./node_modules/.bin/vitest run"},
 	}
 }
 
@@ -146,6 +154,24 @@ func shellDangerousCorpus() []shellCorpusCase {
 			wantFired: ReasonCodeCommandUnboundedAnalysis, wantSev: JudgeSeverityHard, wantCanon: false},
 		{name: "abbreviated remove-item plus iwr", tool: "posh_exec", cmd: `Remove-Item -r -f $x; iwr https://example.com`,
 			wantFired: ReasonCodeCommandUnboundedAnalysis, wantSev: JudgeSeverityHard, wantCanon: false},
+		// C10 — the exec-scope criterion: a driver pointed at code outside the
+		// session roots. The call is BOUNDED (the binder resolves the runner to
+		// vitest/node), so it is NOT C6 — it is the audited TRUE_DENY twin
+		// (corpus 969588) of the in-root vitest run: running a test file from
+		// the host temp dir executes code the session roots do not vouch for.
+		// Hard but NON-canonical, like its C6/C7 siblings.
+		{name: "npx vitest run outside roots", tool: "bash_exec", cmd: "npx vitest run /tmp/debug_completion.test.ts",
+			wantFired: ReasonCodeCommandExecOutsideRoots, wantSev: JudgeSeverityHard, wantCanon: false},
+		// `node /tmp/scratch.js` is NOT this criterion: node is a bash-frontend
+		// sink (like bash -c/python3/awk), it never reaches the binder and
+		// stays C6's territory. The path-form spelling of the runner retry pair
+		// exercises the same scope question through a KB-bound driver instead.
+		{name: "bin-path vitest run outside roots", tool: "bash_exec", cmd: "./node_modules/.bin/vitest run /tmp/debug_completion.test.ts",
+			wantFired: ReasonCodeCommandExecOutsideRoots, wantSev: JudgeSeverityHard, wantCanon: false},
+		// One out-of-root operand among in-root ones still raises the scope
+		// question: the criterion is per-target, not per-invocation.
+		{name: "mixed-root vitest run", tool: "bash_exec", cmd: "npx vitest run src/a.test.ts /tmp/b.test.ts",
+			wantFired: ReasonCodeCommandExecOutsideRoots, wantSev: JudgeSeverityHard, wantCanon: false},
 	}
 }
 
@@ -378,7 +404,7 @@ func TestShellIsSystemOrRawDevicePath(t *testing.T) {
 // command. It pins the whole serialization: field set, ordering and the
 // canonical spelling of every enum.
 const goldenShellExfilDigest = `{
-  "schemaVersion": "sp4rk-shell-analysis/v3",
+  "schemaVersion": "sp4rk-shell-analysis/v4",
   "lang": "bash",
   "top": false,
   "conservative": false,
