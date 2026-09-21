@@ -412,6 +412,7 @@ var staticAnalysisPromptPhrases = []string{
 	"command_destructive_outside_roots",
 	"command_unbounded_analysis",
 	"command_external_content_ingest",
+	"command_exec_outside_roots",
 	"credential_access",
 	"outside_session_roots",
 	"nothing follows from its absence",
@@ -421,15 +422,19 @@ func TestJudgeStrictPromptCoversStaticAnalysis(t *testing.T) {
 	prompt := judge_prompts.JudgeStrictSystem
 	required := append([]string{
 		"not by itself a material risk",
-		"the `judge_reasoning` names the criterion that fired",
-		// Download-cradle criterion (digest v3): flow semantics only — the
+		"the `judge_reasoning` names the winning criterion",
+		// Exec-scope criterion: a hard non-canonical criterion for a driver
+		// pointed at out-of-root code, with the invoked-binary exemption.
+		"exec sibling of `outside_session_roots`",
+		"the invoked binary's own path is not an operand",
+		// Download-cradle criterion: flow semantics only — the
 		// download→execute pattern keyed on the established cradle flow, with
 		// host authority dropped as a deterministic trigger.
 		"command_download_cradle",
 		"network→code-execution **cradle flow**",
 		"`cradleFlows`",
 		"`download→execute`",
-		// External-content-ingest criterion (digest v3): the fail-closed-on-
+		// External-content-ingest criterion: the fail-closed-on-
 		// arbitrary-host replacement for the former host-reputation trigger.
 		"network→filesystem **ingest flow**",
 		"`ingestFlows`",
@@ -438,7 +443,7 @@ func TestJudgeStrictPromptCoversStaticAnalysis(t *testing.T) {
 		// establishment grounds for ALLOW.
 		"stdout/stderr",
 		"NEITHER criterion is in force",
-		// Workspace-scoped verification marker (digest v3): the positive
+		// Workspace-scoped verification marker: the positive
 		// establishment rule for command_unbounded_analysis escalations.
 		"workspaceScopedVerification",
 		"sufficient grounds to ALLOW",

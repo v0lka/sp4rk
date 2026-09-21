@@ -2,8 +2,8 @@
 
 package tools
 
-// Workspace-scoped verification marker tests (digest v3, Track B of the
-// silent-mode deny-accuracy recommendations §2). The marker is positive
+// Workspace-scoped verification marker tests (Track B of the silent-mode
+// deny-accuracy recommendations §2). The marker is positive
 // evidence for the judge's "positive establishment" doctrine on C6: a
 // catalogued verification driver over the session's own roots. The negative
 // rows mirror the audited corpus shapes the marker must NOT clear (the
@@ -161,12 +161,11 @@ func TestShellWorkspaceScopedVerification_RequiresRoots(t *testing.T) {
 // longer escalates on C6.
 //
 // The defense-in-depth contract is unchanged — the marker never removes a
-// criterion — but the C6+marker overlap this file used to pin retired when
-// the binder started resolving the runner: every shape that still fires C6
-// (an unmodelled npx operand, a bash-frontend sink like node/python3, a
-// dynamically named command) breaks the marker's call-coverage condition, so
-// the marker stays off exactly where C6 lives and the judge decides without
-// positive evidence (fail-closed).
+// criterion — but the specific C6+marker overlap this file used to pin
+// retired when the binder started resolving the runner: the audited vitest
+// shape no longer fires C6 at all. The general invariant is still asserted
+// (see TestShellWorkspaceScopedVerification_DoesNotSuppressCriterion, which
+// pins a C6+marker command that must keep escalating).
 func TestShellWorkspaceScopedVerification_MarkedDriverIsDeterministic(t *testing.T) {
 	got := markerAnalyze(t, markerCase{command: "cd frontend && npx vitest run src/App.test.tsx 2>&1 | tail -15"})
 	if !got.Digest.WorkspaceScopedVerification {
@@ -179,6 +178,32 @@ func TestShellWorkspaceScopedVerification_MarkedDriverIsDeterministic(t *testing
 	if len(got.Digest.Criteria) != 0 {
 		t.Errorf("criteria = %v, want empty — the allow must come from the deterministic layer, not from the marker",
 			got.Digest.Criteria)
+	}
+}
+
+// TestShellWorkspaceScopedVerification_DoesNotSuppressCriterion pins the
+// defense-in-depth invariant: the marker is evidence FOR the judge, never a
+// criteria override. A catalogued driver the binder cannot bind — here
+// golangci-lint resolves to a target-less ⊤ CodeExec — leaves the report
+// conservative, so C6 fires with the marker ON; the marker is exactly the
+// positive evidence the judge weighs when clearing that C6 limitation, and
+// the call still escalates.
+func TestShellWorkspaceScopedVerification_DoesNotSuppressCriterion(t *testing.T) {
+	got := markerAnalyze(t, markerCase{command: "gofmt -l core backend && golangci-lint run ./core/... ./backend/... 2>&1 | tail -3"})
+	if !got.Digest.WorkspaceScopedVerification {
+		t.Fatalf("marker = false, want true")
+	}
+	if got.Outcome.Allow || got.Outcome.ReasonCode != ReasonCodeCommandUnboundedAnalysis {
+		t.Errorf("outcome = {allow=%v code=%s}, want deny on command_unbounded_analysis", got.Outcome.Allow, got.Outcome.ReasonCode)
+	}
+	fired := false
+	for _, c := range got.Digest.Criteria {
+		if c.Fired == ReasonCodeCommandUnboundedAnalysis {
+			fired = true
+		}
+	}
+	if !fired {
+		t.Errorf("criteria list lost command_unbounded_analysis when the marker fired: %+v", got.Digest.Criteria)
 	}
 }
 
@@ -201,8 +226,8 @@ func TestShellWorkspaceScopedVerification_PowerShellExcluded(t *testing.T) {
 	}
 }
 
-// TestShellWorkspaceScopedVerification_DigestField pins the v3 field
-// spelling and position in the serialized digest.
+// TestShellWorkspaceScopedVerification_DigestField pins the field spelling
+// and position in the serialized digest.
 func TestShellWorkspaceScopedVerification_DigestField(t *testing.T) {
 	got := markerAnalyze(t, markerCase{command: "gofmt -l ."})
 	raw, err := json.Marshal(got.Digest)

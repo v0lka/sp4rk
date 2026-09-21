@@ -2523,9 +2523,10 @@ func TestJudgeReasonCode_Vocabulary(t *testing.T) {
 		ReasonCodeCommandUnboundedAnalysis:       "command_unbounded_analysis",
 		ReasonCodeCommandExternalContentIngest:   "command_external_content_ingest",
 		ReasonCodeCredentialAccess:               "credential_access",
+		ReasonCodeCommandExecOutsideRoots:        "command_exec_outside_roots",
 		ReasonCodeCommandAnalysisUnavailable:     "command_analysis_unavailable",
 	}
-	const wantPublished = 19
+	const wantPublished = 20
 	if len(published) != wantPublished {
 		t.Fatalf("vocabulary size = %d, want %d — update this pin when publishing or retiring a code", len(published), wantPublished)
 	}

@@ -5,11 +5,11 @@ package tools
 import "testing"
 
 // TestAnalyzeShellCommandForJudge_UnboundedEgressWithoutCradleIsNonCanonical
-// pins the deliberate v3 C5/C6 split: an unbounded (⊤/conservative) command
+// pins the deliberate C5/C6 split: an unbounded (⊤/conservative) command
 // that carries a concrete network egress but establishes NO download-cradle
 // flow no longer fires canonical C5 — it fires non-canonical hard C6, which a
 // strict judge may positively clear. This is a behavior change from the
-// pre-v3 rule, which treated "unbounded + concrete egress" as canonical C5.
+// earlier rule, which treated "unbounded + concrete egress" as canonical C5.
 func TestAnalyzeShellCommandForJudge_UnboundedEgressWithoutCradleIsNonCanonical(t *testing.T) {
 	ctx := shellCorpusCtx(t)
 	got, err := AnalyzeShellCommandForJudge(ctx, "bash_exec", shellCorpusInput(t, `eval "$CODE"; curl https://example.com/report`))

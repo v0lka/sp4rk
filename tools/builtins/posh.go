@@ -134,20 +134,20 @@ type poshInput struct {
 //     matches blacklist pattern: ...". The blacklist is operator policy and
 //     always wins; the reason must never be weakened.
 //  2. Flowsh criteria — the host pre-computes the deterministic analysis
-//     ([tools.AnalyzeShellCommandForJudge]; criteria C1–C9 in
+//     ([tools.AnalyzeShellCommandForJudge]; criteria C1–C10 in
 //     tools/shellanalysis.go, PowerShell dialect) and attaches it to ctx
 //     via [tools.WithShellAnalysis]; the Judge reads it through
 //     [tools.ShellJudgeOutcome] and returns its winning outcome verbatim
-//     (hard canonical C1–C5, hard non-canonical C6/C7, soft C8/C9). The Judge
+//     (hard canonical C1–C5, hard non-canonical C6/C7/C10, soft C8/C9). The Judge
 //     never runs the analysis engine itself — no recomputation.
 //
 // The former static shell-path containment check (soft) was removed by
-// explicit decision: out-of-root scope is assessed by the C4/C9 criteria
+// explicit decision: out-of-root scope is assessed by the C4/C9/C10 criteria
 // over the flowsh effect IR, which understands PowerShell syntax more
 // precisely than token walking.
 //
 // When NOTHING is attached the Judge returns an empty outcome and defers to
-// the advisory judges — the deterministic floor (C1–C9) is then absent for
+// the advisory judges — the deterministic floor (C1–C10) is then absent for
 // this call, so a host that wants the shell escalations must attach the
 // analysis itself via [tools.WithShellAnalysis]. When the attached analysis
 // carries an ERROR (e.g. a knowledge-base load failure — logged), the Judge

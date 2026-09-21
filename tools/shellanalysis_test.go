@@ -39,8 +39,9 @@ type shellCorpusCase struct {
 	name string
 	tool string // "bash_exec" or "posh_exec"
 	cmd  string
-	// wantFired is the highest-priority criterion expected to fire; empty
-	// means no criterion fires at all.
+	// wantFired is the winning criterion expected to fire (the highest
+	// severity, ties broken by the fixed priority order); empty means no
+	// criterion fires at all.
 	wantFired JudgeReasonCode
 	wantSev   JudgeSeverity
 	wantCanon bool
@@ -77,6 +78,13 @@ func shellRoutineCorpus() []shellCorpusCase {
 		{name: "npx vitest run in-root", tool: "bash_exec", cmd: "npx vitest run src/lib/x.test.tsx --reporter=basic"},
 		{name: "npx tsc -b", tool: "bash_exec", cmd: "npx tsc -b"},
 		{name: "bin-path vitest in-root", tool: "bash_exec", cmd: "./node_modules/.bin/vitest run"},
+		// The C10 boundary: a routine in-root verification invoked through an
+		// absolute out-of-root BINARY path must stay criterion-free. The
+		// invoked binary is not an executed-code operand, so the exec-scope
+		// walk never sees it — locking the false-deny boundary (the same
+		// commands the marker-positive suite asserts stay marker-true).
+		{name: "absolute gofmt path", tool: "bash_exec", cmd: "/usr/bin/gofmt -l tools security"},
+		{name: "absolute tsc path", tool: "bash_exec", cmd: "/usr/bin/tsc -b"},
 	}
 }
 
@@ -207,8 +215,8 @@ func TestAnalyzeShellCommandForJudge_DangerousCorpus(t *testing.T) {
 	}
 }
 
-// assertWinner checks the highest-priority fired criterion against the
-// expectation (empty wantFired = nothing may fire).
+// assertWinner checks the winning fired criterion against the expectation
+// (empty wantFired = nothing may fire).
 func assertWinner(t *testing.T, tc shellCorpusCase, got *ShellAnalysis) {
 	t.Helper()
 	if tc.wantFired == "" {
@@ -234,9 +242,11 @@ func assertWinner(t *testing.T, tc shellCorpusCase, got *ShellAnalysis) {
 	}
 }
 
-// TestAnalyzeShellCommandForJudge_PriorityOrder verifies the fixed C1…C9
-// ordering on inputs that fire several criteria at once: the winner is the
-// lowest-numbered criterion, and the digest lists them in priority order.
+// TestAnalyzeShellCommandForJudge_PriorityOrder verifies the fixed C1–C10
+// ordering on inputs that fire several criteria at once: the digest lists the
+// fired criteria in priority order. (The winner is selected separately, by
+// severity then priority — see
+// TestAnalyzeShellCommandForJudge_SeverityBeatsPriority.)
 func TestAnalyzeShellCommandForJudge_PriorityOrder(t *testing.T) {
 	ctx := shellCorpusCtx(t)
 	cases := []struct {
@@ -278,9 +288,60 @@ func TestAnalyzeShellCommandForJudge_PriorityOrder(t *testing.T) {
 	}
 }
 
+// TestAnalyzeShellCommandForJudge_SeverityBeatsPriority pins the winner
+// selection: when a hard criterion and a lower-numbered soft criterion both
+// fire, the HARD one wins the outcome even though the soft one is earlier in
+// the fixed priority order. Here the soft C9 (outside_session_roots, appended
+// first) and the hard C10 (command_exec_outside_roots) co-fire; the digest
+// still lists both in priority order, but the outcome must carry C10.
+func TestAnalyzeShellCommandForJudge_SeverityBeatsPriority(t *testing.T) {
+	ctx := shellCorpusCtx(t)
+	got, err := AnalyzeShellCommandForJudge(ctx, "bash_exec",
+		shellCorpusInput(t, "cat /tmp/a.txt && npx vitest run /tmp/b.test.ts"))
+	if err != nil {
+		t.Fatalf("AnalyzeShellCommandForJudge: %v", err)
+	}
+	wantOrdered := []JudgeReasonCode{ReasonCodeOutsideSessionRoots, ReasonCodeCommandExecOutsideRoots}
+	if len(got.Digest.Criteria) != len(wantOrdered) {
+		t.Fatalf("criteria = %+v, want exactly %v", got.Digest.Criteria, wantOrdered)
+	}
+	for i, want := range wantOrdered {
+		if got.Digest.Criteria[i].Fired != want {
+			t.Fatalf("criteria[%d] = %q, want %q (all: %+v)", i, got.Digest.Criteria[i].Fired, want, got.Digest.Criteria)
+		}
+	}
+	if got.Outcome.Allow || got.Outcome.ReasonCode != ReasonCodeCommandExecOutsideRoots {
+		t.Errorf("winner = {allow=%v code=%s}, want deny on %s", got.Outcome.Allow, got.Outcome.ReasonCode, ReasonCodeCommandExecOutsideRoots)
+	}
+	if got.Outcome.Severity != JudgeSeverityHard {
+		t.Errorf("winner severity = %v, want hard", got.Outcome.Severity)
+	}
+}
+
+// TestAnalyzeShellCommandForJudge_UnboundedSuppressesExecScope pins the
+// boundedness guard on C10: an unbounded report stays the C6 shape, so a
+// driver pointed outside the roots alongside an unresolved irreversible write
+// must NOT also fire the exec-scope criterion.
+func TestAnalyzeShellCommandForJudge_UnboundedSuppressesExecScope(t *testing.T) {
+	ctx := shellCorpusCtx(t)
+	got, err := AnalyzeShellCommandForJudge(ctx, "bash_exec",
+		shellCorpusInput(t, "rm -rf $DIR; npx vitest run /tmp/b.test.ts"))
+	if err != nil {
+		t.Fatalf("AnalyzeShellCommandForJudge: %v", err)
+	}
+	if got.Outcome.Allow || got.Outcome.ReasonCode != ReasonCodeCommandUnboundedAnalysis {
+		t.Fatalf("winner = {allow=%v code=%s}, want deny on %s", got.Outcome.Allow, got.Outcome.ReasonCode, ReasonCodeCommandUnboundedAnalysis)
+	}
+	for _, c := range got.Digest.Criteria {
+		if c.Fired == ReasonCodeCommandExecOutsideRoots {
+			t.Errorf("C10 fired on an unbounded report: %+v", got.Digest.Criteria)
+		}
+	}
+}
+
 // TestAnalyzeShellCommandForJudge_EmptyRootsDisableContainment mirrors the
 // former shell-path containment contract: with no session roots attached, the
-// containment criteria (C4/C9) cannot fire — the destructive home wipe stays
+// containment criteria (C4/C9/C10) cannot fire — the destructive home wipe stays
 // allowed.
 func TestAnalyzeShellCommandForJudge_EmptyRootsDisableContainment(t *testing.T) {
 	got, err := AnalyzeShellCommandForJudge(context.Background(), "bash_exec", shellCorpusInput(t, "rm -rf $HOME/"))

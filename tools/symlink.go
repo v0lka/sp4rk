@@ -35,7 +35,7 @@ type SymlinkTraversal struct {
 // paths: shell expansions ($var, $(cmd), backticks, $env:...) are not
 // statically resolvable and are deliberately not assessed for suspicion here —
 // dynamic constructs are the domain of the deterministic flowsh analysis
-// ([AnalyzeShellCommandForJudge], criteria C1–C9), which the host pre-computes
+// ([AnalyzeShellCommandForJudge], criteria C1–C10), which the host pre-computes
 // once per call and attaches with [WithShellAnalysis]. This walk never runs
 // that analysis itself: with nothing attached it stays a pure literal-path
 // extractor and does not escalate for dynamic constructs.

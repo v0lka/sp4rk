@@ -12,9 +12,11 @@
 //   - The blocklist match stays in the tool's own Judge (bash_exec/posh_exec);
 //     it is NOT re-implemented here. This engine covers everything the
 //     effect IR can see.
-//   - Criteria are evaluated in the fixed priority C1…C9; every fired
-//     criterion is recorded in the digest, and the highest-priority one
-//     becomes the JudgeOutcome.
+//   - Criteria are evaluated in the fixed priority C1–C10; every fired
+//     criterion is recorded in the digest, and the highest-severity fired
+//     criterion (ties broken by the fixed priority order) becomes the
+//     JudgeOutcome — a hard criterion is never dominated by a lower-numbered
+//     soft one.
 //   - Canonicality: C1–C5 are hard AND canonical (hosts must never
 //     auto-override them). C5 fires only on an established cradle FLOW —
 //     the network→code-execution flow the analysis proved (fetched content
@@ -22,12 +24,13 @@
 //     co-occurrence, so a canonical verdict is always backed by a real flow.
 //     C6 (unbounded analysis) and C7 (external-content ingest) are hard but
 //     NON-canonical — an analysis limitation and a flow the advisory judge
-//     may clear. C8/C9 are soft scope questions.
+//     may clear — as is C10 (exec scope). C8/C9 are soft scope questions.
 //   - The flowsh score/grade are carried in the digest for context but are
 //     deliberately NOT used as decision thresholds — the criteria fire off
 //     structural facts (effect kinds, targets, KB classes), not scores.
-//   - Containment (C4/C9) consults only FS* effects whose concrete targets
-//     are path-shaped; CLI noise ("-30", "s/foo/bar/g", "+x") is discarded by
+//   - Containment (C4/C9/C10) consults only path-shaped concrete targets of
+//     the effects it matches — FS* effects for C4/C9, code-exec/process-spawn
+//     effects for C10; CLI noise ("-30", "s/foo/bar/g", "+x") is discarded by
 //     a path-shape check before resolution. Empty session roots disable
 //     containment entirely, as the former shell-path containment check did.
 
@@ -212,14 +215,16 @@ type ShellAnalysisDigest struct {
 type ShellAnalysis struct {
 	// Digest is the compact JSON document for judges (see ShellAnalysisDigest).
 	Digest ShellAnalysisDigest
-	// Outcome is the highest-priority fired criterion expressed as a
-	// JudgeOutcome. Allow=true (zero value otherwise) when no criterion fired.
+	// Outcome is the winning fired criterion — the highest severity, ties
+	// broken by the fixed priority order — expressed as a JudgeOutcome.
+	// Allow=true (zero value otherwise) when no criterion fired.
 	Outcome JudgeOutcome
 	// Canonical reports whether the winning reason is canonical — a hard
 	// security control a host must never auto-override. False for soft
 	// reasons and for the non-canonical hard reasons
-	// ReasonCodeCommandUnboundedAnalysis and
-	// ReasonCodeCommandExternalContentIngest.
+	// ReasonCodeCommandUnboundedAnalysis,
+	// ReasonCodeCommandExternalContentIngest and
+	// ReasonCodeCommandExecOutsideRoots.
 	Canonical bool
 }
 
@@ -233,7 +238,7 @@ type ShellAnalysis struct {
 // "posh_exec", which selects the dialect) and the tool's raw JSON input
 // ({command, working_directory}); the returned ShellAnalysis carries the
 // digest plus the winning judge outcome. Session roots for the containment
-// criteria (C4/C9) come from ctx exactly as they did for the former shell-path
+// criteria (C4/C9/C10) come from ctx exactly as they did for the former shell-path
 // containment check; with no roots attached those criteria cannot fire.
 // Host-known variable bindings attached via [WithShellVarBindings] are
 // forwarded to the analyzer (flowsh Options.Vars): every binding behaves as
@@ -445,6 +450,11 @@ func evaluateShellReport(ctx context.Context, workDir, command string, lang api.
 	hasExfilPair := len(report.Score.ExfilPairs) > 0
 	unbounded := report.Top || report.Conservative
 	unboundedWrite := shellHasUnboundedWrite(report)
+	// bounded is the explicit precondition for the C10 exec-scope criterion:
+	// the report must be genuinely bounded (neither ⊤/conservative nor an
+	// unresolved irreversible write), so C10 never co-fires with the C6
+	// unbounded reason.
+	bounded := !unbounded && !unboundedWrite
 	// The network data-flows the analyzer established: a cradle is a proven
 	// network→code-execution flow (fetched content reaching a shell or
 	// interpreter), an ingest a proven network→filesystem flow (a download
@@ -513,21 +523,24 @@ func evaluateShellReport(ctx context.Context, workDir, command string, lang api.
 		fire(ReasonCodeOutsideSessionRoots, JudgeSeveritySoft, false)
 	}
 	// C10 — direct code-execution/process-spawn effect outside the session
-	// roots: the exec-scope question. Fires only on a bounded report (an
-	// unbounded call is C6's territory) and only where the roots are attached
-	// — the containment walk returns nothing otherwise, so a host that
-	// attaches no roots keeps today's no-criterion behaviour rather than
-	// silently failing open. Hard but NON-canonical: a driver pointed at
-	// out-of-root code is a judgment shape (scratch scripts in the host temp
-	// dir are routine), so the judges may clear it; the verification marker
-	// stays off for it by its own containment condition.
-	if len(shellOutsideRootExecTargets(ctx, report, workDir)) > 0 {
+	// roots: the exec-scope question. Fires only on a bounded report — the
+	// explicit `bounded` guard requires neither ⊤/conservative nor an
+	// unresolved irreversible write, so an unbounded call stays the territory
+	// of C5/C6 rather than relying on the containment walk's incidental
+	// ⊤-target skip — and only where the roots are attached: the containment
+	// walk returns nothing otherwise, so a host that attaches no roots keeps
+	// today's no-criterion behaviour rather than silently failing open. Hard
+	// but NON-canonical: a driver pointed at out-of-root code is a judgment
+	// shape (scratch scripts in the host temp dir are routine), so the judges
+	// may clear it; the verification marker stays off for it by its own
+	// containment condition.
+	if bounded && shellOutsideRootExecTargets(ctx, report, workDir) {
 		fire(ReasonCodeCommandExecOutsideRoots, JudgeSeverityHard, false)
 	}
 
 	result := &ShellAnalysis{Digest: newShellAnalysisDigest(ctx, workDir, command, report, criteria)}
 	if len(criteria) > 0 {
-		winner := criteria[0]
+		winner := shellWinningCriterion(criteria)
 		result.Outcome = JudgeOutcome{
 			Allow:      false,
 			Reason:     shellCriterionReason(winner.Fired),
@@ -541,6 +554,24 @@ func evaluateShellReport(ctx context.Context, workDir, command string, lang api.
 		result.Outcome = JudgeOutcome{Allow: true}
 	}
 	return result
+}
+
+// shellWinningCriterion selects the outcome's winning criterion from the fired
+// set: severity decides first, so a hard criterion is never dominated by a
+// lower-numbered soft one (the C10 exec-scope signal must not be masked by the
+// soft C9 filesystem-scope note); ties keep the fixed priority order (the
+// append order), so among equally severe criteria the lowest-numbered wins.
+// The canonical criteria (C1–C5) are always hard and already lead the append
+// order, so this changes the outcome only where a hard criterion sits after a
+// soft one.
+func shellWinningCriterion(criteria []ShellCriterion) ShellCriterion {
+	winner := criteria[0]
+	for _, c := range criteria[1:] {
+		if c.Severity == JudgeSeverityHard && winner.Severity == JudgeSeveritySoft {
+			winner = c
+		}
+	}
+	return winner
 }
 
 // shellCriterionReason returns the human-readable prose for a fired
@@ -624,22 +655,16 @@ var (
 // resolves outside every session root (a driver pointed at out-of-root code).
 var shellExecKinds = []engine.EffectKind{engine.KindCodeExec, engine.KindProcSpawn}
 
-// shellOutsideRootExecTargets returns the C10 targets: directly performed
-// code-exec/process-spawn effects whose path-shaped, resolvable targets fall
-// outside every session root. Unlike C9 no system-path exclusion applies — the
-// question is not "is the path system-owned" but "is the executed code inside
-// the trusted roots"; the harmless-device exemption inside the containment
-// walk still applies.
-func shellOutsideRootExecTargets(ctx context.Context, report *api.Report, workDir string) []string {
-	hits := shellOutsideRoots(ctx, report, workDir, shellExecKinds, true)
-	if len(hits) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(hits))
-	for _, t := range hits {
-		out = append(out, t.path)
-	}
-	return out
+// shellOutsideRootExecTargets reports whether the C10 exec-scope criterion
+// fired: a directly performed code-exec/process-spawn effect whose path-shaped,
+// resolvable target falls outside every session root. Unlike C9 no system-path
+// exclusion applies — the question is not "is the path system-owned" but "is
+// the executed code inside the trusted roots"; the harmless-device exemption
+// inside the containment walk still applies. It returns a presence flag, not
+// the paths: the digest records the reason code and never the input (the
+// no-echo contract), so the matched paths are deliberately not consumed.
+func shellOutsideRootExecTargets(ctx context.Context, report *api.Report, workDir string) bool {
+	return len(shellOutsideRoots(ctx, report, workDir, shellExecKinds, true)) > 0
 }
 
 // shellEffectKindsHas reports whether kinds contains e.Kind.
@@ -947,7 +972,7 @@ func shellIsSystemOrRawDevicePath(absPath string, lang api.Lang) bool {
 // onto the compact digest: bounded facts only, no input echo, no why-traces.
 // The workspace-scoped verification marker is computed here (it shares the
 // criteria engine's session roots and resolution base) and stamped into the
-// v3 digest.
+// v4 digest.
 func newShellAnalysisDigest(ctx context.Context, workDir, command string, report *api.Report, criteria []ShellCriterion) ShellAnalysisDigest {
 	effects := make([]ShellEffectDigest, 0, len(report.Effects))
 	for _, e := range report.Effects {
@@ -1018,7 +1043,7 @@ func newShellAnalysisDigest(ctx context.Context, workDir, command string, report
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Effect signature (digest v3)
+// Effect signature (digest v4)
 // ─────────────────────────────────────────────────────────────────────────
 //
 // The signature is the comparable identity of a command's EFFECT, not of its
@@ -1140,10 +1165,13 @@ func shellFirstFlagFreeOperand(args []string) (string, bool) {
 // escalate at all — the deterministic layer clears them with zero criteria —
 // and the marker's role is judge evidence and defense in depth, never a
 // criteria override: it NEVER suppresses a criterion. The shapes that still
-// escalate on C6 (an unmodelled npx operand, a bash-frontend sink like
-// node/python3/awk, a dynamically named command) break the call-coverage
-// condition below, so the marker stays OFF exactly where C6 lives — the
-// judge then decides without positive evidence (fail-closed).
+// escalate on C6 fall into two classes. An unknown-driver ⊤ CodeExec — a
+// catalogued driver the binder cannot bind (e.g. golangci-lint) — leaves the
+// marker ON: the ⊤-CodeExec tolerance below is exactly what makes the marker
+// the judge's positive evidence for that C6 limitation. A shape that breaks
+// the call-coverage condition (a bash-frontend sink like node/python3/awk, a
+// dynamically named command) keeps the marker OFF, so the judge decides
+// without positive evidence (fail-closed).
 //
 // Conditions (ALL must hold — any miss keeps the marker off, fail-closed):
 //
