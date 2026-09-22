@@ -326,12 +326,21 @@ func (g *Gateway) configChanged(name string, newCfg ServerConfig) bool {
 		return true
 	}
 
-	// A changed timeout must reconnect the server: the bounds are resolved and
+	// A changed bound must reconnect the server: the bounds are resolved and
 	// captured at Connect time (Server.timeout / Server.callTimeout) and never
 	// re-read, so a live server would otherwise keep the OLD bounds until it
 	// happens to reconnect for some other reason. Comparing them here makes a
 	// timeout-only edit re-apply immediately.
-	if oldCfg.Timeout != newCfg.Timeout || oldCfg.CallTimeout != newCfg.CallTimeout {
+	//
+	// The comparison is on the RESOLVED bounds (resolveTimeoutBounds), not the
+	// raw Timeout / CallTimeout fields, mirroring effectiveToolGroup below: an
+	// edit that leaves the effective bounds unchanged (e.g. normalizing a
+	// non-positive sentinel, or setting CallTimeout to exactly Timeout) does
+	// not alter a single live bound, so tearing the server process down and
+	// re-spawning it would be pure churn.
+	oldHandshake, oldCall := resolveTimeoutBounds(oldCfg)
+	newHandshake, newCall := resolveTimeoutBounds(newCfg)
+	if oldHandshake != newHandshake || oldCall != newCall {
 		return true
 	}
 
@@ -558,11 +567,18 @@ type ServerEntry struct {
 	ToolGroupOverride sdktools.ToolGroup
 	// Timeout bounds this server's initialization handshake (initialize +
 	// tools/list). Zero or negative selects the mcp package default
-	// (defaultMCPTimeout). Forwarded by serverConfigFromEntry so the
+	// (defaultMCPTimeout, 60s). For the HTTP transport it applies to each
+	// transport attempt — the Streamable HTTP attempt and, if that fails, the
+	// SSE fallback — so an unresponsive server can spend up to twice the bound
+	// before Connect fails. Forwarded by serverConfigFromEntry so the
 	// gateway-level configuration path can express it.
 	Timeout time.Duration
 	// CallTimeout bounds a single tools/call invocation against this server.
-	// Zero or negative inherits Timeout (which itself defaults when unset).
+	// Zero or negative inherits Timeout (which itself defaults to
+	// defaultMCPTimeout when unset), so leaving BOTH fields unset caps every
+	// call at 60s — a behavior change for a host that previously ran
+	// long-running calls unbounded on the default configuration. Raise this (or
+	// Timeout) for such a server; there is no way to disable the bound.
 	CallTimeout time.Duration
 }
 

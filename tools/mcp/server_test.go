@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
@@ -542,6 +544,10 @@ const (
 	// stdioHelperNoInit consumes stdin but never answers, so the client's
 	// initialize handshake can only end via its own timeout.
 	stdioHelperNoInit = "noinit"
+	// stdioHelperListHang answers initialize so a connection can be established,
+	// then stays silent on tools/list so discovery can only end via the
+	// handshake timeout.
+	stdioHelperListHang = "listhang"
 	// stdioHelperWedge answers initialize/tools/list so a connection can be
 	// established, answers tools/call "fast" immediately, and stays silent on
 	// any other tool (notably "wedge") so that call can only end via
@@ -589,6 +595,12 @@ func runStdioHelper(mode string) {
 		}
 		if len(req.ID) == 0 {
 			continue // notification (e.g. notifications/initialized)
+		}
+		if mode == stdioHelperListHang && req.Method == "tools/list" {
+			// Deliberately unanswered: discovery can only end via the handshake
+			// timeout. The helper stays responsive to other requests (the loop
+			// keeps decoding) and still exits on stdin EOF.
+			continue
 		}
 
 		switch req.Method {
@@ -824,5 +836,125 @@ func TestServer_CallTool_StdioUnhealthyAfterConsecutiveTimeouts(t *testing.T) {
 	}
 	if s.consecutiveTimeouts != 0 {
 		t.Errorf("consecutiveTimeouts = %d after recovery, want 0", s.consecutiveTimeouts)
+	}
+}
+
+// TestServer_DiscoverTools_StdioTimeout verifies that a server which answers
+// initialize but then hangs on tools/list cannot stall discovery: the tools/list
+// exchange is bounded by the handshake timeout and surfaces a *TimeoutError
+// attributed to Op "list_tools".
+func TestServer_DiscoverTools_StdioTimeout(t *testing.T) {
+	const timeout = 200 * time.Millisecond
+
+	s := newServer("listhang")
+	cfg := stdioHelperServerConfig(t, stdioHelperListHang, timeout, 0)
+	if err := s.Connect(context.Background(), cfg); err != nil {
+		t.Fatalf("Connect to scripted stdio helper: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	start := time.Now()
+	err := s.DiscoverTools(context.Background())
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected a tools/list timeout, got a nil error")
+	}
+	var timeoutErr *TimeoutError
+	if !errors.As(err, &timeoutErr) {
+		t.Fatalf("error = %T (%v), want *TimeoutError", err, err)
+	}
+	if timeoutErr.Op != "list_tools" {
+		t.Errorf("TimeoutError.Op = %q, want %q", timeoutErr.Op, "list_tools")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("errors.Is(err, context.DeadlineExceeded) = false; err = %v", err)
+	}
+	if elapsed < timeout {
+		t.Errorf("discovery returned after %v, before the %v timeout elapsed", elapsed, timeout)
+	}
+	if elapsed > timeout+5*time.Second {
+		t.Errorf("tools/list timeout fired too late (took %v)", elapsed)
+	}
+}
+
+// TestServer_CallTool_StdioContextDeadline verifies that the caller's own
+// context deadline is surfaced as that deadline error — not as a server
+// *TimeoutError — and is not counted toward the unhealthy streak. This is the
+// base.Err() != nil branch of timeoutErrorFor, distinct from the explicit
+// cancellation covered above (a deadline, not a cancel).
+func TestServer_CallTool_StdioContextDeadline(t *testing.T) {
+	// A long per-call timeout guarantees the caller's deadline — not the wire
+	// timeout — is what ends the call.
+	s := connectStdioHelper(t, 30*time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	_, err := s.CallTool(ctx, "wedge", nil)
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context.DeadlineExceeded", err)
+	}
+	var timeoutErr *TimeoutError
+	if errors.As(err, &timeoutErr) {
+		t.Errorf("the caller's own deadline must not be reported as a server *TimeoutError (got %v)", timeoutErr)
+	}
+	if st := s.Status(); st.Unhealthy || st.Error != "" {
+		t.Errorf("a caller deadline must not mark the server unhealthy: %+v", st)
+	}
+	if s.consecutiveTimeouts != 0 {
+		t.Errorf("consecutiveTimeouts = %d after a caller deadline, want 0", s.consecutiveTimeouts)
+	}
+}
+
+// TestServer_Connect_HTTPHandshakeTimeout verifies that an HTTP server which
+// accepts the connection but never answers initialize cannot stall Connect
+// indefinitely: the Streamable HTTP attempt is bounded by the handshake
+// timeout, after which the SSE fallback fails fast (the handler rejects the SSE
+// GET), so Connect returns within the bound instead of hanging.
+func TestServer_Connect_HTTPHandshakeTimeout(t *testing.T) {
+	const timeout = 300 * time.Millisecond
+
+	// release unblocks the held initialize handler at teardown: it must exit
+	// before httptest.Server.Close, which waits for outstanding requests (the
+	// client's timeout aborts its own side but leaves the server-side handler
+	// running, so r.Context().Done() is not a reliable release signal here).
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			// Reject the SSE fallback (and any session teardown) immediately
+			// rather than holding the event stream open, which the transport
+			// would otherwise wait on internally.
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		<-release // hold the initialize POST open: only the client's timeout ends it
+	}))
+	t.Cleanup(func() {
+		close(release)
+		srv.Close()
+	})
+
+	s := newServer("http-hang")
+	start := time.Now()
+	err := s.Connect(context.Background(), ServerConfig{
+		Transport: "http",
+		URL:       srv.URL,
+		Timeout:   timeout,
+	})
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected Connect to fail for an unresponsive HTTP server")
+	}
+	if elapsed < timeout {
+		t.Errorf("Connect returned after %v (err %v), before the %v handshake timeout elapsed", elapsed, err, timeout)
+	}
+	if elapsed > timeout+10*time.Second {
+		t.Errorf("Connect did not honor the handshake bound (took %v; err %v)", elapsed, err)
+	}
+	if s.IsConnected() {
+		t.Error("server must not be left connected after a failed HTTP handshake")
 	}
 }

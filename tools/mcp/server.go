@@ -6,6 +6,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -25,17 +26,25 @@ import (
 	sdktools "github.com/v0lka/sp4rk/tools"
 )
 
-// defaultMCPTimeout is the handshake timeout applied to an MCP server whose
-// ServerConfig leaves Timeout unset (zero or negative). It bounds the
+// defaultMCPTimeout is the timeout applied to an MCP server that leaves its
+// handshake bound unset (Timeout zero or negative). It bounds the
 // initialization handshake (initialize + tools/list), not the lifetime of the
-// server connection.
+// server connection — and, because a per-call bound that is left unset inherits
+// the handshake bound, it also caps a single tools/call by default (see
+// resolveTimeoutBounds).
+//
+// It is intentionally fixed SDK policy rather than a tunable knob: a host whose
+// servers have unusual latency overrides Timeout / CallTimeout per server entry
+// instead of re-tuning a package default.
 const defaultMCPTimeout = 60 * time.Second
 
 // unhealthyTimeoutThreshold is the number of consecutive tools/call timeouts
 // after which a server is flagged unhealthy. A single slow call is tolerated
 // (it may be transient); a sustained streak of back-to-back timeouts indicates
 // a server that is persistently slow or unresponsive, which callers should be
-// able to distinguish from a healthy server via ServerStatus.Unhealthy.
+// able to distinguish from a healthy server via ServerStatus.Unhealthy. Like
+// defaultMCPTimeout it is intentionally fixed SDK policy — the sensitivity is a
+// property of the advisory flag, not a per-server setting.
 const unhealthyTimeoutThreshold = 3
 
 // ServerConfig defines how to launch an MCP server.
@@ -62,11 +71,18 @@ type ServerConfig struct {
 	ToolGroupOverride sdktools.ToolGroup
 
 	// Timeout bounds this server's initialization handshake (initialize +
-	// tools/list). Zero or negative selects defaultMCPTimeout.
+	// tools/list). Zero or negative selects defaultMCPTimeout. For the HTTP
+	// transport it applies to each transport attempt — the Streamable HTTP
+	// attempt and, if that fails, the SSE fallback — so an unresponsive server
+	// can spend up to twice the bound before Connect fails.
 	Timeout time.Duration
 	// CallTimeout bounds a single tools/call invocation against this server.
 	// Zero or negative inherits Timeout (which itself defaults to
-	// defaultMCPTimeout), so a per-call wire timeout is always in effect.
+	// defaultMCPTimeout), so a per-call wire timeout is always in effect —
+	// including for a server that sets neither field, where the 60s default
+	// caps calls that were previously unbounded. Raise it (or raise Timeout)
+	// for a server whose tools legitimately run longer; there is no way to
+	// disable the per-call bound.
 	CallTimeout time.Duration
 }
 
@@ -79,22 +95,26 @@ type Server struct {
 	transportType     string
 	toolGroupOverride sdktools.ToolGroup // per-server group override from ServerConfig; empty = derive from transport
 	// timeout bounds the initialization handshake; callTimeout bounds a single
-	// tools/call. Both are resolved (never zero) in Connect from ServerConfig,
-	// then only read — a changed bound takes effect on the next Connect, which
-	// is why the gateway's configChanged() treats a timeout change as
+	// tools/call. Both are resolved (never zero) from ServerConfig by
+	// resolveTimeoutBounds — the same normalization the gateway diffs against —
+	// then only read: a changed bound takes effect on the next Connect, which
+	// is why configChanged() treats an effective-bounds change as
 	// reconnect-worthy. Guarded by mu.
 	timeout     time.Duration
 	callTimeout time.Duration
 	// consecutiveTimeouts counts tools/call invocations that hit callTimeout
-	// back to back; it resets on any call that returns without timing out. It
-	// lets a caller detect a server that is persistently slow/unresponsive
-	// (as opposed to a one-off slow call). Guarded by mu.
+	// back to back. Only a successful call resets it; a failure that is not a
+	// timeout (a transport/protocol error, or a caller cancellation) neither
+	// extends nor clears the streak, so it still reflects genuinely
+	// back-to-back timeouts. It lets a caller detect a server that is
+	// persistently slow/unresponsive (as opposed to a one-off slow call).
+	// Guarded by mu.
 	consecutiveTimeouts int
 	// unhealthy is set once consecutiveTimeouts reaches
 	// unhealthyTimeoutThreshold; it is surfaced through ServerStatus.Unhealthy
 	// so callers can deprioritize or warn about a persistently unresponsive
-	// server. A subsequent successful call clears it, as does Connect. Guarded
-	// by mu.
+	// server. A subsequent successful call clears it, as do Connect and Close
+	// (a closed connection can no longer be slow). Guarded by mu.
 	unhealthy bool
 	logger    *slog.Logger
 	mu        sync.RWMutex
@@ -145,20 +165,10 @@ func (s *Server) Connect(ctx context.Context, cfg ServerConfig) error {
 			"server", s.name, "override", string(cfg.ToolGroupOverride))
 	}
 
-	// Resolve the effective timeouts once, at connect time. A non-positive
-	// handshake timeout falls back to the built-in default; a non-positive
-	// per-call timeout inherits the handshake timeout (which already includes
-	// the default). Resolving here — rather than at each use site — keeps the
-	// values normalized (never zero) and makes the resolved bounds the single
-	// source of truth the gateway diffs against.
-	s.timeout = cfg.Timeout
-	if s.timeout <= 0 {
-		s.timeout = defaultMCPTimeout
-	}
-	s.callTimeout = cfg.CallTimeout
-	if s.callTimeout <= 0 {
-		s.callTimeout = s.timeout
-	}
+	// Resolve the effective bounds once, at connect time, and make them the
+	// single source of truth the gateway diffs against — see
+	// resolveTimeoutBounds for the one normalization both paths share.
+	s.timeout, s.callTimeout = resolveTimeoutBounds(cfg)
 	s.consecutiveTimeouts = 0
 	s.unhealthy = false
 
@@ -230,6 +240,28 @@ func effectiveToolGroup(override sdktools.ToolGroup, transportName string) sdkto
 	return sdktools.MCPToolGroup(transportName)
 }
 
+// resolveTimeoutBounds normalizes a server's configured timeout bounds into the
+// effective bounds Connect captures and applies: a non-positive handshake
+// timeout (Timeout) falls back to defaultMCPTimeout, and a non-positive
+// per-call timeout (CallTimeout) inherits the resolved handshake bound, so
+// neither resolved bound is ever zero. It is the single normalization for the
+// bounds — Server.Connect applies it when capturing the live bounds and
+// Gateway.configChanged applies it when diffing configs — so an edit that does
+// not alter the effective bounds (e.g. Timeout flipping between two
+// non-positive sentinels, or a CallTimeout that still resolves to the same
+// handshake bound) is not treated as reconnect-worthy.
+func resolveTimeoutBounds(cfg ServerConfig) (handshake, call time.Duration) {
+	handshake = cfg.Timeout
+	if handshake <= 0 {
+		handshake = defaultMCPTimeout
+	}
+	call = cfg.CallTimeout
+	if call <= 0 {
+		call = handshake
+	}
+	return handshake, call
+}
+
 // TimeoutError reports that an MCP operation exceeded the timeout configured
 // for its server. It is a typed error (rather than a bare context error) so
 // callers can attribute the timeout to a specific server/operation/tool,
@@ -257,38 +289,42 @@ func (e *TimeoutError) Error() string {
 // callers that already branch on the context sentinel.
 func (e *TimeoutError) Unwrap() error { return context.DeadlineExceeded }
 
-// timeoutErrorFor classifies a failed lifecycle call whose timeout was applied
-// by deriving a child context from base via context.WithTimeoutCause. Alongside
-// the error to surface it reports whether that error is OUR *TimeoutError (as
-// opposed to the caller's context error), so a caller can act on a genuine
-// timeout without re-inspecting the context.
+// timeoutErrorFor classifies a failed call whose timeout was applied by
+// deriving child from base via context.WithTimeoutCause. Alongside the error to
+// surface it reports whether that error is OUR *TimeoutError (a genuine server
+// timeout) as opposed to the caller's context error, so a caller can act on a
+// genuine timeout without re-inspecting the context. The error is the last
+// result, as the error-return convention requires.
 //
-// It yields our TimeoutError only when OUR timer fired — the child deadline
+// It yields isTimeout=true only when OUR timer fired — the child deadline
 // elapsed while the caller's context is still live. When the caller's context
 // is already done it yields that context's error (context.Canceled for a
 // cancel, context.DeadlineExceeded for the caller's own deadline) with
 // isTimeout=false, so a caller cancellation is never misattributed to the
-// server. When neither context is done it yields (nil, false) — the call
-// failed for some other reason, and the caller should surface the underlying
-// error unchanged.
+// server. When neither context is done it yields (false, nil) — the call failed
+// for some other reason, and the caller should surface the underlying error
+// unchanged.
 //
 // base is the caller-supplied context; child is the context actually handed to
 // the SDK call; fallback is a pre-built attribution returned when the child
-// deadline elapsed but carries no recognisable cause (e.g. the child was not
-// produced by WithTimeoutCause).
-func timeoutErrorFor(base, child context.Context, fallback *TimeoutError) (error, bool) {
+// deadline elapsed but its cause is not a recoverable *TimeoutError. The cause
+// is recovered with errors.As rather than a bare type assertion, so a wrapped
+// cause is still recognised; base.Err() is checked first, so a genuine caller
+// cancellation short-circuits before the cause is consulted.
+func timeoutErrorFor(base, child context.Context, fallback *TimeoutError) (bool, error) {
 	if err := base.Err(); err != nil {
 		// The caller stopped us (cancel or its own deadline): surface the
 		// parent's error, never a TimeoutError blamed on the server.
-		return err, false
+		return false, err
 	}
 	if child.Err() == context.DeadlineExceeded {
-		if cause, ok := context.Cause(child).(*TimeoutError); ok {
-			return cause, true
+		var cause *TimeoutError
+		if errors.As(context.Cause(child), &cause) {
+			return true, cause
 		}
-		return fallback, true
+		return true, fallback
 	}
-	return nil, false
+	return false, nil
 }
 
 // connectStdio creates a stdio MCP client.
@@ -539,6 +575,13 @@ func (s *Server) connectHTTP(ctx context.Context, cfg ServerConfig) (*mcpclient.
 		return nil, fmt.Errorf("http transport requires URL for MCP server %s", s.name)
 	}
 
+	// The handshake bound (s.timeout) applies to EACH transport attempt below:
+	// the Streamable HTTP attempt and, if it fails, the SSE fallback. An HTTP
+	// server that accepts the connection but never answers initialize can
+	// therefore spend up to twice the bound before Connect fails. client.Start
+	// is deliberately not bounded (see initializeClient), so transport setup is
+	// not counted against the bound either.
+
 	// Prepare headers option
 	var opts []transport.StreamableHTTPCOption
 	if len(cfg.Headers) > 0 {
@@ -628,7 +671,7 @@ func (s *Server) initializeClient(ctx context.Context, client *mcpclient.Client)
 	}
 
 	if _, err := client.Initialize(initCtx, initReq); err != nil {
-		if timeoutErr, _ := timeoutErrorFor(ctx, initCtx,
+		if _, timeoutErr := timeoutErrorFor(ctx, initCtx,
 			&TimeoutError{Server: s.name, Op: "initialize", Timeout: s.timeout}); timeoutErr != nil {
 			return timeoutErr
 		}
@@ -661,7 +704,7 @@ func (s *Server) DiscoverTools(ctx context.Context) error {
 	// List all tools from the MCP server
 	result, err := s.client.ListTools(listCtx, mcp.ListToolsRequest{})
 	if err != nil {
-		if timeoutErr, _ := timeoutErrorFor(ctx, listCtx,
+		if _, timeoutErr := timeoutErrorFor(ctx, listCtx,
 			&TimeoutError{Server: s.name, Op: "list_tools", Timeout: s.timeout}); timeoutErr != nil {
 			return timeoutErr
 		}
@@ -740,7 +783,7 @@ func (s *Server) CallTool(ctx context.Context, name string, arguments map[string
 
 	result, err := client.CallTool(callCtx, req)
 	if err != nil {
-		timeoutErr, isTimeout := timeoutErrorFor(ctx, callCtx,
+		isTimeout, timeoutErr := timeoutErrorFor(ctx, callCtx,
 			&TimeoutError{Server: s.name, Op: "call_tool", Tool: name, Timeout: callTimeout})
 		if timeoutErr != nil {
 			// Count only genuine timeouts toward the back-to-back streak; a
@@ -785,6 +828,13 @@ func (s *Server) Close() error {
 	err := s.client.Close()
 	s.client = nil
 	s.tools = nil
+	// A closed connection can no longer be slow: drop the advisory unhealthy
+	// mark together with the timeout streak and its recorded description
+	// (lastError), so Status() does not keep advertising Unhealthy: true — or a
+	// stale timeout error — for a server that is simply disconnected.
+	s.consecutiveTimeouts = 0
+	s.unhealthy = false
+	s.lastError = ""
 	if err != nil {
 		s.lastError = err.Error()
 	}
