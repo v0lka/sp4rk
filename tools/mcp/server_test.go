@@ -3,8 +3,14 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
+	"os"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/mark3labs/mcp-go/mcp"
 )
 
 func TestNewServer_Initialization(t *testing.T) {
@@ -513,5 +519,310 @@ func TestSafeStdioEnv_StripsSchemeLessProxyCredentials(t *testing.T) {
 	}
 	if got[0] != "HTTP_PROXY=proxy.example.com:8080" {
 		t.Errorf("expected scheme-less credential stripped, got %q", got[0])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// stdio transport: timeout, cancellation, unhealthy tracking
+//
+// These tests exercise a real subprocess over the stdio transport, driven by a
+// scripted MCP server. Rather than shipping a separate helper binary, the test
+// binary re-executes itself: when stdioHelperEnvVar is set, TestMain runs
+// runStdioHelper instead of the tests. This is the standard "helper process"
+// pattern — no extra build step, no binary in testdata, and it works on every
+// platform the package is tested on.
+// ---------------------------------------------------------------------------
+
+// stdioHelperEnvVar selects the scripted-server behavior when the test binary is
+// re-executed as a helper subprocess.
+const stdioHelperEnvVar = "SP4RK_MCP_STDIO_HELPER_TEST"
+
+// Scripted-helper modes.
+const (
+	// stdioHelperNoInit consumes stdin but never answers, so the client's
+	// initialize handshake can only end via its own timeout.
+	stdioHelperNoInit = "noinit"
+	// stdioHelperWedge answers initialize/tools/list so a connection can be
+	// established, answers tools/call "fast" immediately, and stays silent on
+	// any other tool (notably "wedge") so that call can only end via
+	// timeout or cancellation.
+	stdioHelperWedge = "wedge"
+)
+
+// TestMain lets the same test binary act as a scripted stdio MCP server when it
+// is re-executed with stdioHelperEnvVar set.
+func TestMain(m *testing.M) {
+	if mode := os.Getenv(stdioHelperEnvVar); mode != "" {
+		runStdioHelper(mode)
+		return
+	}
+	os.Exit(m.Run())
+}
+
+// runStdioHelper implements the scripted MCP server used by the stdio transport
+// tests. It speaks newline-delimited JSON-RPC on stdin/stdout (the stdio
+// transport framing).
+//
+// It returns on stdin EOF — which is exactly what Server.Close triggers by
+// closing the child's stdin — so the process exits cleanly and teardown never
+// hangs on a wedged request. That is why a "wedge" is implemented as silence
+// (no reply) rather than a blocked handler: the helper stays responsive to the
+// other requests, and still terminates the instant the client goes away.
+func runStdioHelper(mode string) {
+	if mode == stdioHelperNoInit {
+		// Read (and discard) forever without ever answering: initialize can
+		// only be ended by the client's timeout.
+		_, _ = io.Copy(io.Discard, os.Stdin)
+		return
+	}
+
+	dec := json.NewDecoder(os.Stdin)
+	enc := json.NewEncoder(os.Stdout)
+	for {
+		var req struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+			Params json.RawMessage `json:"params"`
+		}
+		if err := dec.Decode(&req); err != nil {
+			return // EOF (or broken pipe): the client is gone, exit.
+		}
+		if len(req.ID) == 0 {
+			continue // notification (e.g. notifications/initialized)
+		}
+
+		switch req.Method {
+		case "initialize":
+			writeHelperResult(enc, req.ID, map[string]any{
+				"protocolVersion": mcp.LATEST_PROTOCOL_VERSION,
+				"capabilities":    map[string]any{},
+				"serverInfo": map[string]any{
+					"name":    "stdio-helper",
+					"version": "1.0.0",
+				},
+			})
+		case "tools/list":
+			writeHelperResult(enc, req.ID, map[string]any{"tools": []any{}})
+		case "tools/call":
+			var p struct {
+				Name string `json:"name"`
+			}
+			_ = json.Unmarshal(req.Params, &p)
+			if p.Name == "fast" {
+				writeHelperResult(enc, req.ID, map[string]any{
+					"content": []any{map[string]any{"type": "text", "text": "ok"}},
+					"isError": false,
+				})
+			}
+			// Any other tool (intentionally including "wedge") is left
+			// unanswered so the client's call can only end via
+			// timeout/cancellation.
+		default:
+			writeHelperError(enc, req.ID, -32601, "method not found")
+		}
+	}
+}
+
+func writeHelperResult(enc *json.Encoder, id json.RawMessage, result any) {
+	_ = enc.Encode(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"result":  result,
+	})
+}
+
+func writeHelperError(enc *json.Encoder, id json.RawMessage, code int, message string) {
+	_ = enc.Encode(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"error":   map[string]any{"code": code, "message": message},
+	})
+}
+
+// stdioHelperCommand returns the path to the currently running test binary,
+// which is re-executed as the scripted MCP server.
+func stdioHelperCommand(t *testing.T) string {
+	t.Helper()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("resolve test binary path: %v", err)
+	}
+	return exe
+}
+
+// stdioHelperServerConfig builds a stdio ServerConfig that launches the test
+// binary as the scripted helper in the given mode.
+func stdioHelperServerConfig(t *testing.T, mode string, handshakeTimeout, callTimeout time.Duration) ServerConfig {
+	t.Helper()
+	return ServerConfig{
+		Transport:   "stdio",
+		Command:     stdioHelperCommand(t),
+		Env:         map[string]string{stdioHelperEnvVar: mode},
+		Timeout:     handshakeTimeout,
+		CallTimeout: callTimeout,
+	}
+}
+
+// connectStdioHelper connects to the scripted helper in "wedge" mode with the
+// given per-call timeout and registers teardown.
+func connectStdioHelper(t *testing.T, callTimeout time.Duration) *Server {
+	t.Helper()
+	s := newServer("stdio-helper")
+	cfg := stdioHelperServerConfig(t, stdioHelperWedge, 10*time.Second, callTimeout)
+	if err := s.Connect(context.Background(), cfg); err != nil {
+		t.Fatalf("Connect to scripted stdio helper: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
+// TestServer_Connect_StdioHandshakeTimeout verifies that a server which reads
+// the handshake but never answers cannot stall Connect: the initialize exchange
+// is bounded by the configured timeout and surfaces a *TimeoutError.
+func TestServer_Connect_StdioHandshakeTimeout(t *testing.T) {
+	const timeout = 200 * time.Millisecond
+
+	s := newServer("noinit")
+	start := time.Now()
+	err := s.Connect(context.Background(), stdioHelperServerConfig(t, stdioHelperNoInit, timeout, 0))
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected a handshake timeout, got a nil error")
+	}
+	var timeoutErr *TimeoutError
+	if !errors.As(err, &timeoutErr) {
+		t.Fatalf("error = %T (%v), want *TimeoutError", err, err)
+	}
+	if timeoutErr.Op != "initialize" {
+		t.Errorf("TimeoutError.Op = %q, want %q", timeoutErr.Op, "initialize")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("errors.Is(err, context.DeadlineExceeded) = false; err = %v", err)
+	}
+	if elapsed < timeout {
+		t.Errorf("handshake returned after %v, before the %v timeout elapsed", elapsed, timeout)
+	}
+	if elapsed > timeout+5*time.Second {
+		t.Errorf("handshake timeout fired too late (took %v)", elapsed)
+	}
+	if s.IsConnected() {
+		t.Error("server must not be left connected after a failed handshake")
+	}
+}
+
+// TestServer_CallTool_StdioTimeout verifies that a wedged tools/call returns a
+// *TimeoutError quickly instead of hanging, and does not by itself mark the
+// server unhealthy.
+func TestServer_CallTool_StdioTimeout(t *testing.T) {
+	const callTimeout = 200 * time.Millisecond
+
+	s := connectStdioHelper(t, callTimeout)
+
+	start := time.Now()
+	_, err := s.CallTool(context.Background(), "wedge", nil)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected a timeout for the wedged call, got a nil error")
+	}
+	var timeoutErr *TimeoutError
+	if !errors.As(err, &timeoutErr) {
+		t.Fatalf("error = %T (%v), want *TimeoutError", err, err)
+	}
+	if timeoutErr.Op != "call_tool" || timeoutErr.Tool != "wedge" {
+		t.Errorf("TimeoutError = {Op:%q Tool:%q}, want {call_tool wedge}", timeoutErr.Op, timeoutErr.Tool)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("errors.Is(err, context.DeadlineExceeded) = false; err = %v", err)
+	}
+	if elapsed < callTimeout {
+		t.Errorf("call returned after %v, before the %v timeout elapsed", elapsed, callTimeout)
+	}
+	if elapsed > callTimeout+5*time.Second {
+		t.Errorf("call timeout fired too late (took %v)", elapsed)
+	}
+	if s.Status().Unhealthy {
+		t.Error("a single timeout must not mark the server unhealthy")
+	}
+}
+
+// TestServer_CallTool_StdioContextCancel verifies that cancelling the caller's
+// context aborts an in-flight call promptly with context.Canceled, and that the
+// cancellation is not misattributed to the server (no *TimeoutError, no
+// unhealthy marking, no consecutive-timeout increment).
+func TestServer_CallTool_StdioContextCancel(t *testing.T) {
+	// A long per-call timeout guarantees the caller's cancellation — not the
+	// wire timeout — is what ends the call.
+	s := connectStdioHelper(t, 30*time.Second)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	timer := time.AfterFunc(100*time.Millisecond, cancel)
+	defer timer.Stop()
+
+	start := time.Now()
+	_, err := s.CallTool(ctx, "wedge", nil)
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	var timeoutErr *TimeoutError
+	if errors.As(err, &timeoutErr) {
+		t.Errorf("caller cancellation must not be reported as a server *TimeoutError (got %v)", timeoutErr)
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("cancelled call did not abort promptly (took %v)", elapsed)
+	}
+	if st := s.Status(); st.Unhealthy || st.Error != "" {
+		t.Errorf("caller cancellation must not mark the server unhealthy: %+v", st)
+	}
+	if s.consecutiveTimeouts != 0 {
+		t.Errorf("consecutiveTimeouts = %d after a cancellation, want 0", s.consecutiveTimeouts)
+	}
+}
+
+// TestServer_CallTool_StdioUnhealthyAfterConsecutiveTimeouts verifies the
+// back-to-back timeout streak: fewer than the threshold keeps the server
+// healthy, reaching it flips Unhealthy (with an error string), and a subsequent
+// call that returns in time clears both.
+func TestServer_CallTool_StdioUnhealthyAfterConsecutiveTimeouts(t *testing.T) {
+	const callTimeout = 150 * time.Millisecond
+
+	s := connectStdioHelper(t, callTimeout)
+
+	for i := 1; i <= unhealthyTimeoutThreshold; i++ {
+		if _, err := s.CallTool(context.Background(), "wedge", nil); err == nil {
+			t.Fatalf("timeout %d/%d: expected an error, got nil", i, unhealthyTimeoutThreshold)
+		}
+		if i < unhealthyTimeoutThreshold {
+			if s.Status().Unhealthy {
+				t.Fatalf("server marked unhealthy after only %d timeout(s)", i)
+			}
+		}
+	}
+
+	st := s.Status()
+	if !st.Unhealthy {
+		t.Fatalf("server not marked unhealthy after %d consecutive timeouts", unhealthyTimeoutThreshold)
+	}
+	if st.Error == "" {
+		t.Error("an unhealthy server must report a non-empty error")
+	}
+
+	// A call that returns in time proves the server is responsive again.
+	if _, err := s.CallTool(context.Background(), "fast", nil); err != nil {
+		t.Fatalf("recovery call failed: %v", err)
+	}
+
+	st = s.Status()
+	if st.Unhealthy {
+		t.Error("a successful call must clear the unhealthy flag")
+	}
+	if st.Error != "" {
+		t.Errorf("a successful call must clear the error, got %q", st.Error)
+	}
+	if s.consecutiveTimeouts != 0 {
+		t.Errorf("consecutiveTimeouts = %d after recovery, want 0", s.consecutiveTimeouts)
 	}
 }

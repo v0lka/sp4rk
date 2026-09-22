@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"sort"
 	"sync"
+	"time"
 
 	sdktools "github.com/v0lka/sp4rk/tools"
 )
@@ -325,6 +326,15 @@ func (g *Gateway) configChanged(name string, newCfg ServerConfig) bool {
 		return true
 	}
 
+	// A changed timeout must reconnect the server: the bounds are resolved and
+	// captured at Connect time (Server.timeout / Server.callTimeout) and never
+	// re-read, so a live server would otherwise keep the OLD bounds until it
+	// happens to reconnect for some other reason. Comparing them here makes a
+	// timeout-only edit re-apply immediately.
+	if oldCfg.Timeout != newCfg.Timeout || oldCfg.CallTimeout != newCfg.CallTimeout {
+		return true
+	}
+
 	// A changed group override re-tags every tool the server registers, so it
 	// requires a reconnect (tools are unregistered and re-registered with the
 	// new group). Comparing it here keeps Reconfigure from treating an
@@ -509,6 +519,7 @@ type ServerStatus struct {
 	Name      string   `json:"name"`
 	Transport string   `json:"transport"`
 	Connected bool     `json:"connected"`
+	Unhealthy bool     `json:"unhealthy"`
 	Starting  bool     `json:"starting"`
 	ToolCount int      `json:"tool_count"`
 	Tools     []string `json:"tools"`
@@ -545,12 +556,21 @@ type ServerEntry struct {
 	// StartGateway and Reconfigure, so the gateway-level configuration path
 	// can express the override — not only direct mcp.Server construction.
 	ToolGroupOverride sdktools.ToolGroup
+	// Timeout bounds this server's initialization handshake (initialize +
+	// tools/list). Zero or negative selects the mcp package default
+	// (defaultMCPTimeout). Forwarded by serverConfigFromEntry so the
+	// gateway-level configuration path can express it.
+	Timeout time.Duration
+	// CallTimeout bounds a single tools/call invocation against this server.
+	// Zero or negative inherits Timeout (which itself defaults when unset).
+	CallTimeout time.Duration
 }
 
 // serverConfigFromEntry builds the runtime ServerConfig for a ServerEntry:
 // ${VAR} references in env values, URL, and header values are expanded, and
-// the entry's ToolGroupOverride is forwarded so the gateway-level
-// configuration path can express the per-server group override. workDir is
+// the entry's ToolGroupOverride, Timeout, and CallTimeout are forwarded so the
+// gateway-level configuration path can express the per-server group override
+// and timeout bounds — not only direct mcp.Server construction. workDir is
 // passed in already resolved: StartGateway resolves the default at connect
 // time (Gateway.Start), while Reconfigure resolves it eagerly so the expanded
 // config stored for diffing matches what actually connects.
@@ -576,6 +596,8 @@ func serverConfigFromEntry(entry ServerEntry, workDir string, httpClient *http.C
 		HTTPClient: httpClient,
 
 		ToolGroupOverride: entry.ToolGroupOverride,
+		Timeout:           entry.Timeout,
+		CallTimeout:       entry.CallTimeout,
 	}
 }
 

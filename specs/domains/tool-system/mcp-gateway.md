@@ -6,7 +6,7 @@ Manages connections to external MCP (Model Context Protocol) servers, discovers 
 
 ## Key Files
 
-- `github.com/v0lka/sp4rk/tools/mcp` — `Gateway`, `GatewayConfig`, `ServerEntry`, `StartGateway`, `Server`, `ServerConfig`, `Server.ToolGroup`, `Tool`, `SchemaSanitizer`, `ServerStatus`, error types (`StartError`/`StopError`/`ReconfigureError`)
+- `github.com/v0lka/sp4rk/tools/mcp` — `Gateway`, `GatewayConfig`, `ServerEntry` (`Timeout`, `CallTimeout`), `StartGateway`, `Server`, `ServerConfig` (`Timeout`, `CallTimeout`), `Server.ToolGroup`, `Tool`, `SchemaSanitizer`, `ServerStatus` (`Unhealthy`), the timeout bounds (`defaultMCPTimeout` = 60s, `unhealthyTimeoutThreshold` = 3), error types (`StartError`/`StopError`/`ReconfigureError`, `TimeoutError`)
 - `github.com/v0lka/sp4rk/tools` — `ToolRegistry`, `RegisterWithSource`, `RegisterWithSourceCategory`, `UnregisterBySource`, `StripParamsFromSchema`
 - `github.com/v0lka/sp4rk/sysproc` — `HideConsole` (applied to the stdio subprocess so a GUI-subsystem host spawns no console window)
 
@@ -44,6 +44,17 @@ StartGateway(ctx, cfg, registry, expandEnv, logger)
 | `http` | Connect to a remote server over HTTP | `URL`, `Headers`, `HTTPClient` |
 
 For HTTP, the client first tries the **Streamable HTTP** transport and falls back to **SSE** (Server-Sent Events) if initialization fails — compatible with both modern and legacy MCP HTTP servers.
+
+### Per-server timeouts
+
+Each server carries two optional bounds, resolved once at connect time and applied via `context.WithTimeoutCause` (never zero at any use site):
+
+- `ServerEntry.Timeout` / `ServerConfig.Timeout` — bounds the **initialization handshake** (`initialize` + `tools/list`). Zero or negative selects `defaultMCPTimeout` (**60s**). Forwarded from the entry by `serverConfigFromEntry`.
+- `ServerEntry.CallTimeout` / `ServerConfig.CallTimeout` — bounds a single `tools/call`. Zero or negative **inherits `Timeout`** (which itself already includes the default), so a per-call wire timeout is always in effect.
+
+`Server.Connect` resolves both into the unexported `timeout` / `callTimeout`, which then become the single source of truth the gateway diffs against: `configChanged` treats a timeout-only change as reconnect-worthy so a new bound re-applies immediately (the bounds are captured at connect time and never re-read). The `initialize` and `tools/list` exchanges are bounded by the handshake timeout; `tools/call` by the per-call timeout. `client.Start` is **deliberately never wrapped** — for stdio the child process is spawned with `context.Background()` and `Start` only attaches to it, so coupling its context to the handshake deadline would kill a merely-slow server's process instead of aborting and retrying the handshake; `Start` also returns as soon as the transport is up, so it is not the blocking step a timeout needs to bound.
+
+A bounded operation that exceeds its bound returns a typed `*TimeoutError` (server / `Op` / tool attribution; unwraps to `context.DeadlineExceeded`). Only **our** timer firing counts toward unhealthiness — `timeoutErrorFor` reports `isTimeout=false` for a caller cancellation, which surfaces the parent context's error and is never blamed on the server. After `unhealthyTimeoutThreshold` (**3**) consecutive genuine `tools/call` timeouts the server is marked `Unhealthy` (with a streak description recorded as its last error); any clean call resets the streak and clears the mark, as does `Connect`. A timeout never closes the connection or kills the process — `Unhealthy` is an advisory status flag.
 
 ### Capability-group derivation and override
 
@@ -83,7 +94,7 @@ After connecting, each server is queried with `tools/list`. Returned tools becom
 
 ### Status & introspection
 
-`Status()` returns per-server `ServerStatus` (name, transport, connected, starting, tool count, tools, error), sorted by name for deterministic output. `starting` is a transient state distinct from `Connected`/`Error`, marking an entry still being initialized; it is non-omitempty (always serialized) so a frontend can treat it as a first-class state. `ServerNames()`, `ToolCount()`, and `GetServer(name)` provide further introspection.
+`Status()` returns per-server `ServerStatus` (name, transport, connected, unhealthy, starting, tool count, tools, error), sorted by name for deterministic output. `starting` is a transient state distinct from `Connected`/`Error`, marking an entry still being initialized; it is non-omitempty (always serialized) so a frontend can treat it as a first-class state. `unhealthy` is likewise non-omitempty — an advisory mark set after 3 consecutive `tools/call` timeouts (see [Per-server timeouts](#per-server-timeouts)); a clean call clears it. `ServerNames()`, `ToolCount()`, and `GetServer(name)` provide further introspection.
 
 `Status()` also includes configured servers whose `Connect` or `DiscoverTools` failed: their last failure is kept in a separate `failedServers` map (`Connected: false`, last error set, transport defaulted) and merged into the result, so callers can render every configured server. Failed entries are cleared when the server connects successfully, is removed from the config, or the gateway stops. Failed servers never enter the live connection map (`servers`/`expandedConfigs`) — the clean-state invariant for reconnection diffing is unchanged — and `Reconfigure` always retries a configured server that is only in `failedServers`.
 
@@ -96,6 +107,7 @@ MCP failures are **non-fatal** — a single broken server never prevents the age
 - `Gateway.Stop` returns a `*StopError` if any server fails to close cleanly.
 - `Gateway.Reconfigure` returns a `*ReconfigureError` for failed operations.
 - `Gateway.Stop()` always attempts graceful close of all connections.
+- A bounded operation that exceeds its timeout returns a typed `*TimeoutError` (attributed to server / `Op` / tool; `errors.Is(err, context.DeadlineExceeded)` holds). A handshake timeout fails that server's connect (non-fatal to the remaining servers, as above); a call timeout is returned to the caller. A timeout is never swallowed and never closes the connection.
 
 ## Invariants
 
@@ -106,6 +118,9 @@ MCP failures are **non-fatal** — a single broken server never prevents the age
 - An MCP tool may never shadow an already-registered non-MCP tool; an MCP server re-registering its own tools is allowed.
 - `Reconfigure` is additive/preserving: unchanged servers are not reconnected.
 - `Stop` always attempts graceful close.
+- Every server has a non-zero resolved handshake bound (`defaultMCPTimeout` = 60s when `Timeout` is unset) and a non-zero per-call bound (inherits the handshake bound when `CallTimeout` is unset) — no MCP operation runs unbounded.
+- `client.Start` is never bounded by the handshake timeout (a slow handshake must not kill the stdio child process).
+- 3 consecutive genuine `tools/call` timeouts set `ServerStatus.Unhealthy`; a clean call (or `Connect`) clears it; a timeout **marks**, never kills — the connection stays open.
 
 ## Related Specs
 

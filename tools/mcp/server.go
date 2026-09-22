@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	mcpclient "github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/client/transport"
@@ -23,6 +24,19 @@ import (
 	"github.com/v0lka/sp4rk/sysproc"
 	sdktools "github.com/v0lka/sp4rk/tools"
 )
+
+// defaultMCPTimeout is the handshake timeout applied to an MCP server whose
+// ServerConfig leaves Timeout unset (zero or negative). It bounds the
+// initialization handshake (initialize + tools/list), not the lifetime of the
+// server connection.
+const defaultMCPTimeout = 60 * time.Second
+
+// unhealthyTimeoutThreshold is the number of consecutive tools/call timeouts
+// after which a server is flagged unhealthy. A single slow call is tolerated
+// (it may be transient); a sustained streak of back-to-back timeouts indicates
+// a server that is persistently slow or unresponsive, which callers should be
+// able to distinguish from a healthy server via ServerStatus.Unhealthy.
+const unhealthyTimeoutThreshold = 3
 
 // ServerConfig defines how to launch an MCP server.
 // This is a local copy to avoid importing backend/config.
@@ -46,6 +60,14 @@ type ServerConfig struct {
 	// system override would exempt an entire untrusted external server from
 	// every security check.
 	ToolGroupOverride sdktools.ToolGroup
+
+	// Timeout bounds this server's initialization handshake (initialize +
+	// tools/list). Zero or negative selects defaultMCPTimeout.
+	Timeout time.Duration
+	// CallTimeout bounds a single tools/call invocation against this server.
+	// Zero or negative inherits Timeout (which itself defaults to
+	// defaultMCPTimeout), so a per-call wire timeout is always in effect.
+	CallTimeout time.Duration
 }
 
 // Server represents a connection to an external MCP server process.
@@ -56,8 +78,26 @@ type Server struct {
 	lastError         string
 	transportType     string
 	toolGroupOverride sdktools.ToolGroup // per-server group override from ServerConfig; empty = derive from transport
-	logger            *slog.Logger
-	mu                sync.RWMutex
+	// timeout bounds the initialization handshake; callTimeout bounds a single
+	// tools/call. Both are resolved (never zero) in Connect from ServerConfig,
+	// then only read — a changed bound takes effect on the next Connect, which
+	// is why the gateway's configChanged() treats a timeout change as
+	// reconnect-worthy. Guarded by mu.
+	timeout     time.Duration
+	callTimeout time.Duration
+	// consecutiveTimeouts counts tools/call invocations that hit callTimeout
+	// back to back; it resets on any call that returns without timing out. It
+	// lets a caller detect a server that is persistently slow/unresponsive
+	// (as opposed to a one-off slow call). Guarded by mu.
+	consecutiveTimeouts int
+	// unhealthy is set once consecutiveTimeouts reaches
+	// unhealthyTimeoutThreshold; it is surfaced through ServerStatus.Unhealthy
+	// so callers can deprioritize or warn about a persistently unresponsive
+	// server. A subsequent successful call clears it, as does Connect. Guarded
+	// by mu.
+	unhealthy bool
+	logger    *slog.Logger
+	mu        sync.RWMutex
 }
 
 // ToolInfo holds metadata about a tool discovered from an MCP server.
@@ -104,6 +144,23 @@ func (s *Server) Connect(ctx context.Context, cfg ServerConfig) error {
 		s.log().Warn("MCP server tool_group override ignored: unknown or reserved group; using the transport-derived group",
 			"server", s.name, "override", string(cfg.ToolGroupOverride))
 	}
+
+	// Resolve the effective timeouts once, at connect time. A non-positive
+	// handshake timeout falls back to the built-in default; a non-positive
+	// per-call timeout inherits the handshake timeout (which already includes
+	// the default). Resolving here — rather than at each use site — keeps the
+	// values normalized (never zero) and makes the resolved bounds the single
+	// source of truth the gateway diffs against.
+	s.timeout = cfg.Timeout
+	if s.timeout <= 0 {
+		s.timeout = defaultMCPTimeout
+	}
+	s.callTimeout = cfg.CallTimeout
+	if s.callTimeout <= 0 {
+		s.callTimeout = s.timeout
+	}
+	s.consecutiveTimeouts = 0
+	s.unhealthy = false
 
 	// Determine transport type (default to stdio when unspecified)
 	transportType := cfg.Transport
@@ -171,6 +228,67 @@ func effectiveToolGroup(override sdktools.ToolGroup, transportName string) sdkto
 		return override
 	}
 	return sdktools.MCPToolGroup(transportName)
+}
+
+// TimeoutError reports that an MCP operation exceeded the timeout configured
+// for its server. It is a typed error (rather than a bare context error) so
+// callers can attribute the timeout to a specific server/operation/tool,
+// distinguish a slow server from a caller cancellation, and inspect the bound
+// that elapsed. Unwrap reports context.DeadlineExceeded, so
+// errors.Is(err, context.DeadlineExceeded) holds for every TimeoutError.
+type TimeoutError struct {
+	Server  string        // MCP server name the operation ran against
+	Op      string        // operation: "initialize" | "list_tools" | "call_tool"
+	Tool    string        // tool name for Op == "call_tool"; empty otherwise
+	Timeout time.Duration // the bound that elapsed
+}
+
+// Error renders the timeout with its attribution. The tool name is included
+// only for per-tool operations.
+func (e *TimeoutError) Error() string {
+	if e.Tool != "" {
+		return fmt.Sprintf("MCP server %s: %s %s timed out after %s", e.Server, e.Op, e.Tool, e.Timeout)
+	}
+	return fmt.Sprintf("MCP server %s: %s timed out after %s", e.Server, e.Op, e.Timeout)
+}
+
+// Unwrap exposes context.DeadlineExceeded as the cause, so a TimeoutError
+// satisfies errors.Is(err, context.DeadlineExceeded) and interoperates with
+// callers that already branch on the context sentinel.
+func (e *TimeoutError) Unwrap() error { return context.DeadlineExceeded }
+
+// timeoutErrorFor classifies a failed lifecycle call whose timeout was applied
+// by deriving a child context from base via context.WithTimeoutCause. Alongside
+// the error to surface it reports whether that error is OUR *TimeoutError (as
+// opposed to the caller's context error), so a caller can act on a genuine
+// timeout without re-inspecting the context.
+//
+// It yields our TimeoutError only when OUR timer fired — the child deadline
+// elapsed while the caller's context is still live. When the caller's context
+// is already done it yields that context's error (context.Canceled for a
+// cancel, context.DeadlineExceeded for the caller's own deadline) with
+// isTimeout=false, so a caller cancellation is never misattributed to the
+// server. When neither context is done it yields (nil, false) — the call
+// failed for some other reason, and the caller should surface the underlying
+// error unchanged.
+//
+// base is the caller-supplied context; child is the context actually handed to
+// the SDK call; fallback is a pre-built attribution returned when the child
+// deadline elapsed but carries no recognisable cause (e.g. the child was not
+// produced by WithTimeoutCause).
+func timeoutErrorFor(base, child context.Context, fallback *TimeoutError) (error, bool) {
+	if err := base.Err(); err != nil {
+		// The caller stopped us (cancel or its own deadline): surface the
+		// parent's error, never a TimeoutError blamed on the server.
+		return err, false
+	}
+	if child.Err() == context.DeadlineExceeded {
+		if cause, ok := context.Cause(child).(*TimeoutError); ok {
+			return cause, true
+		}
+		return fallback, true
+	}
+	return nil, false
 }
 
 // connectStdio creates a stdio MCP client.
@@ -467,8 +585,20 @@ func (s *Server) connectHTTP(ctx context.Context, cfg ServerConfig) (*mcpclient.
 }
 
 // initializeClient initializes the MCP connection for the given client.
+//
+// Caller must hold s.mu (Connect holds it), so reading the resolved s.timeout
+// without an additional lock is safe.
 func (s *Server) initializeClient(ctx context.Context, client *mcpclient.Client) error {
-	// Start the client transport
+	// Start the client transport. This call is DELIBERATELY NOT wrapped with
+	// the handshake timeout: for the stdio transport the process is already
+	// started with context.Background() by the transport constructor, and Start
+	// only attaches to it — deriving Start's context from a timeout would
+	// couple the child process's lifetime to the handshake deadline, so a
+	// server that is merely slow to finish the MCP handshake would have its
+	// process killed (and the connection torn down) instead of the handshake
+	// being aborted and retried. Start also returns as soon as the transport is
+	// up, so it is not the blocking step a timeout needs to bound. Only the
+	// Initialize exchange below is time-bounded.
 	if err := client.Start(ctx); err != nil {
 		return fmt.Errorf("failed to start MCP client for %s: %w", s.name, err)
 	}
@@ -485,8 +615,23 @@ func (s *Server) initializeClient(ctx context.Context, client *mcpclient.Client)
 		},
 	}
 
-	_, err := client.Initialize(ctx, initReq)
-	if err != nil {
+	// Bound the handshake exchange by the resolved handshake timeout. The
+	// timeout is attached as a context cause (the *TimeoutError we want the
+	// caller to see), so we can tell OUR timer firing apart from the caller
+	// cancelling ctx — see timeoutErrorFor.
+	initCtx := ctx
+	if s.timeout > 0 {
+		var cancel context.CancelFunc
+		initCtx, cancel = context.WithTimeoutCause(ctx, s.timeout,
+			&TimeoutError{Server: s.name, Op: "initialize", Timeout: s.timeout})
+		defer cancel()
+	}
+
+	if _, err := client.Initialize(initCtx, initReq); err != nil {
+		if timeoutErr, _ := timeoutErrorFor(ctx, initCtx,
+			&TimeoutError{Server: s.name, Op: "initialize", Timeout: s.timeout}); timeoutErr != nil {
+			return timeoutErr
+		}
 		return fmt.Errorf("failed to initialize MCP server %s: %w", s.name, err)
 	}
 
@@ -502,9 +647,24 @@ func (s *Server) DiscoverTools(ctx context.Context) error {
 		return fmt.Errorf("mcp server %s is not connected", s.name)
 	}
 
+	// Bound tools/list by the resolved handshake timeout. Discovery is part of
+	// the connection handshake: a server that answers initialize but then hangs
+	// on tools/list must not stall startup (or a reconnect) indefinitely.
+	listCtx := ctx
+	if s.timeout > 0 {
+		var cancel context.CancelFunc
+		listCtx, cancel = context.WithTimeoutCause(ctx, s.timeout,
+			&TimeoutError{Server: s.name, Op: "list_tools", Timeout: s.timeout})
+		defer cancel()
+	}
+
 	// List all tools from the MCP server
-	result, err := s.client.ListTools(ctx, mcp.ListToolsRequest{})
+	result, err := s.client.ListTools(listCtx, mcp.ListToolsRequest{})
 	if err != nil {
+		if timeoutErr, _ := timeoutErrorFor(ctx, listCtx,
+			&TimeoutError{Server: s.name, Op: "list_tools", Timeout: s.timeout}); timeoutErr != nil {
+			return timeoutErr
+		}
 		return fmt.Errorf("failed to list tools from MCP server %s: %w", s.name, err)
 	}
 
@@ -553,6 +713,7 @@ func (s *Server) Tools() []ToolInfo {
 func (s *Server) CallTool(ctx context.Context, name string, arguments map[string]any) (*mcp.CallToolResult, error) {
 	s.mu.RLock()
 	client := s.client
+	callTimeout := s.callTimeout
 	s.mu.RUnlock()
 
 	if client == nil {
@@ -566,7 +727,50 @@ func (s *Server) CallTool(ctx context.Context, name string, arguments map[string
 		},
 	}
 
-	return client.CallTool(ctx, req)
+	// Bound the call by the resolved per-call timeout. The *TimeoutError is
+	// attached as the deadline cause so timeoutErrorFor can tell OUR timer
+	// firing apart from the caller cancelling ctx.
+	callCtx := ctx
+	if callTimeout > 0 {
+		var cancel context.CancelFunc
+		callCtx, cancel = context.WithTimeoutCause(ctx, callTimeout,
+			&TimeoutError{Server: s.name, Op: "call_tool", Tool: name, Timeout: callTimeout})
+		defer cancel()
+	}
+
+	result, err := client.CallTool(callCtx, req)
+	if err != nil {
+		timeoutErr, isTimeout := timeoutErrorFor(ctx, callCtx,
+			&TimeoutError{Server: s.name, Op: "call_tool", Tool: name, Timeout: callTimeout})
+		if timeoutErr != nil {
+			// Count only genuine timeouts toward the back-to-back streak; a
+			// caller cancellation surfaces the parent error but is not the
+			// server's fault.
+			if isTimeout {
+				s.mu.Lock()
+				s.consecutiveTimeouts++
+				if s.consecutiveTimeouts >= unhealthyTimeoutThreshold {
+					s.unhealthy = true
+					s.lastError = fmt.Sprintf("%d consecutive tool-call timeouts (last timeout: %s)",
+						s.consecutiveTimeouts, s.callTimeout)
+				}
+				s.mu.Unlock()
+			}
+			return nil, timeoutErr
+		}
+		return nil, err
+	}
+
+	// A clean return clears the back-to-back timeout streak and any unhealthy
+	// mark: a call that returns in time proves the server is responsive again,
+	// so the stale lastError from the timeout streak is dropped too.
+	s.mu.Lock()
+	s.consecutiveTimeouts = 0
+	s.unhealthy = false
+	s.lastError = ""
+	s.mu.Unlock()
+
+	return result, nil
 }
 
 // Close shuts down the MCP server connection.
@@ -609,6 +813,7 @@ func (s *Server) Status() ServerStatus {
 		Name:      s.name,
 		Transport: s.transportType,
 		Connected: s.client != nil,
+		Unhealthy: s.unhealthy,
 		ToolCount: len(s.tools),
 		Tools:     toolNames,
 		Error:     s.lastError,
