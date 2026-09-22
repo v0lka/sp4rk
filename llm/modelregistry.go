@@ -1596,10 +1596,28 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 
 		// ── Qwen models (Alibaba) ───────────────────────────────────────
 		// Source: https://www.alibabacloud.com/help/en/model-studio/text-generation-model
-		// Current (Aug 2026) recommended: qwen3.7-max/plus and qwen3.6-flash
+		// Current (Sep 2026) recommended: qwen3.8-max and qwen3.7-max/plus
 		// (1M context, thinking, function calling). Text-generation Qwen
-		// models are text-only — vision lives in the separate qwen-vl line.
-		// Qwen3.x 1M-context models support up to 65K max output.
+		// models are text-only — vision lives in the separate qwen-vl line —
+		// except qwen3.8-max, which natively accepts image and video input.
+		// Qwen3.x 1M-context models support up to 65K max output;
+		// qwen3.8-max raises this to 131K (plus 262K max reasoning).
+		// Qwen3.8-Max: the Qwen Cloud serving name of the open
+		// Qwen3.8-2.4T-A95B flagship (2.4T total / 95B active MoE). Unlike
+		// the text-only, thinking-mandatory open checkpoint, the API model
+		// adds native vision input (image/video), non-thinking support, and
+		// a 1M context window by default; thinking depth is tunable via
+		// reasoning_effort (xhigh default / medium / low), and history is
+		// retained via preserve_thinking.
+		//   source: https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B
+		//   limits: https://www.qwencloud.com/models/qwen3.8-max
+		"qwen3.8-max": {
+			ContextWindow: 1048576,
+			OutputLimit:   131072,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
 		"qwen3.7-max": {
 			ContextWindow: 1000000,
 			OutputLimit:   65536,

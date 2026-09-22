@@ -80,6 +80,7 @@ func TestIsQwen38OrLater(t *testing.T) {
 		want  bool
 	}{
 		{"qwen3.8-27b", true},
+		{"qwen3.8-max", true},
 		{"Qwen3.8", true},   // case-insensitive
 		{"qwen4-72b", true}, // future major
 		{"qwen/qwen3.8-flash-next", true},

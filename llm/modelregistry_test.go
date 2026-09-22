@@ -77,6 +77,10 @@ func TestModelRegistry_BuiltInResolution(t *testing.T) {
 		{"qwen/qwen3.8-flash-next", 262144, 65536, "approximate"},
 		{"zai-org/glm-5.3-flash", 1048576, 128000, "approximate"},
 
+		// Qwen3.8-Max — the Qwen Cloud serving name of the open
+		// Qwen3.8-2.4T-A95B flagship: 1M context, 131K max output.
+		{"qwen3.8-max", 1048576, 131072, "approximate"},
+
 		// Grok models — verified from docs.x.ai
 		{"grok-4.20", 1000000, 32768, "approximate"},
 		{"grok-3-mini", 131072, 32768, "approximate"},
@@ -3001,6 +3005,32 @@ func TestModelRegistry_Qwen38FlashServingNameResolves(t *testing.T) {
 		}
 		if meta.Family != "qwen" {
 			t.Errorf("ResolveBuiltInModel(%q).Family = %q, want qwen", id, meta.Family)
+		}
+	}
+}
+
+// TestModelRegistry_Qwen38MaxServingNameResolves pins that "qwen3.8-max" —
+// the Qwen Cloud serving name of the open Qwen3.8-2.4T-A95B flagship — is
+// resolvable in the built-in catalog under bare, case-drifted, prefixed, and
+// separator-drifted spellings, with its 1M window / 131K output / native
+// vision capability instead of the generic fallback defaults.
+func TestModelRegistry_Qwen38MaxServingNameResolves(t *testing.T) {
+	for _, id := range []string{"qwen3.8-max", "Qwen3.8-Max", "qwen/qwen3.8-max", "Qwen/Qwen3.8-Max", "qwen38-max"} {
+		meta, ok := ResolveBuiltInModel(id)
+		if !ok {
+			t.Fatalf("ResolveBuiltInModel(%q): expected ok=true", id)
+		}
+		if meta.ContextWindow != 1048576 {
+			t.Errorf("ResolveBuiltInModel(%q).ContextWindow = %d, want 1048576", id, meta.ContextWindow)
+		}
+		if meta.OutputLimit != 131072 {
+			t.Errorf("ResolveBuiltInModel(%q).OutputLimit = %d, want 131072", id, meta.OutputLimit)
+		}
+		if meta.Family != "qwen" {
+			t.Errorf("ResolveBuiltInModel(%q).Family = %q, want qwen", id, meta.Family)
+		}
+		if !meta.Capabilities.Attachment {
+			t.Errorf("ResolveBuiltInModel(%q).Capabilities.Attachment = false, want true (native image/video input)", id)
 		}
 	}
 }

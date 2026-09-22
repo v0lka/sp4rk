@@ -53,6 +53,7 @@ func TestDetectProtocol(t *testing.T) {
 		{"deepseek-v4-pro", ProtocolChatCompletions},
 		{"mistral-large-latest", ProtocolChatCompletions},
 		{"qwen-plus", ProtocolChatCompletions},
+		{"qwen3.8-max", ProtocolChatCompletions},
 		{"qwq-32b", ProtocolChatCompletions},
 		{"glm-5.2", ProtocolChatCompletions},
 		{"chatglm-4", ProtocolChatCompletions},

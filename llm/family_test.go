@@ -65,6 +65,7 @@ func TestDetectFamily(t *testing.T) {
 		{"qwen-max", FamilyQwen},
 		{"qwen-2.5-72b", FamilyQwen},
 		{"qwen3.8-flash-next", FamilyQwen},
+		{"qwen3.8-max", FamilyQwen},
 		{"qwq-plus", FamilyQwen},
 		{"qwq-32b", FamilyQwen},
 
