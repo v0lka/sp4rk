@@ -656,10 +656,11 @@ Provider errors are wrapped in a classified `*Error`:
 
 ```go
 type Error struct {
-    Provider   string // e.g. "openai", "anthropic"
-    StatusCode int    // HTTP status code (0 if not applicable)
-    Retryable  bool   // whether this error is safe to retry
-    Err        error  // the original underlying error
+    Provider   string  // e.g. "openai", "anthropic"
+    StatusCode int     // HTTP status code (0 if not applicable)
+    Retryable  bool    // whether this error is safe to retry
+    ErrType    ErrType // transport-independent failure class ("" if unknown)
+    Err        error   // the original underlying error
 }
 ```
 
@@ -667,3 +668,4 @@ type Error struct {
 - `WrapProviderError(provider, statusCode, err)` — classify by HTTP status and network error type.
 - `IsRetryable(err)` — true when the chain contains a `*Error` with `Retryable == true`.
 - `NewContextWindowError(...)` — non-retryable error for context window overflow, wrapping `ErrContextWindowExceeded`.
+- `ErrType` — transport-independent failure class: `ErrTypeRateLimit`, `ErrTypeOverloaded`, or `""` (unknown). It is derived from the HTTP status on status-carrying transports (429 → `rate_limit`, 529 → `overloaded`) and from the Anthropic SDK's error type field otherwise (that SDK parses the JSON error body without exposing a status). Match on `ErrType` instead of `StatusCode` when the failure class — not the raw transport detail — is what matters (e.g. arming a rate-limit backoff).

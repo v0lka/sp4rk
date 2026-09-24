@@ -499,7 +499,20 @@ func (p *AnthropicProvider) wrapError(err error) error {
 	var apiErr *anthropic.APIError
 	if errors.As(err, &apiErr) {
 		retryable := apiErr.IsRateLimitErr() || apiErr.IsOverloadedErr() || apiErr.IsApiErr()
-		return NewError(p.name, 0, retryable, err)
+		// The Anthropic SDK parses the JSON error body into APIError, which
+		// carries no HTTP status — classify by the provider's own error type
+		// field so transport-independent consumers (e.g. auto-retry arming)
+		// still see the failure class.
+		errType := ErrType("")
+		switch {
+		case apiErr.IsRateLimitErr():
+			errType = ErrTypeRateLimit
+		case apiErr.IsOverloadedErr():
+			errType = ErrTypeOverloaded
+		}
+		e := NewError(p.name, 0, retryable, err)
+		e.ErrType = errType
+		return e
 	}
 	var reqErr *anthropic.RequestError
 	if errors.As(err, &reqErr) {

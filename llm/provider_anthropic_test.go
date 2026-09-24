@@ -711,6 +711,9 @@ func TestAnthropicProvider_WrapError_Types(t *testing.T) {
 		if !llmErr.Retryable {
 			t.Error("expected retryable for rate limit")
 		}
+		if llmErr.ErrType != ErrTypeRateLimit {
+			t.Errorf("ErrType = %q, want %q (Anthropic APIError carries no status; the type field is the only rate-limit signal)", llmErr.ErrType, ErrTypeRateLimit)
+		}
 	})
 
 	t.Run("APIError overloaded is retryable", func(t *testing.T) {
@@ -725,6 +728,9 @@ func TestAnthropicProvider_WrapError_Types(t *testing.T) {
 		}
 		if !llmErr.Retryable {
 			t.Error("expected retryable for overloaded")
+		}
+		if llmErr.ErrType != ErrTypeOverloaded {
+			t.Errorf("ErrType = %q, want %q", llmErr.ErrType, ErrTypeOverloaded)
 		}
 	})
 
@@ -770,6 +776,24 @@ func TestAnthropicProvider_WrapError_Types(t *testing.T) {
 		}
 		if llmErr.StatusCode != 400 {
 			t.Errorf("expected status 400, got %d", llmErr.StatusCode)
+		}
+	})
+
+	t.Run("RequestError rate limit classifies via status", func(t *testing.T) {
+		reqErr := &anthropic.RequestError{
+			StatusCode: 429,
+			Err:        errors.New("too many requests"),
+		}
+		result := p.wrapError(reqErr)
+		var llmErr *Error
+		if !errors.As(result, &llmErr) {
+			t.Fatal("expected *Error")
+		}
+		if llmErr.StatusCode != 429 {
+			t.Errorf("expected status 429, got %d", llmErr.StatusCode)
+		}
+		if llmErr.ErrType != ErrTypeRateLimit {
+			t.Errorf("ErrType = %q, want %q", llmErr.ErrType, ErrTypeRateLimit)
 		}
 	})
 }

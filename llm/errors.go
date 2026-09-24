@@ -8,12 +8,46 @@ import (
 	"syscall"
 )
 
+// ErrType is a transport-independent classification of a provider error,
+// derived from the HTTP status code when the transport carries one (OpenAI,
+// Google, generic request errors) or from the provider's own error type
+// field when it does not (the Anthropic SDK parses the JSON error body into
+// APIError, which carries no HTTP status). It lets callers reason about the
+// failure class (e.g. rate limiting) without knowing which SDK produced the
+// error. Empty when no classification is available.
+type ErrType string
+
+const (
+	// ErrTypeRateLimit marks a rate-limit / quota rejection. HTTP 429 on
+	// status-carrying transports; the "rate_limit_error" APIError type on
+	// the Anthropic transport.
+	ErrTypeRateLimit ErrType = "rate_limit"
+	// ErrTypeOverloaded marks a transient provider overload. HTTP 529 on
+	// status-carrying transports; the "overloaded_error" APIError type on
+	// the Anthropic transport.
+	ErrTypeOverloaded ErrType = "overloaded"
+)
+
+// errTypeForStatus maps an HTTP status code to its ErrType classification,
+// or "" when the code carries no classification.
+func errTypeForStatus(statusCode int) ErrType {
+	switch statusCode {
+	case 429:
+		return ErrTypeRateLimit
+	case 529:
+		return ErrTypeOverloaded
+	default:
+		return ""
+	}
+}
+
 // Error wraps provider errors with classification metadata.
 type Error struct {
-	Provider   string // e.g. "openai", "anthropic"
-	StatusCode int    // HTTP status code (0 if not applicable, e.g. network error)
-	Retryable  bool   // whether this error is safe to retry
-	Err        error  // the original underlying error
+	Provider   string  // e.g. "openai", "anthropic"
+	StatusCode int     // HTTP status code (0 if not applicable, e.g. network error)
+	Retryable  bool    // whether this error is safe to retry
+	ErrType    ErrType // transport-independent failure class ("" if unknown)
+	Err        error   // the original underlying error
 }
 
 // Error formats the error like "llm [provider] error (HTTP status, retryable=bool): original message".
@@ -32,6 +66,7 @@ func NewError(provider string, statusCode int, retryable bool, err error) *Error
 		Provider:   provider,
 		StatusCode: statusCode,
 		Retryable:  retryable,
+		ErrType:    errTypeForStatus(statusCode),
 		Err:        err,
 	}
 }
