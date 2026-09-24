@@ -51,7 +51,14 @@ type ModelMetadata struct {
 	// set, it is AUTHORITATIVE: resolveFamily returns it as-is and only falls
 	// back to DetectFamily when it is empty. Thus the Family value in a built-in
 	// or override record is not merely documentary — it wins over substring
-	// detection. Omit it only when DetectFamily should derive the family.
+	// detection.
+	//
+	// An EMPTY Family is inheritable like the other unset dimensions: a partial
+	// record (a config override or an observed runtime entry pinning only some
+	// fields) picks up the family declared by the lower tiers — normally the
+	// built-in catalog — via enrichPartialWith before resolveFamily ever runs.
+	// Omit it, therefore, only when the family should come from a lower tier or,
+	// failing that, from DetectFamily's name-based derivation.
 	Family string
 	// Protocol is the wire protocol / canonical endpoint postfix the model
 	// speaks. Populated lazily by resolveProtocol at Resolve time from
@@ -534,13 +541,22 @@ func resolveProtocol(modelID string, meta ModelMetadata) APIProtocol {
 //
 // A field already set in the override is authoritative and left untouched, so
 // a fully-specified override (the common case: config.yaml entries whose
-// ContextWindow/OutputLimit/TokenizerType/Capabilities are all populated at
-// registry construction) is returned verbatim. Only the inheritable fields
-// participate: Family is derived by resolveFamily, and Protocol is always
+// ContextWindow/OutputLimit/TokenizerType/Family/Capabilities are all
+// populated at registry construction) is returned verbatim. Only the
+// inheritable fields participate; Protocol is not one of them — it is always
 // authoritative (that is precisely what a partial override exists to pin).
 //
-// The inheritable fields are ContextWindow, OutputLimit, TokenizerType, and
-// Capabilities. Capabilities joins the scalar set as a first-class inheritable
+// The inheritable fields are ContextWindow, OutputLimit, TokenizerType,
+// Family, and Capabilities. Family joins the set because a host's partial
+// record typically pins exactly one dimension (the context window it sized
+// for the machine) and must not thereby erase the catalog's authoritative
+// family: inheriting it keeps a checkpoint whose name carries no family token
+// ("Bonsai 2 27B" → catalog Family "qwen") from degrading to DetectFamily's
+// name-derived "default". Inheritance is only a fill — when every lower tier
+// also leaves Family empty (a catalog-miss model), the field stays empty and
+// resolveFamily derives it from the model ID exactly as before.
+//
+// Capabilities joins the scalar set as a first-class inheritable
 // field via its nil pointer: nil = "unset, inherit from the lower tiers",
 // exactly like a zero ContextWindow, while a non-nil value is AUTHORITATIVE —
 // even when every flag is false. This closes the footgun where a minimal
@@ -568,7 +584,7 @@ func (r *ModelRegistry) enrichPartialOverride(model, key string, override ModelM
 // logic in two places.
 func (r *ModelRegistry) enrichPartialWith(override ModelMetadata, baseline func() ModelMetadata) ModelMetadata {
 	if override.ContextWindow != 0 && override.OutputLimit != 0 &&
-		override.TokenizerType != "" && override.Capabilities != nil {
+		override.TokenizerType != "" && override.Family != "" && override.Capabilities != nil {
 		return override
 	}
 	lower := baseline()
@@ -580,6 +596,20 @@ func (r *ModelRegistry) enrichPartialWith(override ModelMetadata, baseline func(
 	}
 	if override.TokenizerType == "" {
 		override.TokenizerType = lower.TokenizerType
+	}
+	// Family is inheritable for the same reason the scalars are: a host's
+	// partial record pins the ONE dimension it owns (typically the context
+	// window it sized for the machine) and must not thereby erase the
+	// catalog's authoritative family. Without this the catalog Family would
+	// be shadowed by an empty override field and re-derived from the model
+	// NAME by resolveFamily/DetectFamily — which knows nothing about a
+	// checkpoint whose name carries no family token ("Bonsai 2 27B" would
+	// degrade to "default", losing the family-gated prompt adaptation and the
+	// reasoning option set). An override that DOES name a family stays
+	// authoritative, and a baseline with no family (catalog miss) leaves the
+	// field empty so DetectFamily still derives it as before.
+	if override.Family == "" {
+		override.Family = lower.Family
 	}
 	if override.Capabilities == nil {
 		override.Capabilities = lower.Capabilities
@@ -1984,6 +2014,45 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 		"qwen/qwen3.8-27b-fp8": {
 			ContextWindow: 262144,
 			OutputLimit:   65536,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		// Ternary-Bonsai-2-27B (PrismML): a community checkpoint built on the
+		// Qwen3.8 dense architecture — its GGUF metadata reports
+		// qwen35.context_length=262144, so it carries the same 256K window,
+		// the same native per-request reasoning_effort (thinking on by
+		// default), and the same tool-calling support as "qwen/qwen3.8-27b".
+		// The name carries no "qwen" token, so the Family is pinned explicitly
+		// here (DetectFamily would fall back to "default") and the version is
+		// registered in llm.qwen38ArchitectureAliases (see IsQwen38OrLater).
+		//
+		// OutputLimit is deliberately 32768 rather than the 65536 the rest of
+		// the 3.8 lineup carries: 32768 is the tier-5 fallback the model
+		// resolved to before this entry existed, so hosts that size the window
+		// by available RAM (8192..131072) are not regressed, and it keeps
+		// OutputLimit below ContextWindow. Attachment is true — the value the
+		// optimistic unknown-capability guess already produced — so a host's
+		// vision gating is unchanged by this entry.
+		//   config: qwen35.context_length=262144
+		//   source: https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf
+		"prism-ml/ternary-bonsai-2-27b": {
+			ContextWindow: 262144,
+			OutputLimit:   32768,
+			TokenizerType: "approximate",
+			Family:        "qwen",
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		// The same checkpoint under the bare serving name a host registers it
+		// with: an embedded llama-server supervisor exposes the model as
+		// "Bonsai 2 27B" (no vendor prefix). Keyed separately because the
+		// fuzzy index normalizes only separators and delivery postfixes, not
+		// word boundaries — "bonsai 2 27b" (spaces kept) and
+		// "ternarybonsai227b" are distinct normalized forms, so neither entry
+		// reaches the other. Values mirror the prefixed entry above.
+		"bonsai 2 27b": {
+			ContextWindow: 262144,
+			OutputLimit:   32768,
 			TokenizerType: "approximate",
 			Family:        "qwen",
 			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},

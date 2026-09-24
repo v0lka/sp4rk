@@ -91,6 +91,15 @@ func TestIsQwen38OrLater(t *testing.T) {
 		{"qwq-32b", false},    // unversioned Qwen-family reasoning model
 		{"qvq-72b", false},    // unversioned non-reasoning variant
 		{"qwen-turbo", false}, // unversioned legacy commercial name
+		// Qwen3.8-architecture checkpoints whose name carries no readable
+		// "qwen<version>" token: matched through qwen38ArchitectureAliases on
+		// the NORMALIZED identifier, so casing, a provider prefix, and a
+		// delivery postfix all resolve to the same entry.
+		{"Bonsai 2 27B", true},
+		{"embedded/Bonsai 2 27B", true},
+		{"prism-ml/ternary-bonsai-2-27b", true},
+		{"Ternary-Bonsai-2-27B-gguf", true},
+		{"bonsai 2 7b", false}, // a different size is not an aliased identifier
 		{"", false},
 		{"claude-sonnet-4", false},
 	}
@@ -177,6 +186,27 @@ func TestModelReasoningOptions(t *testing.T) {
 			wantOK:      true,
 		},
 		{
+			// A Qwen3.8-architecture checkpoint whose name carries no version
+			// token (see qwen38ArchitectureAliases): the alias funnel must
+			// reach the model-level view too, or the picker would offer only
+			// the legacy binary switch for a model that speaks
+			// reasoning_effort natively.
+			name:        "qwen 3.8 architecture alias",
+			family:      "qwen",
+			model:       "Bonsai 2 27B",
+			wantOptions: []string{"xhigh", "medium", "low", "Off"},
+			wantDefault: "xhigh",
+			wantOK:      true,
+		},
+		{
+			name:        "qwen 3.8 architecture alias composite id",
+			family:      "qwen",
+			model:       "embedded/Bonsai 2 27B",
+			wantOptions: []string{"xhigh", "medium", "low", "Off"},
+			wantDefault: "xhigh",
+			wantOK:      true,
+		},
+		{
 			name:        "qwen 3 legacy on/off",
 			family:      "qwen",
 			model:       "qwen3-235b-a22b-instruct",
@@ -237,5 +267,25 @@ func TestModelReasoningOptions(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestQwen38ArchitectureAliases_KeysAreNormalized guards the alias table's
+// keying contract: IsQwen38OrLater looks an incoming identifier up by its
+// normalizeModelID form, so every key must ALREADY be in that form. A key
+// written in a raw spelling ("Bonsai 2 27B" with capitals, a vendor prefix, or
+// a delivery postfix such as "-gguf") can never match, and the model would
+// silently fall back to the legacy binary thinking switch — the picker would
+// offer "On"/"Off" and applyQwenReasoning would stop sending
+// reasoning_effort. The table is built with normalizeModelID calls precisely
+// so this holds by construction; the test keeps a hand-edited literal honest.
+func TestQwen38ArchitectureAliases_KeysAreNormalized(t *testing.T) {
+	if len(qwen38ArchitectureAliases) == 0 {
+		t.Fatal("len(qwen38ArchitectureAliases) = 0, want at least the Ternary-Bonsai-2-27B spellings")
+	}
+	for alias := range qwen38ArchitectureAliases {
+		if got, want := normalizeModelID(alias), alias; got != want {
+			t.Errorf("qwen38ArchitectureAliases key %q is not normalized: normalizeModelID(%q) = %q, want %q", alias, alias, got, want)
+		}
 	}
 }

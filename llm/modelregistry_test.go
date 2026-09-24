@@ -3052,3 +3052,245 @@ func TestResolveBuiltInModel_UnaffectedByOverride(t *testing.T) {
 		t.Errorf("override leaked into built-in lookup: got OutputLimit %d, want 16384", meta.OutputLimit)
 	}
 }
+
+// TestModelRegistry_BonsaiServingNameResolves pins the built-in catalog
+// entries for the Ternary-Bonsai-2-27B checkpoint — a Qwen3.8-architecture
+// model whose name carries no "qwen" token — under every spelling a host
+// resolves it with: the bare serving name an embedded llama-server registers
+// ("Bonsai 2 27B"), the composite provider selector ("embedded/Bonsai 2 27B"),
+// the HuggingFace checkpoint id, and the GGUF download spelling (the last two
+// reached through the normalized fuzzy index). Every spelling must land on the
+// declared catalog entry — Family "qwen", the native Qwen3.8 capability set,
+// GuessedCapabilities false — rather than fall through to the tier-5
+// defaults, whose name-derived family is "default" and whose capabilities are
+// an optimistic guess. The last row is the contrast case: a spelling the
+// catalog does not cover still falls back, so the entries cannot have widened
+// matching beyond the checkpoint they describe.
+func TestModelRegistry_BonsaiServingNameResolves(t *testing.T) {
+	registry := NewModelRegistry(nil)
+
+	// The capability set declared by both catalog entries. Attachment is true
+	// — the same value the unknown-model guess produced before the entry
+	// existed — so a host's vision gating is unchanged by this catalog data.
+	declared := ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true}
+
+	tests := []struct {
+		model             string
+		wantOK            bool
+		wantFamily        string
+		wantContextWindow int
+		wantOutputLimit   int
+		wantTokenizer     string
+		wantProtocol      APIProtocol
+		wantCaps          ModelCapabilities
+		wantGuessed       bool
+	}{
+		{
+			model:             "Bonsai 2 27B",
+			wantOK:            true,
+			wantFamily:        "qwen",
+			wantContextWindow: 262144,
+			wantOutputLimit:   32768,
+			wantTokenizer:     "approximate",
+			wantProtocol:      ProtocolChatCompletions,
+			wantCaps:          declared,
+		},
+		{
+			model:             "embedded/Bonsai 2 27B",
+			wantOK:            true,
+			wantFamily:        "qwen",
+			wantContextWindow: 262144,
+			wantOutputLimit:   32768,
+			wantTokenizer:     "approximate",
+			wantProtocol:      ProtocolChatCompletions,
+			wantCaps:          declared,
+		},
+		{
+			model:             "prism-ml/ternary-bonsai-2-27b",
+			wantOK:            true,
+			wantFamily:        "qwen",
+			wantContextWindow: 262144,
+			wantOutputLimit:   32768,
+			wantTokenizer:     "approximate",
+			wantProtocol:      ProtocolChatCompletions,
+			wantCaps:          declared,
+		},
+		{
+			model:             "prism-ml/Ternary-Bonsai-2-27B-gguf",
+			wantOK:            true,
+			wantFamily:        "qwen",
+			wantContextWindow: 262144,
+			wantOutputLimit:   32768,
+			wantTokenizer:     "approximate",
+			wantProtocol:      ProtocolChatCompletions,
+			wantCaps:          declared,
+		},
+		{
+			model:             "bonsai 2 7b",
+			wantOK:            false,
+			wantFamily:        "default",
+			wantContextWindow: 128000,
+			wantOutputLimit:   32768,
+			wantTokenizer:     "approximate",
+			wantProtocol:      ProtocolChatCompletions,
+			wantCaps:          ModelCapabilities{Attachment: true},
+			wantGuessed:       true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.model, func(t *testing.T) {
+			meta, ok := registry.ResolveLocal(tt.model)
+			if ok != tt.wantOK {
+				t.Errorf("ResolveLocal(%q) ok = %v, want %v", tt.model, ok, tt.wantOK)
+			}
+			if meta.Family != tt.wantFamily {
+				t.Errorf("ResolveLocal(%q) Family = %q, want %q", tt.model, meta.Family, tt.wantFamily)
+			}
+			if meta.ContextWindow != tt.wantContextWindow {
+				t.Errorf("ResolveLocal(%q) ContextWindow = %d, want %d", tt.model, meta.ContextWindow, tt.wantContextWindow)
+			}
+			if meta.OutputLimit != tt.wantOutputLimit {
+				t.Errorf("ResolveLocal(%q) OutputLimit = %d, want %d", tt.model, meta.OutputLimit, tt.wantOutputLimit)
+			}
+			if meta.TokenizerType != tt.wantTokenizer {
+				t.Errorf("ResolveLocal(%q) TokenizerType = %q, want %q", tt.model, meta.TokenizerType, tt.wantTokenizer)
+			}
+			if meta.Protocol != tt.wantProtocol {
+				t.Errorf("ResolveLocal(%q) Protocol = %q, want %q", tt.model, meta.Protocol, tt.wantProtocol)
+			}
+			if meta.Capabilities == nil {
+				t.Fatalf("ResolveLocal(%q) Capabilities = nil, want %+v", tt.model, tt.wantCaps)
+			}
+			if *meta.Capabilities != tt.wantCaps {
+				t.Errorf("ResolveLocal(%q) Capabilities = %+v, want %+v", tt.model, *meta.Capabilities, tt.wantCaps)
+			}
+			if meta.GuessedCapabilities != tt.wantGuessed {
+				t.Errorf("ResolveLocal(%q) GuessedCapabilities = %v, want %v", tt.model, meta.GuessedCapabilities, tt.wantGuessed)
+			}
+		})
+	}
+}
+
+// TestModelRegistry_PartialOverrideInheritsCatalogFamily covers the override
+// shape a host writes for the embedded model: a tier-1 llm.models entry that
+// pins ONLY context_window (sized to the machine's RAM). Family is an
+// inheritable field, so the catalog's "qwen" must survive that partial record
+// instead of being shadowed by its empty Family and re-derived from the name —
+// DetectFamily("Bonsai 2 27B") yields "default", which would strip the model
+// of its family-gated prompt adaptation and of its native reasoning option
+// set. The rows also pin the two boundaries of the inheritance: an explicit
+// Family in the override stays authoritative, and a catalog-miss override with
+// no family still gets DetectFamily's answer (the pre-existing behavior).
+func TestModelRegistry_PartialOverrideInheritsCatalogFamily(t *testing.T) {
+	declared := ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true}
+
+	tests := []struct {
+		name              string
+		model             string
+		override          ModelMetadata
+		wantFamily        string
+		wantContextWindow int
+		wantOutputLimit   int
+		wantTokenizer     string
+		wantCaps          ModelCapabilities
+		wantGuessed       bool
+	}{
+		{
+			name:              "context-window-only override inherits family and capabilities",
+			model:             "Bonsai 2 27B",
+			override:          ModelMetadata{ContextWindow: 32768},
+			wantFamily:        "qwen",
+			wantContextWindow: 32768,
+			wantOutputLimit:   32768,
+			wantTokenizer:     "approximate",
+			wantCaps:          declared,
+		},
+		{
+			name:              "a RAM-tiered window keeps the catalog family",
+			model:             "Bonsai 2 27B",
+			override:          ModelMetadata{ContextWindow: 8192},
+			wantFamily:        "qwen",
+			wantContextWindow: 8192,
+			wantOutputLimit:   32768,
+			wantTokenizer:     "approximate",
+			wantCaps:          declared,
+		},
+		{
+			name:              "composite selector inherits through the fuzzy tier",
+			model:             "embedded/Bonsai 2 27B",
+			override:          ModelMetadata{ContextWindow: 16384},
+			wantFamily:        "qwen",
+			wantContextWindow: 16384,
+			wantOutputLimit:   32768,
+			wantTokenizer:     "approximate",
+			wantCaps:          declared,
+		},
+		{
+			name:              "an explicit override family stays authoritative",
+			model:             "Bonsai 2 27B",
+			override:          ModelMetadata{ContextWindow: 16384, Family: "anthropic"},
+			wantFamily:        "anthropic",
+			wantContextWindow: 16384,
+			wantOutputLimit:   32768,
+			wantTokenizer:     "approximate",
+			wantCaps:          declared,
+		},
+		{
+			name:              "a fully specified override is returned verbatim",
+			model:             "Bonsai 2 27B",
+			override:          ModelMetadata{ContextWindow: 8192, OutputLimit: 4096, TokenizerType: "custom", Family: "default", Capabilities: &ModelCapabilities{}},
+			wantFamily:        "default",
+			wantContextWindow: 8192,
+			wantOutputLimit:   4096,
+			wantTokenizer:     "custom",
+			wantCaps:          ModelCapabilities{},
+		},
+		{
+			// Catalog miss: no lower tier declares a family, so the inherited
+			// value stays empty and DetectFamily derives it from the name —
+			// the behavior TestResolveFamily_UserOverride pins.
+			name:              "a catalog-miss override without family still uses DetectFamily",
+			model:             "claude-custom",
+			override:          ModelMetadata{ContextWindow: 100000},
+			wantFamily:        "anthropic",
+			wantContextWindow: 100000,
+			wantOutputLimit:   32768,
+			wantTokenizer:     "approximate",
+			wantCaps:          ModelCapabilities{Attachment: true},
+			wantGuessed:       true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			registry := NewModelRegistry(map[string]ModelMetadata{tt.model: tt.override})
+
+			meta, ok := registry.ResolveLocal(tt.model)
+			if !ok {
+				t.Errorf("ResolveLocal(%q) ok = false, want true (override present)", tt.model)
+			}
+			if meta.Family != tt.wantFamily {
+				t.Errorf("ResolveLocal(%q) Family = %q, want %q", tt.model, meta.Family, tt.wantFamily)
+			}
+			if meta.ContextWindow != tt.wantContextWindow {
+				t.Errorf("ResolveLocal(%q) ContextWindow = %d, want %d", tt.model, meta.ContextWindow, tt.wantContextWindow)
+			}
+			if meta.OutputLimit != tt.wantOutputLimit {
+				t.Errorf("ResolveLocal(%q) OutputLimit = %d, want %d", tt.model, meta.OutputLimit, tt.wantOutputLimit)
+			}
+			if meta.TokenizerType != tt.wantTokenizer {
+				t.Errorf("ResolveLocal(%q) TokenizerType = %q, want %q", tt.model, meta.TokenizerType, tt.wantTokenizer)
+			}
+			if meta.Capabilities == nil {
+				t.Fatalf("ResolveLocal(%q) Capabilities = nil, want %+v", tt.model, tt.wantCaps)
+			}
+			if *meta.Capabilities != tt.wantCaps {
+				t.Errorf("ResolveLocal(%q) Capabilities = %+v, want %+v", tt.model, *meta.Capabilities, tt.wantCaps)
+			}
+			if meta.GuessedCapabilities != tt.wantGuessed {
+				t.Errorf("ResolveLocal(%q) GuessedCapabilities = %v, want %v", tt.model, meta.GuessedCapabilities, tt.wantGuessed)
+			}
+		})
+	}
+}

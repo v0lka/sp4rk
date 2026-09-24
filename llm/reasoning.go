@@ -74,13 +74,45 @@ func IsGLM52OrLater(model string) bool {
 // minor version and is not a 3.8 deployment) match only their actual number.
 var qwenVersionRe = regexp.MustCompile(`^qwen(\d+)(?:\.(\d+))?`)
 
+// qwen38ArchitectureAliases lists models that ARE built on the Qwen 3.8
+// architecture — and therefore speak its native per-request reasoning_effort
+// protocol — but whose identifiers carry no "qwen<version>" token, so
+// qwenVersionRe cannot read a version out of them. Keys are normalizeModelID
+// forms, which makes the match insensitive to casing, to a vendor prefix, and
+// to delivery postfixes: a single entry covers the bare serving name
+// "Bonsai 2 27B", the composite selector "embedded/Bonsai 2 27B", and the
+// checkpoint spelling "Ternary-Bonsai-2-27B-gguf".
+//
+// This table is the ONE funnel for such models. IsQwen38OrLater is consulted
+// both by the user-facing option set (ModelReasoningOptions) and by the
+// wire-level encoder (applyQwenReasoning), so registering an alias here fixes
+// the picker and the request encoding together — teaching only one of the two
+// would either offer native efforts the provider path then refuses to send, or
+// send efforts the picker never offered. The catalog counterpart (Family
+// "qwen" for the same identifiers) lives in makeBuiltInRegistry: the family
+// gates ModelReasoningOptions' qwen branch, this table gates the version.
+var qwen38ArchitectureAliases = map[string]struct{}{
+	// Ternary-Bonsai-2-27B (PrismML): a Qwen3.8-architecture checkpoint
+	// published and served under its own name. See the catalog entries
+	// "prism-ml/ternary-bonsai-2-27b" and "bonsai 2 27b".
+	normalizeModelID("prism-ml/ternary-bonsai-2-27b"): {},
+	normalizeModelID("bonsai 2 27b"):                  {},
+}
+
 // IsQwen38OrLater reports whether model is a Qwen model version 3.8 or later.
 // Qwen 3.8 introduced the per-request reasoning_effort parameter (values
 // "xhigh"/"medium"/"low"); older Qwen models support only the binary
 // enable_thinking switch and reject or ignore reasoning_effort. The model
 // argument may be a bare name ("qwen3.8-27b") or a composite
 // "provider/name" identifier ("qwen/qwen3.8-flash-next").
+//
+// A model whose name carries no readable version but which is built on the
+// 3.8 architecture is recognized through qwen38ArchitectureAliases, which is
+// consulted first and matches on the normalized identifier.
 func IsQwen38OrLater(model string) bool {
+	if _, ok := qwen38ArchitectureAliases[normalizeModelID(model)]; ok {
+		return true
+	}
 	bare := strings.ToLower(strings.TrimSpace(BareModel(model)))
 	m := qwenVersionRe.FindStringSubmatch(bare)
 	if m == nil {

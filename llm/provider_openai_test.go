@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -2142,4 +2143,256 @@ func TestOpenAIProvider_NullResponseBodyIsError(t *testing.T) {
 	if !IsRetryable(err) {
 		t.Errorf("expected null-body error to be retryable, got %v", err)
 	}
+}
+
+// --- ReasoningWire: the per-provider Qwen reasoning-control spelling ---
+
+// TestApplyQwenReasoning_WireSpelling pins the EXACT extra fields
+// applyQwenReasoning emits for every effort value under both wire spellings.
+//
+// The vendor-default column is the historical behavior and is the regression
+// guard for the switch: it must not move when a new wire is added. The
+// chat_template_kwargs column is the llama.cpp spelling — one top-level object
+// whose enable_thinking is a JSON BOOLEAN (the server dumps each kwarg and
+// re-parses it, and a quoted string makes it throw) and whose reasoning_effort
+// is only ever a native level.
+func TestApplyQwenReasoning_WireSpelling(t *testing.T) {
+	const (
+		modelQwen38  = "qwen3.8-27b"
+		modelBonsai  = "Bonsai 2 27B"
+		modelPre38   = "qwen3-235b-a22b-instruct"
+		modelPre38No = "qwen2.5-72b-instruct"
+	)
+	// ctk builds the expected chat_template_kwargs extra.
+	ctk := func(kv map[string]any) map[string]any {
+		return map[string]any{"chat_template_kwargs": kv}
+	}
+
+	tests := []struct {
+		name   string
+		model  string
+		effort string
+		wire   ReasoningWire
+		want   map[string]any
+	}{
+		// --- vendor default: top-level fields, unchanged ---
+		{name: "vendor-default Off", model: modelQwen38, effort: "Off", wire: ReasoningWireVendorDefault, want: map[string]any{"enable_thinking": false}},
+		{name: "vendor-default lower-case off", model: modelQwen38, effort: "off", wire: ReasoningWireVendorDefault, want: map[string]any{"enable_thinking": false}},
+		{name: "vendor-default any-case OFF", model: modelQwen38, effort: "OFF", wire: ReasoningWireVendorDefault, want: map[string]any{"enable_thinking": false}},
+		{name: "vendor-default none fails closed", model: modelQwen38, effort: "none", wire: ReasoningWireVendorDefault, want: map[string]any{"enable_thinking": false}},
+		{name: "vendor-default On", model: modelQwen38, effort: "On", wire: ReasoningWireVendorDefault, want: map[string]any{"enable_thinking": true}},
+		{name: "vendor-default xhigh", model: modelQwen38, effort: "xhigh", wire: ReasoningWireVendorDefault, want: map[string]any{"enable_thinking": true}},
+		{name: "vendor-default medium", model: modelQwen38, effort: "medium", wire: ReasoningWireVendorDefault, want: map[string]any{"reasoning_effort": "medium"}},
+		{name: "vendor-default low", model: modelQwen38, effort: "low", wire: ReasoningWireVendorDefault, want: map[string]any{"reasoning_effort": "low"}},
+		{name: "vendor-default unknown fails closed", model: modelQwen38, effort: "bogus", wire: ReasoningWireVendorDefault, want: map[string]any{"enable_thinking": false}},
+		{name: "zero-value wire is the vendor default", model: modelQwen38, effort: "Off", wire: ReasoningWire(""), want: map[string]any{"enable_thinking": false}},
+		{name: "unrecognized wire falls back to the vendor default", model: modelQwen38, effort: "medium", wire: ReasoningWire("something-else"), want: map[string]any{"reasoning_effort": "medium"}},
+		{name: "vendor-default pre-3.8 On", model: modelPre38, effort: "On", wire: ReasoningWireVendorDefault, want: map[string]any{"enable_thinking": true}},
+		{name: "vendor-default pre-3.8 medium is binary", model: modelPre38, effort: "medium", wire: ReasoningWireVendorDefault, want: map[string]any{"enable_thinking": true}},
+		{name: "vendor-default pre-3.8 unknown fails closed", model: modelPre38No, effort: "bogus", wire: ReasoningWireVendorDefault, want: map[string]any{"enable_thinking": false}},
+
+		// --- chat_template_kwargs: the llama.cpp spelling ---
+		{name: "ctk Off", model: modelQwen38, effort: "Off", wire: ReasoningWireChatTemplateKwargs, want: ctk(map[string]any{"enable_thinking": false})},
+		{name: "ctk lower-case off", model: modelQwen38, effort: "off", wire: ReasoningWireChatTemplateKwargs, want: ctk(map[string]any{"enable_thinking": false})},
+		{name: "ctk any-case OFF", model: modelQwen38, effort: "OFF", wire: ReasoningWireChatTemplateKwargs, want: ctk(map[string]any{"enable_thinking": false})},
+		{name: "ctk none never becomes a kwarg effort", model: modelQwen38, effort: "none", wire: ReasoningWireChatTemplateKwargs, want: ctk(map[string]any{"enable_thinking": false})},
+		{name: "ctk On", model: modelQwen38, effort: "On", wire: ReasoningWireChatTemplateKwargs, want: ctk(map[string]any{"enable_thinking": true})},
+		{name: "ctk xhigh is the native default", model: modelQwen38, effort: "xhigh", wire: ReasoningWireChatTemplateKwargs, want: ctk(map[string]any{"enable_thinking": true})},
+		{name: "ctk medium", model: modelQwen38, effort: "medium", wire: ReasoningWireChatTemplateKwargs, want: ctk(map[string]any{"enable_thinking": true, "reasoning_effort": "medium"})},
+		{name: "ctk low", model: modelQwen38, effort: "low", wire: ReasoningWireChatTemplateKwargs, want: ctk(map[string]any{"enable_thinking": true, "reasoning_effort": "low"})},
+		{name: "ctk unknown fails closed", model: modelQwen38, effort: "bogus", wire: ReasoningWireChatTemplateKwargs, want: ctk(map[string]any{"enable_thinking": false})},
+		{name: "ctk pre-3.8 On", model: modelPre38, effort: "On", wire: ReasoningWireChatTemplateKwargs, want: ctk(map[string]any{"enable_thinking": true})},
+		{name: "ctk pre-3.8 medium is binary", model: modelPre38, effort: "medium", wire: ReasoningWireChatTemplateKwargs, want: ctk(map[string]any{"enable_thinking": true})},
+		{name: "ctk pre-3.8 unknown fails closed", model: modelPre38No, effort: "bogus", wire: ReasoningWireChatTemplateKwargs, want: ctk(map[string]any{"enable_thinking": false})},
+
+		// --- the embedded Bonsai checkpoint (Qwen 3.8 architecture alias) ---
+		{name: "ctk Bonsai Off", model: modelBonsai, effort: "Off", wire: ReasoningWireChatTemplateKwargs, want: ctk(map[string]any{"enable_thinking": false})},
+		{name: "ctk Bonsai On", model: modelBonsai, effort: "On", wire: ReasoningWireChatTemplateKwargs, want: ctk(map[string]any{"enable_thinking": true})},
+		{name: "ctk Bonsai medium", model: modelBonsai, effort: "medium", wire: ReasoningWireChatTemplateKwargs, want: ctk(map[string]any{"enable_thinking": true, "reasoning_effort": "medium"})},
+		{name: "vendor-default Bonsai Off", model: modelBonsai, effort: "Off", wire: ReasoningWireVendorDefault, want: map[string]any{"enable_thinking": false}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			params := &oai.ChatCompletionNewParams{}
+			applyQwenReasoning(params, tt.model, tt.effort, tt.wire)
+			got := params.ExtraFields()
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("applyQwenReasoning(model=%q, effort=%q, wire=%q) extra fields = %#v, want %#v",
+					tt.model, tt.effort, tt.wire, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestApplyQwenReasoning_VendorDefaultWireByteIdentical is the byte-level
+// regression guard for the wire switch: with the vendor-default spelling (the
+// zero value, i.e. what every provider that does not opt in gets) the
+// serialized reasoning extras must be exactly what sp4rk emitted before
+// ReasoningWire existed, and no chat_template_kwargs object may appear.
+func TestApplyQwenReasoning_VendorDefaultWireByteIdentical(t *testing.T) {
+	rows := []struct {
+		effort   string
+		wantJSON string
+	}{
+		{effort: "Off", wantJSON: `{"enable_thinking":false}`},
+		{effort: "off", wantJSON: `{"enable_thinking":false}`},
+		{effort: "none", wantJSON: `{"enable_thinking":false}`},
+		{effort: "On", wantJSON: `{"enable_thinking":true}`},
+		{effort: "xhigh", wantJSON: `{"enable_thinking":true}`},
+		{effort: "medium", wantJSON: `{"reasoning_effort":"medium"}`},
+		{effort: "low", wantJSON: `{"reasoning_effort":"low"}`},
+		{effort: "bogus", wantJSON: `{"enable_thinking":false}`},
+	}
+	for _, row := range rows {
+		t.Run("effort="+row.effort, func(t *testing.T) {
+			explicit := &oai.ChatCompletionNewParams{}
+			applyQwenReasoning(explicit, "qwen3.8-27b", row.effort, ReasoningWireVendorDefault)
+			gotJSON, err := json.Marshal(explicit.ExtraFields())
+			if err != nil {
+				t.Fatalf("marshal extra fields: %v", err)
+			}
+			if string(gotJSON) != row.wantJSON {
+				t.Errorf("applyQwenReasoning(vendor-default, effort=%q) extras JSON = %s, want %s", row.effort, gotJSON, row.wantJSON)
+			}
+
+			// The zero value must select the identical encoding.
+			zero := &oai.ChatCompletionNewParams{}
+			applyQwenReasoning(zero, "qwen3.8-27b", row.effort, ReasoningWire(""))
+			zeroJSON, err := json.Marshal(zero.ExtraFields())
+			if err != nil {
+				t.Fatalf("marshal extra fields: %v", err)
+			}
+			if !bytes.Equal(zeroJSON, gotJSON) {
+				t.Errorf("zero-value wire extras JSON = %s, want %s (identical to ReasoningWireVendorDefault)", zeroJSON, gotJSON)
+			}
+		})
+	}
+
+	t.Run("full request body unchanged", func(t *testing.T) {
+		topK := 20
+		req := ChatRequest{
+			Model:             "qwen3.8-27b",
+			Messages:          []Message{{Role: "user", Content: "hi"}},
+			ReasoningEffort:   "Off",
+			TopK:              &topK,
+			RepetitionPenalty: floatPtr(1.05),
+		}
+		zero, err := NewOpenAIProvider(OpenAIProviderConfig{Name: "qwen", APIKey: "k", BaseURL: "https://example.invalid/v1"})
+		if err != nil {
+			t.Fatalf("NewOpenAIProvider (zero wire): %v", err)
+		}
+		explicit, err := NewOpenAIProvider(OpenAIProviderConfig{
+			Name:          "qwen",
+			APIKey:        "k",
+			BaseURL:       "https://example.invalid/v1",
+			ReasoningWire: ReasoningWireVendorDefault,
+		})
+		if err != nil {
+			t.Fatalf("NewOpenAIProvider (vendor-default wire): %v", err)
+		}
+		// The SDK appends extra fields to the request body in map-iteration
+		// order, so the raw bytes are not reproducible across two runs of the
+		// same code — compare the decoded bodies instead. (The extras-only
+		// golden strings above ARE byte-exact: encoding/json sorts map keys.)
+		gotZero := jsonMap(t, zero.buildChatParams(req))
+		gotExplicit := jsonMap(t, explicit.buildChatParams(req))
+		if !reflect.DeepEqual(gotZero, gotExplicit) {
+			t.Errorf("vendor-default body differs from the zero-value body:\n zero     = %v\n explicit = %v", gotZero, gotExplicit)
+		}
+		if got, present := gotZero["chat_template_kwargs"]; present {
+			t.Errorf("vendor-default body must not carry chat_template_kwargs, got %v", got)
+		}
+		if got, present := gotZero["reasoning_effort"]; present {
+			t.Errorf("vendor-default body must not carry reasoning_effort for Off, got %v", got)
+		}
+		if gotZero["enable_thinking"] != false {
+			t.Errorf("vendor-default body lost the top-level enable_thinking extra: enable_thinking = %v, want false (body %v)",
+				gotZero["enable_thinking"], gotZero)
+		}
+		// The sampling extras must survive next to the reasoning extra.
+		wantNum(t, gotZero, "top_k", 20)
+		wantNum(t, gotZero, "repetition_penalty", 1.05)
+	})
+}
+
+// TestApplyQwenReasoning_ChatTemplateKwargsOnlyNativeEfforts guards the hard
+// server-side constraint of the Bonsai chat template: it RAISES on a
+// reasoning_effort outside {xhigh, medium, low}, so no other value — in
+// particular not the "Off"/"On"/"none" sentinels — may ever be placed in
+// chat_template_kwargs.
+func TestApplyQwenReasoning_ChatTemplateKwargsOnlyNativeEfforts(t *testing.T) {
+	native := map[string]bool{"xhigh": true, "medium": true, "low": true}
+	efforts := []string{
+		"Off", "off", "OFF", "On", "on", "ON", "none", "None", "NONE",
+		"high", "max", "minimal", "xhigh", "medium", "low", "bogus", "",
+	}
+	models := []string{"qwen3.8-27b", "Bonsai 2 27B", "qwen3-235b-a22b-instruct", "unknown-model"}
+
+	for _, model := range models {
+		for _, effort := range efforts {
+			params := &oai.ChatCompletionNewParams{}
+			applyQwenReasoning(params, model, effort, ReasoningWireChatTemplateKwargs)
+			kwargs, ok := params.ExtraFields()["chat_template_kwargs"].(map[string]any)
+			if !ok {
+				t.Fatalf("applyQwenReasoning(model=%q, effort=%q, chat_template_kwargs) did not emit a chat_template_kwargs object, got %#v",
+					model, effort, params.ExtraFields())
+			}
+			value, present := kwargs["reasoning_effort"]
+			if !present {
+				continue
+			}
+			level, isString := value.(string)
+			if !isString || !native[level] {
+				t.Errorf("applyQwenReasoning(model=%q, effort=%q, chat_template_kwargs) forwarded reasoning_effort=%#v; only xhigh/medium/low may ever reach chat_template_kwargs",
+					model, effort, value)
+				continue
+			}
+			if kwargs["enable_thinking"] != true {
+				t.Errorf("applyQwenReasoning(model=%q, effort=%q, chat_template_kwargs) forwarded reasoning_effort=%q without enable_thinking=true, got %#v",
+					model, effort, level, kwargs)
+			}
+		}
+	}
+}
+
+// TestOpenAIProvider_ChatTemplateKwargsMergesWithSamplingExtras proves the new
+// spelling uses mergeExtraFields rather than SetExtraFields: the reasoning
+// extra and the top_k/repetition_penalty extras that buildChatParams merges
+// afterwards must all survive in one body.
+func TestOpenAIProvider_ChatTemplateKwargsMergesWithSamplingExtras(t *testing.T) {
+	p, err := NewOpenAIProvider(OpenAIProviderConfig{
+		Name:          "embedded",
+		APIKey:        "k",
+		BaseURL:       "https://example.invalid/v1",
+		ReasoningWire: ReasoningWireChatTemplateKwargs,
+	})
+	if err != nil {
+		t.Fatalf("NewOpenAIProvider: %v", err)
+	}
+	topK := 20
+	req := ChatRequest{
+		Model:             "Bonsai 2 27B",
+		ModelFamily:       "qwen",
+		Messages:          []Message{{Role: "user", Content: "hi"}},
+		ReasoningEffort:   "medium",
+		TopK:              &topK,
+		RepetitionPenalty: floatPtr(1.05),
+	}
+	out := jsonMap(t, p.buildChatParams(req))
+	kwargs, ok := out["chat_template_kwargs"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected a chat_template_kwargs object in the body, got %v", out)
+	}
+	if kwargs["enable_thinking"] != true {
+		t.Errorf("chat_template_kwargs.enable_thinking = %v (%T), want true", kwargs["enable_thinking"], kwargs["enable_thinking"])
+	}
+	if kwargs["reasoning_effort"] != "medium" {
+		t.Errorf("chat_template_kwargs.reasoning_effort = %v, want medium", kwargs["reasoning_effort"])
+	}
+	if _, present := out["enable_thinking"]; present {
+		t.Errorf("top-level enable_thinking must not be emitted under the chat_template_kwargs wire, got %v", out["enable_thinking"])
+	}
+	wantNum(t, out, "top_k", 20)
+	wantNum(t, out, "repetition_penalty", 1.05)
 }

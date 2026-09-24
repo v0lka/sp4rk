@@ -22,6 +22,14 @@ type OpenAIProviderConfig struct {
 	BaseURL    string       // empty = default OpenAI; otherwise custom endpoint
 	HTTPClient *http.Client // optional proxy-configured HTTP client (nil = default)
 	Logger     *slog.Logger // optional structured logger (nil = slog.Default())
+	// ReasoningWire selects the JSON spelling this endpoint expects for
+	// Qwen-family reasoning controls (enable_thinking / reasoning_effort).
+	// Zero value = ReasoningWireVendorDefault (top-level request fields),
+	// which every OpenAI-compatible server except llama.cpp reads. Set it to
+	// ReasoningWireChatTemplateKwargs for a llama.cpp-served endpoint, which
+	// ignores a top-level enable_thinking and only honors the one nested in
+	// chat_template_kwargs. See ReasoningWire for the full contract.
+	ReasoningWire ReasoningWire
 }
 
 // OpenAIProvider implements Provider for OpenAI and compatible APIs.
@@ -34,6 +42,7 @@ type OpenAIProvider struct {
 	apiKey            string       // API key (passed to the Google delegate; empty for local backends)
 	httpClient        *http.Client // optional proxy-configured HTTP client (passed to the Google delegate; nil = http.DefaultClient)
 	logger            *slog.Logger
+	reasoningWire     ReasoningWire // Qwen reasoning-control spelling for this endpoint (zero = vendor default)
 }
 
 // log returns the provider's logger, defaulting to slog.Default() when unset.
@@ -95,6 +104,7 @@ func NewOpenAIProvider(cfg OpenAIProviderConfig) (*OpenAIProvider, error) {
 		apiKey:            cfg.APIKey,
 		httpClient:        cfg.HTTPClient,
 		logger:            cfg.Logger,
+		reasoningWire:     cfg.ReasoningWire,
 	}, nil
 }
 
@@ -290,7 +300,7 @@ func (p *OpenAIProvider) buildChatParams(req ChatRequest) oai.ChatCompletionNewP
 		case "deepseek":
 			applyDeepSeekReasoning(&params, req.ReasoningEffort)
 		case "qwen":
-			applyQwenReasoning(&params, req.Model, req.ReasoningEffort)
+			applyQwenReasoning(&params, req.Model, req.ReasoningEffort, p.reasoningWire)
 		case "glm":
 			applyGLMReasoning(&params, req.Model, req.ReasoningEffort)
 		}
@@ -302,7 +312,7 @@ func (p *OpenAIProvider) buildChatParams(req ChatRequest) oai.ChatCompletionNewP
 	// read them from the same Chat Completions payload, so they are forwarded
 	// only when a custom baseURL is configured. Applied after the reasoning
 	// switch above because mergeExtraFields must preserve the extras it may
-	// have set ("thinking", "enable_thinking", ...).
+	// have set ("thinking", "enable_thinking", "chat_template_kwargs", ...).
 	if p.baseURL != "" {
 		extras := make(map[string]any)
 		if req.TopK != nil {
@@ -374,7 +384,19 @@ func mergeExtraFields(params *oai.ChatCompletionNewParams, extra map[string]any)
 // evolve into a vendor-default pass-through that re-enables thinking for the
 // sentinel. Any other value fails closed to thinking disabled, preserving
 // the pre-reasoning_effort behavior of enable_thinking = (effort == "On").
-func applyQwenReasoning(params *oai.ChatCompletionNewParams, model, effort string) {
+//
+// wire selects the JSON SPELLING of those controls (see ReasoningWire):
+// ReasoningWireVendorDefault — the zero value, and the fall-back for any
+// unrecognized wire — emits them as top-level request fields, which is what
+// vLLM, LM Studio, SGLang, Ollama and DashScope read. A llama.cpp server
+// ignores a top-level enable_thinking, so endpoints served by one opt into
+// ReasoningWireChatTemplateKwargs and get the identical decision table encoded
+// inside "chat_template_kwargs" instead.
+func applyQwenReasoning(params *oai.ChatCompletionNewParams, model, effort string, wire ReasoningWire) {
+	if wire == ReasoningWireChatTemplateKwargs {
+		applyQwenReasoningChatTemplateKwargs(params, model, effort)
+		return
+	}
 	// "off" is the value c0wrk stores in its small-LLM config; "Off" is the
 	// canonical spelling. Both disable thinking; the guard runs before the
 	// switch so the semantics of the documented sentinel are pinned
@@ -409,6 +431,59 @@ func applyQwenReasoning(params *oai.ChatCompletionNewParams, model, effort strin
 			"enable_thinking": false,
 		})
 	}
+}
+
+// applyQwenReasoningChatTemplateKwargs encodes applyQwenReasoning's decision
+// table in the llama.cpp spelling: ONE top-level "chat_template_kwargs" object
+// holding the controls, instead of top-level fields.
+//
+// Two server-side facts (tools/server/server-common.cpp,
+// oaicompat_chat_params_parse) drive the shape:
+//
+//   - each kwarg value is JSON-dumped into a key→string map and re-parsed into
+//     the template's extra context, and the dumped enable_thinking is compared
+//     against the strings "true"/"false". A JSON boolean dumps to exactly that;
+//     a JSON *string* dumps WITH quotes and makes the server throw
+//     `invalid type for "enable_thinking" (expected boolean, got string)`. So
+//     enable_thinking is emitted as a Go bool, never as "true"/"false".
+//   - a top-level enable_thinking is never read, which is precisely why this
+//     spelling exists: without it, "Off" is a silent no-op and the model keeps
+//     thinking.
+//
+// reasoning_effort is emitted ONLY for the native levels medium/low, and always
+// together with enable_thinking=true (a kwarg effort does not by itself switch
+// thinking on, unlike the top-level spelling where llama.cpp forwards the value
+// itself). The Bonsai chat template raises on a reasoning_effort outside
+// {xhigh, medium, low}, so the "Off"/"On" sentinels — which are not native
+// levels — must never be forwarded as that kwarg: "On"/"xhigh" mean "thinking
+// at the template's native default (xhigh)" and are expressed as
+// enable_thinking=true alone.
+//
+// mergeExtraFields (not SetExtraFields) is used so extras set earlier on the
+// same params — and the top_k/repetition_penalty merge that runs after this in
+// buildChatParams — are preserved rather than clobbered.
+func applyQwenReasoningChatTemplateKwargs(params *oai.ChatCompletionNewParams, model, effort string) {
+	kwargs := make(map[string]any, 2)
+	switch {
+	case strings.EqualFold(effort, "off"):
+		kwargs["enable_thinking"] = false
+	case !IsQwen38OrLater(model):
+		// Legacy binary control, same fail-closed mapping as the
+		// vendor-default spelling: a known effort value requests thinking,
+		// anything else disables it, and reasoning_effort is never sent
+		// (pre-3.8 models do not know the parameter).
+		kwargs["enable_thinking"] = effort == "On" || effort == "xhigh" || effort == "medium" || effort == "low"
+	case effort == "On", effort == "xhigh":
+		kwargs["enable_thinking"] = true
+	case effort == "medium", effort == "low":
+		kwargs["enable_thinking"] = true
+		kwargs["reasoning_effort"] = effort
+	default:
+		kwargs["enable_thinking"] = false
+	}
+	mergeExtraFields(params, map[string]any{
+		"chat_template_kwargs": kwargs,
+	})
 }
 
 // applyDeepSeekReasoning sets the thinking control for DeepSeek models. The

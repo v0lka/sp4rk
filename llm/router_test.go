@@ -2,9 +2,11 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -575,7 +577,7 @@ func TestCreateProviderFromConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			p, err := createProviderFromConfig(context.Background(), tt.providerName, tt.provType, tt.apiKey, tt.baseURL, nil, nil)
+			p, err := createProviderFromConfig(context.Background(), tt.providerName, tt.provType, tt.apiKey, tt.baseURL, nil, nil, ReasoningWireVendorDefault)
 			if tt.wantErr {
 				if err == nil {
 					t.Error("expected error, got nil")
@@ -1044,4 +1046,134 @@ func TestParseCompositeModelID(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestNewRouter_ProviderEntryReasoningWirePlumbing proves the per-provider
+// ReasoningWire switch travels the whole way — RouterConfig → ProviderEntry →
+// createProviderFromConfig → OpenAIProviderConfig → OpenAIProvider → request
+// body. An entry that opts into the llama.cpp spelling produces a provider
+// whose chat-completions body carries chat_template_kwargs (and NO top-level
+// enable_thinking, which a llama.cpp server never reads); an entry that does
+// not opt in keeps the historical top-level fields.
+func TestNewRouter_ProviderEntryReasoningWirePlumbing(t *testing.T) {
+	const model = "Bonsai 2 27B"
+
+	// requestOff is the request both sub-tests submit: the embedded Bonsai
+	// checkpoint with thinking switched off. ModelFamily is pinned because the
+	// reasoning branch keys off the family the router resolves from registry
+	// metadata (Router fills it in before dispatch), not off the model name.
+	requestOff := func() ChatRequest {
+		return ChatRequest{
+			Model:           model,
+			ModelFamily:     "qwen",
+			Messages:        []Message{{Role: "user", Content: "hi"}},
+			ReasoningEffort: "Off",
+		}
+	}
+
+	// routedProvider builds a one-provider router from the given entry and
+	// returns the constructed OpenAIProvider plus the recorder that captures
+	// its request bodies.
+	routedProvider := func(t *testing.T, wire ReasoningWire) (*OpenAIProvider, *[]byte) {
+		t.Helper()
+		body, srv := chatBodyRecorder(t)
+		r, err := NewRouter(context.Background(), RouterConfig{
+			Providers: []ProviderEntry{{
+				Name:          "embedded",
+				ProviderType:  "openai",
+				BaseURL:       srv.URL,
+				Models:        []string{model},
+				ReasoningWire: wire,
+			}},
+			MaxRetries: -1, // retries disabled: the recorder answers once
+		}, nil)
+		if err != nil {
+			t.Fatalf("NewRouter: %v", err)
+		}
+		p, ok := r.providers["embedded"].(*OpenAIProvider)
+		if !ok {
+			t.Fatalf("router provider type = %T, want *OpenAIProvider", r.providers["embedded"])
+		}
+		return p, body
+	}
+
+	t.Run("chat_template_kwargs wire reaches the request body", func(t *testing.T) {
+		p, body := routedProvider(t, ReasoningWireChatTemplateKwargs)
+		if p.reasoningWire != ReasoningWireChatTemplateKwargs {
+			t.Errorf("provider reasoningWire = %q, want %q", p.reasoningWire, ReasoningWireChatTemplateKwargs)
+		}
+		if _, err := p.ChatCompletion(context.Background(), requestOff()); err != nil {
+			t.Fatalf("ChatCompletion: %v", err)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(*body, &payload); err != nil {
+			t.Fatalf("unmarshal request body: %v", err)
+		}
+		kwargs, ok := payload["chat_template_kwargs"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected a chat_template_kwargs object in the request body, got %v", payload)
+		}
+		if kwargs["enable_thinking"] != false {
+			t.Errorf("chat_template_kwargs.enable_thinking = %v (%T), want false — a llama.cpp server compares the dumped value against the strings \"true\"/\"false\", so this must serialize as a JSON boolean",
+				kwargs["enable_thinking"], kwargs["enable_thinking"])
+		}
+		if got, present := kwargs["reasoning_effort"]; present {
+			t.Errorf("chat_template_kwargs.reasoning_effort = %v, want absent for Off (the Bonsai template raises on a non-native effort)", got)
+		}
+		if got, present := payload["enable_thinking"]; present {
+			t.Errorf("top-level enable_thinking = %v, want absent under the chat_template_kwargs wire", got)
+		}
+		if !strings.Contains(string(*body), `"enable_thinking":false`) {
+			t.Errorf("request body must carry a JSON boolean enable_thinking, got %s", *body)
+		}
+	})
+
+	t.Run("vendor-default wire keeps the top-level fields", func(t *testing.T) {
+		p, body := routedProvider(t, ReasoningWireVendorDefault)
+		if p.reasoningWire != ReasoningWireVendorDefault {
+			t.Errorf("provider reasoningWire = %q, want %q", p.reasoningWire, ReasoningWireVendorDefault)
+		}
+		if _, err := p.ChatCompletion(context.Background(), requestOff()); err != nil {
+			t.Fatalf("ChatCompletion: %v", err)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(*body, &payload); err != nil {
+			t.Fatalf("unmarshal request body: %v", err)
+		}
+		if payload["enable_thinking"] != false {
+			t.Errorf("top-level enable_thinking = %v, want false", payload["enable_thinking"])
+		}
+		if got, present := payload["chat_template_kwargs"]; present {
+			t.Errorf("chat_template_kwargs = %v, want absent under the vendor-default wire", got)
+		}
+	})
+
+	t.Run("an entry without the flag keeps the zero value", func(t *testing.T) {
+		body, srv := chatBodyRecorder(t)
+		r, err := NewRouter(context.Background(), RouterConfig{
+			Providers: []ProviderEntry{{
+				Name:         "lmstudio",
+				ProviderType: "openai",
+				BaseURL:      srv.URL,
+				Models:       []string{model},
+			}},
+			MaxRetries: -1,
+		}, nil)
+		if err != nil {
+			t.Fatalf("NewRouter: %v", err)
+		}
+		p, ok := r.providers["lmstudio"].(*OpenAIProvider)
+		if !ok {
+			t.Fatalf("router provider type = %T, want *OpenAIProvider", r.providers["lmstudio"])
+		}
+		if p.reasoningWire != ReasoningWireVendorDefault {
+			t.Errorf("provider reasoningWire = %q, want the zero value %q", p.reasoningWire, ReasoningWireVendorDefault)
+		}
+		if _, err := p.ChatCompletion(context.Background(), requestOff()); err != nil {
+			t.Fatalf("ChatCompletion: %v", err)
+		}
+		if strings.Contains(string(*body), "chat_template_kwargs") {
+			t.Errorf("an entry without ReasoningWire must not emit chat_template_kwargs, got %s", *body)
+		}
+	})
 }

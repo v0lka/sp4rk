@@ -54,6 +54,57 @@ type RouterConfig struct {
 	Logger              *slog.Logger    // Optional logger for ambiguity warnings (nil = silent)
 }
 
+// ReasoningWire selects the JSON spelling a provider expects for Qwen-family
+// reasoning controls (enable_thinking / reasoning_effort). It is an explicit,
+// operator-chosen per-provider switch — sp4rk deliberately does NOT guess it
+// from the base URL, because a loopback heuristic mislabels every non-llama.cpp
+// local server (LM Studio, vLLM, Ollama, KoboldCpp) and silently changes the
+// request body of providers that were working.
+//
+// ReasoningWireVendorDefault keeps the historical spelling: both controls as
+// TOP-LEVEL request fields. That is what vLLM, LM Studio, SGLang, Ollama and
+// DashScope read.
+//
+// llama.cpp — and forks of it, e.g. the PrismML-Eng/llama.cpp build that serves
+// c0wrk's embedded Bonsai 2 27B model — parses the same payload differently, in
+// oaicompat_chat_params_parse (tools/server/server-common.cpp):
+//
+//   - A TOP-LEVEL "enable_thinking" is never read. The flag is picked up only
+//     from "chat_template_kwargs", whose values are JSON-dumped into a
+//     key→string map and later re-parsed (common/chat.cpp) into the template's
+//     extra context. The dumped form is compared against the strings
+//     "true"/"false", so a JSON BOOLEAN works, while a JSON *string* dumps with
+//     surrounding quotes and makes the server throw
+//     `invalid type for "enable_thinking" (expected boolean, got string)`.
+//     Sending enable_thinking at the top level is therefore a silent no-op
+//     there: "Off" would not turn thinking off.
+//   - A TOP-LEVEL "reasoning_effort" IS read: "none" sets enable_thinking=false
+//     and erases the kwarg; any other non-empty value is copied into
+//     chat_template_kwargs["reasoning_effort"]. This is why the native
+//     xhigh/medium/low levels already reach a llama.cpp server today.
+//   - Unknown top-level fields are silently ignored (there is no strict schema
+//     validation), so the vendor-default spelling is harmless — it just does
+//     not express "thinking off".
+//
+// ReasoningWireChatTemplateKwargs emits the llama.cpp spelling: one top-level
+// "chat_template_kwargs" object carrying enable_thinking (as a JSON boolean)
+// and, for the native effort levels only, reasoning_effort.
+type ReasoningWire string
+
+const (
+	// ReasoningWireVendorDefault emits Qwen reasoning controls as top-level
+	// request fields (enable_thinking, reasoning_effort) — the historical
+	// sp4rk behavior, and the correct spelling for every OpenAI-compatible
+	// server that reads them there. Zero value; used by every provider that
+	// does not opt in.
+	ReasoningWireVendorDefault ReasoningWire = ""
+
+	// ReasoningWireChatTemplateKwargs emits Qwen reasoning controls inside a
+	// single top-level "chat_template_kwargs" object, the spelling llama.cpp
+	// (and its forks) parses. See ReasoningWire for the server-side contract.
+	ReasoningWireChatTemplateKwargs ReasoningWire = "chat_template_kwargs"
+)
+
 // ProviderEntry describes a single LLM provider with its enabled models.
 type ProviderEntry struct {
 	Name         string   // logical name ("anthropic", "openai_compatible", …)
@@ -65,6 +116,11 @@ type ProviderEntry struct {
 	// provider only (e.g. a per-provider TLS configuration). nil = use
 	// RouterConfig.HTTPClient (which may itself be nil → SDK default).
 	HTTPClient *http.Client
+	// ReasoningWire optionally selects a non-default JSON spelling for
+	// Qwen-family reasoning controls on THIS provider only (see
+	// ReasoningWire). Zero value = ReasoningWireVendorDefault. Set it to
+	// ReasoningWireChatTemplateKwargs for a llama.cpp-served endpoint.
+	ReasoningWire ReasoningWire
 }
 
 // Router routes LLM calls to the active provider.
@@ -117,7 +173,7 @@ func NewRouter(ctx context.Context, cfg RouterConfig, registry *ModelRegistry) (
 		if providerClient == nil {
 			providerClient = cfg.HTTPClient
 		}
-		provider, err := createProviderFromConfig(ctx, entry.Name, entry.ProviderType, entry.APIKey, entry.BaseURL, providerClient, cfg.Logger)
+		provider, err := createProviderFromConfig(ctx, entry.Name, entry.ProviderType, entry.APIKey, entry.BaseURL, providerClient, cfg.Logger, entry.ReasoningWire)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create provider %q: %w", entry.Name, err)
 		}
@@ -200,16 +256,19 @@ func NewRouter(ctx context.Context, cfg RouterConfig, registry *ModelRegistry) (
 // reporting; it is forwarded to the provider so named compatible providers
 // (e.g. "lmstudio", "my-anthropic-proxy") report their real name, not a
 // hardcoded family name. logger is forwarded to the provider for debug-level
-// diagnostics (nil = slog.Default()).
-func createProviderFromConfig(ctx context.Context, name, provType, apiKey, baseURL string, httpClient *http.Client, logger *slog.Logger) (Provider, error) {
+// diagnostics (nil = slog.Default()). reasoningWire selects the JSON spelling
+// of Qwen-family reasoning controls for this provider (zero value =
+// vendor-default top-level fields; see ReasoningWire).
+func createProviderFromConfig(ctx context.Context, name, provType, apiKey, baseURL string, httpClient *http.Client, logger *slog.Logger, reasoningWire ReasoningWire) (Provider, error) {
 	switch provType {
 	case "openai":
 		return NewOpenAIProvider(OpenAIProviderConfig{
-			Name:       name,
-			APIKey:     apiKey,
-			BaseURL:    baseURL,
-			HTTPClient: httpClient,
-			Logger:     logger,
+			Name:          name,
+			APIKey:        apiKey,
+			BaseURL:       baseURL,
+			HTTPClient:    httpClient,
+			Logger:        logger,
+			ReasoningWire: reasoningWire,
 		})
 
 	case "anthropic":
