@@ -17,6 +17,31 @@ func (e *mockNetError) Error() string   { return "mock net error" }
 func (e *mockNetError) Timeout() bool   { return e.timeout }
 func (e *mockNetError) Temporary() bool { return false }
 
+// TestErrKindClassification pins the transport-independent failure class:
+// NewError derives it from the HTTP status when present, and the Anthropic
+// transport sets it from the SDK's error type field when no status exists
+// (see provider tests). Consumers match on it instead of StatusCode.
+func TestErrKindClassification(t *testing.T) {
+	tests := []struct {
+		name string
+		err  *Error
+		want ErrKind
+	}{
+		{"429 via NewError", NewError("openai", 429, true, errors.New("rl")), ErrKindRateLimit},
+		{"529 via NewError", NewError("anthropic", 529, true, errors.New("ol")), ErrKindOverloaded},
+		{"500 via NewError", NewError("openai", 500, true, errors.New("boom")), ""},
+		{"network via NewError", NewError("openai", 0, false, errors.New("dial fail")), ""},
+		{"429 via WrapProviderError", WrapProviderError("lmstudio", 429, errors.New("rl")), ErrKindRateLimit},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.err.ErrKind != tt.want {
+				t.Errorf("ErrKind = %q, want %q", tt.err.ErrKind, tt.want)
+			}
+		})
+	}
+}
+
 func TestIsRetryable_HTTPStatus(t *testing.T) {
 	tests := []struct {
 		name      string
