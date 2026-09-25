@@ -711,8 +711,8 @@ func TestAnthropicProvider_WrapError_Types(t *testing.T) {
 		if !llmErr.Retryable {
 			t.Error("expected retryable for rate limit")
 		}
-		if llmErr.ErrType != ErrTypeRateLimit {
-			t.Errorf("ErrType = %q, want %q (Anthropic APIError carries no status; the type field is the only rate-limit signal)", llmErr.ErrType, ErrTypeRateLimit)
+		if llmErr.ErrKind != ErrKindRateLimit {
+			t.Errorf("ErrKind = %q, want %q (Anthropic APIError carries no status; the type field is the only rate-limit signal)", llmErr.ErrKind, ErrKindRateLimit)
 		}
 	})
 
@@ -729,8 +729,8 @@ func TestAnthropicProvider_WrapError_Types(t *testing.T) {
 		if !llmErr.Retryable {
 			t.Error("expected retryable for overloaded")
 		}
-		if llmErr.ErrType != ErrTypeOverloaded {
-			t.Errorf("ErrType = %q, want %q", llmErr.ErrType, ErrTypeOverloaded)
+		if llmErr.ErrKind != ErrKindOverloaded {
+			t.Errorf("ErrKind = %q, want %q", llmErr.ErrKind, ErrKindOverloaded)
 		}
 	})
 
@@ -792,8 +792,8 @@ func TestAnthropicProvider_WrapError_Types(t *testing.T) {
 		if llmErr.StatusCode != 429 {
 			t.Errorf("expected status 429, got %d", llmErr.StatusCode)
 		}
-		if llmErr.ErrType != ErrTypeRateLimit {
-			t.Errorf("ErrType = %q, want %q", llmErr.ErrType, ErrTypeRateLimit)
+		if llmErr.ErrKind != ErrKindRateLimit {
+			t.Errorf("ErrKind = %q, want %q", llmErr.ErrKind, ErrKindRateLimit)
 		}
 	})
 }

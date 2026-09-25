@@ -8,34 +8,37 @@ import (
 	"syscall"
 )
 
-// ErrType is a transport-independent classification of a provider error,
+// ErrKind is a transport-independent classification of a provider error,
 // derived from the HTTP status code when the transport carries one (OpenAI,
 // Google, generic request errors) or from the provider's own error type
 // field when it does not (the Anthropic SDK parses the JSON error body into
 // APIError, which carries no HTTP status). It lets callers reason about the
 // failure class (e.g. rate limiting) without knowing which SDK produced the
-// error. Empty when no classification is available.
-type ErrType string
+// error. Empty when no classification is available. Not to be confused with
+// the Anthropic SDK's anthropic.ErrType, whose constants carry the
+// provider-side "rate_limit_error" spelling — always bridge via the SDK's
+// Is*Err() helpers.
+type ErrKind string
 
 const (
-	// ErrTypeRateLimit marks a rate-limit / quota rejection. HTTP 429 on
+	// ErrKindRateLimit marks a rate-limit / quota rejection. HTTP 429 on
 	// status-carrying transports; the "rate_limit_error" APIError type on
 	// the Anthropic transport.
-	ErrTypeRateLimit ErrType = "rate_limit"
-	// ErrTypeOverloaded marks a transient provider overload. HTTP 529 on
+	ErrKindRateLimit ErrKind = "rate_limit"
+	// ErrKindOverloaded marks a transient provider overload. HTTP 529 on
 	// status-carrying transports; the "overloaded_error" APIError type on
 	// the Anthropic transport.
-	ErrTypeOverloaded ErrType = "overloaded"
+	ErrKindOverloaded ErrKind = "overloaded"
 )
 
-// errTypeForStatus maps an HTTP status code to its ErrType classification,
+// errKindForStatus maps an HTTP status code to its ErrKind classification,
 // or "" when the code carries no classification.
-func errTypeForStatus(statusCode int) ErrType {
+func errKindForStatus(statusCode int) ErrKind {
 	switch statusCode {
 	case 429:
-		return ErrTypeRateLimit
+		return ErrKindRateLimit
 	case 529:
-		return ErrTypeOverloaded
+		return ErrKindOverloaded
 	default:
 		return ""
 	}
@@ -46,7 +49,7 @@ type Error struct {
 	Provider   string  // e.g. "openai", "anthropic"
 	StatusCode int     // HTTP status code (0 if not applicable, e.g. network error)
 	Retryable  bool    // whether this error is safe to retry
-	ErrType    ErrType // transport-independent failure class ("" if unknown)
+	ErrKind    ErrKind // transport-independent failure class ("" if unknown); derived by NewError/WrapProviderError from the status — hand-built literals must set it explicitly
 	Err        error   // the original underlying error
 }
 
@@ -66,7 +69,7 @@ func NewError(provider string, statusCode int, retryable bool, err error) *Error
 		Provider:   provider,
 		StatusCode: statusCode,
 		Retryable:  retryable,
-		ErrType:    errTypeForStatus(statusCode),
+		ErrKind:    errKindForStatus(statusCode),
 		Err:        err,
 	}
 }

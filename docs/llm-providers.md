@@ -659,7 +659,8 @@ type Error struct {
     Provider   string  // e.g. "openai", "anthropic"
     StatusCode int     // HTTP status code (0 if not applicable)
     Retryable  bool    // whether this error is safe to retry
-    ErrType    ErrType // transport-independent failure class ("" if unknown)
+    ErrKind    ErrKind // transport-independent failure class ("" if unknown)
+                       // derived by NewError/WrapProviderError from the status — hand-built literals must set it explicitly
     Err        error   // the original underlying error
 }
 ```
@@ -668,4 +669,4 @@ type Error struct {
 - `WrapProviderError(provider, statusCode, err)` — classify by HTTP status and network error type.
 - `IsRetryable(err)` — true when the chain contains a `*Error` with `Retryable == true`.
 - `NewContextWindowError(...)` — non-retryable error for context window overflow, wrapping `ErrContextWindowExceeded`.
-- `ErrType` — transport-independent failure class: `ErrTypeRateLimit`, `ErrTypeOverloaded`, or `""` (unknown). It is derived from the HTTP status on status-carrying transports (429 → `rate_limit`, 529 → `overloaded`) and from the Anthropic SDK's error type field otherwise (that SDK parses the JSON error body without exposing a status). Match on `ErrType` instead of `StatusCode` when the failure class — not the raw transport detail — is what matters (e.g. arming a rate-limit backoff).
+- `ErrKind` — transport-independent failure class: `ErrKindRateLimit`, `ErrKindOverloaded`, or `""` (unknown). It is derived from the HTTP status on status-carrying transports (429 → `rate_limit`, 529 → `overloaded`) and from the Anthropic SDK's error type field otherwise (that SDK parses the JSON error body without exposing a status). Match on `ErrKind` instead of `StatusCode` when the failure class — not the raw transport detail — is what matters (e.g. arming a rate-limit backoff). Not to be confused with `anthropic.ErrType`, whose constants carry the provider-side `"rate_limit_error"` spelling — always bridge via the SDK's `Is*Err()` helpers.

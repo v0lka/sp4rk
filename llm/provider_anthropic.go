@@ -503,15 +503,15 @@ func (p *AnthropicProvider) wrapError(err error) error {
 		// carries no HTTP status — classify by the provider's own error type
 		// field so transport-independent consumers (e.g. auto-retry arming)
 		// still see the failure class.
-		errType := ErrType("")
+		errKind := ErrKind("")
 		switch {
 		case apiErr.IsRateLimitErr():
-			errType = ErrTypeRateLimit
+			errKind = ErrKindRateLimit
 		case apiErr.IsOverloadedErr():
-			errType = ErrTypeOverloaded
+			errKind = ErrKindOverloaded
 		}
 		e := NewError(p.name, 0, retryable, err)
-		e.ErrType = errType
+		e.ErrKind = errKind
 		return e
 	}
 	var reqErr *anthropic.RequestError
