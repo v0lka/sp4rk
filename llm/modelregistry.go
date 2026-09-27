@@ -146,6 +146,64 @@ func NewModelRegistry(overrides map[string]ModelMetadata) *ModelRegistry {
 	}
 }
 
+// ApplyOverrides upserts entries into the tier-1 user-override map of an
+// already-constructed registry — the runtime write-side companion of
+// NewModelRegistry. An entry replaces any stored entry for the same model
+// wholesale; models absent from the argument are left untouched, so a caller
+// can refresh one model's metadata without re-deriving every other override
+// the registry was built with. Callers needing replace-everything semantics
+// construct a new registry instead.
+//
+// The same defensive-copy contract as NewModelRegistry applies: keys are
+// normalized to lowercase, and each entry's Capabilities pointer is cloned,
+// so a caller mutating its own map or capability structs after the call can
+// neither reach nor race the registry's stored entries.
+//
+// Under the same write lock the fuzzy overrides index is rebuilt and the
+// lazy cache (tier 3) entries reachable through the affected models are
+// dropped. Exact lookups never consult the cache on an override hit, but a
+// PARTIAL override's enrichment does (resolveBuiltinOrCache), and a cached
+// RESOLVED twin under a query spelling that fuzzy-maps to an updated model
+// would otherwise keep serving the pre-upsert window and limits after the
+// entry itself has moved. Cache drops are bounded by the affected keys plus
+// one normalized-ID pass over the cache; writes are rare, so the scan is
+// not worth indexing.
+func (r *ModelRegistry) ApplyOverrides(overrides map[string]ModelMetadata) {
+	if len(overrides) == 0 {
+		return
+	}
+	copied := make(map[string]ModelMetadata, len(overrides))
+	affected := make(map[string]struct{}, len(overrides))
+	affectedIDs := make(map[string]struct{}, len(overrides))
+	for k, v := range overrides {
+		// Normalize override keys to lowercase so they are matched by the
+		// case-insensitive Resolve lookup — the stored map carries no other
+		// spelling, so an upsert under a differing case replaces the entry
+		// rather than orphaning it.
+		key := strings.ToLower(k)
+		v.Capabilities = cloneCapabilities(v.Capabilities)
+		copied[key] = v
+		affected[key] = struct{}{}
+		if norm := normalizeModelID(key); norm != "" {
+			affectedIDs[norm] = struct{}{}
+		}
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for key, meta := range copied {
+		r.overrides[key] = meta
+	}
+	r.overridesIndex = buildNormalizedIndex(r.overrides)
+	for key := range r.cache {
+		_, keyHit := affected[key]
+		_, idHit := affectedIDs[normalizeModelID(key)]
+		if keyHit || idHit {
+			delete(r.cache, key)
+		}
+	}
+}
+
 // SetHTTPClient replaces the HTTP client used for metadata lookups (e.g., HuggingFace).
 func (r *ModelRegistry) SetHTTPClient(client *http.Client) {
 	r.mu.Lock()
@@ -295,8 +353,13 @@ func (r *ModelRegistry) ResolveLocal(model string) (ModelMetadata, bool) {
 	// family/protocol detection lowercases independently.
 	key := strings.ToLower(model)
 
-	// Priority 1: Check overrides (no lock needed for read-only map after construction)
-	if meta, ok := r.overrides[key]; ok {
+	// Priority 1: Check overrides. The map is written at runtime by
+	// ApplyOverrides under the write lock, so the read takes a short RLock —
+	// released before enrichment, whose baselines take the same RWMutex.
+	r.mu.RLock()
+	meta, ok := r.overrides[key]
+	r.mu.RUnlock()
+	if ok {
 		// A partial override (one that pins only some fields, e.g. a
 		// protocol-only auto-remap) inherits its unset scalar fields from the
 		// lower non-network tiers so it does not collapse the context window
@@ -338,7 +401,7 @@ func (r *ModelRegistry) ResolveLocal(model string) (ModelMetadata, bool) {
 	// Priority 3: Lazy cache, read-only. Entries arrive from the outside —
 	// Resolve's network tiers or SetCachedMetadata — never from this method.
 	r.mu.RLock()
-	meta, ok := r.cache[key]
+	meta, ok = r.cache[key]
 	r.mu.RUnlock()
 	if ok {
 		return finalizeMeta(model, meta), true
@@ -857,9 +920,10 @@ func normalizeModelID(id string) string {
 // matches, so callers can fall through to network sources and the final default.
 //
 // Lookups are O(1) map reads against the normalized-ID indexes
-// (r.overridesIndex, r.builtInIndex, r.runtimeIndex). The first two are
-// immutable after construction (no lock); r.runtimeIndex is rebuilt under the
-// write lock on every runtime write and read under RLock — the RLock is
+// (r.overridesIndex, r.builtInIndex, r.runtimeIndex). The built-in catalog is
+// immutable after construction (no lock); the overrides index is written at
+// runtime by ApplyOverrides, and r.runtimeIndex is rebuilt under the write
+// lock on every runtime write — both are read under a short RLock that is
 // released before any enrichment baseline runs, so no recursive locking.
 //
 // A partial runtime entry found here enriches against the tiers strictly
@@ -871,7 +935,13 @@ func (r *ModelRegistry) fuzzyLookup(model string) (ModelMetadata, bool) {
 	if want == "" {
 		return ModelMetadata{}, false
 	}
-	if meta, ok := r.overridesIndex[want]; ok {
+	// Short RLock on the map read only — the index is written at runtime by
+	// ApplyOverrides; enrichment runs after release so its baselines can take
+	// the same RWMutex without recursive locking.
+	r.mu.RLock()
+	meta, ok := r.overridesIndex[want]
+	r.mu.RUnlock()
+	if ok {
 		// A partial override hit only via the fuzzy/normalized key must
 		// inherit its unset scalar fields exactly like the exact-tier hit
 		// (see ResolveLocal), otherwise a protocol-only override surfaced
@@ -880,14 +950,14 @@ func (r *ModelRegistry) fuzzyLookup(model string) (ModelMetadata, bool) {
 		meta = r.enrichPartialOverride(model, key, meta)
 		return meta, true
 	}
-	if meta, ok := r.runtimeFuzzyLookup(want); ok {
+	if meta, ok = r.runtimeFuzzyLookup(want); ok {
 		key := strings.ToLower(model)
 		meta = r.enrichPartialWith(meta, func() ModelMetadata {
 			return r.resolveSpecOrCache(model, key)
 		})
 		return meta, true
 	}
-	meta, ok := r.builtInIndex[want]
+	meta, ok = r.builtInIndex[want]
 	return meta, ok
 }
 

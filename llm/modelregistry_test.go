@@ -1302,6 +1302,155 @@ func TestModelRegistry_OverridesCopiedOnConstruction(t *testing.T) {
 	}
 }
 
+// TestModelRegistry_ApplyOverrides_Upsert: ApplyOverrides replaces the stored
+// entry for the models it carries and leaves every other override untouched —
+// the write-side companion of NewModelRegistry used by runtime corrections
+// (e.g. an embedded loader persisting the context a live server reported).
+func TestModelRegistry_ApplyOverrides_Upsert(t *testing.T) {
+	registry := NewModelRegistry(map[string]ModelMetadata{
+		"model-a": {ContextWindow: 1000, OutputLimit: 100},
+		"model-b": {ContextWindow: 2000, OutputLimit: 200},
+	})
+
+	registry.ApplyOverrides(map[string]ModelMetadata{
+		"model-a": {ContextWindow: 262144, OutputLimit: 100},
+	})
+
+	if meta, ok := registry.ResolveLocal("model-a"); !ok {
+		t.Fatal("ResolveLocal(model-a): expected ok=true")
+	} else if meta.ContextWindow != 262144 {
+		t.Errorf("ResolveLocal(model-a): ContextWindow = %d, want the upserted 262144", meta.ContextWindow)
+	}
+	if meta, ok := registry.ResolveLocal("model-b"); !ok {
+		t.Fatal("ResolveLocal(model-b): expected ok=true")
+	} else if meta.ContextWindow != 2000 || meta.OutputLimit != 200 {
+		t.Errorf("ResolveLocal(model-b): {%d, %d}, want the untouched {2000, 200}", meta.ContextWindow, meta.OutputLimit)
+	}
+
+	// A fresh model joins the tier and the case-insensitive lookup finds it
+	// under any casing, because the key was normalized on the way in.
+	registry.ApplyOverrides(map[string]ModelMetadata{
+		"Bonsai 2 27B": {ContextWindow: 65536, OutputLimit: 32768},
+	})
+	for _, model := range []string{"Bonsai 2 27B", "bonsai 2 27b", "BONSAI 2 27b"} {
+		if meta, ok := registry.ResolveLocal(model); !ok {
+			t.Fatalf("ResolveLocal(%q): expected ok=true after upsert", model)
+		} else if meta.ContextWindow != 65536 {
+			t.Errorf("ResolveLocal(%q): ContextWindow = %d, want 65536", model, meta.ContextWindow)
+		}
+	}
+
+	// A second upsert of the same key REPLACES the entry wholesale: an unset
+	// scalar in the incoming entry drops the value the stored entry carried
+	// (back to inheritance), not silently keeps it.
+	registry.ApplyOverrides(map[string]ModelMetadata{
+		"bonsai 2 27b": {ContextWindow: 262144},
+	})
+	if meta, ok := registry.ResolveLocal("Bonsai 2 27B"); !ok {
+		t.Fatal("ResolveLocal after replacement: expected ok=true")
+	} else if meta.ContextWindow != 262144 {
+		t.Errorf("ContextWindow = %d, want the replaced 262144", meta.ContextWindow)
+	}
+}
+
+// TestModelRegistry_ApplyOverrides_CopiesCapabilities: the same deep-copy
+// contract as the constructor — a caller mutating its own map or capability
+// struct after hand-off cannot reach (or race) the stored entries.
+func TestModelRegistry_ApplyOverrides_CopiesCapabilities(t *testing.T) {
+	caps := &ModelCapabilities{Attachment: true}
+	entry := ModelMetadata{ContextWindow: 1000, Capabilities: caps}
+	batch := map[string]ModelMetadata{"my-local-model": entry}
+
+	registry := NewModelRegistry(nil)
+	registry.ApplyOverrides(batch)
+
+	*caps = ModelCapabilities{}                               // caller mutates its own struct
+	batch["my-local-model"] = ModelMetadata{ContextWindow: 1} // and its own map
+	batch["injected"] = ModelMetadata{ContextWindow: 2}       // after the call
+
+	meta, ok := registry.ResolveLocal("my-local-model")
+	if !ok {
+		t.Fatal("expected ok=true for the upserted model")
+	}
+	if want := (ModelCapabilities{Attachment: true}); *meta.Capabilities != want {
+		t.Errorf("Capabilities = %+v, want %+v (ApplyOverrides must deep-copy)", *meta.Capabilities, want)
+	}
+	if meta.ContextWindow != 1000 {
+		t.Errorf("ContextWindow = %d, want the handed-off 1000", meta.ContextWindow)
+	}
+	if _, ok := registry.ResolveLocal("injected"); ok {
+		t.Error("a map entry added after ApplyOverrides reached the registry; the hand-off must be a copy")
+	}
+}
+
+// TestModelRegistry_ApplyOverrides_DropsStaleCacheTwins: a cached RESOLVED
+// snapshot under a query spelling that maps to an upserted model would
+// otherwise keep feeding a partial override's enrichment (and fuzzy lookups
+// that miss the rebuilt index) with the pre-upsert window and limits.
+func TestModelRegistry_ApplyOverrides_DropsStaleCacheTwins(t *testing.T) {
+	registry := NewModelRegistry(map[string]ModelMetadata{
+		// A PARTIAL override: only the window is pinned, the rest inherits.
+		"local-checkpoint": {ContextWindow: 9},
+	})
+
+	// A stale resolved twin under the same key and under a query spelling
+	// that fuzzy-maps to it (vendor prefix + punctuation stripped).
+	stale := ModelMetadata{ContextWindow: 12345, OutputLimit: 999, TokenizerType: "stale"}
+	registry.SetCachedMetadata("local-checkpoint", stale)
+	registry.SetCachedMetadata("vendor/local.checkpoint", stale)
+
+	registry.ApplyOverrides(map[string]ModelMetadata{
+		"local-checkpoint": {ContextWindow: 9},
+	})
+
+	registry.mu.RLock()
+	_, directTwin := registry.cache["local-checkpoint"]
+	_, fuzzyTwin := registry.cache["vendor/local.checkpoint"]
+	registry.mu.RUnlock()
+	if directTwin || fuzzyTwin {
+		t.Error("stale cache twins survived ApplyOverrides; partial-override enrichment would read pre-upsert scalars")
+	}
+
+	// The override still answers with its pinned window, now enriched from
+	// the tiers below instead of the dropped cache twin.
+	meta, ok := registry.ResolveLocal("local-checkpoint")
+	if !ok {
+		t.Fatal("expected ok=true for the partial override")
+	}
+	if meta.ContextWindow != 9 {
+		t.Errorf("ContextWindow = %d, want the override's 9", meta.ContextWindow)
+	}
+	if meta.TokenizerType == "stale" {
+		t.Errorf("TokenizerType = %q from the dropped cache twin, want a value from the surviving tiers", meta.TokenizerType)
+	}
+}
+
+// TestModelRegistry_ApplyOverrides_Concurrent: readers resolving while a
+// writer upserts must never race (run under -race).
+func TestModelRegistry_ApplyOverrides_Concurrent(t *testing.T) {
+	registry := NewModelRegistry(map[string]ModelMetadata{
+		"my-local-model": {ContextWindow: 1000},
+	})
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for window := 1; window <= 200; window++ {
+			registry.ApplyOverrides(map[string]ModelMetadata{
+				"my-local-model": {ContextWindow: window},
+			})
+		}
+	}()
+	for i := 0; i < 4; i++ {
+		for j := 0; j < 200; j++ {
+			if _, ok := registry.ResolveLocal("my-local-model"); !ok {
+				t.Fatal("expected ok=true while a concurrent upsert runs")
+			}
+		}
+	}
+	<-done
+}
+
 // TestModelRegistry_SetCachedMetadata_CopiesCapabilities: a caller reusing its
 // ModelMetadata value (e.g. a probe loop) must not reach the stored entry.
 func TestModelRegistry_SetCachedMetadata_CopiesCapabilities(t *testing.T) {
