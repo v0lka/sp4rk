@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 )
 
 // --- Test helpers ---
@@ -237,5 +238,188 @@ func TestTrackingCaller_WithContextTracker(t *testing.T) {
 	in, out := sessionTracker.Totals()
 	if in != 200 || out != 100 {
 		t.Errorf("session totals = %d/%d, want 200/100", in, out)
+	}
+}
+
+// --- Timed usage tests ---
+
+// delayedCaller implements Caller with an artificial delay so that the
+// wall-clock duration measured by TrackingCaller is strictly positive.
+type delayedCaller struct {
+	resp  *ChatResponse
+	delay time.Duration
+}
+
+func (m *delayedCaller) Call(_ context.Context, _ ChatRequest) (*ChatResponse, error) {
+	time.Sleep(m.delay)
+	return m.resp, nil
+}
+
+func TestUsageTracker_RecordTimed_Totals(t *testing.T) {
+	tr := NewUsageTracker()
+	tr.RecordTimed(TokenUsage{InputTokens: 100, OutputTokens: 50}, 150*time.Millisecond, "gpt-4o", "openai")
+	tr.RecordTimed(TokenUsage{InputTokens: 200, OutputTokens: 80}, 300*time.Millisecond, "gpt-4o", "openai")
+
+	in, out := tr.Totals()
+	if in != 300 {
+		t.Errorf("totalIn = %d, want 300", in)
+	}
+	if out != 130 {
+		t.Errorf("totalOut = %d, want 130", out)
+	}
+}
+
+func TestUsageTracker_TimedObserver(t *testing.T) {
+	tr := NewUsageTracker()
+
+	type timedCall struct {
+		usage    TokenUsage
+		duration time.Duration
+		totalIn  int
+		totalOut int
+		model    string
+		family   string
+	}
+	var timedCalls []timedCall
+
+	tr.AddTimedObserver(func(usage TokenUsage, duration time.Duration, totalIn, totalOut int, model, family string) {
+		timedCalls = append(timedCalls, timedCall{usage, duration, totalIn, totalOut, model, family})
+	})
+
+	plainCalls := 0
+	tr.AddObserver(func(usage TokenUsage, totalIn, totalOut int, model, family string) {
+		plainCalls++
+	})
+
+	tr.RecordTimed(TokenUsage{InputTokens: 10, OutputTokens: 5}, 42*time.Millisecond, "m1", "f1")
+	tr.RecordTimed(TokenUsage{InputTokens: 20, OutputTokens: 15}, 84*time.Millisecond, "m2", "f2")
+
+	if len(timedCalls) != 2 {
+		t.Fatalf("timed observer called %d times, want 2", len(timedCalls))
+	}
+	if plainCalls != 2 {
+		t.Errorf("plain observer called %d times, want 2 (RecordTimed notifies UsageObservers too)", plainCalls)
+	}
+
+	// First call: per-call usage, duration, and cumulative totals.
+	first := timedCalls[0]
+	if first.usage.InputTokens != 10 || first.usage.OutputTokens != 5 {
+		t.Errorf("first timed call usage = %+v, want {10 5}", first.usage)
+	}
+	if first.duration != 42*time.Millisecond {
+		t.Errorf("first timed call duration = %v, want 42ms", first.duration)
+	}
+	if first.totalIn != 10 || first.totalOut != 5 {
+		t.Errorf("first timed call totals = %d/%d, want 10/5", first.totalIn, first.totalOut)
+	}
+	if first.model != "m1" || first.family != "f1" {
+		t.Errorf("first timed call model=%q family=%q", first.model, first.family)
+	}
+
+	// Second call: cumulative totals include the first call.
+	second := timedCalls[1]
+	if second.totalIn != 30 || second.totalOut != 20 {
+		t.Errorf("second timed call totals = %d/%d, want 30/20", second.totalIn, second.totalOut)
+	}
+	if second.duration != 84*time.Millisecond {
+		t.Errorf("second timed call duration = %v, want 84ms", second.duration)
+	}
+	if second.model != "m2" || second.family != "f2" {
+		t.Errorf("second timed call model=%q family=%q", second.model, second.family)
+	}
+}
+
+func TestUsageTracker_Record_DoesNotNotifyTimedObserver(t *testing.T) {
+	tr := NewUsageTracker()
+
+	timedCalls := 0
+	tr.AddTimedObserver(func(usage TokenUsage, duration time.Duration, totalIn, totalOut int, model, family string) {
+		timedCalls++
+	})
+	plainCalls := 0
+	tr.AddObserver(func(usage TokenUsage, totalIn, totalOut int, model, family string) {
+		plainCalls++
+	})
+
+	// The duration-less Record path is unchanged: it never fires timed observers.
+	tr.Record(TokenUsage{InputTokens: 10, OutputTokens: 5}, "m", "f")
+
+	if timedCalls != 0 {
+		t.Errorf("timed observer called %d times via Record, want 0", timedCalls)
+	}
+	if plainCalls != 1 {
+		t.Errorf("plain observer called %d times, want 1", plainCalls)
+	}
+}
+
+func TestTrackingCaller_CallTimedObserver(t *testing.T) {
+	inner := &delayedCaller{
+		resp: &ChatResponse{
+			Model:  "gpt-4o",
+			Family: "openai",
+			Usage:  TokenUsage{InputTokens: 100, OutputTokens: 50},
+		},
+		delay: 2 * time.Millisecond,
+	}
+	tracker := NewUsageTracker()
+	tc := NewTrackingCaller(inner, tracker)
+
+	var (
+		gotUsage    TokenUsage
+		gotDuration time.Duration
+		gotTotalIn  int
+		gotTotalOut int
+		gotModel    string
+		gotFamily   string
+	)
+	timedCalls := 0
+	tracker.AddTimedObserver(func(usage TokenUsage, duration time.Duration, totalIn, totalOut int, model, family string) {
+		timedCalls++
+		gotUsage = usage
+		gotDuration = duration
+		gotTotalIn = totalIn
+		gotTotalOut = totalOut
+		gotModel = model
+		gotFamily = family
+	})
+
+	plainCalls := 0
+	tracker.AddObserver(func(usage TokenUsage, totalIn, totalOut int, model, family string) {
+		plainCalls++
+	})
+
+	_, err := tc.Call(context.Background(), ChatRequest{Model: "gpt-4o"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if timedCalls != 1 {
+		t.Fatalf("timed observer called %d times, want 1", timedCalls)
+	}
+	if gotUsage.InputTokens != 100 || gotUsage.OutputTokens != 50 {
+		t.Errorf("timed usage = %+v, want {100 50}", gotUsage)
+	}
+	if gotDuration <= 0 {
+		t.Errorf("timed duration = %v, want > 0", gotDuration)
+	}
+	if gotDuration < 2*time.Millisecond {
+		t.Errorf("timed duration = %v, want >= 2ms (inner call slept 2ms)", gotDuration)
+	}
+	if gotTotalIn != 100 || gotTotalOut != 50 {
+		t.Errorf("timed totals = %d/%d, want 100/50", gotTotalIn, gotTotalOut)
+	}
+	if gotModel != "gpt-4o" || gotFamily != "openai" {
+		t.Errorf("timed model=%q family=%q, want gpt-4o/openai", gotModel, gotFamily)
+	}
+
+	// The plain observer path is unchanged: still notified once per call.
+	if plainCalls != 1 {
+		t.Errorf("plain observer called %d times, want 1", plainCalls)
+	}
+
+	// Totals still accumulate through the timed path.
+	in, out := tracker.Totals()
+	if in != 100 || out != 50 {
+		t.Errorf("tracker totals: %d/%d, want 100/50", in, out)
 	}
 }

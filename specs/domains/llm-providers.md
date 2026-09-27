@@ -9,7 +9,7 @@ Provides LLM provider abstractions, a model registry, and routing for multi-prov
 - `github.com/v0lka/sp4rk/llm` — `Router`, `RouterConfig`, `SamplingDefaults`, `SamplingFunc`, `CallPurpose`, `DeterministicTemperature`, `NewRouter`, `SetModel`/`ActiveModel`/`Call`, `Provider` interface, `ProviderEntry`
 - `github.com/v0lka/sp4rk/llm` (metadata) — `ModelRegistry`, `ModelMetadata`, `ModelCapabilities`, `DetectFamily`, `FamilyReasoningOptions`, `ResolveBuiltInModel`, `ResolveLocal`, `SetCachedMetadata`, `SetRuntimeMetadata`, `RuntimeMetadata`
 - `github.com/v0lka/sp4rk/llm` (protocol) — `APIProtocol`, `DetectProtocol`, and the four protocol constants (`ProtocolChatCompletions`, `ProtocolResponses`, `ProtocolAnthropic`, `ProtocolGoogle`)
-- `github.com/v0lka/sp4rk/llm` (token accounting) — `TokenCounter`, `SimpleTokenCounter`, `TiktokenCounter`, `NewTokenCounter`, `ContextTokenTracker`, `UsageTracker`, `TrackingCaller`
+- `github.com/v0lka/sp4rk/llm` (token accounting) — `TokenCounter`, `SimpleTokenCounter`, `TiktokenCounter`, `NewTokenCounter`, `ContextTokenTracker`, `UsageTracker`, `UsageObserver`, `TimedUsageObserver`, `TrackingCaller`
 - `github.com/v0lka/sp4rk/llm` (request/response) — `ChatRequest`, `ChatResponse`, `Message`, `ContentBlock`, `NormalizeContentBlocks`, `ValidateContentBlocks`, `ToolCall`, `ToolDefinition`, `TokenUsage`
 - `github.com/v0lka/sp4rk/llm` (errors) — `Error`, `ErrKind` (`ErrKindRateLimit`, `ErrKindOverloaded`), `NewError`, `WrapProviderError`, `IsRetryable`, `ErrContextWindowExceeded`
 
@@ -175,6 +175,8 @@ Two counters: `SimpleTokenCounter` (~4 chars = 1 token approximation) and `Tikto
 Both counters account for structured content blocks: when a message carries non-empty `ContentBlocks` (after `NormalizeContentBlocks`), text blocks are counted via the counter and image blocks are estimated at a per-image cost; unknown block types are skipped (matching provider rendering). The per-image estimate is provider-specific: the conservative default is **765 tokens** (OpenAI high-detail orientation), but `NewTokenCounter` overrides this to **85 tokens** for `anthropic-api` models so image-heavy Anthropic conversations are not over-counted ~9× and trigger premature context compaction.
 
 `ContextTokenTracker` combines predictive counting with API-corrected actuals (`AddDelta`/`EstimateTotal`/`Correct(apiInputTokens)`/`Reset`). `UsageTracker` accumulates token usage across a session (thread-safe, observer callbacks). `TrackingCaller` wraps a `Caller` to record usage into a `UsageTracker` and correct a `ContextTokenTracker`; `WithContextTracker` returns a step-local caller sharing the same inner caller and session tracker — use it for parallel execution branches.
+
+**Timed recording seam.** `TrackingCaller.Call` measures the wall-clock duration around `inner.Call` and reports it through the timed recording path: `UsageTracker.RecordTimed(usage, duration, model, family)` updates the same running totals and notifies both observer kinds — plain `UsageObserver`s exactly as `Record` does, plus `TimedUsageObserver`s (registered via `AddTimedObserver`) which additionally receive the per-call `duration`. The duration-less `Record`/`AddObserver` path is unchanged: `Record` never fires timed observers, so observers that ignore durations see no behavior difference. An unsuccessful call short-circuits before any recording — neither usage nor duration is reported.
 
 ## Multi-protocol routing
 

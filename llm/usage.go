@@ -3,18 +3,25 @@ package llm
 import (
 	"context"
 	"sync"
+	"time"
 )
 
 // UsageObserver is called after each LLM call with per-call and cumulative usage.
 type UsageObserver func(usage TokenUsage, totalIn, totalOut int, model, family string)
 
+// TimedUsageObserver is called after each timed LLM call with per-call usage,
+// the measured wall-clock duration of the call, and cumulative usage. It is
+// notified only by RecordTimed; Record (the duration-less path) never fires it.
+type TimedUsageObserver func(usage TokenUsage, duration time.Duration, totalIn, totalOut int, model, family string)
+
 // UsageTracker accumulates token usage across all LLM calls in a session.
 // Thread-safe. Upper layers register observers to react to usage changes.
 type UsageTracker struct {
-	mu        sync.Mutex
-	totalIn   int
-	totalOut  int
-	observers []UsageObserver
+	mu             sync.Mutex
+	totalIn        int
+	totalOut       int
+	observers      []UsageObserver
+	timedObservers []TimedUsageObserver
 }
 
 // NewUsageTracker creates a new UsageTracker.
@@ -46,6 +53,39 @@ func (t *UsageTracker) AddObserver(fn UsageObserver) {
 	t.observers = append(t.observers, fn)
 }
 
+// RecordTimed adds per-call usage to the running totals and notifies all
+// observers, passing the measured wall-clock duration to timed observers.
+// Plain UsageObservers are notified exactly as by Record; TimedUsageObservers
+// are notified only through this method.
+func (t *UsageTracker) RecordTimed(usage TokenUsage, duration time.Duration, model, family string) {
+	t.mu.Lock()
+	t.totalIn += usage.InputTokens
+	t.totalOut += usage.OutputTokens
+	totalIn := t.totalIn
+	totalOut := t.totalOut
+	// Snapshot observers under lock to avoid races on the slices.
+	observers := make([]UsageObserver, len(t.observers))
+	copy(observers, t.observers)
+	timedObservers := make([]TimedUsageObserver, len(t.timedObservers))
+	copy(timedObservers, t.timedObservers)
+	t.mu.Unlock()
+
+	for _, fn := range observers {
+		fn(usage, totalIn, totalOut, model, family)
+	}
+	for _, fn := range timedObservers {
+		fn(usage, duration, totalIn, totalOut, model, family)
+	}
+}
+
+// AddTimedObserver registers a callback that is invoked on every RecordTimed
+// call. Record never notifies timed observers.
+func (t *UsageTracker) AddTimedObserver(fn TimedUsageObserver) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.timedObservers = append(t.timedObservers, fn)
+}
+
 // Totals returns the current accumulated input and output token counts.
 func (t *UsageTracker) Totals() (inputTokens, outputTokens int) {
 	t.mu.Lock()
@@ -71,14 +111,16 @@ func NewTrackingCaller(inner Caller, tracker *UsageTracker) *TrackingCaller {
 	}
 }
 
-// Call delegates to the inner caller, then records usage and corrects the context tracker.
+// Call delegates to the inner caller, measuring the wall-clock duration of the
+// call, then records usage (with duration) and corrects the context tracker.
 func (tc *TrackingCaller) Call(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
+	start := time.Now()
 	resp, err := tc.inner.Call(ctx, req)
 	if err != nil {
 		return nil, err
 	}
 
-	tc.session.Record(resp.Usage, resp.Model, resp.Family)
+	tc.session.RecordTimed(resp.Usage, time.Since(start), resp.Model, resp.Family)
 
 	tc.ctxMu.RLock()
 	ct := tc.ctxTracker
