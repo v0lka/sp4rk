@@ -172,7 +172,7 @@ Buckets materially reduce both wall time and tensor RSS for short-heavy corpora.
 
 ## Multi-Session Grid Decision
 
-`BenchmarkEmbedderMultiSessionGrid` (in `embedding/multi_session_bench_test.go`) evaluates running several ONNX sessions in parallel — the only unexplored throughput axis after buckets and the batch pipeline. It is a **benchmark-only harness**: the production `Embedder` keeps its single mutex-serialized session path, and no production API or c0wrk wiring exposes multiple sessions.
+`BenchmarkEmbedderMultiSessionGrid` (in `embedding/multi_session_bench_test.go`) evaluates running several ONNX sessions in parallel — the only unexplored throughput axis after buckets and the batch pipeline. It is a **benchmark-only harness**: the production `Embedder` keeps its single mutex-serialized session path, and no production API exposes multiple sessions.
 
 Harness invariants (covered by `multi_session_pool_test.go` under the race detector):
 

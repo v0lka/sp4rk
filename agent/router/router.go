@@ -4,22 +4,23 @@ package router
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/v0lka/sp4rk/agent"
 	"github.com/v0lka/sp4rk/llm"
+	"github.com/v0lka/sp4rk/oneshot"
 	"github.com/v0lka/sp4rk/prompt"
 	"github.com/v0lka/sp4rk/tools"
 )
 
 // ErrRoutingParse is returned when the routing decision JSON could not be
-// parsed even after the built-in repair retry. Callers can detect it with
-// errors.Is to degrade gracefully (e.g. fall back to a default routing
-// decision) instead of failing the whole task. It wraps the final unmarshal
-// error of the repair attempt.
+// parsed even after the built-in two-nudge repair policy (three attempts
+// total). Callers can detect it with errors.Is to degrade gracefully (e.g.
+// fall back to a default routing decision) instead of failing the whole task.
+// It is attached to every unparseable-response parse error, so it surfaces in
+// the final refusal error but never on transport failures.
 var ErrRoutingParse = errors.New("routing decision parse failed")
 
 // toolMatchingInstruction is the prompt section injected via the TOOL-MATCHING
@@ -65,6 +66,12 @@ type Config struct {
 	// pick relevant tools and return them in RoutingDecision.MatchedTools.
 	// Equivalent to calling Router.SetToolMatching(true). Defaults to false.
 	ToolMatching bool
+	// Family and Model identify the model that will serve the routing call,
+	// for reasoning-tier resolution (see reasoningEffortForCall). Both are
+	// optional: when empty, the tier-Off policy resolves to "" and no
+	// reasoning field is sent.
+	Family string
+	Model  string
 }
 
 // Router classifies user requests by domain and complexity.
@@ -73,6 +80,8 @@ type Router struct {
 	systemPrompt          string
 	historyWindow         int
 	reasoningEffort       string
+	family                string
+	model                 string
 	toolMatching          bool
 	appendContextSections func(ctx context.Context) string
 }
@@ -87,14 +96,29 @@ func New(caller agent.LLMCaller, cfg Config) *Router {
 		llm:                   caller,
 		systemPrompt:          cfg.SystemPrompt,
 		historyWindow:         hw,
+		family:                cfg.Family,
+		model:                 cfg.Model,
 		toolMatching:          cfg.ToolMatching,
 		appendContextSections: cfg.AppendContextSections,
 	}
 }
 
-// SetReasoningEffort sets the reasoning effort for the router.
+// SetReasoningEffort sets the reasoning effort for the router, overriding the
+// tier-Off default resolution for subsequent Route calls.
 func (r *Router) SetReasoningEffort(effort string) {
 	r.reasoningEffort = effort
+}
+
+// reasoningEffortForCall resolves the reasoning effort for one routing call.
+// An explicit SetReasoningEffort override wins; otherwise the one-shot
+// routing policy applies: reasoning tier OFF, resolved to the serving model's
+// native disable spelling via llm.ReasoningForCall ("" — no field sent — when
+// the family/model are unknown, preserving the pre-tier wire behavior).
+func (r *Router) reasoningEffortForCall() string {
+	if r.reasoningEffort != "" {
+		return r.reasoningEffort
+	}
+	return llm.ReasoningForCall(r.family, r.model, llm.ReasoningTierOff)
 }
 
 // SetToolMatching enables or disables semantic tool selection. When enabled,
@@ -186,55 +210,43 @@ func (r *Router) Route(ctx context.Context, userMessage string, availableTools [
 	// Create chat request
 	req := llm.ChatRequest{
 		Messages:        messages,
-		ReasoningEffort: r.reasoningEffort,
+		ReasoningEffort: r.reasoningEffortForCall(),
 		// The routing decision is parsed as JSON — request the deterministic
 		// sampling profile instead of the vendor preset.
 		CallPurpose: llm.CallPurposeRouting,
 	}
 
-	// Call LLM
-	resp, err := r.llm.Call(ctx, req)
-	if err != nil {
-		return nil, fmt.Errorf("router LLM call failed: %w", err)
-	}
-	if resp == nil {
-		return nil, errors.New("router LLM call returned nil response")
-	}
-
-	// Extract JSON from response (handle markdown code blocks)
-	jsonStr := llm.ExtractJSON(resp.Message.Content)
-
-	// Unmarshal into RoutingDecision
-	var routingDecision RoutingDecision
-	if err := json.Unmarshal([]byte(jsonStr), &routingDecision); err != nil {
-		// Retry with repair prompt
-		repairMessages := make([]llm.Message, len(messages)+2)
-		copy(repairMessages, messages)
-		repairMessages[len(messages)] = llm.Message{Role: "assistant", Content: resp.Message.Content, ReasoningContent: resp.Message.ReasoningContent}
-		repairMessages[len(messages)+1] = llm.Message{
-			Role: "user",
-			// The repair prompt echoes the schema the router was asked to produce,
-			// including matched_tools when tool matching is enabled.
-			Content: "Your previous response was not valid JSON. " + jsonSchema,
+	// Call the LLM through the one-shot client: on an unparseable response it
+	// re-asks with a corrective nudge (assistant echo of the failed output +
+	// a "[System]" user message restating the JSON schema) — exactly two
+	// nudges, three attempts total — before the final refusal. The parse
+	// error carries ErrRoutingParse so the final refusal stays detectable
+	// with errors.Is while transport failures do not match it.
+	parse := func(resp *llm.ChatResponse) (RoutingDecision, error) {
+		decision, err := oneshot.ParseJSON[RoutingDecision](resp)
+		if err != nil {
+			return RoutingDecision{}, fmt.Errorf("%w: %w", ErrRoutingParse, err)
 		}
-
-		retryResp, retryErr := r.llm.Call(ctx, llm.ChatRequest{Messages: repairMessages, ReasoningEffort: r.reasoningEffort, CallPurpose: llm.CallPurposeRouting})
-		if retryErr != nil {
-			return nil, fmt.Errorf("router retry LLM call failed: %w", retryErr)
-		}
-		if retryResp == nil {
-			return nil, errors.New("router LLM retry call returned nil response")
-		}
-
-		retryJSON := llm.ExtractJSON(retryResp.Message.Content)
-		if retryErr := json.Unmarshal([]byte(retryJSON), &routingDecision); retryErr != nil {
-			return nil, fmt.Errorf("%w after repair retry: %w", ErrRoutingParse, retryErr)
-		}
+		return decision, nil
 	}
 
-	validateRoutingDecision(&routingDecision)
+	parsed, doErr := oneshot.Do(ctx, r.llm, req, parse, oneshot.Options[RoutingDecision]{
+		Kind: "routing_decision",
+		// The repair feedback restates the schema the router was asked to
+		// produce, including matched_tools when tool matching is enabled —
+		// the same jsonSchema injected into the system prompt.
+		RetryHint: jsonSchema,
+	})
+	if doErr != nil {
+		if errors.Is(doErr, ErrRoutingParse) {
+			return nil, fmt.Errorf("router: routing decision unparseable after repair attempts: %w", doErr)
+		}
+		return nil, fmt.Errorf("router LLM call failed: %w", doErr)
+	}
 
-	return &routingDecision, nil
+	validateRoutingDecision(&parsed)
+
+	return &parsed, nil
 }
 
 // validateRoutingDecision sanitizes and corrects a routing decision from LLM output.

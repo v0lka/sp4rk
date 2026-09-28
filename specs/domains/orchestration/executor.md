@@ -46,6 +46,10 @@ func (e *Executor) Run(ctx context.Context, taskTools []tools.ToolDescriptor, cw
 
 The loop terminates when `finish` is called (`Finished: true`) or the budget is exhausted (`Finished: false`).
 
+### Nudge convention
+
+Every corrective nudge the executor injects (circuit breakers, mutation/checklist gates, implicit-finish failure modes, wrap-up warnings) is delivered as a user-channel message prefixed with `[System]` — an operator-side directive the model is taught to treat as system-grade guidance delivered through the user channel. The engine's one-shot service client ([../oneshot.md](../oneshot.md)) repeats exactly this convention for single structured calls: each repair turn pairs an assistant echo of the model's own failed output with a `[System]`-prefixed user message restating the required format, with the same bound — two nudges, then a final refusal — where the executor aborts (`Finished: false`) and the one-shot client resolves its `OnFailurePolicy`.
+
 ### Circuit breakers
 
 `CircuitBreakerConfig` holds thresholds that protect the executor from unproductive loops. When a threshold is crossed, a nudge is injected and, if the behavior persists, the loop aborts with `Finished: false`.
@@ -91,7 +95,7 @@ When the LLM returns no tool calls, the executor decides whether to accept an im
 
 `SetFinishGuard(func(ctx) error)` lets a caller block premature completion. It is a **hard gate**: every `finish` call re-invokes the guard, and a non-nil error rejects `finish` with a nudge and retries the action every time — finish is never auto-accepted while the guard still errors. (Contrast the mutation and checklist gates, which are soft: after one nudge attempt each, finish is accepted regardless.) This is how the Conductor's pending-delegations join check is expressed.
 
-`SetStopTools(names ...string)` registers ordinary (host-provided) tools as **turn terminators**. A successful call to a listed tool ends the run with `Finished=true` — the tool's observation becomes the run output — instead of continuing to the next step; a *failed* call to a stop tool does not terminate the run (the error observation is returned to the model as usual). It is distinct from the inline `finish` tool: it lets the host model a bounded-turn protocol where the executor — not the model — ends the turn. The c0wrk goal loop uses it so a per-turn working run ends the moment the agent declares its verdict (`declare_goal_status`), which is what makes a goal turn one bounded attempt that advances the turn counter and the turn budget. Threaded from the host via `orchestration.ConductorConfig.StopTools`.
+`SetStopTools(names ...string)` registers ordinary (host-provided) tools as **turn terminators**. A successful call to a listed tool ends the run with `Finished=true` — the tool's observation becomes the run output — instead of continuing to the next step; a *failed* call to a stop tool does not terminate the run (the error observation is returned to the model as usual). It is distinct from the inline `finish` tool: it lets the host model a bounded-turn protocol where the executor — not the model — ends the turn. A host goal-loop protocol, for example, registers the tool the agent uses to declare its goal verdict as a stop tool, so the per-turn working run ends the moment the verdict is declared — which is what makes a goal turn one bounded attempt that advances the turn counter and the turn budget. Threaded from the host via `orchestration.ConductorConfig.StopTools`.
 
 Two semantics matter for reuse. First, the terminator fires for a stop-tool call made **inside `batch`** as well as standalone (shared `processSingleToolCall`/`processBatchTool` helper), so a host protocol cannot be silently defeated by batching the call. Second, a stop tool is a terminal boundary exactly like `finish`, so it **honours the `SetFinishGuard` join gate**: when the guard rejects (e.g. pending async delegations), the run injects the guard's nudge and retries instead of terminating — a stop tool cannot bypass the pending-async gate. Because a stop tool has no `answer` argument like `finish`, the run also records the model's own final assistant text in `ExecutorResult.Summary` (mirrored on `orchestration.ExecutionResult.Summary`), so a host can recover the turn's modeled output when `Output` holds only the tool's short confirmation.
 
@@ -173,5 +177,6 @@ The `batch` tool lets the model dispatch multiple tool calls in one turn. It is 
 - [conductor.md](conductor.md) — the top-level Executor caller
 - [subagents.md](subagents.md) — isolated Executor instances in goroutines
 - [reflector.md](reflector.md) — reads the trajectory via `TrajectoryStore`
+- [../oneshot.md](../oneshot.md) — the one-shot service client repeating this nudge convention for single structured calls
 - [../memory/compaction.md](../memory/compaction.md) — compaction strategies driving the per-iteration fill check
 - [../tool-system/README.md](../tool-system/README.md) — tool execution pipeline and trust classification

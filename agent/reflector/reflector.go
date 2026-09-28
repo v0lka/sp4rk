@@ -12,6 +12,7 @@ import (
 
 	"github.com/v0lka/sp4rk/agent"
 	"github.com/v0lka/sp4rk/llm"
+	"github.com/v0lka/sp4rk/oneshot"
 	"github.com/v0lka/sp4rk/orchestration"
 	"github.com/v0lka/sp4rk/prompt"
 	"github.com/v0lka/sp4rk/security"
@@ -23,6 +24,31 @@ var _ orchestration.Reflector = (*Reflector)(nil)
 
 const defaultAnalyzeFooter = "Please analyze this execution and provide a structured reflection."
 
+// reflectionRetryHint restates the reflection JSON contract inside the oneshot
+// nudge, mirroring the fields of the reflection system prompt. The reflector
+// previously had no retry at all, so this is the corrective feedback a
+// model-facing retry now gets.
+const reflectionRetryHint = "The reflection must be a single JSON object with the fields " +
+	`"summary" (string), "root_cause" (string), "suggested_action" ("retry", "replan", or "abort"), ` +
+	`and "action_plan" (string). Respond with only the JSON object — no prose before or after it, no markdown code fences.`
+
+// errReflectionUnparseable marks reflection responses that failed JSON
+// parsing, so Reflect can distinguish final parse refusals from transport
+// failures without altering either error's message.
+var errReflectionUnparseable = errors.New("reflector: reflection response unparseable")
+
+// reflectionParseError wraps one reflection parse error. Its Error() text is
+// exactly the underlying error's text (it surfaces in the final refusal),
+// while errors.Is matches errReflectionUnparseable for caller-side
+// classification.
+type reflectionParseError struct{ err error }
+
+func (e *reflectionParseError) Error() string { return e.err.Error() }
+func (e *reflectionParseError) Unwrap() error { return e.err }
+func (e *reflectionParseError) Is(target error) bool {
+	return target == errReflectionUnparseable
+}
+
 // Config holds the configuration for a Reflector.
 type Config struct {
 	// SystemPrompt is the reflection system prompt.
@@ -30,8 +56,16 @@ type Config struct {
 	// AnalyzeFooter is appended to the user message. Defaults to a standard analysis request.
 	AnalyzeFooter string
 	// ReasoningEffort sets the initial LLM reasoning effort for reflection
-	// calls. May be changed at runtime via SetReasoningEffort.
+	// calls. May be changed at runtime via SetReasoningEffort. When empty,
+	// the one-shot tier-Off policy is resolved via llm.ReasoningForCall from
+	// the optional Family/Model identity below.
 	ReasoningEffort string
+	// Family and Model identify the model that will serve the reflection
+	// call, for reasoning-tier resolution (see reasoningEffortForCall). Both
+	// are optional: when empty, the tier-Off policy resolves to "" and no
+	// reasoning field is sent.
+	Family string
+	Model  string
 }
 
 // Reflector analyzes execution trajectory to produce structured self-correction insights.
@@ -40,6 +74,8 @@ type Reflector struct {
 	systemPrompt    string
 	analyzeFooter   string
 	reasoningEffort string // read by Reflect; must not be set concurrently with Reflect
+	family          string
+	model           string
 }
 
 // New creates a new Reflector with the given caller and config.
@@ -53,15 +89,31 @@ func New(caller agent.LLMCaller, cfg Config) *Reflector {
 		systemPrompt:    cfg.SystemPrompt,
 		analyzeFooter:   footer,
 		reasoningEffort: cfg.ReasoningEffort,
+		family:          cfg.Family,
+		model:           cfg.Model,
 	}
 }
 
-// SetReasoningEffort sets the reasoning effort for the reflector.
+// SetReasoningEffort sets the reasoning effort for the reflector, overriding
+// the tier-Off default resolution for subsequent Reflect calls.
 // Must not be called concurrently with Reflect; callers using a shared
 // Reflector across goroutines should serialize access (e.g. via a mutex
 // or by sequencing all calls on the same goroutine).
 func (r *Reflector) SetReasoningEffort(effort string) {
 	r.reasoningEffort = effort
+}
+
+// reasoningEffortForCall resolves the reasoning effort for one reflection
+// call. An explicit SetReasoningEffort override wins; otherwise the one-shot
+// reflection policy applies: reasoning tier OFF, resolved to the serving
+// model's native disable spelling via llm.ReasoningForCall ("" — no field
+// sent — when the family/model are unknown, preserving the pre-tier wire
+// behavior).
+func (r *Reflector) reasoningEffortForCall() string {
+	if r.reasoningEffort != "" {
+		return r.reasoningEffort
+	}
+	return llm.ReasoningForCall(r.family, r.model, llm.ReasoningTierOff)
 }
 
 // Reflect analyzes execution trajectory to produce structured self-correction insights.
@@ -89,22 +141,33 @@ func (r *Reflector) Reflect(
 
 	req := llm.ChatRequest{
 		Messages:        messages,
-		ReasoningEffort: r.reasoningEffort,
+		ReasoningEffort: r.reasoningEffortForCall(),
 		// The reflection is parsed as JSON — deterministic sampling, like routing.
 		CallPurpose: llm.CallPurposeRouting,
 	}
 
-	resp, err := r.llm.Call(ctx, req)
-	if err != nil {
-		return nil, fmt.Errorf("reflector LLM call failed: %w", err)
-	}
-	if resp == nil {
-		return nil, errors.New("reflector LLM call returned nil response")
+	// Call the LLM through the one-shot client: an unparseable response is
+	// re-asked with a corrective nudge (assistant echo of the failed output +
+	// a "[System]" user message restating the reflection JSON contract) —
+	// exactly two nudges, three attempts total — where the reflector
+	// previously gave up after the first attempt.
+	parse := func(resp *llm.ChatResponse) (*orchestration.Reflection, error) {
+		reflection, err := r.parseReflectionResponse(resp.Message.Content)
+		if err != nil {
+			return nil, &reflectionParseError{err: err}
+		}
+		return reflection, nil
 	}
 
-	reflection, err := r.parseReflectionResponse(resp.Message.Content)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse reflection response: %w", err)
+	reflection, doErr := oneshot.Do(ctx, r.llm, req, parse, oneshot.Options[*orchestration.Reflection]{
+		Kind:      "reflection",
+		RetryHint: reflectionRetryHint,
+	})
+	if doErr != nil {
+		if errors.Is(doErr, errReflectionUnparseable) {
+			return nil, fmt.Errorf("failed to parse reflection response: %w", doErr)
+		}
+		return nil, fmt.Errorf("reflector LLM call failed: %w", doErr)
 	}
 
 	reflection.Timestamp = time.Now()

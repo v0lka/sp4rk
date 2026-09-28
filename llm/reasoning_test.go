@@ -289,3 +289,88 @@ func TestQwen38ArchitectureAliases_KeysAreNormalized(t *testing.T) {
 		}
 	}
 }
+
+// TestReasoningForCall pins the tier → native spelling mapping per family.
+// The expected values are the WIRE spellings: the returned string goes into
+// ChatRequest.ReasoningEffort verbatim, so casing matters (Google "MINIMAL",
+// DeepSeek "High") and "" means "send no reasoning field at all".
+//
+// Families with no disable spelling degrade the Off tier to their minimal
+// effort (openai/google have effort-only APIs, GLM-flash and Kimi are
+// thinking-locked); the capability gate returns "" only for AUTHORITATIVE
+// no-reasoning declarations (kimi-k2), not for unknown models.
+func TestReasoningForCall(t *testing.T) {
+	tests := []struct {
+		name   string
+		family string
+		model  string
+		tier   ReasoningTier
+		want   string
+	}{
+		// Qwen 3.8+ — native efforts, "Off" disable spelling.
+		{"qwen38 off disables thinking", "qwen", "qwen3.8-max", ReasoningTierOff, "Off"},
+		{"qwen38 minimal is low", "qwen", "qwen3.8-max", ReasoningTierMinimal, "low"},
+		// Pre-3.8 Qwen — binary On/Off only.
+		{"qwen pre-3.8 off", "qwen", "qwen3-coder-plus", ReasoningTierOff, "Off"},
+		{"qwen pre-3.8 minimal is binary On", "qwen", "qwen3-coder-plus", ReasoningTierMinimal, "On"},
+		// Qwen 3.8 architecture alias (no version token in the name).
+		{"qwen alias off", "qwen", "Bonsai 2 27B", ReasoningTierOff, "Off"},
+		{"qwen alias minimal is low", "qwen", "Bonsai 2 27B", ReasoningTierMinimal, "low"},
+		{"qwen alias composite id minimal is low", "qwen", "embedded/Bonsai 2 27B", ReasoningTierMinimal, "low"},
+		// OpenAI — effort-only API, no disable spelling: both tiers land on
+		// the cheapest effort.
+		{"openai minimal", "openai_flagship", "gpt-5.6", ReasoningTierMinimal, "minimal"},
+		{"openai off degrades to minimal", "openai_flagship", "gpt-5.6", ReasoningTierOff, "minimal"},
+		{"openai codex minimal", "openai_codex", "gpt-5.3-codex", ReasoningTierMinimal, "minimal"},
+		// Google — uppercase spellings preserved verbatim, no disable.
+		{"google minimal keeps MINIMAL spelling", "google", "gemini-2.5-pro", ReasoningTierMinimal, "MINIMAL"},
+		{"google off degrades to MINIMAL", "google", "gemini-2.5-pro", ReasoningTierOff, "MINIMAL"},
+		// DeepSeek — "Off" exists, efforts are High/Max.
+		{"deepseek off", "deepseek", "deepseek-v4-pro", ReasoningTierOff, "Off"},
+		{"deepseek minimal is High", "deepseek", "deepseek-v4-pro", ReasoningTierMinimal, "High"},
+		// Anthropic — binary thinking switch.
+		{"anthropic off", "anthropic", "claude-sonnet-4-5", ReasoningTierOff, "Off"},
+		{"anthropic minimal is On", "anthropic", "claude-sonnet-4-5", ReasoningTierMinimal, "On"},
+		// GLM pre-5.2 — binary On/Off.
+		{"glm pre-5.2 off", "glm", "glm-4.7", ReasoningTierOff, "Off"},
+		{"glm pre-5.2 minimal is On", "glm", "glm-4.7", ReasoningTierMinimal, "On"},
+		// GLM 5.2+ — reasoning_effort with the "none" disable spelling.
+		{"glm 5.2 off is none", "glm", "glm-5.2", ReasoningTierOff, "none"},
+		{"glm 5.2 minimal is high", "glm", "glm-5.2", ReasoningTierMinimal, "high"},
+		// GLM-flash — always thinking, no disable spelling: both tiers land
+		// on the weaker of the two enable efforts.
+		{"glm flash off degrades to high", "glm", "zai-org/glm-5.3-flash", ReasoningTierOff, "high"},
+		{"glm flash minimal is high", "glm", "zai-org/glm-5.3-flash", ReasoningTierMinimal, "high"},
+		// Kimi — thinking-locked, no declared option set: the documented
+		// effort floor of the K3-style models serves both tiers.
+		{"kimi minimal is low", "kimi", "kimi-k3", ReasoningTierMinimal, "low"},
+		{"kimi off degrades to low", "kimi", "kimi-k3", ReasoningTierOff, "low"},
+		{"kimi composite id minimal is low", "kimi", "moonshot/kimi-k3", ReasoningTierMinimal, "low"},
+		// Authoritative no-reasoning capability — no field at all, any tier.
+		{"no-reasoning capability minimal", "kimi", "kimi-k2", ReasoningTierMinimal, ""},
+		{"no-reasoning capability off", "kimi", "kimi-k2", ReasoningTierOff, ""},
+		// Fail-closed paths.
+		{"unknown family", "mistral", "mistral-large", ReasoningTierMinimal, ""},
+		{"empty family", "", "gpt-5.6", ReasoningTierMinimal, ""},
+		{"unknown tier", "openai_flagship", "gpt-5.6", ReasoningTier("turbo"), ""},
+		{"zero tier", "openai_flagship", "gpt-5.6", ReasoningTier(""), ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ReasoningForCall(tt.family, tt.model, tt.tier); got != tt.want {
+				t.Errorf("ReasoningForCall(%q, %q, %q) = %q, want %q", tt.family, tt.model, tt.tier, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestReasoningForCall_UnknownModelNotGated guards the capability gate's
+// declared-only contract: a model outside the built-in catalog has GUESSED
+// capabilities (never Reasoning=true by authority), so it must NOT be stripped
+// of its reasoning field — the caller's declared family decides, mirroring
+// Router.applyDefaultSampling's treatment of GuessedCapabilities.
+func TestReasoningForCall_UnknownModelNotGated(t *testing.T) {
+	if got := ReasoningForCall("openai_flagship", "gpt-9-unknown-to-the-catalog", ReasoningTierMinimal); got != "minimal" {
+		t.Errorf("ReasoningForCall(openai_flagship, unknown, minimal) = %q, want %q", got, "minimal")
+	}
+}

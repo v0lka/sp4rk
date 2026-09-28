@@ -8,7 +8,7 @@
 | Request lifecycle inside the engine                           | [architecture/data-flow.md](architecture/data-flow.md)                          |
 | Tool policies, confirmations, judge                           | [architecture/security-model.md](architecture/security-model.md)                |
 | Tool capability groups, MCP group overrides, agent tool budgets | [contracts/tools.md](contracts/tools.md), [domains/tool-system/README.md](domains/tool-system/README.md), [domains/tool-system/mcp-gateway.md](domains/tool-system/mcp-gateway.md), [domains/agents.md](domains/agents.md) |
-| Strict/session-aware ToolJudge evaluation                      | [architecture/security-model.md](architecture/security-model.md), [contracts/tools.md](contracts/tools.md), [domains/tool-system/README.md](domains/tool-system/README.md) |
+| Strict/session-aware ToolJudge evaluation                      | [architecture/security-model.md](architecture/security-model.md), [contracts/tools.md](contracts/tools.md), [domains/tool-system/README.md](domains/tool-system/README.md), [domains/oneshot.md](domains/oneshot.md) |
 | Prompt-injection defense, untrusted-content wrapping          | [architecture/security-model.md](architecture/security-model.md)                |
 | Orchestration overview (Conductor pipeline)                   | [domains/orchestration/README.md](domains/orchestration/README.md)              |
 | Conductor (runs a task end-to-end)                            | [domains/orchestration/conductor.md](domains/orchestration/conductor.md)        |
@@ -30,6 +30,8 @@
 | Context window, compaction strategies                         | [domains/memory/compaction.md](domains/memory/compaction.md)                    |
 | Blackboard, shared state, facts, attachments                  | [domains/memory/blackboard.md](domains/memory/blackboard.md)                    |
 | LLM providers, router, model registry, tokens                 | [domains/llm-providers.md](domains/llm-providers.md)                            |
+| One-shot structured LLM calls, the parse-repair loop, failure policies | [domains/oneshot.md](domains/oneshot.md), [decisions/008-unified-oneshot-service-client.md](decisions/008-unified-oneshot-service-client.md) |
+| Adding a new structured service call (router/planner/reflector/judge-style) | [domains/oneshot.md](domains/oneshot.md), [contracts/llm-providers.md](contracts/llm-providers.md) |
 | Purpose-aware sampling and provider parameter filtering       | [contracts/llm-providers.md](contracts/llm-providers.md), [domains/llm-providers.md](domains/llm-providers.md), [domains/prompt-building.md](domains/prompt-building.md) |
 | Multi-protocol routing (Responses/Anthropic/Google/Chat), multimodal content blocks | [domains/llm-providers.md](domains/llm-providers.md)                            |
 | Skill system, activation, resources                           | [domains/skills.md](domains/skills.md)                                          |
@@ -78,6 +80,7 @@ sp4rk is a single Go module (`github.com/v0lka/sp4rk`). Arrows show import direc
    agents          → {}                   (stdlib + yaml.v3 + log/slog only; no engine packages)
    ignore          → {pathutil}          (external doublestar only otherwise)
    sysproc         → {golang.org/x/sys/windows}  (stdlib on non-Windows; Windows process-tree containment uses golang.org/x/sys/windows behind a //go:build windows tag; no-op elsewhere)
+   oneshot         → {llm}               (leaf one-shot structured-call client; consumed by planner, agent/router, agent/reflector, and the tools judges)
 ```
 
 Supporting packages — `prompt`, `skills`, `agents`, `security`, `embedding`, `pathutil`, `strutil`, `sysproc`, `ignore` — are consumed across layers as needed and have no upward dependencies.
@@ -121,6 +124,7 @@ See [META.md](META.md) for document templates, naming rules, and update protocol
 ### domains/ (single-file)
 
 - [llm-providers.md](domains/llm-providers.md) - Provider abstraction, router, model registry, token counting
+- [oneshot.md](domains/oneshot.md) - One-shot structured-output LLM client: the Do loop, failure policies, parser toolkit, call-site catalog
 - [skills.md](domains/skills.md) - Skill system, activation, resource access
 - [agents.md](domains/agents.md) - Subagent Profiles (AGENT.md discovery, parsing, management)
 - [prompt-building.md](domains/prompt-building.md) - Prompt builder and system-prompt composition

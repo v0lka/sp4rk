@@ -189,3 +189,156 @@ func glmFlashAlwaysThinking(model string) bool {
 	}
 	return strings.Contains(bare, "flash")
 }
+
+// ReasoningTier is the family-agnostic reasoning level a caller wants for a
+// single LLM call. It abstracts over the per-family native spellings so call
+// sites can request a reasoning BUDGET ("as cheap as this model allows") or
+// an OFF without knowing which family serves the request:
+//
+//   - ReasoningTierOff: reasoning disabled — maps to the family's disable
+//     spelling ("Off" for the binary families, "none" for GLM 5.2+). When the
+//     resolved option set carries no disable spelling (GLM-flash, Kimi, and
+//     effort-only families like OpenAI/Google whose APIs have no off), the
+//     tier degrades to the minimal available effort — the closest the
+//     provider can get.
+//   - ReasoningTierMinimal: the cheapest non-disabled effort of the family
+//     ("minimal" for OpenAI, "low" for Qwen 3.8+, "High" for DeepSeek, "On"
+//     for the binary families, "high" for GLM-flash, …).
+//
+// The zero value and any unrecognized tier fail closed to "" (no field).
+type ReasoningTier string
+
+const (
+	// ReasoningTierOff asks for reasoning to be disabled on the call,
+	// degrading to the minimal effort where no disable spelling exists.
+	ReasoningTierOff ReasoningTier = "off"
+	// ReasoningTierMinimal asks for the cheapest non-disabled reasoning
+	// effort the model's family offers.
+	ReasoningTierMinimal ReasoningTier = "minimal"
+)
+
+// reasoningEffortRank orders the known native effort spellings from cheapest
+// to strongest so minimalReasoningEffort can pick the floor of an arbitrary
+// family's option set. The declared option lists are NOT consistently
+// ordered (OpenAI/Google list weakest-first, Qwen strongest-first, GLM 5.2+
+// carries the disable spelling first), so no positional rule can find the
+// floor — the rank table can. Keys are lowercased spellings; callers must
+// lowercase before lookup and keep the ORIGINAL spelling of the winning
+// option (the wire value is case-sensitive per family — Google's "MINIMAL",
+// DeepSeek's "High").
+//
+// "on" is the single non-disabled value of the binary families, so ranking it
+// cheapest is harmless: it can only win when it is the only candidate.
+// Unrecognized spellings rank strongest — never chosen over a known effort,
+// but still returned when they are the only non-disabled option (they are,
+// by definition, the minimal available one then).
+var reasoningEffortRank = map[string]int{
+	"minimal": 0,
+	"on":      0,
+	"low":     1,
+	"medium":  2,
+	"high":    3,
+	"xhigh":   4,
+	"max":     5,
+}
+
+// reasoningUnknownEffortRank ranks spellings missing from reasoningEffortRank.
+const reasoningUnknownEffortRank = 1 << 30
+
+// reasoningDisableSpelling returns the disable spelling of a family's option
+// set — "Off" for the binary families, "none" for GLM 5.2+ — matched
+// case-insensitively, or "" when thinking cannot be disabled. The returned
+// spelling preserves the option set's native casing.
+func reasoningDisableSpelling(options []string) string {
+	for _, opt := range options {
+		if strings.EqualFold(opt, "off") || strings.EqualFold(opt, "none") {
+			return opt
+		}
+	}
+	return ""
+}
+
+// minimalReasoningEffort returns the cheapest non-disabled effort of a
+// family's option set (see reasoningEffortRank), preserving its native
+// spelling, or "" when every option is a disable spelling.
+func minimalReasoningEffort(options []string) string {
+	best := ""
+	bestRank := reasoningUnknownEffortRank + 1
+	for _, opt := range options {
+		if strings.EqualFold(opt, "off") || strings.EqualFold(opt, "none") {
+			continue
+		}
+		rank, ok := reasoningEffortRank[strings.ToLower(opt)]
+		if !ok {
+			rank = reasoningUnknownEffortRank
+		}
+		if rank < bestRank {
+			best, bestRank = opt, rank
+		}
+	}
+	return best
+}
+
+// kimiMinimalReasoningEffort is the floor of the Kimi reasoning_effort range
+// (low/high/max — see the kimi-k3 catalog entry). The kimi family declares no
+// option set in FamilyReasoningOptions — its models are thinking-locked with
+// heterogeneous, partly undocumented controls — but the effort-tuned K3 /
+// K2.7-code models document this floor, so it is the minimal available
+// effort a tier can target. Whether the field is actually emitted for a given
+// Kimi model remains the wire layer's decision (see the provider family
+// switch): only the K3 series documents the field, so the wire emits it for
+// K3-series models and drops it (fail-closed) for every other kimi model,
+// same as for every other spelling this helper returns.
+const kimiMinimalReasoningEffort = "low"
+
+// ReasoningForCall maps an abstract reasoning tier to the native
+// reasoning_effort spelling to send for ONE call to the given model. It is
+// the per-call counterpart of the option pickers (FamilyReasoningOptions /
+// ModelReasoningOptions): those describe what a family CAN express, this
+// resolves what to actually PUT ON THE WIRE for a desired budget. Version
+// awareness rides on ModelReasoningOptions, so GLM 5.2+ (reasoning_effort
+// with the "none" disable spelling), GLM-flash (always thinking — no disable
+// spelling) and Qwen 3.8+ / qwen38ArchitectureAliases (native efforts;
+// pre-3.8 models binary "On"/"Off") are handled without extra logic here.
+//
+// The empty-string contract: "" means "send no reasoning field at all" and is
+// returned when (a) the tier is unrecognized, (b) the model AUTHORITATIVELY
+// declares no reasoning capability (built-in catalog Capabilities.Reasoning ==
+// false — e.g. kimi-k2; guessed capabilities of unknown models do NOT gate,
+// mirroring Router.applyDefaultSampling), or (c) the family has no known
+// reasoning control (mistral, unknown names). Callers merge "" by simply not
+// setting ChatRequest.ReasoningEffort.
+func ReasoningForCall(family, model string, tier ReasoningTier) string {
+	switch tier {
+	case ReasoningTierOff, ReasoningTierMinimal:
+	default:
+		return ""
+	}
+	// Capability gate — declared-only. ResolveBuiltInModel reports known=false
+	// for models outside the built-in catalog, whose filled capabilities are
+	// registry guesswork; trusting those would silently strip the reasoning
+	// field from unknown/local models the host knows better.
+	if meta, known := ResolveBuiltInModel(model); known && meta.Capabilities != nil && !meta.Capabilities.Reasoning {
+		return ""
+	}
+	options, _, ok := ModelReasoningOptions(family, model)
+	if !ok {
+		// Families with no declared option set. Kimi is thinking-locked:
+		// no disable spelling exists, so both tiers land on the documented
+		// effort floor of the effort-tuned models. Every other
+		// option-less family fails closed — no field.
+		if family == "kimi" {
+			return kimiMinimalReasoningEffort
+		}
+		return ""
+	}
+	if tier == ReasoningTierOff {
+		if off := reasoningDisableSpelling(options); off != "" {
+			return off
+		}
+		// No disable spelling (GLM-flash, Kimi-style thinking-locked
+		// variants of families that do declare efforts, OpenAI, Google):
+		// the closest possible is the cheapest effort — fall through.
+	}
+	return minimalReasoningEffort(options)
+}

@@ -11,6 +11,7 @@ Generates DAG execution plans from free-text tasks. A `Planner` takes a task and
 - `github.com/v0lka/sp4rk/agent` — `LLMCaller`, `ContextManager`, exploration `Executor`
 - `github.com/v0lka/sp4rk/skills` — `SkillDescriptor`
 - `github.com/v0lka/sp4rk/llm` — `ModelRegistry`, `TokenCounter`
+- `github.com/v0lka/sp4rk/oneshot` — the one-shot client the plan-generation call runs through (see [../oneshot.md](../oneshot.md))
 
 ## Behavior
 
@@ -31,11 +32,11 @@ The planner supports two strategies:
 | `FormatWorkspacePath` / `AppendContextSections` | Workspace instruction block and appended context sections. |
 | `ToolRegistry` | Provides tools for the exploration executor and tool listing. Must combine `agent.ToolExecutor` + a `ToolLister`. |
 | `PlannerToolNames` | Set of tool names allowed for exploration. **Empty means no exploration tools are available** — the planner falls back to direct planning. |
-| `ModelRegistry` / `Model` | Resolve model metadata/family for the exploration executor. |
+| `ModelRegistry` / `Model` | Resolve model metadata/family for the exploration executor. `Model` also feeds the plan-generation reasoning-tier resolution. |
 | `ContextFactory` | Creates a `ContextManager` for the exploration loop. When nil, falls back to direct planning. |
 | `CallerForStep` | Returns a step-local `LLMCaller` for a given context manager + step ID (independent context trackers). |
 | `MaxExploreSteps` | Step budget for the exploration loop. Defaults to `7`. |
-| `ReasoningEffort` | Applied to the exploration executor and plan-generation calls. |
+| `ReasoningEffort` | Plan-generation override: when set, applied verbatim instead of the one-shot tier-Off resolution (`llm.ReasoningForCall` from the resolved family + `Model`; `""` — no field — when unknown). Also passed to the exploration executor verbatim. |
 
 `DefaultConfig()` returns sensible standalone defaults (no-op context functions, `MaxExploreSteps` of `7`); override `Prompts`, `Model`, and (for exploration) `ToolRegistry` + `PlannerToolNames` + `ContextFactory`.
 
@@ -68,7 +69,8 @@ Direct planning is used when `domain == general` with `complexity < 4`, or when 
 ## Error Handling
 
 - **`NewPlanner` with a nil caller**: returns an error (caller is required).
-- **LLM call failure / unparseable plan JSON**: `Plan`/`Replan`/`PlanContinuation` return an error; the orchestrator may retry or surface the failure.
+- **LLM call failure**: `Plan`/`Replan`/`PlanContinuation` return an error; the orchestrator may retry or surface the failure. Transport errors are never retried here — provider-level retry is the Router's.
+- **Unparseable plan JSON**: retried by the one-shot client (see [../oneshot.md](../oneshot.md)) with corrective nudges — exactly two, each pairing an assistant echo of the failed output with a `[System]` user message whose hint comes from `RetryHintFn`: invalid JSON / DAG-validation failures get the schema-restating feedback, zero-step plans get the "at least one step" feedback, both quoting the underlying error verbatim. After the two nudges the final refusal returns the parse error.
 - **No exploration tools**: silently falls back to direct planning (not an error).
 
 ## Invariants
@@ -86,5 +88,6 @@ Direct planning is used when `domain == general` with `complexity < 4`, or when 
 - [router.md](router.md) — domain/complexity drive the planning strategy
 - [reflector.md](reflector.md) — reflections feed `Replan`
 - [conductor.md](conductor.md) — the executor that runs each generated `PlanStep`
+- [../oneshot.md](../oneshot.md) — the one-shot client the plan-generation call runs through
 - [../agents.md](../agents.md) — Subagent Profiles targeted by `PlanStep.Agent`
 - [../memory/blackboard.md](../memory/blackboard.md) — `BuildCarryForward` / `CompletedStep` carry-forward semantics

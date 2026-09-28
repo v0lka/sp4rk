@@ -15,7 +15,7 @@ func loopJudgeResponse(content string) *llm.ChatResponse {
 }
 
 func TestJudgeStepLimit_FailClosedNilProvider(t *testing.T) {
-	j := NewToolJudge(nil, "test-model", 0, nil)
+	j := NewToolJudge(nil, nil, 0, nil)
 	v, reason, err := j.JudgeStepLimit(context.Background(), StepLimitJudgeRequest{CurrentStep: 5, MaxSteps: 5})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -30,7 +30,7 @@ func TestJudgeStepLimit_FailClosedNilProvider(t *testing.T) {
 
 func TestJudgeStepLimit_FailClosedOnProviderError(t *testing.T) {
 	m := &mockLLMProvider{err: errors.New("boom")}
-	j := NewToolJudge(m, "test-model", 0, nil)
+	j := NewToolJudge(m, nil, 0, nil)
 	v, _, err := j.JudgeStepLimit(context.Background(), StepLimitJudgeRequest{CurrentStep: 3, MaxSteps: 3})
 	if err != nil {
 		t.Fatalf("provider error must be swallowed (fail-closed), got %v", err)
@@ -42,7 +42,7 @@ func TestJudgeStepLimit_FailClosedOnProviderError(t *testing.T) {
 
 func TestJudgeStepLimit_FailClosedOnEmptyResponse(t *testing.T) {
 	m := &mockLLMProvider{response: nil}
-	j := NewToolJudge(m, "test-model", 0, nil)
+	j := NewToolJudge(m, nil, 0, nil)
 	v, _, err := j.JudgeStepLimit(context.Background(), StepLimitJudgeRequest{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -54,7 +54,7 @@ func TestJudgeStepLimit_FailClosedOnEmptyResponse(t *testing.T) {
 
 func TestJudgeStepLimit_FailClosedOnUnparseable(t *testing.T) {
 	m := &mockLLMProvider{response: loopJudgeResponse("???")}
-	j := NewToolJudge(m, "test-model", 0, nil)
+	j := NewToolJudge(m, nil, 0, nil)
 	v, reason, err := j.JudgeStepLimit(context.Background(), StepLimitJudgeRequest{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -92,7 +92,7 @@ func TestJudgeStepLimit_VerdictParsing(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			m := &mockLLMProvider{response: loopJudgeResponse(tc.content)}
-			j := NewToolJudge(m, "test-model", 0, nil)
+			j := NewToolJudge(m, nil, 0, nil)
 			v, _, err := j.JudgeStepLimit(context.Background(), StepLimitJudgeRequest{})
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
@@ -106,7 +106,7 @@ func TestJudgeStepLimit_VerdictParsing(t *testing.T) {
 
 func TestJudgeStepLimit_NotCached(t *testing.T) {
 	m := &mockLLMProvider{response: loopJudgeResponse("VERDICT: ALLOW_ONCE\nREASON: x")}
-	j := NewToolJudge(m, "test-model", 0, nil)
+	j := NewToolJudge(m, nil, 0, nil)
 	req := StepLimitJudgeRequest{CurrentStep: 4, MaxSteps: 4, AbortCategory: LoopBoundaryBudget}
 	for i := 0; i < 3; i++ {
 		if _, _, err := j.JudgeStepLimit(context.Background(), req); err != nil {
@@ -120,7 +120,7 @@ func TestJudgeStepLimit_NotCached(t *testing.T) {
 
 func TestJudgeStepLimit_PromptCarriesTrajectoryAndMetrics(t *testing.T) {
 	m := &mockLLMProvider{response: loopJudgeResponse("VERDICT: DENY\nREASON: loop")}
-	j := NewToolJudge(m, "test-model", 0, nil)
+	j := NewToolJudge(m, nil, 0, nil)
 	req := StepLimitJudgeRequest{
 		TaskContext:   "refactor the parser",
 		PlanSnapshot:  "step 2 of 4",
@@ -179,7 +179,7 @@ func TestJudgeStepLimit_PromptCarriesTrajectoryAndMetrics(t *testing.T) {
 
 func TestJudgeStepLimit_EmptyCategoryDefaultsToCircuitBreaker(t *testing.T) {
 	m := &mockLLMProvider{response: loopJudgeResponse("VERDICT: DENY\nREASON: x")}
-	j := NewToolJudge(m, "test-model", 0, nil)
+	j := NewToolJudge(m, nil, 0, nil)
 	if _, _, err := j.JudgeStepLimit(context.Background(), StepLimitJudgeRequest{}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

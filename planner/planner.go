@@ -12,6 +12,7 @@ import (
 
 	"github.com/v0lka/sp4rk/agent"
 	"github.com/v0lka/sp4rk/llm"
+	"github.com/v0lka/sp4rk/oneshot"
 	"github.com/v0lka/sp4rk/orchestration"
 	"github.com/v0lka/sp4rk/prompt"
 	"github.com/v0lka/sp4rk/skills"
@@ -63,9 +64,29 @@ const (
 	defaultParseErrorAbortThreshold = 3
 )
 
-// parsePlanMaxRetries is the maximum number of retries when the LLM produces
-// a plan response that cannot be parsed as valid JSON.
-const parsePlanMaxRetries = 5
+// errPlanZeroSteps is the parse-loop error for a syntactically valid plan
+// that carries an empty steps array. Defense-in-depth: the LLM may return
+// valid JSON with {"steps": []}, which causes the orchestrator to complete
+// silently with no output — the oneshot retry loop treats it like any other
+// unparseable response and re-asks with the zero-steps feedback.
+var errPlanZeroSteps = errors.New("plan has zero steps — at least one step is required")
+
+// errPlanUnparseable marks plan responses that failed parsing/DAG validation,
+// so callAndParsePlan can distinguish final parse refusals from transport
+// failures without altering either error's message.
+var errPlanUnparseable = errors.New("planner: plan response unparseable")
+
+// planParseError wraps one parse-loop error. Its Error() text is exactly the
+// underlying error's text — the text rides back to the model in the retry
+// hint and surfaces in the final refusal — while errors.Is matches
+// errPlanUnparseable for caller-side classification.
+type planParseError struct{ err error }
+
+func (e *planParseError) Error() string { return e.err.Error() }
+func (e *planParseError) Unwrap() error { return e.err }
+func (e *planParseError) Is(target error) bool {
+	return target == errPlanUnparseable
+}
 
 // defaultMaxExploreSteps is the default step budget for the planner's exploration loop.
 const defaultMaxExploreSteps = 7
@@ -702,9 +723,12 @@ func formatConversationHistory(history []llm.Message) string {
 // ---------------------------------------------------------------------------
 
 // callAndParsePlan calls the LLM with the given messages, parses the response
-// as a plan, and retries with error feedback if parsing fails or the plan has
-// zero steps. Retries up to parsePlanMaxRetries times. The initialMessages
-// slice is not mutated.
+// as a plan, and retries with corrective feedback if parsing fails or the plan
+// has zero steps. The retry policy is the one-shot client's built-in
+// two-nudge loop — exactly two nudges (assistant echo of the failed output +
+// a "[System]" user message restating the exact problem), three attempts
+// total — aligned with the agent loop's parse-retry budget. The
+// initialMessages slice is not mutated.
 func (p *Planner) callAndParsePlan(
 	ctx context.Context,
 	initialMessages []llm.Message,
@@ -714,79 +738,80 @@ func (p *Planner) callAndParsePlan(
 	copy(messages, initialMessages)
 	req := llm.ChatRequest{
 		Messages:        messages,
-		ReasoningEffort: p.Cfg.ReasoningEffort,
+		ReasoningEffort: p.reasoningEffortForCall(ctx),
 		// Plan generation is a structured-decision call (JSON plan output):
 		// deterministic sampling, like routing.
 		CallPurpose: llm.CallPurposeRouting,
 	}
 
-	var lastParseErr error
-	for attempt := 0; attempt < parsePlanMaxRetries; attempt++ {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-
-		resp, err := p.llm.Call(ctx, req)
-		if err != nil {
-			return nil, fmt.Errorf("planner: LLM call failed: %w", err)
-		}
-		if resp == nil {
-			return nil, errors.New("planner: LLM call returned nil response")
-		}
-
+	parse := func(resp *llm.ChatResponse) (*orchestration.Plan, error) {
 		plan, err := p.parsePlanResponse(resp.Message.Content, availableSkills)
-		if err == nil {
-			// Defense-in-depth: reject plans with zero steps — the LLM
-			// may return valid JSON with an empty steps array ({"steps": []}),
-			// which causes the orchestrator to complete silently with no
-			// output. Treat this as a retryable error with an explicit
-			// prompt instructing the model to generate at least one step.
-			if len(plan.Steps) == 0 {
-				err = errors.New("plan has zero steps — at least one step is required")
-				lastParseErr = err
-				p.log().Warn("planner: empty plan returned, retrying",
-					"attempt", attempt+1,
-					"max_retries", parsePlanMaxRetries,
-					"error", err,
-				)
-				req.Messages = append(req.Messages,
-					llm.Message{Role: "assistant", Content: resp.Message.Content},
-					llm.Message{Role: "user", Content: fmt.Sprintf(
-						"Your response was valid JSON but contained zero steps. Error: %s\n\n"+
-							"The plan MUST contain at least one step with a summary, description, "+
-							"and dependencies. Decompose the user's task into at least one concrete, "+
-							"executable step. Respond ONLY with a valid JSON object containing a "+
-							"non-empty \"steps\" array.",
-						err,
-					)},
-				)
-				continue
-			}
-			return plan, nil
+		if err != nil {
+			return nil, &planParseError{err: err}
 		}
-
-		lastParseErr = err
-		p.log().Warn("planner: parse failed, retrying",
-			"attempt", attempt+1,
-			"max_retries", parsePlanMaxRetries,
-			"error", err,
-		)
-
-		req.Messages = append(req.Messages,
-			llm.Message{Role: "assistant", Content: resp.Message.Content},
-			llm.Message{Role: "user", Content: fmt.Sprintf(
-				"Your response was invalid JSON. Error: %s\n\n"+
-					"Respond ONLY with a valid JSON object. "+
-					"Do NOT use markdown code fences (```json ... ```). "+
-					"Do NOT include any text, HTML, or commentary before or after the JSON. "+
-					"Your entire response must start with { and end with } "+
-					"and be parseable by a standard JSON parser.",
-				err,
-			)},
-		)
+		// Defense-in-depth: reject plans with zero steps — the LLM may return
+		// valid JSON with an empty steps array ({"steps": []}), which causes
+		// the orchestrator to complete silently with no output. Treat this as
+		// a retryable error with an explicit hint instructing the model to
+		// generate at least one step.
+		if len(plan.Steps) == 0 {
+			return nil, &planParseError{err: errPlanZeroSteps}
+		}
+		return plan, nil
 	}
 
-	return nil, fmt.Errorf("planner: failed to parse plan response after %d attempts: %w", parsePlanMaxRetries, lastParseErr)
+	plan, doErr := oneshot.Do(ctx, p.llm, req, parse, oneshot.Options[*orchestration.Plan]{
+		Kind:        "plan_generation",
+		Logger:      p.log(),
+		RetryHintFn: p.planRetryHint,
+	})
+	if doErr != nil {
+		if errors.Is(doErr, errPlanUnparseable) {
+			return nil, fmt.Errorf("planner: failed to parse plan response: %w", doErr)
+		}
+		return nil, fmt.Errorf("planner: LLM call failed: %w", doErr)
+	}
+	return plan, nil
+}
+
+// planRetryHint renders the corrective feedback for one plan-retry nudge from
+// the parse error that triggered it, preserving the two established feedback
+// texts: one for responses that were not valid JSON (or failed DAG
+// validation) and one for valid JSON that carried zero steps. Both carry the
+// underlying error verbatim so the model can fix the exact problem.
+func (p *Planner) planRetryHint(parseErr error) string {
+	if errors.Is(parseErr, errPlanZeroSteps) {
+		return fmt.Sprintf(
+			"Your response was valid JSON but contained zero steps. Error: %s\n\n"+
+				"The plan MUST contain at least one step with a summary, description, "+
+				"and dependencies. Decompose the user's task into at least one concrete, "+
+				"executable step. Respond ONLY with a valid JSON object containing a "+
+				"non-empty \"steps\" array.",
+			parseErr,
+		)
+	}
+	return fmt.Sprintf(
+		"Your response was invalid JSON. Error: %s\n\n"+
+			"Respond ONLY with a valid JSON object. "+
+			"Do NOT use markdown code fences (```json ... ```). "+
+			"Do NOT include any text, HTML, or commentary before or after the JSON. "+
+			"Your entire response must start with { and end with } "+
+			"and be parseable by a standard JSON parser.",
+		parseErr,
+	)
+}
+
+// reasoningEffortForCall resolves the reasoning effort for one plan call. An
+// explicit Cfg.ReasoningEffort override wins; otherwise the one-shot planning
+// policy applies: reasoning tier OFF, resolved to the planning model's native
+// disable spelling via llm.ReasoningForCall ("" — no field sent — when the
+// registry cannot resolve a known reasoning-capable family, preserving the
+// pre-tier wire behavior).
+func (p *Planner) reasoningEffortForCall(ctx context.Context) string {
+	if p.Cfg.ReasoningEffort != "" {
+		return p.Cfg.ReasoningEffort
+	}
+	return llm.ReasoningForCall(p.getFamily(ctx), p.Cfg.Model, llm.ReasoningTierOff)
 }
 
 // parsePlanResponse extracts a valid plan from LLM response content. It handles

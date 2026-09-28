@@ -3,11 +3,12 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/v0lka/sp4rk/llm"
+	"github.com/v0lka/sp4rk/oneshot"
 	"github.com/v0lka/sp4rk/security"
 	"github.com/v0lka/sp4rk/strutil"
 	"github.com/v0lka/sp4rk/tools/internal/judge_prompts"
@@ -113,16 +114,16 @@ type StepLimitJudgeRequest struct {
 
 // JudgeStepLimit asks the LLM judge to decide a step-limit boundary among the
 // four LoopVerdict outcomes. Unlike Judge it NEVER caches: every boundary is
-// evaluated against its own trajectory. It fails CLOSED — a nil provider, an
-// LLM error, or an unparseable response all return LoopVerdictDeny (with an
-// explanatory reasoning) and a nil error, so the caller can stop the run
-// without inventing a transport error.
+// evaluated against its own trajectory. It fails CLOSED — a nil caller, an
+// LLM error, or an unparseable response (after the oneshot nudge loop) all
+// return LoopVerdictDeny (with an explanatory reasoning) and a nil error, so
+// the caller can stop the run without inventing a transport error.
 func (j *ToolJudge) JudgeStepLimit(ctx context.Context, req StepLimitJudgeRequest) (LoopVerdict, string, error) {
 	log := j.logger
 
-	// provider and model are write-once (set in NewToolJudge, never mutated),
-	// so they are read without the lock — mirroring Judge.
-	if j.provider == nil {
+	// caller is write-once (set in NewToolJudge, never mutated), so it is
+	// read without the lock — mirroring Judge.
+	if j.caller == nil {
 		if log != nil {
 			log.Warn("step-limit judge: provider unavailable, fail-closed to DENY")
 		}
@@ -130,26 +131,21 @@ func (j *ToolJudge) JudgeStepLimit(ctx context.Context, req StepLimitJudgeReques
 	}
 
 	userPrompt := buildStepLimitUserPrompt(req)
-	chatReq := llm.ChatRequest{
-		Model: j.model,
-		Messages: []llm.Message{
-			{Role: "system", Content: judge_prompts.StepLimitSystem},
-			{Role: "user", Content: userPrompt},
-		},
-		MaxTokens: 200,
-		// Deterministic sampling class — the judge calls the provider directly,
-		// bypassing the router; the purpose is declared for consistency and the
-		// deterministic profile is pinned explicitly (see [judgeSamplingPin]).
-		CallPurpose: llm.CallPurposeRouting,
-		Temperature: judgeSamplingPin(j.model),
-	}
+	chatReq := judgeChatRequest(judge_prompts.StepLimitSystem, userPrompt, 200, judgeReasoningEffort(j.routeCaller))
 
-	// Bound the judge call so a slow/hung provider cannot stall the run at the
-	// boundary; on timeout the fail-closed DENY below applies.
-	judgeCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
-
-	resp, err := j.provider.ChatCompletion(judgeCtx, chatReq)
+	// One-shot call with the unified parse-failure nudge loop (two nudges,
+	// three attempts) and the fail-closed DENY as the final refusal. The
+	// timeout budget is the caller's ctx — whatever deadline the host arms
+	// on it (a service timeout, a run context, the provider client's own
+	// request budget); the judge keeps no private deadline, so all attempts
+	// share ONE budget instead of a fresh one per attempt.
+	result, err := oneshot.Do(ctx, j.caller, chatReq, parseLoopJudgeChat, oneshot.Options[loopJudgeResult]{
+		Kind:          "judge_step_limit",
+		Logger:        log,
+		OnFailure:     oneshot.OnFailureFailSafe,
+		FallbackValue: loopJudgeResult{verdict: LoopVerdictDeny, reasoning: loopJudgeUnparsedReason},
+		RetryHint:     stepLimitJudgeRetryHint,
+	})
 	if err != nil {
 		if log != nil {
 			// Do not log the provider error: provider diagnostics can echo the
@@ -159,28 +155,15 @@ func (j *ToolJudge) JudgeStepLimit(ctx context.Context, req StepLimitJudgeReques
 		}
 		return LoopVerdictDeny, "Step-limit judge evaluation failed; stopping for safety", nil
 	}
-	if resp == nil {
-		if log != nil {
-			log.Warn("step-limit judge: empty response, fail-closed to DENY")
-		}
-		return LoopVerdictDeny, "Step-limit judge returned no response; stopping for safety", nil
-	}
 
-	content := strings.TrimSpace(resp.Message.Content)
-	verdict, reasoning := parseLoopVerdict(content)
-
-	if reasoning == loopJudgeUnparsedReason && log != nil {
-		log.Warn("step-limit judge: could not parse LLM response, fail-closed to DENY",
-			"raw_response", strutil.TruncateUTF8(content, 500))
-	}
 	if log != nil {
 		log.Debug("step-limit judge: verdict",
-			"verdict", verdict.String(),
+			"verdict", result.verdict.String(),
 			"category", normaliseAbortCategory(req.AbortCategory),
-			"reasoning", strutil.TruncateUTF8(reasoning, 160),
+			"reasoning", strutil.TruncateUTF8(result.reasoning, 160),
 		)
 	}
-	return verdict, reasoning, nil
+	return result.verdict, result.reasoning, nil
 }
 
 // normaliseAbortCategory maps an unrecognised/empty category onto the
@@ -281,43 +264,58 @@ func sanitizeMultiline(s string) string {
 	}, strings.TrimSpace(s))
 }
 
-// parseLoopVerdict extracts a LoopVerdict and reasoning from a judge response,
-// tolerating the formatting variations models produce (KEY: value lines,
-// markdown decoration, a JSON object, or a bare token). Any total parse
-// failure yields LoopVerdictDeny with loopJudgeUnparsedReason.
-func parseLoopVerdict(content string) (verdict LoopVerdict, reason string) {
+// loopJudgeResult pairs the parsed verdict with its reasoning for the
+// one-shot parse function and the fail-safe fallback value.
+type loopJudgeResult struct {
+	verdict   LoopVerdict
+	reasoning string
+}
+
+// parseLoopJudgeChat extracts a loop verdict from a one-shot ChatResponse. It
+// is the step-limit judge's oneshot.Parse function: every candidate text
+// field (Content → ReasoningContent → Reasoning) is run through the
+// string-level parser. A total parse failure returns an error — oneshot's
+// nudge loop re-asks, and the judge's OnFailureFailSafe policy supplies the
+// fail-closed terminal DENY.
+func parseLoopJudgeChat(resp *llm.ChatResponse) (loopJudgeResult, error) {
+	for _, candidate := range oneshot.CandidateTexts(resp) {
+		if verdict, reason, ok := parseLoopVerdictText(candidate); ok {
+			return loopJudgeResult{verdict: verdict, reasoning: reason}, nil
+		}
+	}
+	return loopJudgeResult{}, errors.New("step-limit judge: no verdict recovered from the response")
+}
+
+// parseLoopVerdictText extracts a LoopVerdict and reasoning from one candidate
+// text, tolerating the formatting variations models produce (KEY: value lines,
+// markdown decoration via the oneshot parser toolkit, a JSON object, or a bare
+// token). ok=false marks a total parse failure; the caller decides whether
+// that triggers a format nudge or the fail-closed DENY.
+func parseLoopVerdictText(content string) (verdict LoopVerdict, reason string, ok bool) {
 	content = strings.TrimSpace(content)
 	if content == "" {
-		return LoopVerdictDeny, loopJudgeUnparsedReason
+		return LoopVerdictDeny, loopJudgeUnparsedReason, false
 	}
 
-	if v, r, ok := parseLoopVerdictJSON(content); ok {
+	if v, r, jok := parseLoopVerdictJSON(content); jok {
 		if r == "" {
 			r = defaultLoopReason(v)
 		}
-		return v, r
+		return v, r, true
 	}
 
 	foundVerdict := false
-	for _, raw := range strings.Split(content, "\n") {
-		line := stripJudgeLineDecoration(strings.TrimSpace(raw))
-		if line == "" {
-			continue
-		}
-		m := judgeKeyRe.FindStringSubmatch(line)
-		if m == nil {
-			continue
-		}
-		key := strings.ToLower(m[1])
-		val := strings.TrimSpace(m[2])
+	for _, kv := range oneshot.ParseKeyLines(content, "verdict", "reason") {
 		switch {
-		case strings.HasPrefix(key, "verdict"):
-			if v, ok := matchLoopVerdict(val); ok {
+		case strings.HasPrefix(kv.Key, "verdict"):
+			if v, mok := matchLoopVerdict(kv.Value); mok {
 				verdict = v
 				foundVerdict = true
 			}
-		case strings.HasPrefix(key, "reason"):
-			reason = normalizeReason(val)
+		default: // "reason" — the key-line parser's prefix-extends semantics
+			// covers the REASONING alias. Last reason line wins, mirroring the
+			// historical parser.
+			reason = oneshot.Unquote(kv.Value)
 		}
 	}
 
@@ -325,32 +323,42 @@ func parseLoopVerdict(content string) (verdict LoopVerdict, reason string) {
 		// Fall back to a bare token: matchLoopVerdict accepts only an exact
 		// one/two-token run, so prose that merely contains a verdict word
 		// does not match and the response stays unparsed (fail-closed DENY).
-		if v, ok := matchLoopVerdict(content); ok {
+		if v, mok := matchLoopVerdict(content); mok {
 			verdict = v
 			foundVerdict = true
 		}
 	}
 	if !foundVerdict {
-		return LoopVerdictDeny, loopJudgeUnparsedReason
+		return LoopVerdictDeny, loopJudgeUnparsedReason, false
 	}
 	if reason == "" {
 		reason = defaultLoopReason(verdict)
 	}
-	return verdict, reason
+	return verdict, reason, true
+}
+
+// loopResponseJSON models the JSON verdict objects some models emit despite
+// the two-line format. encoding/json matches keys case-insensitively.
+type loopResponseJSON struct {
+	Verdict   string `json:"verdict"`
+	Decision  string `json:"decision"`
+	Reason    string `json:"reason"`
+	Reasoning string `json:"reasoning"`
 }
 
 // parseLoopVerdictJSON extracts a loop verdict from a JSON object embedded in
-// prose ({"verdict":"ALLOW_ONCE","reason":"..."}).
+// prose ({"verdict":"ALLOW_ONCE","reason":"..."}). llm.ExtractJSON recovers
+// fenced blocks and the outermost brace pair.
 func parseLoopVerdictJSON(content string) (LoopVerdict, string, bool) {
-	raw := judgeJSONRe.FindString(content)
+	raw := llm.ExtractJSON(content)
 	if raw == "" {
 		return LoopVerdictDeny, "", false
 	}
-	var obj map[string]any
+	var obj loopResponseJSON
 	if err := json.Unmarshal([]byte(raw), &obj); err != nil {
 		return LoopVerdictDeny, "", false
 	}
-	verdictStr := firstJSONString(obj, "verdict", "decision")
+	verdictStr := firstNonEmpty(obj.Verdict, obj.Decision)
 	if verdictStr == "" {
 		return LoopVerdictDeny, "", false
 	}
@@ -358,7 +366,7 @@ func parseLoopVerdictJSON(content string) (LoopVerdict, string, bool) {
 	if !ok {
 		return LoopVerdictDeny, "", false
 	}
-	return v, normalizeReason(firstJSONString(obj, "reason", "reasoning")), true
+	return v, oneshot.Unquote(firstNonEmpty(obj.Reason, obj.Reasoning)), true
 }
 
 // matchLoopVerdict maps a free-form verdict token onto a LoopVerdict. Separators
@@ -371,7 +379,7 @@ func parseLoopVerdictJSON(content string) (LoopVerdict, string, bool) {
 // bare ALLOW grants the minimal extension (AllowOnce) — never a full batch —
 // so an under-specified ALLOW cannot silently unlock unlimited work.
 func matchLoopVerdict(val string) (LoopVerdict, bool) {
-	norm := strings.ToUpper(strings.TrimSpace(trimEmphasis(val)))
+	norm := strings.ToUpper(strings.TrimSpace(oneshot.TrimEmphasis(val)))
 	norm = strings.NewReplacer("_", " ", "-", " ", ".", " ").Replace(norm)
 	fields := strings.Fields(norm)
 	switch len(fields) {

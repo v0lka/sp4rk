@@ -454,3 +454,146 @@ func TestReflector_TrustedObservationNotWrapped(t *testing.T) {
 		t.Error("expected trusted observation to appear verbatim")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// oneshot two-nudge retry policy
+// ---------------------------------------------------------------------------
+
+// TestReflector_TwoNudgePolicy pins the oneshot retry contract: two
+// unparseable responses produce two nudges (each an assistant echo of the
+// failed output followed by a "[System]" user message restating the
+// reflection JSON contract), a parseable third answer succeeds, and the
+// sanitize layer still applies to the parsed reflection.
+func TestReflector_TwoNudgePolicy(t *testing.T) {
+	calls := 0
+	mock := &mockLLMCaller{
+		callFn: func(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
+			calls++
+			switch calls {
+			case 1, 2:
+				return &llm.ChatResponse{
+					Message:    llm.Message{Role: "assistant", Content: "analysis prose, not JSON"},
+					StopReason: "end_turn",
+				}, nil
+			default:
+				return &llm.ChatResponse{
+					Message: llm.Message{
+						Role:    "assistant",
+						Content: `{"summary":"transient","root_cause":"flaky test","suggested_action":"custom-unknown","action_plan":"rerun"}`,
+					},
+					StopReason: "end_turn",
+				}, nil
+			}
+		},
+	}
+
+	r := newTestReflector(mock)
+	reflection, err := r.Reflect(context.Background(), nil, nil, nil)
+	if err != nil {
+		t.Fatalf("expected success on the third attempt, got error: %v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("expected exactly 3 LLM calls (initial + two nudges), got %d", calls)
+	}
+	if reflection.SuggestedAction != "retry" {
+		t.Errorf("sanitize layer must default unknown actions to retry, got %q", reflection.SuggestedAction)
+	}
+	if reflection.Timestamp.IsZero() {
+		t.Error("expected the reflection timestamp to be set")
+	}
+
+	for _, attempt := range []int{2, 3} {
+		msgs := mock.calls[attempt-1].Messages
+		wantLen := 2 + 2*(attempt-1) // original [system, user] + one [echo, nudge] pair per prior failure
+		if len(msgs) != wantLen {
+			t.Fatalf("attempt %d: expected %d messages, got %d", attempt, wantLen, len(msgs))
+		}
+		echo, nudge := msgs[wantLen-2], msgs[wantLen-1]
+		if echo.Role != "assistant" || echo.Content != "analysis prose, not JSON" {
+			t.Errorf("attempt %d: echo = (%q, %q), want assistant echo of the failed output", attempt, echo.Role, echo.Content)
+		}
+		if nudge.Role != "user" {
+			t.Errorf("attempt %d: nudge role = %q, want user", attempt, nudge.Role)
+		}
+		if !strings.HasPrefix(nudge.Content, "[System]") {
+			t.Errorf("attempt %d: nudge must start with %q, got %q", attempt, "[System]", nudge.Content)
+		}
+		if !strings.Contains(nudge.Content, `"suggested_action" ("retry", "replan", or "abort")`) {
+			t.Errorf("attempt %d: nudge must restate the reflection JSON contract, got %q", attempt, nudge.Content)
+		}
+	}
+}
+
+// TestReflector_FinalRefusalAfterThreeAttempts pins the retry budget: three
+// consecutive unparseable responses exhaust the policy (exactly three LLM
+// calls) and the final error is a parse refusal carrying the established
+// "failed to parse reflection response" prefix.
+func TestReflector_FinalRefusalAfterThreeAttempts(t *testing.T) {
+	mock := &mockLLMCaller{
+		callFn: func(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
+			return &llm.ChatResponse{
+				Message:    llm.Message{Role: "assistant", Content: "not valid json"},
+				StopReason: "end_turn",
+			}, nil
+		},
+	}
+
+	r := newTestReflector(mock)
+	_, err := r.Reflect(context.Background(), nil, nil, nil)
+	if err == nil {
+		t.Fatal("expected final parse refusal after three attempts")
+	}
+	if !errors.Is(err, errReflectionUnparseable) {
+		t.Errorf("expected errReflectionUnparseable in the error chain, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "failed to parse reflection response") {
+		t.Errorf("expected the reflection parse-refusal prefix, got: %v", err)
+	}
+	if len(mock.calls) != 3 {
+		t.Errorf("expected exactly 3 LLM calls (initial + two nudges), got %d", len(mock.calls))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// reasoning tier resolution
+// ---------------------------------------------------------------------------
+
+// TestReflector_ReasoningTierOffResolution verifies the one-shot reflection
+// policy: with a known family/model the call resolves reasoning tier OFF to
+// the family's native disable spelling via llm.ReasoningForCall, while an
+// explicit SetReasoningEffort override still wins.
+func TestReflector_ReasoningTierOffResolution(t *testing.T) {
+	newRecordingMock := func() *mockLLMCaller {
+		return &mockLLMCaller{
+			callFn: func(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
+				return &llm.ChatResponse{
+					Message:    llm.Message{Role: "assistant", Content: `{"summary":"ok","suggested_action":"retry"}`},
+					StopReason: "end_turn",
+				}, nil
+			},
+		}
+	}
+
+	t.Run("known family/model resolves tier off", func(t *testing.T) {
+		mock := newRecordingMock()
+		r := New(mock, Config{SystemPrompt: "You are a reflector.", Family: "qwen", Model: "qwen3.8-max"})
+		if _, err := r.Reflect(context.Background(), nil, nil, nil); err != nil {
+			t.Fatalf("Reflect returned error: %v", err)
+		}
+		if got := mock.lastCall().ReasoningEffort; got != "Off" {
+			t.Errorf("expected ReasoningEffort=%q for the qwen tier-Off policy, got %q", "Off", got)
+		}
+	})
+
+	t.Run("explicit override beats the tier resolution", func(t *testing.T) {
+		mock := newRecordingMock()
+		r := New(mock, Config{SystemPrompt: "You are a reflector.", Family: "qwen", Model: "qwen3.8-max"})
+		r.SetReasoningEffort("low")
+		if _, err := r.Reflect(context.Background(), nil, nil, nil); err != nil {
+			t.Fatalf("Reflect returned error: %v", err)
+		}
+		if got := mock.lastCall().ReasoningEffort; got != "low" {
+			t.Errorf("expected explicit ReasoningEffort=%q to win, got %q", "low", got)
+		}
+	})
+}

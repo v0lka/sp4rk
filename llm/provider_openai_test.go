@@ -2106,6 +2106,85 @@ func TestApplyGLMReasoning(t *testing.T) {
 	}
 }
 
+// TestApplyKimiReasoning pins the Kimi reasoning-control mapping, in
+// particular the fail-closed contract: only the K3 series documents the
+// reasoning_effort field, so the value is emitted for K3-series models with a
+// documented effort spelling and dropped (no field at all) for every other
+// kimi model and every value outside the documented set — a strict gateway
+// rejects unknown request fields, and for the thinking-locked models the
+// omitted parameter resolves to the server-managed default.
+func TestApplyKimiReasoning(t *testing.T) {
+	tests := []struct {
+		name   string
+		model  string
+		effort string
+		want   string
+	}{
+		{"kimi-k3 low emits reasoning_effort", "kimi-k3", "low", "low"},
+		{"kimi-k3 high emits reasoning_effort", "kimi-k3", "high", "high"},
+		{"kimi-k3 max emits reasoning_effort", "kimi-k3", "max", "max"},
+		{"kimi code alias k3 emits reasoning_effort", "k3", "low", "low"},
+		{"kimi code alias k3-256k emits reasoning_effort", "k3-256k", "low", "low"},
+		{"kimi-k3 matching is case-insensitive", "KIMI-K3", "low", "low"},
+		{"composite model id strips the provider prefix", "moonshotai/kimi-k3", "low", "low"},
+		{"kimi-k3 On is outside the documented set", "kimi-k3", "On", ""},
+		{"kimi-k3 Off is outside the documented set", "kimi-k3", "Off", ""},
+		{"kimi-k3 medium is outside the documented set", "kimi-k3", "medium", ""},
+		{"kimi-k3 unknown effort fails closed", "kimi-k3", "turbo", ""},
+		{"kimi-k2.7-code has no documented effort field", "kimi-k2.7-code", "low", ""},
+		{"kimi-for-coding has no documented effort field", "kimi-for-coding", "low", ""},
+		{"kimi-k2.6 has no documented effort field", "kimi-k2.6", "low", ""},
+		{"kimi-k2.5 has no documented effort field", "kimi-k2.5", "low", ""},
+		{"kimi-k2 has no documented effort field", "kimi-k2", "low", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			params := &oai.ChatCompletionNewParams{}
+			applyKimiReasoning(params, tt.model, tt.effort)
+			if got := string(params.ReasoningEffort); got != tt.want {
+				t.Errorf("applyKimiReasoning(model=%q, effort=%q) reasoning_effort = %q, want %q",
+					tt.model, tt.effort, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestOpenAIProvider_KimiReasoningSwitch pins the buildChatParams family
+// switch routing for the kimi family: the resolved effort reaches the wire as
+// the top-level reasoning_effort key for K3-series models and is absent for
+// models without a documented field.
+func TestOpenAIProvider_KimiReasoningSwitch(t *testing.T) {
+	p, err := NewOpenAIProvider(OpenAIProviderConfig{
+		Name:    "kimi",
+		APIKey:  "k",
+		BaseURL: "https://example.invalid/v1",
+	})
+	if err != nil {
+		t.Fatalf("NewOpenAIProvider: %v", err)
+	}
+	req := ChatRequest{
+		Model:           "kimi-k3",
+		ModelFamily:     "kimi",
+		Messages:        []Message{{Role: "user", Content: "hi"}},
+		ReasoningEffort: "low",
+	}
+	out := jsonMap(t, p.buildChatParams(req))
+	if out["reasoning_effort"] != "low" {
+		t.Errorf("reasoning_effort = %v (%T), want \"low\"", out["reasoning_effort"], out["reasoning_effort"])
+	}
+
+	locked := ChatRequest{
+		Model:           "kimi-k2.7-code",
+		ModelFamily:     "kimi",
+		Messages:        []Message{{Role: "user", Content: "hi"}},
+		ReasoningEffort: "low",
+	}
+	out = jsonMap(t, p.buildChatParams(locked))
+	if _, present := out["reasoning_effort"]; present {
+		t.Errorf("reasoning_effort = %v, want no field for a thinking-locked kimi model", out["reasoning_effort"])
+	}
+}
+
 // TestOpenAIProvider_NullResponseBodyIsError is a regression test for a crash
 // where a provider returned HTTP 200 with the literal JSON body `null`. The
 // openai-go SDK decodes JSON null into a nil response pointer with a nil error

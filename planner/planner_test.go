@@ -1740,3 +1740,189 @@ func TestPlanDirect_EmptyConversationHistoryPlaceholder(t *testing.T) {
 		t.Errorf("RECENT-CONVERSATION placeholder should be substituted, got:\n%s", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// callAndParsePlan: oneshot two-nudge retry policy
+// ---------------------------------------------------------------------------
+
+// scriptedPlanCaller replays scripted responses in call order and records
+// every request.
+type scriptedPlanCaller struct {
+	responses []*llm.ChatResponse
+	calls     []llm.ChatRequest
+}
+
+func (m *scriptedPlanCaller) Call(_ context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
+	m.calls = append(m.calls, req)
+	if len(m.calls) <= len(m.responses) {
+		return m.responses[len(m.calls)-1], nil
+	}
+	return &llm.ChatResponse{}, nil
+}
+
+func testCallMessages() []llm.Message {
+	return []llm.Message{
+		{Role: "system", Content: "system prompt"},
+		{Role: "user", Content: "task"},
+	}
+}
+
+// TestCallAndParsePlan_TwoNudgePolicy pins the oneshot retry contract: two
+// corrective nudges for two unparseable responses, each nudge an assistant
+// echo of the failed output plus a "[System]" user message carrying the
+// established planner feedback texts (invalid-JSON feedback, then zero-steps
+// feedback), and success on the third attempt.
+func TestCallAndParsePlan_TwoNudgePolicy(t *testing.T) {
+	caller := &scriptedPlanCaller{responses: []*llm.ChatResponse{
+		newPlanResponse(`garbage not json`),
+		newPlanResponse(`{"steps":[]}`),
+		newPlanResponse(`{"steps":[{"id":"step_1","summary":"do it"}]}`),
+	}}
+	p := &Planner{llm: caller, Cfg: makeTestConfig("Plan")}
+
+	plan, err := p.callAndParsePlan(context.Background(), testCallMessages(), nil)
+	if err != nil {
+		t.Fatalf("expected success on the third attempt, got error: %v", err)
+	}
+	if len(plan.Steps) != 1 || plan.Steps[0].ID != "step_1" {
+		t.Errorf("unexpected plan: %+v", plan.Steps)
+	}
+	if len(caller.calls) != 3 {
+		t.Fatalf("expected exactly 3 LLM calls (initial + two nudges), got %d", len(caller.calls))
+	}
+
+	// Attempt 2: one [echo, nudge] pair appended; the nudge carries the
+	// invalid-JSON feedback text with the underlying parse error verbatim.
+	msgs := caller.calls[1].Messages
+	if len(msgs) != 4 {
+		t.Fatalf("attempt 2: expected 4 messages (2 original + echo + nudge), got %d", len(msgs))
+	}
+	if msgs[2].Role != "assistant" || msgs[2].Content != `garbage not json` {
+		t.Errorf("attempt 2: echo = (%q, %q), want assistant echo of the failed output", msgs[2].Role, msgs[2].Content)
+	}
+	if nudge := msgs[3].Content; !strings.HasPrefix(nudge, "[System]") ||
+		!strings.Contains(nudge, "Your response was invalid JSON.") ||
+		!strings.Contains(nudge, "planner: no valid JSON object found in response") {
+		t.Errorf("attempt 2: nudge must restate the invalid-JSON feedback with the parse error, got %q", nudge)
+	}
+
+	// Attempt 3: second [echo, nudge] pair; the nudge carries the zero-steps
+	// feedback text (valid JSON but empty steps array).
+	msgs = caller.calls[2].Messages
+	if len(msgs) != 6 {
+		t.Fatalf("attempt 3: expected 6 messages (2 original + two echo/nudge pairs), got %d", len(msgs))
+	}
+	if msgs[4].Role != "assistant" || msgs[4].Content != `{"steps":[]}` {
+		t.Errorf("attempt 3: echo = (%q, %q), want assistant echo of the zero-steps output", msgs[4].Role, msgs[4].Content)
+	}
+	if nudge := msgs[5].Content; !strings.HasPrefix(nudge, "[System]") ||
+		!strings.Contains(nudge, "Your response was valid JSON but contained zero steps.") ||
+		!strings.Contains(nudge, "plan has zero steps — at least one step is required") {
+		t.Errorf("attempt 3: nudge must restate the zero-steps feedback with the error, got %q", nudge)
+	}
+}
+
+// TestCallAndParsePlan_FinalRefusalAfterThreeAttempts pins the retry budget:
+// three consecutive unparseable responses exhaust the policy (exactly three
+// LLM calls — two nudges) and the final error is a parse refusal, not a
+// transport failure.
+func TestCallAndParsePlan_FinalRefusalAfterThreeAttempts(t *testing.T) {
+	caller := &scriptedPlanCaller{responses: []*llm.ChatResponse{
+		newPlanResponse(`nope 1`),
+		newPlanResponse(`nope 2`),
+		newPlanResponse(`nope 3`),
+	}}
+	p := &Planner{llm: caller, Cfg: makeTestConfig("Plan")}
+
+	_, err := p.callAndParsePlan(context.Background(), testCallMessages(), nil)
+	if err == nil {
+		t.Fatal("expected final parse refusal after three attempts")
+	}
+	if !errors.Is(err, errPlanUnparseable) {
+		t.Errorf("expected errPlanUnparseable in the error chain, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "planner: failed to parse plan response") {
+		t.Errorf("expected the planner parse-refusal prefix, got: %v", err)
+	}
+	if len(caller.calls) != 3 {
+		t.Errorf("expected exactly 3 LLM calls (initial + two nudges), got %d", len(caller.calls))
+	}
+}
+
+// TestCallAndParsePlan_TransportErrorNotRetried pins that transport failures
+// surface immediately (no nudge retries) wrapped as LLM call failures.
+func TestCallAndParsePlan_TransportErrorNotRetried(t *testing.T) {
+	p := &Planner{llm: &failingPlanCaller{err: errors.New("llm down")}, Cfg: makeTestConfig("Plan")}
+
+	_, err := p.callAndParsePlan(context.Background(), testCallMessages(), nil)
+	if err == nil {
+		t.Fatal("expected error from LLM failure")
+	}
+	if !strings.Contains(err.Error(), "planner: LLM call failed") {
+		t.Errorf("expected the transport-failure prefix, got: %v", err)
+	}
+}
+
+// failingPlanCaller always returns a transport error.
+type failingPlanCaller struct{ err error }
+
+func (f *failingPlanCaller) Call(context.Context, llm.ChatRequest) (*llm.ChatResponse, error) {
+	return nil, f.err
+}
+
+// ---------------------------------------------------------------------------
+// callAndParsePlan: reasoning tier resolution
+// ---------------------------------------------------------------------------
+
+// TestCallAndParsePlan_ReasoningTierOffResolution verifies the one-shot
+// planning policy: with a known planning model the call resolves reasoning
+// tier OFF to the family's native disable spelling via llm.ReasoningForCall,
+// while an explicit Cfg.ReasoningEffort override still wins and an unknown
+// model sends no reasoning field at all.
+func TestCallAndParsePlan_ReasoningTierOffResolution(t *testing.T) {
+	validPlan := newPlanResponse(`{"steps":[{"id":"step_1","summary":"do it"}]}`)
+
+	t.Run("known planning model resolves tier off", func(t *testing.T) {
+		caller := &scriptedPlanCaller{responses: []*llm.ChatResponse{validPlan}}
+		cfg := makeTestConfig("Plan")
+		cfg.ModelRegistry = llm.NewModelRegistry(nil)
+		cfg.Model = "qwen3.8-max"
+		p := &Planner{llm: caller, Cfg: cfg}
+
+		if _, err := p.callAndParsePlan(context.Background(), testCallMessages(), nil); err != nil {
+			t.Fatalf("callAndParsePlan returned error: %v", err)
+		}
+		if got := caller.calls[0].ReasoningEffort; got != "Off" {
+			t.Errorf("expected ReasoningEffort=%q for the qwen tier-Off policy, got %q", "Off", got)
+		}
+	})
+
+	t.Run("explicit override wins", func(t *testing.T) {
+		caller := &scriptedPlanCaller{responses: []*llm.ChatResponse{validPlan}}
+		cfg := makeTestConfig("Plan")
+		cfg.ModelRegistry = llm.NewModelRegistry(nil)
+		cfg.Model = "qwen3.8-max"
+		cfg.ReasoningEffort = "low"
+		p := &Planner{llm: caller, Cfg: cfg}
+
+		if _, err := p.callAndParsePlan(context.Background(), testCallMessages(), nil); err != nil {
+			t.Fatalf("callAndParsePlan returned error: %v", err)
+		}
+		if got := caller.calls[0].ReasoningEffort; got != "low" {
+			t.Errorf("expected explicit ReasoningEffort=%q to win, got %q", "low", got)
+		}
+	})
+
+	t.Run("unknown model sends no reasoning field", func(t *testing.T) {
+		caller := &scriptedPlanCaller{responses: []*llm.ChatResponse{validPlan}}
+		cfg := makeTestConfig("Plan")
+		p := &Planner{llm: caller, Cfg: cfg}
+
+		if _, err := p.callAndParsePlan(context.Background(), testCallMessages(), nil); err != nil {
+			t.Fatalf("callAndParsePlan returned error: %v", err)
+		}
+		if got := caller.calls[0].ReasoningEffort; got != "" {
+			t.Errorf("expected no reasoning field for an unknown model, got %q", got)
+		}
+	})
+}

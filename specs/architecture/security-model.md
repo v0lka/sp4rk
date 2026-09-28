@@ -121,15 +121,26 @@ This is the SDK hook a host uses to implement its own safety checks (for example
 
 The separate `ToolJudge` (`github.com/v0lka/sp4rk/tools` `judge.go`) is an LLM-backed **advisory** safety evaluation invoked on demand by the host — it is not an automatic gate.
 
+### Judge wiring (a caller, not a provider)
+
+All three judges — advisory `Judge`, `JudgeStrict`, and the loop judge `JudgeStepLimit` — issue their LLM calls through the unified one-shot client (`oneshot.Do`, see [../domains/oneshot.md](../domains/oneshot.md)) over a **caller** (`NewToolJudge(caller, tracker, maxCacheSize, logger)`): by construction the session's `llm.Router`, never a pinned provider/model pair ([decision 008](../decisions/008-unified-oneshot-service-client.md)). Security- and operation-relevant consequences:
+
+- **The judge rides the active model.** Requests carry no model; the Router fills its active one. Switching the session's model re-targets the judges; there is no judge model knob left to fall out of sync with a pinned provider pair.
+- **Token accounting is structural.** When a `*llm.UsageTracker` is supplied, the caller is wrapped in `llm.TrackingCaller`, so judge consumption lands in the session's accounting no matter which judge path fires. (Supplying a tracker on top of an already-tracking caller would double-count.)
+- **No private timeout.** The deadline is the caller's ctx — the host's single service timeout; the judges' former 2-minute private budgets are gone.
+- **No pinned sampling.** Judge requests declare `CallPurposeRouting`, so the Router layers the model catalog's deterministic temperature and strips sampling entirely for models that authoritatively reject the parameter (a former hard-pinned temperature 400-ed on those endpoints).
+- **Reasoning tier Off.** The effort spelling is resolved per call via `llm.ReasoningForCall` from the caller's `ActiveModel()` (probed on the unwrapped caller); verdicts are short structured decisions and effort-seeded families default to their strongest effort, so reasoning-off is the judges' fixed policy. A caller that hides its active model degrades to sending no reasoning field.
+- **Fail-safe resolution.** The final parse refusal and transport errors resolve to the same typed fail-safe terminals as unparseable output (CONFIRM for advisory/strict, DENY for the loop judge), and provider error text is never logged — the one-shot client's records carry no model output or provider diagnostics, both of which can echo untrusted tool arguments.
+
 ### Strict ToolJudge mode
 
 `ToolJudge.JudgeStrict(ctx, StrictJudgeRequest)` is the conservative LLM primitive a host may invoke when deciding whether a soft confirmation escalation can be auto-resolved. `StrictJudgeRequest` supplies `ToolName`, raw `Input`, `TaskContext`, `ToolSource`, and optionally `AnalysisContext` (the one-line flowsh digest for shell tools — empty for non-shell tools, and the envelope field is omitted entirely); the judge adds compact environment information and the current `SessionRoots(ctx)`.
 
 Strict mode differs from advisory `Judge` in three security-relevant ways:
 
-1. It performs one LLM call for every invocation. Internal-tool and in-session path fast paths are disabled, and no verdict cache is read or written.
+1. It performs one uncached evaluation per invocation: the one-shot loop may re-ask with corrective nudges on consecutive parse failures (two nudges, three attempts — see [../domains/oneshot.md](../domains/oneshot.md)), but internal-tool and in-session path fast paths are disabled and no verdict cache is ever read or written.
 2. It serializes a JSON envelope rather than interpolating the tool arguments into instructions. Raw input, host-supplied session-directory values, and the host's judge reasoning (host-generated, but it may quote fragments of the untrusted command, e.g. an unresolvable path-like token) are wrapped in `untrusted-content` boundaries and line-sanitized before serialization.
-3. It accepts only the strict `VERDICT`/`REASON` response contract — a three-verdict scale in which `DENY` is a deliberate rejection (the judge positively assessed the call as dangerous; the call must not run) and `CONFIRM` means the judge cannot decide and defers to a human. Missing provider, request construction failure, provider error, cancellation/timeout, nil response, and unparseable output all return `VerdictConfirm`. Provider error text is excluded from strict logs because it may echo sensitive tool input.
+3. It accepts only the strict `VERDICT`/`REASON` response contract — a three-verdict scale in which `DENY` is a deliberate rejection (the judge positively assessed the call as dangerous; the call must not run) and `CONFIRM` means the judge cannot decide and defers to a human. Missing caller, request construction failure, provider error, cancellation/timeout, nil response, and unparseable output after the repair loop all return `VerdictConfirm`. Provider error text is excluded from strict logs because it may echo sensitive tool input.
 
 Strict mode remains advisory to the host: it returns an allow/confirm/deny recommendation and never bypasses `PolicyAlwaysDeny`, a hard `JudgeSeverity`, or registry confirmation policy by itself.
 
@@ -139,10 +150,10 @@ Strict mode remains advisory to the host: it returns an allow/confirm/deny recom
 
 Security properties, mirroring strict mode:
 
-1. One uncached LLM call per boundary — each decision is judged against its own trajectory.
+1. One uncached evaluation per boundary — each decision is judged against its own trajectory (the one-shot loop may re-ask on parse failures; the cache is never read or written).
 2. Every value that may quote untrusted content (task, plan snapshot, breaker reason, step digests with tool args/results) is line-sanitized and wrapped in an `untrusted-content` boundary inside the prompt envelope.
 3. The verdict parses only from an explicit token (`VERDICT:` line value, JSON field, or bare token — at most `ALLOW` plus one qualifier); prose that merely contains a verdict word is a parse failure, so negative prose can never grant `ALLOW_ALWAYS`.
-4. Fail-closed: missing provider, provider error, timeout, nil response, and unparseable output all return `LoopVerdictDeny` (stop) with a nil error, and provider error text is excluded from logs.
+4. Fail-closed: missing caller, provider error, timeout, nil response, and unparseable output after the repair loop all return `LoopVerdictDeny` (stop) with a nil error, and provider error text is excluded from logs.
 
 The verdict (`deny`/`allow_once`/`allow_more`/`allow_always`) is a recommendation the host maps onto its step-limit response handling; it never grants budget by itself. See [../contracts/tools.md](../contracts/tools.md).
 
@@ -316,8 +327,9 @@ File-based defaults, session roots, and blacklist regexes are host-application c
 - The untrusted-content boundary survives compaction: `ContextWindow` re-wraps untrusted tool messages retained in the frozen compacted prefix, so untrusted content never re-enters LLM context raw after compaction.
 - `WrapUntrustedContent` always sanitizes its content with `StripUntrustedTags` first.
 - An MCP tool registration can never overwrite an existing non-MCP tool.
-- The LLM-powered advisory `ToolJudge` cache key incorporates session roots and partitions cached verdicts by directory scope; its prompt carries the same wrapped scope data.
-- `ToolJudge.JudgeStrict` performs an uncached, no-fast-path LLM evaluation per invocation and maps every construction/provider/timeout/parse failure to `VerdictConfirm` without logging potentially sensitive provider diagnostics.
+- The LLM-powered advisory `ToolJudge` cache key incorporates the serving model, session roots, and the rendered static-analysis block alongside tool name and input — partitions by model and directory scope, because the judge rides the caller's active model and its prompt depends on both; its prompt carries the same wrapped scope data.
+- The LLM judges own no provider, model, timeout, or sampling policy of their own: they issue one-shot calls through a caller (the session's `llm.Router`), account tokens through `llm.TrackingCaller` when a tracker is supplied, resolve reasoning to tier Off from the caller's active model, and map a nil caller (like any transport or parse failure) to their fail-safe terminal.
+- `ToolJudge.JudgeStrict` performs an uncached, no-fast-path evaluation per invocation and maps every construction/provider/timeout/parse failure to `VerdictConfirm` without logging potentially sensitive provider diagnostics.
 - `ToolJudge.JudgeStepLimit` (loop judge) is likewise uncached, parses verdicts only from explicit tokens (prose containing a verdict word is a parse failure), wraps the task, plan snapshot, breaker reason, and trajectory in untrusted-content boundaries, and maps every provider/timeout/parse failure to `LoopVerdictDeny` without logging provider diagnostics.
 - The LLM-powered `ToolJudge` verdict parser fails **safe** to `VerdictConfirm` on any unrecognized or ambiguous verdict: verdict tokens are matched whole-token (case-insensitive), so negations of allow-words (e.g. `DISALLOW`, `DISAPPROVE`) are never misclassified as `VerdictAllow` — they map to the deliberate-rejection `VerdictDeny`. An LLM error likewise yields `VerdictConfirm`. See [../contracts/tools.md](../contracts/tools.md) for the verdict vocabulary.
 
@@ -334,3 +346,4 @@ File-based defaults, session roots, and blacklist regexes are host-application c
 - [layers.md](layers.md) - Where the security primitives live in the package hierarchy
 - [data-flow.md](data-flow.md) - Tool execution flow and the fail-closed gate
 - [../contracts/tools.md](../contracts/tools.md) - The Tool and ToolJudger interface contract
+- [../domains/oneshot.md](../domains/oneshot.md) - The one-shot client the LLM judges issue their calls through (wiring, fail-safe terminals, logging posture)

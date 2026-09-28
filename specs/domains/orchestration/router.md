@@ -57,7 +57,7 @@ Semantic tool selection is opt-in. It is disabled by default and enabled either 
 
 - A tool-selection instruction is injected into the prompt (via the `TOOL-MATCHING` placeholder), directing the LLM to pick the relevant tools from the available set and return them in `matched_tools`.
 - The JSON output schema (injected via the `JSON-OUTPUT-SCHEMA` placeholder) includes a `matched_tools` array alongside the base fields.
-- The repair prompt used after an invalid-JSON retry echoes the active schema, including `matched_tools`.
+- The repair nudge issued on a parse failure restates the active schema, including `matched_tools` (see [../oneshot.md](../oneshot.md)).
 - `RoutingDecision.MatchedTools` is populated, deduplicated, and trimmed during validation.
 
 When disabled, the tool-selection instruction is omitted, the schema resolves to the default (without `matched_tools`), and behavior is identical to before the feature existed. `MatchedTools` is the host's to consume (e.g. to narrow the tool pool handed to a step); the Router itself does not modify the tool registry.
@@ -66,10 +66,9 @@ When disabled, the tool-selection instruction is omitted, the schema resolves to
 
 1. Build the system prompt from the caller-supplied template. The template must contain `AVAILABLE-TOOLS` and `AVAILABLE-SKILLS` placeholders. Tool/skill lists and any project-context section are substituted via single-pass data substitution (placeholders inside these externally-influenced values are never expanded). The template may optionally include `TOOL-MATCHING` and `JSON-OUTPUT-SCHEMA` placeholders; these resolve to in-package trusted constants (iterative substitution): when tool matching is off, `TOOL-MATCHING` resolves to empty and `JSON-OUTPUT-SCHEMA` resolves to the default schema. A template without these placeholders behaves exactly as before — `Replace` is a no-op for absent placeholders.
 2. Construct messages: system + history (last `HistoryWindow`) + `"Classify this request: {msg}"`.
-3. Apply the reasoning effort set via `SetReasoningEffort`.
-4. Call the LLM.
-5. Extract JSON from the response via `llm.ExtractJSON` (handles surrounding prose and markdown fences).
-6. Unmarshal into `RoutingDecision`; validate and clamp.
+3. Apply the resolved reasoning effort: an explicit `SetReasoningEffort` override wins; otherwise the service-call policy — reasoning tier Off, resolved to the serving model's native disable spelling via `llm.ReasoningForCall` from `Config.Family`/`Config.Model` (`""` — no field sent — when the identity is empty or unknown).
+4. Call the LLM through the one-shot client (see [../oneshot.md](../oneshot.md)): the parse function runs `oneshot.ParseJSON` — built on `llm.ExtractJSON`, which handles surrounding prose and markdown fences across all candidate text fields — and unmarshals into `RoutingDecision`.
+5. On success, validate and clamp (rules below).
 
 ### Validation rules
 
@@ -81,15 +80,16 @@ When disabled, the tool-selection instruction is omitted, the schema resolves to
 ### Optional dependencies
 
 - `SetModelRegistry(*llm.ModelRegistry)` — model metadata resolution.
-- `SetReasoningEffort(effort string)` — sets the reasoning effort applied to the LLM call.
+- `Config.Family` / `Config.Model` — optional identity of the serving model used for reasoning-tier resolution; with both empty (or an unknown family) no reasoning field is sent.
+- `SetReasoningEffort(effort string)` — sets a reasoning effort that overrides the tier-Off resolution for subsequent `Route` calls.
 - `Config.ToolMatching` / `SetToolMatching(enabled bool)` — enable semantic tool selection (see [Tool matching](#tool-matching-optional)); defaults to false. `Config.ToolMatching` is equivalent to calling `SetToolMatching(true)` at construction.
 - `Config.AppendContextSections` — a function producing additional prompt sections (e.g. project conventions) inserted via a `PROJECT-CONTEXT` placeholder; if the template lacks that placeholder the section is appended for backward compatibility.
 
 ## Error Handling
 
-- **LLM call failure**: returns an error wrapping the failure (no fallback routing).
-- **JSON parse failure**: one retry with a repair prompt that echoes the active JSON output schema (including `matched_tools` when tool matching is enabled), asking the LLM to fix its JSON.
-- **Second parse failure**: returns an error.
+- **LLM call failure**: returns an error wrapping the failure (no fallback routing). Transport errors are never retried here — provider-level retry is the Router's.
+- **JSON parse failure**: retried by the one-shot client with corrective nudges — an assistant echo of the failed output plus a `[System]` user message restating the active JSON output schema (including `matched_tools` when tool matching is enabled); exactly two nudges, three attempts (see [../oneshot.md](../oneshot.md)).
+- **Final parse failure after the two nudges**: returns an error (`ErrRoutingParse` wrapped with the last parse error).
 
 ## Invariants
 

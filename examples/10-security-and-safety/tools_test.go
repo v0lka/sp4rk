@@ -20,7 +20,7 @@ func TestCustomToolsDeclareCapabilityGroups(t *testing.T) {
 }
 
 func TestStrictJudgeWithoutProviderFailsSafeWithoutNetwork(t *testing.T) {
-	judge := tools.NewToolJudge(nil, "", 0, nil)
+	judge := tools.NewToolJudge(nil, nil, 0, nil)
 	verdict, reason, err := judge.JudgeStrict(context.Background(), tools.StrictJudgeRequest{
 		ToolName:    "append_log",
 		Input:       json.RawMessage(`{"path":"/outside","line":"blocked"}`),

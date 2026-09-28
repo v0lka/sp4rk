@@ -21,10 +21,14 @@ The `Reflector` is a stateless wrapper around an `LLMCaller`: each `Reflect` cal
 type Config struct {
     SystemPrompt  string // reflection system prompt; instructs the LLM on analysis + JSON schema
     AnalyzeFooter string // appended to the user message; defaults to a standard analysis request
+
+    ReasoningEffort string // initial reasoning effort; may be changed at runtime via SetReasoningEffort
+    Family          string // optional model identity for reasoning-tier resolution
+    Model           string
 }
 ```
 
-The system prompt should instruct the model to return a JSON object matching the `Reflection` schema. The reflector extracts JSON from the response (tolerating surrounding prose or markdown fences) and unmarshals it.
+The system prompt should instruct the model to return a JSON object matching the `Reflection` schema. The reflector runs the call through the one-shot client (see [../oneshot.md](../oneshot.md)) and extracts JSON from the response (tolerating surrounding prose or markdown fences) before unmarshalling it. The reasoning effort is resolved per call: an explicit `SetReasoningEffort` (or `Config.ReasoningEffort`) override wins; otherwise the service-call policy applies — reasoning tier Off, resolved to the serving model's native disable spelling via `llm.ReasoningForCall` from `Family`/`Model` (`""` — no field sent — when the identity is empty or unknown).
 
 ### Reflect
 
@@ -83,7 +87,7 @@ Reflections persist on the `orchestration.Blackboard` (`AddReflection` appends; 
 
 ## Error Handling
 
-- Returns an error if the LLM call fails, returns nil, or produces unparseable JSON.
+- Returns an error if the LLM call fails (transport errors are never retried here — provider-level retry is the Router's), returns nil, or stays unparseable after the one-shot client's repair loop: exactly two corrective nudges (assistant echo of the failed output + a `[System]` user message restating the required JSON schema — see [../oneshot.md](../oneshot.md)), then a final refusal wrapping the last parse error. The sanitize layer (below) is untouched by the repair loop.
 - An unrecognised/empty `SuggestedAction` is normalized to `"retry"` rather than treated as an error.
 
 ## Invariants
@@ -100,4 +104,5 @@ Reflections persist on the `orchestration.Blackboard` (`AddReflection` appends; 
 - [planner.md](planner.md) — `SuggestedAction == "replan"` triggers `Planner.Replan`
 - [executor.md](executor.md) — provides the trajectory via `TrajectoryStore`
 - [conductor.md](conductor.md) — runs the steps the reflector analyses
+- [../oneshot.md](../oneshot.md) — the one-shot client the reflection call runs through
 - [../memory/blackboard.md](../memory/blackboard.md) — reflection persistence

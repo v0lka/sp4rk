@@ -157,10 +157,11 @@ func TestRoute_ToolMatchingPromptIncludesToolNames(t *testing.T) {
 }
 
 // TestRoute_ParseErrorAfterRepairIsSentinel verifies that when the routing
-// decision JSON stays unparseable after the built-in repair retry, Route
-// returns an error matching ErrRoutingParse, so callers can detect the
+// decision JSON stays unparseable after the built-in two-nudge repair policy,
+// Route returns an error matching ErrRoutingParse, so callers can detect the
 // exhausted repair cycle and degrade gracefully (e.g. fall back to a default
-// routing decision) instead of failing the whole task.
+// routing decision) instead of failing the whole task. The policy is exactly
+// two nudges: initial call + two corrective nudges = three LLM calls.
 func TestRoute_ParseErrorAfterRepairIsSentinel(t *testing.T) {
 	mock := &mockLLMCaller{
 		responses: []*llm.ChatResponse{{
@@ -177,8 +178,64 @@ func TestRoute_ParseErrorAfterRepairIsSentinel(t *testing.T) {
 	if !errors.Is(err, ErrRoutingParse) {
 		t.Errorf("expected ErrRoutingParse in error chain, got: %v", err)
 	}
-	if mock.callIdx != 2 {
-		t.Errorf("expected initial call + one repair retry (2 LLM calls), got %d", mock.callIdx)
+	if mock.callIdx != 3 {
+		t.Errorf("expected initial call + two repair nudges (3 LLM calls), got %d", mock.callIdx)
+	}
+}
+
+// TestRoute_TwoNudgePolicy verifies the oneshot retry contract end to end:
+// two unparseable responses produce two nudges (each an assistant echo of the
+// failed output followed by a "[System]" user message restating the JSON
+// schema) with roles kept alternating, and a parseable third answer succeeds.
+func TestRoute_TwoNudgePolicy(t *testing.T) {
+	calls := 0
+	mock := &mockLLMCaller{
+		callFn: func(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
+			calls++
+			switch calls {
+			case 1, 2:
+				return &llm.ChatResponse{
+					Message: llm.Message{Role: "assistant", Content: "I think this is a code task"},
+				}, nil
+			default:
+				return &llm.ChatResponse{
+					Message: llm.Message{Role: "assistant", Content: `{"domain":"code","complexity":2,"needs_clarification":false}`},
+				}, nil
+			}
+		},
+	}
+
+	r := newTestRouter(mock, 5)
+	decision, err := r.Route(context.Background(), "fix the bug", nil, nil, nil)
+	if err != nil {
+		t.Fatalf("expected success on the third attempt, got error: %v", err)
+	}
+	if decision.Domain != "code" || decision.Complexity != 2 {
+		t.Errorf("unexpected decision: %+v", decision)
+	}
+	if calls != 3 {
+		t.Fatalf("expected exactly 3 LLM calls (initial + two nudges), got %d", calls)
+	}
+
+	for _, attempt := range []int{2, 3} {
+		msgs := mock.calls[attempt-1].Messages
+		wantLen := 2 + 2*(attempt-1) // original [system, user] + one [echo, nudge] pair per prior failure
+		if len(msgs) != wantLen {
+			t.Fatalf("attempt %d: expected %d messages, got %d", attempt, wantLen, len(msgs))
+		}
+		echo, nudge := msgs[wantLen-2], msgs[wantLen-1]
+		if echo.Role != "assistant" || echo.Content != "I think this is a code task" {
+			t.Errorf("attempt %d: echo = (%q, %q), want assistant echo of the failed output", attempt, echo.Role, echo.Content)
+		}
+		if nudge.Role != "user" {
+			t.Errorf("attempt %d: nudge role = %q, want user", attempt, nudge.Role)
+		}
+		if !strings.HasPrefix(nudge.Content, "[System]") {
+			t.Errorf("attempt %d: nudge must start with %q, got %q", attempt, "[System]", nudge.Content)
+		}
+		if !strings.Contains(nudge.Content, routingJSONSchemaDefault) {
+			t.Errorf("attempt %d: nudge must restate the JSON schema, got %q", attempt, nudge.Content)
+		}
 	}
 }
 
@@ -472,6 +529,55 @@ func TestRoute_NoReasoningEffortWhenEmpty(t *testing.T) {
 	if got != "" {
 		t.Errorf("expected empty ReasoningEffort, got %q", got)
 	}
+}
+
+// TestRoute_ReasoningTierOffResolution verifies the one-shot routing policy:
+// with a known family/model the call resolves reasoning tier OFF to the
+// family's native disable spelling via llm.ReasoningForCall, while an
+// explicit SetReasoningEffort override still wins.
+func TestRoute_ReasoningTierOffResolution(t *testing.T) {
+	newRecordingMock := func() *mockLLMCaller {
+		return &mockLLMCaller{
+			callFn: func(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
+				return &llm.ChatResponse{
+					Message: llm.Message{Role: "assistant", Content: `{"domain":"code","complexity":2}`},
+				}, nil
+			},
+		}
+	}
+
+	t.Run("known family/model resolves tier off to the disable spelling", func(t *testing.T) {
+		mock := newRecordingMock()
+		r := New(mock, Config{
+			SystemPrompt:  "Tools: {{AVAILABLE-TOOLS}}\nSkills: {{AVAILABLE-SKILLS}}",
+			HistoryWindow: 5,
+			Family:        "qwen",
+			Model:         "qwen3.8-max",
+		})
+		if _, err := r.Route(context.Background(), "test", nil, nil, nil); err != nil {
+			t.Fatalf("Route returned error: %v", err)
+		}
+		if got := mock.lastCall().ReasoningEffort; got != "Off" {
+			t.Errorf("expected ReasoningEffort=%q for the qwen tier-Off policy, got %q", "Off", got)
+		}
+	})
+
+	t.Run("explicit override beats the tier resolution", func(t *testing.T) {
+		mock := newRecordingMock()
+		r := New(mock, Config{
+			SystemPrompt:  "Tools: {{AVAILABLE-TOOLS}}\nSkills: {{AVAILABLE-SKILLS}}",
+			HistoryWindow: 5,
+			Family:        "qwen",
+			Model:         "qwen3.8-max",
+		})
+		r.SetReasoningEffort("low")
+		if _, err := r.Route(context.Background(), "test", nil, nil, nil); err != nil {
+			t.Fatalf("Route returned error: %v", err)
+		}
+		if got := mock.lastCall().ReasoningEffort; got != "low" {
+			t.Errorf("expected explicit ReasoningEffort=%q to win, got %q", "low", got)
+		}
+	})
 }
 
 // TestRoute_ToolMatchingInjectsSection verifies that SetToolMatching(true)

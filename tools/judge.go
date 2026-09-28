@@ -6,15 +6,16 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/v0lka/sp4rk/llm"
+	"github.com/v0lka/sp4rk/oneshot"
 	"github.com/v0lka/sp4rk/security"
 	"github.com/v0lka/sp4rk/strutil"
 	"github.com/v0lka/sp4rk/tools/internal/judge_prompts"
@@ -33,49 +34,27 @@ const (
 	strictJudgeFailureReason = "Strict judge evaluation failed; requiring manual confirmation for safety"
 )
 
-// strictJudgeRetryFeedback is appended to the system prompt when the model's
-// first strict-judge response cannot be parsed: the evaluation is re-asked
-// once with the response format restated emphatically. An unparseable
-// response is a format failure, not a danger signal, so one retry happens
-// before the fail-safe CONFIRM (which a silent-mode host resolves as deny).
-// The feedback deliberately does not quote the unparseable response (raw
-// model output may echo untrusted tool arguments) and deliberately keeps the
-// [system, user] message shape — some providers (Gemini) reject consecutive
-// same-role messages.
-const strictJudgeRetryFeedback = "\n\nIMPORTANT: Your previous response could not be parsed. " +
-	"Answer again, strictly as exactly two lines and nothing else:\n" +
-	"VERDICT: ALLOW, DENY or CONFIRM\n" +
-	"REASON: one short sentence"
-
-// judgeSamplingPin returns the deterministic sampling temperature pinned onto
-// every judge LLM call for the given model: verdicts must be reproducible on
-// identical input, so the judge runs on the deterministic sampling profile.
-// The judge calls the provider directly (bypassing the router's
-// applyDefaultSampling), so the profile is reconstructed here from the model
-// id: DetectFamily maps it onto its family and DeterministicTemperature
-// returns the family-safe deterministic value — a flat 0.0 would be rejected
-// outright by endpoints that pin temperature (kimi/google), turning every
-// judge call into a fail-safe CONFIRM.
-func judgeSamplingPin(model string) *float64 {
-	return llm.DeterministicTemperature(string(llm.DetectFamily(model)))
-}
-
-// The following regexes make parseJudgeResponse tolerant of the formatting
-// variations LLMs commonly produce despite the requested two-line format.
-var (
-	// judgeListPrefixRe matches a leading markdown list marker ("- ", "* ",
-	// "+ ", "1. ") so such lines are still recognized as key/value pairs.
-	judgeListPrefixRe = regexp.MustCompile(`^(?:[-*+]|\d+\.)\s+`)
-	// judgeKeyRe matches a "KEY: value" or "KEY = value" pair at the start of a
-	// (markdown-stripped) line. The key is matched case-insensitively and
-	// accepts both VERDICT and REASON/REASONING aliases.
-	judgeKeyRe = regexp.MustCompile(`(?i)^(verdict|reason(?:ing)?)\s*[:=]\s*(.*)$`)
-	// judgeReasonInlineRe locates an inline REASON key within a VERDICT line
-	// value, e.g. "ALLOW — REASON: safe" so a single-line answer is parsed.
-	judgeReasonInlineRe = regexp.MustCompile(`(?i)\breason(?:ing)?\s*[:=]\s*(.*)$`)
-	// judgeJSONRe extracts a JSON object possibly embedded in prose, for models
-	// that emit {"verdict":"ALLOW","reason":"..."} despite the format request.
-	judgeJSONRe = regexp.MustCompile(`(?s)\{.*\}`)
+// The judge retry hints restate the required output format inside oneshot's
+// "[System]" corrective nudge when a response cannot be parsed. An
+// unparseable response is a format failure, not a danger signal, so the
+// oneshot loop re-asks (two nudges, three attempts total) before the judge
+// fail-safes (CONFIRM for advisory/strict — which a silent-mode host resolves
+// as deny — and DENY for the loop judge, fail-closed). The hints deliberately
+// do not quote the unparseable response (raw model output may echo untrusted
+// tool arguments); the response travels back as oneshot's assistant-role echo
+// — the model's own words, never prose inside user/system text — and the
+// nudges keep roles alternating ([system, user, assistant, user, …]) per the
+// Gemini consecutive-role constraint.
+const (
+	advisoryJudgeRetryHint = "Answer strictly as two lines and nothing else:\n" +
+		"VERDICT: ALLOW or CONFIRM\n" +
+		"REASON: one short sentence"
+	strictJudgeRetryHint = "Answer again, strictly as exactly two lines and nothing else:\n" +
+		"VERDICT: ALLOW, DENY or CONFIRM\n" +
+		"REASON: one short sentence"
+	stepLimitJudgeRetryHint = "Answer strictly as two lines and nothing else:\n" +
+		"VERDICT: DENY, ALLOW_ONCE, ALLOW_MORE or ALLOW_ALWAYS\n" +
+		"REASON: one short sentence"
 )
 
 // JudgeVerdict represents the safety assessment of a tool call.
@@ -172,13 +151,26 @@ type judgeResult struct {
 // ToolJudge evaluates whether a mutating tool call is safe to auto-approve.
 // It maintains an LRU-style cache keyed by tool+input to avoid redundant LLM calls.
 //
-// The provider and model fields are write-once: they are set in NewToolJudge
-// and never mutated afterward, so they may be read without holding mu. The
-// remaining mutable fields (systemPrompt, isInternalFn, cache) are guarded by
-// mu and must be accessed under the lock.
+// The judge does not own a provider or a model: it issues every one-shot call
+// through the Caller it was constructed with — the session's llm.Router by
+// construction — and therefore always rides the router's ACTIVE model
+// (requests carry no Model; the router fills it) and the router's deterministic
+// sampling profile for routing-purpose calls, resolved from the model catalog.
+// The caller and the optional usage tracker are write-once: they are set in
+// NewToolJudge and never mutated afterward, so they may be read without
+// holding mu. The remaining mutable fields (systemPrompt, isInternalFn, cache)
+// are guarded by mu and must be accessed under the lock.
 type ToolJudge struct {
-	provider     llm.Provider
-	model        string
+	// routeCaller is the caller as constructed (never wrapped). The judge
+	// probes it for the optional ActiveModel capability to resolve the
+	// tier-off reasoning spelling and the advisory cache key's model
+	// component. Write-once.
+	routeCaller llm.Caller
+	// caller is the LLM surface every judge call goes through: routeCaller,
+	// wrapped in a TrackingCaller when a usage tracker was supplied at
+	// construction, so judge token usage lands in the session's token
+	// accounting. Write-once; read without mu.
+	caller       llm.Caller
 	systemPrompt string            // judge system prompt (defaults to judge_prompts.JudgeSystem)
 	isInternalFn func(string) bool // returns true for internal tools that bypass the judge
 	cache        map[string]judgeResult
@@ -187,20 +179,104 @@ type ToolJudge struct {
 	logger       *slog.Logger
 }
 
-// NewToolJudge creates a new ToolJudge with the given LLM provider and model.
+// NewToolJudge creates a new ToolJudge that issues its one-shot calls through
+// the given caller — the session's llm.Router by construction, so the judge
+// rides the router's active model and the model catalog's deterministic
+// sampling profile instead of pinning its own.
+//
+// tracker, when non-nil, wraps the caller in a TrackingCaller so every judge
+// call's token usage is recorded into it — judge calls are real session
+// consumption and must be accounted. Pass nil when the caller already records
+// usage (an already-tracking caller) or when judge calls should not be
+// accounted; supplying a tracker on top of an already-tracking caller counts
+// tokens twice.
+//
 // If maxCacheSize is 0, defaults to 1000. Logger may be nil.
-func NewToolJudge(provider llm.Provider, model string, maxCacheSize int, logger *slog.Logger) *ToolJudge {
+func NewToolJudge(caller llm.Caller, tracker *llm.UsageTracker, maxCacheSize int, logger *slog.Logger) *ToolJudge {
 	if maxCacheSize == 0 {
 		maxCacheSize = 1000
 	}
-	return &ToolJudge{
-		provider:     provider,
-		model:        model,
+	j := &ToolJudge{
+		routeCaller:  caller,
 		systemPrompt: judge_prompts.JudgeSystem,
 		isInternalFn: func(string) bool { return false }, // default: no internal tools
 		cache:        make(map[string]judgeResult),
 		maxCacheSize: maxCacheSize,
 		logger:       logger,
+	}
+	if caller != nil && tracker != nil {
+		j.caller = llm.NewTrackingCaller(caller, tracker)
+	} else {
+		j.caller = caller
+	}
+	return j
+}
+
+// activeModelSource is an optional capability of the judge's caller: the
+// composite id of the model the caller currently routes to. *llm.Router
+// implements it. A caller that hides the router (a bare provider, a caller
+// wrapped in layers that do not forward it) does not, and the judge then
+// degrades to the pre-tier behavior — no reasoning field on its calls and a
+// model-less advisory cache key.
+type activeModelSource interface {
+	ActiveModel() string
+}
+
+// judgeActiveModel returns the bare model name the caller currently routes
+// to, or "" when the caller does not expose its active model.
+func judgeActiveModel(caller llm.Caller) string {
+	src, ok := caller.(activeModelSource)
+	if !ok {
+		return ""
+	}
+	return llm.BareModel(src.ActiveModel())
+}
+
+// judgeModelFamily resolves the model's family catalog-first: the built-in
+// catalog is authoritative for models it knows — including architecture
+// aliases a name-based detection cannot see (e.g. "Bonsai 2 27B" → qwen) —
+// and DetectFamily is the name-based fallback for everything else.
+func judgeModelFamily(model string) string {
+	if meta, ok := llm.ResolveBuiltInModel(model); ok && meta.Family != "" {
+		return meta.Family
+	}
+	return string(llm.DetectFamily(model))
+}
+
+// judgeReasoningEffort resolves the judge's tier-off reasoning policy into
+// the native reasoning_effort spelling of the model the caller routes to.
+// Judge verdicts are short structured decisions: reasoning adds latency and
+// tokens without improving them, and on effort-seeded families (Qwen 3.8+,
+// GLM 5.2+) the SERVER default is the strongest effort, so reasoning-off is
+// the judges' fixed policy. It returns "" — meaning "send no reasoning field
+// at all" — when the caller does not expose its active model, or when the
+// model/family has no known reasoning control, the same fail-closed-no-field
+// contract llm.ReasoningForCall documents.
+func judgeReasoningEffort(caller llm.Caller) string {
+	model := judgeActiveModel(caller)
+	if model == "" {
+		return ""
+	}
+	return llm.ReasoningForCall(judgeModelFamily(model), model, llm.ReasoningTierOff)
+}
+
+// judgeChatRequest builds the judges' base one-shot request: [system, user],
+// the routing purpose (the caller — a Router — layers the deterministic
+// sampling profile from the model catalog onto it, and strips sampling for
+// models that authoritatively cannot take it), the resolved reasoning-effort
+// spelling, and NO model: the caller routes to its active model by
+// construction. The judges deliberately set no temperature: an explicit value
+// would win over the catalog profile and would 400 on endpoints that reject
+// the parameter outright.
+func judgeChatRequest(systemPrompt, userPrompt string, maxTokens int, reasoningEffort string) llm.ChatRequest {
+	return llm.ChatRequest{
+		Messages: []llm.Message{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: userPrompt},
+		},
+		MaxTokens:       maxTokens,
+		CallPurpose:     llm.CallPurposeRouting,
+		ReasoningEffort: reasoningEffort,
 	}
 }
 
@@ -223,17 +299,26 @@ func (j *ToolJudge) SetIsInternalFn(fn func(string) bool) {
 	j.isInternalFn = fn
 }
 
-// judgeCacheKey generates a cache key from tool name, input, the session
-// roots, and the rendered static-analysis block. Roots participate because
-// the judge's LLM prompt (and therefore the verdict) depends on the session's
-// directory scope: the same tool+input is a different safety question in a
-// session whose workspace or auxiliary work directories differ, so a verdict
-// must never be reused across scopes. The analysis block participates for the
-// same reason: it changes the prompt, so a verdict computed with a digest
-// attached must not be reused without it (or vice versa).
-func judgeCacheKey(toolName string, input json.RawMessage, roots []string, analysisBlock string) string {
+// judgeCacheKey generates a cache key from tool name, input, the serving
+// model, the session roots, and the rendered static-analysis block. The model
+// participates because the judge rides the caller's ACTIVE model: the same
+// tool+input evaluated by a different model is a different safety question,
+// so a verdict computed on one model must never be reused for another. Roots
+// participate because the judge's LLM prompt (and therefore the verdict)
+// depends on the session's directory scope: the same tool+input is a
+// different safety question in a session whose workspace or auxiliary work
+// directories differ, so a verdict must never be reused across scopes. The
+// analysis block participates for the same reason: it changes the prompt, so
+// a verdict computed with a digest attached must not be reused without it
+// (or vice versa). The model is "" when the caller does not expose its active
+// model, in which case it contributes nothing (the historical key shape).
+func judgeCacheKey(toolName string, input json.RawMessage, roots []string, analysisBlock, model string) string {
 	h := sha256.Sum256(input)
 	key := toolName + ":" + hex.EncodeToString(h[:])
+	if model != "" {
+		mh := sha256.Sum256([]byte(model))
+		key += ":" + hex.EncodeToString(mh[:])
+	}
 	if len(roots) > 0 {
 		rh := sha256.Sum256([]byte(strings.Join(roots, "\x00")))
 		key += ":" + hex.EncodeToString(rh[:])
@@ -425,16 +510,18 @@ func (j *ToolJudge) Judge(ctx context.Context, toolName string, input json.RawMe
 		}
 	}
 
-	// Compute cache key. Session roots participate so a verdict is never
-	// reused across sessions with different directory scopes (the prompt now
-	// lists the roots, so the same tool+input is a different question). The
-	// attached static-analysis digest participates for the same reason: it
-	// appends the "## Static Analysis Report" block to the prompt, so a
-	// verdict computed with a digest must not be reused for a digest-less
-	// evaluation of the same call (or vice versa).
+	// Compute cache key. The caller's active model participates (the judge
+	// rides the caller's active model, so the same tool+input is a different
+	// question on a different model). Session roots participate so a verdict
+	// is never reused across sessions with different directory scopes (the
+	// prompt lists the roots, so the same tool+input is a different question
+	// there too). The attached static-analysis digest participates for the
+	// same reason: it appends the "## Static Analysis Report" block to the
+	// prompt, so a verdict computed with a digest must not be reused for a
+	// digest-less evaluation of the same call (or vice versa).
 	roots := SessionRoots(ctx)
 	analysisBlock := formatShellAnalysisBlock(ctx, toolName)
-	key := judgeCacheKey(toolName, input, roots, analysisBlock)
+	key := judgeCacheKey(toolName, input, roots, analysisBlock, judgeActiveModel(j.routeCaller))
 
 	// Check cache under RLock
 	j.mu.RLock()
@@ -447,10 +534,10 @@ func (j *ToolJudge) Judge(ctx context.Context, toolName string, input json.RawMe
 	}
 	j.mu.RUnlock()
 
-	// provider is immutable after construction (write-once in NewToolJudge),
-	// so it is read without the lock. A nil provider means the judge was
+	// caller is immutable after construction (write-once in NewToolJudge),
+	// so it is read without the lock. A nil caller means the judge was
 	// configured without an LLM backend; fail safe to CONFIRM.
-	if j.provider == nil {
+	if j.caller == nil {
 		if log != nil {
 			log.Warn("judge: provider unavailable, fail-safe to CONFIRM", "tool", toolName)
 		}
@@ -483,52 +570,36 @@ func (j *ToolJudge) Judge(ctx context.Context, toolName string, input json.RawMe
 		userPrompt += "\n\n" + analysisBlock
 	}
 
-	req := llm.ChatRequest{
-		Model: j.model,
-		Messages: []llm.Message{
-			{Role: "system", Content: systemPrompt},
-			{Role: "user", Content: userPrompt},
-		},
-		MaxTokens: 100, // Need more tokens for verdict + reason
-		// Verdict JSON: deterministic sampling class (routing). The judge
-		// calls the provider directly, bypassing the router — the purpose is
-		// declared for consistency and future consumers, and the
-		// deterministic sampling profile is pinned explicitly
-		// (see [judgeSamplingPin]).
-		CallPurpose: llm.CallPurposeRouting,
-		Temperature: judgeSamplingPin(j.model),
-	}
-
-	// Create a dedicated context for the judge LLM call with its own timeout.
-	// Uses the parent context so that application shutdown is respected.
-	// On timeout, the judge fail-safes to VerdictConfirm below.
-	judgeCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
+	req := judgeChatRequest(systemPrompt, userPrompt, 100 /* verdict + reason */, judgeReasoningEffort(j.routeCaller))
 
 	if log != nil {
-		log.Debug("judge: LLM evaluation starting", "tool", toolName, "model", j.model)
+		log.Debug("judge: LLM evaluation starting", "tool", toolName)
 	}
 
-	// Call LLM
-	resp, err := j.provider.ChatCompletion(judgeCtx, req)
+	// One-shot call with the unified parse-failure nudge loop (two nudges,
+	// three attempts) and the fail-safe CONFIRM as the final refusal. The
+	// timeout budget is the caller's ctx — whatever deadline the host arms
+	// on it; the judge keeps no private deadline. The parse never fails on
+	// recovered verdicts/reasons, so only total garbage (or an empty
+	// response) reaches the nudge loop.
+	result, err := oneshot.Do(ctx, j.caller, req, parseJudgeChat, oneshot.Options[judgeResult]{
+		Kind:          "judge_advisory",
+		Logger:        log,
+		OnFailure:     oneshot.OnFailureFailSafe,
+		FallbackValue: judgeResult{verdict: VerdictConfirm, reasoning: judgeUnparsedReason},
+		RetryHint:     advisoryJudgeRetryHint,
+	})
 	if err != nil {
+		// Transport error (the caller's retry policy already ran). Fail-safe:
+		// default to CONFIRM with explanatory reasoning. The error is NOT
+		// logged: provider diagnostics can echo the request and therefore
+		// sensitive tool arguments.
 		if log != nil {
-			log.Warn("judge: LLM call failed, fail-safe to CONFIRM", "tool", toolName, "error", err)
+			log.Warn("judge: LLM call failed, fail-safe to CONFIRM", "tool", toolName)
 		}
-		// Fail-safe: default to CONFIRM on error with explanatory reasoning
 		return VerdictConfirm, "Judge evaluation failed; requiring manual confirmation for safety", nil
 	}
-
-	// Parse response - extract verdict and reason
-	content := strings.TrimSpace(resp.Message.Content)
-	verdict, reasoning := parseJudgeResponse(content)
-
-	if reasoning == judgeUnparsedReason && log != nil {
-		// Surface the raw model output so the unparseable response can be
-		// diagnosed instead of disappearing into a generic fail-safe message.
-		log.Warn("judge: could not parse LLM response, fail-safe to CONFIRM",
-			"tool", toolName, "raw_response", strutil.TruncateUTF8(content, 500))
-	}
+	verdict, reasoning := result.verdict, result.reasoning
 
 	if log != nil {
 		abbrevReasoning := strutil.TruncateUTF8(reasoning, 120)
@@ -559,7 +630,8 @@ func (j *ToolJudge) Judge(ctx context.Context, toolName string, input json.RawMe
 // session-root fast paths and deliberately does not cache results: every gate
 // is evaluated against its current task, source, input, and environment
 // context. Any request construction failure, provider error, timeout, or
-// unparseable response fails safe to VerdictConfirm.
+// unparseable response (after the oneshot nudge loop) fails safe to
+// VerdictConfirm.
 func (j *ToolJudge) JudgeStrict(ctx context.Context, request StrictJudgeRequest) (JudgeVerdict, string, error) {
 	log := j.logger
 	if log != nil {
@@ -596,30 +668,29 @@ func (j *ToolJudge) JudgeStrict(ctx context.Context, request StrictJudgeRequest)
 		return VerdictConfirm, strictJudgeFailureReason, nil
 	}
 
-	// provider and model are write-once after construction (see ToolJudge
-	// doc comment), so they are read without holding mu.
-	if j.provider == nil {
+	// caller is write-once after construction (see ToolJudge doc comment),
+	// so it is read without holding mu.
+	if j.caller == nil {
 		if log != nil {
 			log.Warn("strict judge: provider unavailable, fail-safe to CONFIRM", "tool", request.ToolName)
 		}
 		return VerdictConfirm, strictJudgeFailureReason, nil
 	}
 
-	req := llm.ChatRequest{
-		Model: j.model,
-		Messages: []llm.Message{
-			{Role: "system", Content: judge_prompts.JudgeStrictSystem},
-			{Role: "user", Content: string(prompt)},
-		},
-		MaxTokens: 100,
-		// Verdict JSON: deterministic sampling class (routing).
-		CallPurpose: llm.CallPurposeRouting,
-		// Pinned deterministic sampling — see [judgeSamplingPin].
-		Temperature: judgeSamplingPin(j.model),
-	}
+	req := judgeChatRequest(judge_prompts.JudgeStrictSystem, string(prompt), 100, judgeReasoningEffort(j.routeCaller))
 
-	resp, callErr := j.judgeStrictChat(ctx, req)
-	if callErr != nil || resp == nil {
+	// One-shot call with the unified parse-failure nudge loop (two nudges,
+	// three attempts) and the fail-safe CONFIRM as the final refusal. The
+	// timeout budget is the caller's ctx (whatever deadline the host arms on
+	// it; no private judge deadline).
+	result, callErr := oneshot.Do(ctx, j.caller, req, parseStrictJudgeChat, oneshot.Options[judgeResult]{
+		Kind:          "judge_strict",
+		Logger:        log,
+		OnFailure:     oneshot.OnFailureFailSafe,
+		FallbackValue: judgeResult{verdict: VerdictConfirm, reasoning: judgeUnparsedReason},
+		RetryHint:     strictJudgeRetryHint,
+	})
+	if callErr != nil {
 		if log != nil {
 			// Do not log the provider error: provider diagnostics can echo the
 			// request and therefore sensitive tool arguments.
@@ -627,42 +698,10 @@ func (j *ToolJudge) JudgeStrict(ctx context.Context, request StrictJudgeRequest)
 		}
 		return VerdictConfirm, strictJudgeFailureReason, nil
 	}
-
-	verdict, reasoning := parseStrictJudgeResponse(strings.TrimSpace(resp.Message.Content))
-	if reasoning == judgeUnparsedReason {
-		if log != nil {
-			log.Debug("strict judge: response unparseable, retrying once with format feedback", "tool", request.ToolName)
-		}
-		retryReq := req
-		retryReq.Messages = []llm.Message{
-			{Role: "system", Content: judge_prompts.JudgeStrictSystem + strictJudgeRetryFeedback},
-			{Role: "user", Content: string(prompt)},
-		}
-		resp2, retryErr := j.judgeStrictChat(ctx, retryReq)
-		switch {
-		case retryErr != nil || resp2 == nil:
-			if log != nil {
-				log.Warn("strict judge: retry LLM call failed, fail-safe to CONFIRM", "tool", request.ToolName)
-			}
-			verdict, reasoning = VerdictConfirm, strictJudgeFailureReason
-		default:
-			verdict, reasoning = parseStrictJudgeResponse(strings.TrimSpace(resp2.Message.Content))
-		}
-	}
 	if log != nil {
-		log.Debug("strict judge: LLM verdict", "tool", request.ToolName, "verdict", verdictString(verdict))
+		log.Debug("strict judge: LLM verdict", "tool", request.ToolName, "verdict", verdictString(result.verdict))
 	}
-	return verdict, reasoning, nil
-}
-
-// judgeStrictChat performs one strict-judge LLM call under its own 2-minute
-// budget derived from ctx. Each attempt (including the parse-failure retry)
-// gets a fresh deadline rather than whatever remains of a previous call's
-// budget. Uses the parent context so application shutdown is respected.
-func (j *ToolJudge) judgeStrictChat(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
-	judgeCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
-	return j.provider.ChatCompletion(judgeCtx, req)
+	return result.verdict, result.reasoning, nil
 }
 
 // parseStrictJudgeResponse accepts only the strict prompt's three canonical
@@ -697,6 +736,21 @@ func parseStrictJudgeResponse(content string) (verdict JudgeVerdict, reasoning s
 	default:
 		return VerdictConfirm, judgeUnparsedReason
 	}
+}
+
+// parseStrictJudgeChat is the strict judge's oneshot.Parse function: it
+// accepts only the canonical two-line response and returns an error for
+// anything else, so oneshot's nudge loop re-asks with the format restated
+// before the judge's OnFailureFailSafe policy supplies the terminal CONFIRM.
+// Unlike the advisory parser it deliberately does not read the reasoning
+// fields or tolerate embellishments: the strict prompt demands exactly two
+// lines and only three canonical verdict tokens.
+func parseStrictJudgeChat(resp *llm.ChatResponse) (judgeResult, error) {
+	verdict, reasoning := parseStrictJudgeResponse(strings.TrimSpace(resp.Message.Content))
+	if reasoning == judgeUnparsedReason {
+		return judgeResult{}, errors.New("strict judge: response does not match the required two-line format")
+	}
+	return judgeResult{verdict: verdict, reasoning: reasoning}, nil
 }
 
 // isShellTool reports whether the tool executes arbitrary shell commands.
@@ -933,7 +987,34 @@ func AllPathsInSessionRoots(ctx context.Context, input json.RawMessage) bool {
 	return true
 }
 
-// parseJudgeResponse extracts verdict and reasoning from an LLM response.
+// parseJudgeChat extracts a judgeResult from a one-shot ChatResponse. It is
+// the advisory judge's oneshot.Parse function: every candidate text field
+// (Content → ReasoningContent → Reasoning) is run through the string-level
+// parser, so a small reasoning model that answered inside a reasoning field
+// is still recovered. A total parse failure returns an error — oneshot's
+// nudge loop treats it as a format failure, re-asks, and the judge's
+// OnFailureFailSafe policy supplies the terminal CONFIRM.
+func parseJudgeChat(resp *llm.ChatResponse) (judgeResult, error) {
+	for _, candidate := range oneshot.CandidateTexts(resp) {
+		if verdict, reasoning, ok := parseJudgeResponseText(candidate); ok {
+			return judgeResult{verdict: verdict, reasoning: reasoning}, nil
+		}
+	}
+	return judgeResult{}, errors.New("judge: no verdict or reason recovered from the response")
+}
+
+// parseJudgeResponse extracts verdict and reasoning from an LLM response and
+// NEVER fails: a total parse failure yields the fail-safe VerdictConfirm with
+// the judgeUnparsedReason sentinel (the historical string-level contract,
+// kept for direct callers and tests). The one-shot call path uses
+// parseJudgeResponseText instead, whose ok=false drives the nudge loop.
+func parseJudgeResponse(content string) (verdict JudgeVerdict, reasoning string) {
+	verdict, reasoning, _ = parseJudgeResponseText(content)
+	return verdict, reasoning
+}
+
+// parseJudgeResponseText extracts verdict and reasoning from one candidate
+// text, reporting whether anything was recovered at all.
 //
 // The judge prompt asks for exactly two lines:
 //
@@ -943,50 +1024,47 @@ func AllPathsInSessionRoots(ctx context.Context, input json.RawMessage) bool {
 // In practice LLMs frequently embellish the answer — markdown bold/italics
 // ("**VERDICT:** ALLOW"), list markers ("- VERDICT:"), code fences, lowercase
 // keys ("Verdict:"), an inline single-line form ("VERDICT: ALLOW — REASON: x"),
-// or even JSON. This parser tolerates all of those so a well-reasoned verdict
-// is not discarded as "unparseable", while still failing safe (VerdictConfirm)
-// when nothing can be recovered.
-func parseJudgeResponse(content string) (verdict JudgeVerdict, reasoning string) {
-	verdict = VerdictConfirm // default to safe
-	reasoning = ""           // empty == "not found"; finalizeJudge fills defaults
-
+// or even JSON. This parser tolerates all of those — via the oneshot parser
+// toolkit (JSON extraction, key-line parsing, inline-key splitting, emphasis
+// and quote trimming) — so a well-reasoned verdict is not discarded as
+// "unparseable". A response from which neither a recognized verdict token nor
+// any reason text could be recovered yields ok=false (the caller decides
+// whether that triggers a format nudge or the fail-safe CONFIRM).
+func parseJudgeResponseText(content string) (verdict JudgeVerdict, reasoning string, ok bool) {
 	// 1) JSON object fallback (some models ignore the format and emit JSON).
-	if v, r, ok := parseJudgeJSON(content); ok {
-		return finalizeJudge(v, r)
+	if v, r, jok := parseJudgeJSONText(content); jok {
+		verdict, reasoning = finalizeJudge(v, r)
+		return verdict, reasoning, true
 	}
 
 	// 2) Line-based extraction, tolerant of markdown decorations.
-	for _, raw := range strings.Split(content, "\n") {
-		line := stripJudgeLineDecoration(raw)
-		if line == "" {
-			continue
-		}
-		m := judgeKeyRe.FindStringSubmatch(line)
-		if m == nil {
-			continue
-		}
-		key := strings.ToUpper(m[1])
-		val := strings.TrimSpace(m[2])
-
-		if key == "VERDICT" {
+	verdict = VerdictConfirm // default to safe
+	reasoning = ""           // empty == "not found"; finalizeJudge fills defaults
+	foundVerdict := false
+	for _, kv := range oneshot.ParseKeyLines(content, "verdict", "reason") {
+		switch {
+		case strings.HasPrefix(kv.Key, "verdict"):
 			// A single line may carry both keys, e.g. "ALLOW | REASON: safe".
-			vPart, rPart, hasInline := splitInlineReason(val)
-			if v, ok := matchVerdict(vPart); ok {
+			vPart, _, rPart, hasInline := oneshot.SplitInline(kv.Value, "reason")
+			if v, mok := matchVerdict(vPart); mok {
 				verdict = v
+				foundVerdict = true
 			}
 			if hasInline && reasoning == "" {
-				reasoning = normalizeReason(rPart)
+				reasoning = oneshot.Unquote(rPart)
 			}
-			continue
-		}
-
-		// key == "REASON" or "REASONING"
-		if reasoning == "" && val != "" {
-			reasoning = normalizeReason(val)
+		default: // "reason" — the key-line parser's prefix-extends semantics
+			// covers the REASONING alias.
+			if reasoning == "" && kv.Value != "" {
+				reasoning = oneshot.Unquote(kv.Value)
+			}
 		}
 	}
-
-	return finalizeJudge(verdict, reasoning)
+	if !foundVerdict && reasoning == "" {
+		return VerdictConfirm, judgeUnparsedReason, false
+	}
+	verdict, reasoning = finalizeJudge(verdict, reasoning)
+	return verdict, reasoning, true
 }
 
 // finalizeJudge applies the documented defaults when no reason was recovered:
@@ -1001,48 +1079,64 @@ func finalizeJudge(verdict JudgeVerdict, reasoning string) (finalVerdict JudgeVe
 	return verdict, reasoning
 }
 
-// stripJudgeLineDecoration removes markdown decorations that would hide a
-// leading KEY: prefix: code fences, blockquote markers, list markers, and
-// emphasis/bold characters (`*`, `_`, backtick) in the key region (the part
-// before the first ':' or '=' separator). Leading/trailing emphasis on the
-// value itself is removed later by trimEmphasis (see matchVerdict /
-// normalizeReason), so internal emphasis inside a reason is preserved.
-func stripJudgeLineDecoration(line string) string {
-	line = strings.TrimSpace(line)
-	line = strings.TrimPrefix(line, "```")
-	line = strings.TrimSuffix(line, "```")
-	// Leading blockquote markers.
-	line = strings.TrimLeft(line, "> \t")
-	// Leading list marker ("- ", "* ", "+ ", "12. ").
-	line = judgeListPrefixRe.ReplaceAllString(line, "")
-	// Strip emphasis in the key region only (everything up to the separator),
-	// so "**VERDICT:**" exposes the VERDICT: prefix. The separator and the
-	// free-form value (which may contain colons, e.g. "12:00") are untouched.
-	if idx := strings.IndexAny(line, ":="); idx >= 0 {
-		deEmph := strings.NewReplacer("*", "", "_", "", "`", "")
-		line = deEmph.Replace(line[:idx]) + line[idx:]
-	}
-	return strings.TrimSpace(line)
+// judgeResponseJSON models the JSON verdict objects some models emit despite
+// the two-line format. encoding/json matches keys case-insensitively, so the
+// alias set covers "Verdict"/"DECISION" spellings the same way the historical
+// firstJSONString helper did.
+type judgeResponseJSON struct {
+	Verdict       string `json:"verdict"`
+	Decision      string `json:"decision"`
+	Result        string `json:"result"`
+	Reason        string `json:"reason"`
+	Reasoning     string `json:"reasoning"`
+	Explanation   string `json:"explanation"`
+	Justification string `json:"justification"`
 }
 
-// trimEmphasis strips leading/trailing whitespace plus markdown emphasis and
-// code characters (`*`, `_`, backtick) from a value. Used on verdict and reason
-// values so decorative wrapping like "**ALLOW**" or a leading "** " (left by a
-// bold key whose closing marker trails the separator) does not corrupt parsing.
-func trimEmphasis(s string) string {
-	return strings.Trim(s, "*_` \t")
+// verdictToken returns the first non-empty verdict alias.
+func (o judgeResponseJSON) verdictToken() string {
+	return firstNonEmpty(o.Verdict, o.Decision, o.Result)
 }
 
-// splitInlineReason detects a REASON key embedded in a VERDICT value (e.g.
-// "ALLOW — REASON: safe read") and returns the verdict part and reason part.
-func splitInlineReason(val string) (verdictPart, reasonPart string, ok bool) {
-	loc := judgeReasonInlineRe.FindStringSubmatchIndex(val)
-	if loc == nil {
-		return val, "", false
+// reasonToken returns the first non-empty reason alias.
+func (o judgeResponseJSON) reasonToken() string {
+	return firstNonEmpty(o.Reason, o.Reasoning, o.Explanation, o.Justification)
+}
+
+// firstNonEmpty returns the first whitespace-trimmed non-empty string.
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if s := strings.TrimSpace(v); s != "" {
+			return s
+		}
 	}
-	reasonPart = val[loc[2]:loc[3]]
-	verdictPart = val[:loc[0]]
-	return verdictPart, reasonPart, true
+	return ""
+}
+
+// parseJudgeJSONText attempts to decode a JSON object embedded in the response
+// and extract verdict/reason from common key aliases. llm.ExtractJSON recovers
+// fenced blocks and the outermost brace pair from JSON embedded in prose.
+func parseJudgeJSONText(content string) (verdict JudgeVerdict, reasoning string, ok bool) {
+	raw := llm.ExtractJSON(content)
+	if raw == "" {
+		return VerdictConfirm, "", false
+	}
+	var obj judgeResponseJSON
+	if err := json.Unmarshal([]byte(raw), &obj); err != nil {
+		return VerdictConfirm, "", false
+	}
+	vStr := obj.verdictToken()
+	rStr := obj.reasonToken()
+	if vStr == "" && rStr == "" {
+		return VerdictConfirm, "", false
+	}
+	verdict = VerdictConfirm
+	if vStr != "" {
+		if v, mok := matchVerdict(vStr); mok {
+			verdict = v
+		}
+	}
+	return verdict, rStr, true
 }
 
 // judgeAllowTokens, judgeConfirmTokens, and judgeDenyTokens are the exact
@@ -1085,7 +1179,7 @@ var judgeDenyTokens = map[string]struct{}{
 // Returns ok=false when the token is not recognizable (the caller keeps the
 // safe default verdict in that case).
 func matchVerdict(val string) (JudgeVerdict, bool) {
-	v := strings.ToUpper(strings.TrimSpace(trimEmphasis(val)))
+	v := strings.ToUpper(strings.TrimSpace(oneshot.TrimEmphasis(val)))
 	// Consider only the first whitespace/punctuation-delimited token so inline
 	// tails like "ALLOW — REASON: …" or "ALLOW (read-only)" still match.
 	if i := strings.IndexAny(v, " \t;|,\n"); i >= 0 {
@@ -1104,64 +1198,21 @@ func matchVerdict(val string) (JudgeVerdict, bool) {
 	return VerdictConfirm, false
 }
 
-// normalizeReason trims surrounding whitespace and a single layer of matching
-// quote/backtick characters from a reason value.
-func normalizeReason(val string) string {
-	r := trimEmphasis(val)
-	if len(r) >= 2 {
-		first, last := r[0], r[len(r)-1]
-		if (first == '"' && last == '"') || (first == '\'' && last == '\'') || (first == '`' && last == '`') {
-			r = strings.TrimSpace(r[1 : len(r)-1])
-		}
-	}
-	return r
-}
-
-// parseJudgeJSON attempts to decode a JSON object embedded in the response and
-// extract verdict/reason from common key aliases.
-func parseJudgeJSON(content string) (verdict JudgeVerdict, reasoning string, ok bool) {
-	raw := judgeJSONRe.FindString(content)
-	if raw == "" {
-		return VerdictConfirm, "", false
-	}
-	var obj map[string]any
-	if err := json.Unmarshal([]byte(raw), &obj); err != nil {
-		return VerdictConfirm, "", false
-	}
-	vStr := firstJSONString(obj, "verdict", "decision", "result")
-	rStr := firstJSONString(obj, "reason", "reasoning", "explanation", "justification")
-	if vStr == "" && rStr == "" {
-		return VerdictConfirm, "", false
-	}
-	verdict = VerdictConfirm
-	if vStr != "" {
-		if v, mok := matchVerdict(vStr); mok {
-			verdict = v
-		}
-	}
-	return verdict, rStr, true
-}
-
-// firstJSONString returns the first non-empty string value found under any of
-// the given case-insensitive keys.
-func firstJSONString(obj map[string]any, keys ...string) string {
-	for _, k := range keys {
-		for key, val := range obj {
-			if strings.EqualFold(key, k) {
-				if s, ok := val.(string); ok && strings.TrimSpace(s) != "" {
-					return strings.TrimSpace(s)
-				}
-			}
-		}
-	}
-	return ""
-}
-
 // JudgeConfig holds the settings needed to create a ToolJudge.
 type JudgeConfig struct {
-	Model        string // specific model for judge; if empty, uses DefaultModel
-	DefaultModel string // fallback model from active provider
-	Provider     llm.Provider
+	// Caller is the LLM surface the judge issues its one-shot calls through —
+	// the session's llm.Router by construction: the judge rides the router's
+	// ACTIVE model (its requests carry no Model) and the router layers the
+	// deterministic sampling profile from the model catalog onto every call.
+	// Required; a nil Caller disables the judge (NewToolJudgeFromConfig
+	// returns nil).
+	Caller llm.Caller
+	// UsageTracker optionally routes every judge call through a TrackingCaller
+	// recording into it, so judge token usage lands in the session's
+	// accounting. Pass nil when the caller already records usage (an
+	// already-tracking caller) — wrapping an already-tracking caller counts
+	// tokens twice — or when judge calls should not be accounted.
+	UsageTracker *llm.UsageTracker
 	MaxCacheSize int               // max cached results before cache is cleared (default: 1000)
 	SystemPrompt string            // judge system prompt; if empty, uses judge_prompts.JudgeSystem
 	IsInternalFn func(string) bool // returns true for internal tools that bypass the judge
@@ -1170,23 +1221,11 @@ type JudgeConfig struct {
 // NewToolJudgeFromConfig creates a ToolJudge if properly configured.
 // Returns nil if misconfigured. Logs warnings via the provided logger.
 func NewToolJudgeFromConfig(cfg JudgeConfig, logger *slog.Logger) *ToolJudge {
-	if cfg.Provider == nil {
+	if cfg.Caller == nil {
 		return nil
 	}
 
-	model := cfg.Model
-	if model == "" {
-		model = cfg.DefaultModel
-	}
-
-	if model == "" {
-		if logger != nil {
-			logger.Warn("tool judge disabled: no model configured")
-		}
-		return nil
-	}
-
-	judge := NewToolJudge(cfg.Provider, model, cfg.MaxCacheSize, logger)
+	judge := NewToolJudge(cfg.Caller, cfg.UsageTracker, cfg.MaxCacheSize, logger)
 	if cfg.SystemPrompt != "" {
 		judge.SetSystemPrompt(cfg.SystemPrompt)
 	}
@@ -1194,7 +1233,11 @@ func NewToolJudgeFromConfig(cfg JudgeConfig, logger *slog.Logger) *ToolJudge {
 		judge.SetIsInternalFn(cfg.IsInternalFn)
 	}
 	if logger != nil {
-		logger.Info("tool judge initialized", "model", model)
+		if model := judgeActiveModel(cfg.Caller); model != "" {
+			logger.Info("tool judge initialized", "model", model)
+		} else {
+			logger.Info("tool judge initialized")
+		}
 	}
 	return judge
 }

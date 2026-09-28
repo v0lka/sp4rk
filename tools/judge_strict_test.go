@@ -67,7 +67,7 @@ func TestParseStrictJudgeResponse(t *testing.T) {
 
 func TestJudgeStrictAlwaysCallsLLMAndIncludesContext(t *testing.T) {
 	provider := &mockLLMProvider{response: strictResponse("VERDICT: ALLOW\nREASON: bounded read")}
-	judge := NewToolJudge(provider, "test-model", 10, nil)
+	judge := NewToolJudge(provider, nil, 10, nil)
 	judge.SetIsInternalFn(func(string) bool { return true })
 
 	ctx := WithWorkspacePath(context.Background(), t.TempDir())
@@ -137,7 +137,7 @@ func TestJudgeStrictAlwaysCallsLLMAndIncludesContext(t *testing.T) {
 
 func TestJudgeStrictCallsLLMForMalformedInput(t *testing.T) {
 	provider := &mockLLMProvider{response: strictResponse("VERDICT: CONFIRM\nREASON: malformed input requires review")}
-	judge := NewToolJudge(provider, "test-model", 0, nil)
+	judge := NewToolJudge(provider, nil, 0, nil)
 	input := json.RawMessage(`{"unterminated"`)
 
 	verdict, _, err := judge.JudgeStrict(context.Background(), StrictJudgeRequest{
@@ -173,7 +173,7 @@ func TestJudgeStrictSanitizesJudgeReasoning(t *testing.T) {
 	// cannot forge prompt structure via line injection (e.g. a fake
 	// "## Response Format" header instructing the model to answer ALLOW).
 	provider := &mockLLMProvider{response: strictResponse("VERDICT: CONFIRM\nREASON: reasoning needs review")}
-	judge := NewToolJudge(provider, "test-model", 10, nil)
+	judge := NewToolJudge(provider, nil, 10, nil)
 
 	ctx := WithWorkspacePath(context.Background(), t.TempDir())
 	request := StrictJudgeRequest{
@@ -235,7 +235,7 @@ func TestJudgeStrictEscapesJudgeReasoningBoundaryBreakout(t *testing.T) {
 	// the break, so the envelope carries exactly one structural boundary
 	// around the whole reason.
 	provider := &mockLLMProvider{response: strictResponse("VERDICT: CONFIRM\nREASON: reasoning needs review")}
-	judge := NewToolJudge(provider, "test-model", 10, nil)
+	judge := NewToolJudge(provider, nil, 10, nil)
 
 	ctx := WithWorkspacePath(context.Background(), t.TempDir())
 	request := StrictJudgeRequest{
@@ -275,7 +275,7 @@ func TestJudgeStrictEscapesJudgeReasoningBoundaryBreakout(t *testing.T) {
 
 func TestJudgeStrictDoesNotReuseVerdictAcrossContexts(t *testing.T) {
 	provider := &mockLLMProvider{response: strictResponse("VERDICT: CONFIRM\nREASON: context requires review")}
-	judge := NewToolJudge(provider, "test-model", 10, nil)
+	judge := NewToolJudge(provider, nil, 10, nil)
 	input := json.RawMessage(`{"command":"tool --check"}`)
 
 	requests := []StrictJudgeRequest{
@@ -300,7 +300,7 @@ func TestJudgeStrictDoesNotReuseVerdictAcrossContexts(t *testing.T) {
 func TestJudgeStrictFailsSafe(t *testing.T) {
 	t.Run("provider error", func(t *testing.T) {
 		provider := &mockLLMProvider{err: errors.New("provider echoed secret-token")}
-		judge := NewToolJudge(provider, "test-model", 0, nil)
+		judge := NewToolJudge(provider, nil, 0, nil)
 		verdict, reason, err := judge.JudgeStrict(context.Background(), StrictJudgeRequest{ToolName: "bash_exec", Input: json.RawMessage(`{"token":"secret-token"}`)})
 		if err != nil || verdict != VerdictConfirm || reason != strictJudgeFailureReason {
 			t.Fatalf("got (%v, %q, %v), want fail-safe CONFIRM", verdict, reason, err)
@@ -312,7 +312,7 @@ func TestJudgeStrictFailsSafe(t *testing.T) {
 			<-ctx.Done()
 			return nil, ctx.Err()
 		}}
-		judge := NewToolJudge(provider, "test-model", 0, nil)
+		judge := NewToolJudge(provider, nil, 0, nil)
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		verdict, reason, err := judge.JudgeStrict(ctx, StrictJudgeRequest{ToolName: "write_file", Input: json.RawMessage(`{}`)})
@@ -326,7 +326,7 @@ func TestJudgeStrictFailsSafe(t *testing.T) {
 			<-ctx.Done()
 			return nil, ctx.Err()
 		}}
-		judge := NewToolJudge(provider, "test-model", 0, nil)
+		judge := NewToolJudge(provider, nil, 0, nil)
 		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
 		defer cancel()
 		verdict, reason, err := judge.JudgeStrict(ctx, StrictJudgeRequest{ToolName: "write_file", Input: json.RawMessage(`{}`)})
@@ -336,15 +336,18 @@ func TestJudgeStrictFailsSafe(t *testing.T) {
 	})
 
 	t.Run("nil response", func(t *testing.T) {
-		judge := NewToolJudge(&mockLLMProvider{}, "test-model", 0, nil)
+		// A nil response with a nil error is a parse failure in the unified
+		// one-shot contract (not a transport error): the nudge loop runs, and
+		// the final refusal fail-safes to CONFIRM with the unparseable reason.
+		judge := NewToolJudge(&mockLLMProvider{}, nil, 0, nil)
 		verdict, reason, err := judge.JudgeStrict(context.Background(), StrictJudgeRequest{ToolName: "write_file", Input: json.RawMessage(`{}`)})
-		if err != nil || verdict != VerdictConfirm || reason != strictJudgeFailureReason {
+		if err != nil || verdict != VerdictConfirm || reason != judgeUnparsedReason {
 			t.Fatalf("got (%v, %q, %v), want fail-safe CONFIRM", verdict, reason, err)
 		}
 	})
 
 	t.Run("unparseable", func(t *testing.T) {
-		judge := NewToolJudge(&mockLLMProvider{response: strictResponse("probably okay")}, "test-model", 0, nil)
+		judge := NewToolJudge(&mockLLMProvider{response: strictResponse("probably okay")}, nil, 0, nil)
 		verdict, reason, err := judge.JudgeStrict(context.Background(), StrictJudgeRequest{ToolName: "write_file", Input: json.RawMessage(`{}`)})
 		if err != nil || verdict != VerdictConfirm || reason != judgeUnparsedReason {
 			t.Fatalf("got (%v, %q, %v), want unparseable CONFIRM", verdict, reason, err)
@@ -357,7 +360,7 @@ func TestJudgeStrictDoesNotLogSensitiveArguments(t *testing.T) {
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	provider := &mockLLMProvider{err: errors.New("provider failure containing " + secret)}
-	judge := NewToolJudge(provider, "test-model", 0, logger)
+	judge := NewToolJudge(provider, nil, 0, logger)
 
 	_, _, _ = judge.JudgeStrict(context.Background(), StrictJudgeRequest{
 		ToolName: "bash_exec",
@@ -370,7 +373,7 @@ func TestJudgeStrictDoesNotLogSensitiveArguments(t *testing.T) {
 
 func TestJudgeStrictConcurrentAccess(t *testing.T) {
 	provider := &mockLLMProvider{response: strictResponse("VERDICT: ALLOW\nREASON: bounded read")}
-	judge := NewToolJudge(provider, "test-model", 4, nil)
+	judge := NewToolJudge(provider, nil, 4, nil)
 
 	const workers = 32
 	var wg sync.WaitGroup
@@ -487,7 +490,7 @@ func TestJudgeStrictIncludesAnalysisContext(t *testing.T) {
 	// with literal (non-HTML-escaped) tags, and a payload collapsed to a
 	// single line so a hostile operand cannot forge prompt structure.
 	provider := &mockLLMProvider{response: strictResponse("VERDICT: CONFIRM\nREASON: analysis requires review")}
-	judge := NewToolJudge(provider, "test-model", 10, nil)
+	judge := NewToolJudge(provider, nil, 10, nil)
 
 	ctx := WithWorkspacePath(context.Background(), t.TempDir())
 	digest := `{"schemaVersion":"sp4rk-shell-analysis/v4","lang":"bash","top":false,` +
@@ -551,7 +554,7 @@ func TestJudgeStrictOmitsAnalysisWhenAbsent(t *testing.T) {
 	// one) the request must be semantically unchanged: the omitempty field
 	// stays absent from the envelope JSON entirely.
 	provider := &mockLLMProvider{response: strictResponse("VERDICT: CONFIRM\nREASON: review required")}
-	judge := NewToolJudge(provider, "test-model", 10, nil)
+	judge := NewToolJudge(provider, nil, 10, nil)
 
 	ctx := WithWorkspacePath(context.Background(), t.TempDir())
 	request := StrictJudgeRequest{
@@ -608,15 +611,23 @@ func (s *sequencedProvider) ChatCompletion(ctx context.Context, req llm.ChatRequ
 	return s.responses[i], nil
 }
 
-func TestJudgeStrictRetriesOnceOnUnparseableResponse(t *testing.T) {
+// Call must be overridden alongside ChatCompletion: the promoted
+// mockLLMProvider.Call would delegate to the EMBEDDED mock's ChatCompletion,
+// bypassing the sequence.
+func (s *sequencedProvider) Call(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
+	return s.ChatCompletion(ctx, req)
+}
+
+func TestJudgeStrictRetriesOnUnparseableResponse(t *testing.T) {
 	// The first response is prose (the audit's 968120/968408 shape: a
-	// format failure misread as a verdict). One retry with the format
-	// feedback must run, and its parsed verdict must be the one returned.
+	// format failure misread as a verdict). The unified one-shot nudge loop
+	// re-asks with a format-restating "[System]" nudge, and the retried
+	// verdict is the one returned.
 	provider := &sequencedProvider{responses: []*llm.ChatResponse{
 		strictResponse("Sure — this looks safe to me, no concerns."),
 		strictResponse("VERDICT: ALLOW\nREASON: bounded verification driver"),
 	}}
-	judge := NewToolJudge(provider, "test-model", 0, nil)
+	judge := NewToolJudge(provider, nil, 0, nil)
 
 	verdict, reason, err := judge.JudgeStrict(context.Background(), StrictJudgeRequest{
 		ToolName: "bash_exec",
@@ -631,24 +642,37 @@ func TestJudgeStrictRetriesOnceOnUnparseableResponse(t *testing.T) {
 
 	requests := provider.snapshot()
 	if len(requests) != 2 {
-		t.Fatalf("expected exactly one retry (2 LLM calls), got %d", len(requests))
+		t.Fatalf("expected the first retry to succeed (2 LLM calls), got %d", len(requests))
 	}
-	// The retry must restate the format in the system prompt while keeping
-	// the provider-universal [system, user] shape (Gemini rejects
-	// consecutive same-role messages) and the very same evaluation envelope.
-	if len(requests[0].Messages) != 2 || len(requests[1].Messages) != 2 {
-		t.Fatalf("expected [system, user] shape on both attempts, got %d and %d messages",
-			len(requests[0].Messages), len(requests[1].Messages))
+	// The retry appends the assistant echo + the "[System]" format nudge to
+	// the SAME conversation (roles keep alternating per the Gemini
+	// consecutive-role constraint) while the system prompt stays unmodified
+	// and the evaluation envelope is re-sent verbatim.
+	if len(requests[0].Messages) != 2 {
+		t.Fatalf("expected [system, user] on the first attempt, got %d messages", len(requests[0].Messages))
+	}
+	if len(requests[1].Messages) != 4 {
+		t.Fatalf("expected [system, user, assistant, user] on the retry, got %d messages", len(requests[1].Messages))
 	}
 	if requests[0].Messages[0].Content != judge_prompts.JudgeStrictSystem {
 		t.Error("first attempt must use the unmodified strict system prompt")
 	}
-	if !strings.Contains(requests[1].Messages[0].Content, judge_prompts.JudgeStrictSystem) ||
-		!strings.Contains(requests[1].Messages[0].Content, "could not be parsed") {
-		t.Error("retry must append the format feedback to the strict system prompt")
+	if requests[1].Messages[0].Content != judge_prompts.JudgeStrictSystem {
+		t.Error("retry must keep the unmodified strict system prompt (the format rides the nudge)")
 	}
-	if requests[0].Messages[1].Content != requests[1].Messages[1].Content {
+	if requests[1].Messages[1].Content != requests[0].Messages[1].Content {
 		t.Error("retry must re-send the identical evaluation envelope")
+	}
+	if echo := requests[1].Messages[2]; echo.Role != "assistant" ||
+		echo.Content != "Sure — this looks safe to me, no concerns." {
+		t.Errorf("retry must echo the failed response as an assistant message, got role=%q content=%q", echo.Role, echo.Content)
+	}
+	nudge := requests[1].Messages[3]
+	if nudge.Role != "user" || !strings.HasPrefix(nudge.Content, "[System]") {
+		t.Errorf("retry nudge must be a user message starting with [System], got role=%q content=%q", nudge.Role, nudge.Content)
+	}
+	if !strings.Contains(nudge.Content, "VERDICT: ALLOW, DENY or CONFIRM") {
+		t.Errorf("retry nudge must restate the strict format, got %q", nudge.Content)
 	}
 }
 
@@ -660,7 +684,7 @@ func TestJudgeStrictRetryExhaustedFailsSafeToCONFIRM(t *testing.T) {
 		strictResponse("probably okay"),
 		strictResponse("still not the format"),
 	}}
-	judge := NewToolJudge(provider, "test-model", 0, nil)
+	judge := NewToolJudge(provider, nil, 0, nil)
 
 	verdict, reason, err := judge.JudgeStrict(context.Background(), StrictJudgeRequest{
 		ToolName: "write_file",
@@ -669,8 +693,8 @@ func TestJudgeStrictRetryExhaustedFailsSafeToCONFIRM(t *testing.T) {
 	if err != nil || verdict != VerdictConfirm || reason != judgeUnparsedReason {
 		t.Fatalf("got (%v, %q, %v), want fail-safe CONFIRM with unparseable reason", verdict, reason, err)
 	}
-	if got := len(provider.snapshot()); got != 2 {
-		t.Fatalf("expected exactly 2 LLM calls (attempt + one retry), got %d", got)
+	if got := len(provider.snapshot()); got != 3 {
+		t.Fatalf("expected exactly 3 LLM calls (attempt + two nudges), got %d", got)
 	}
 }
 
@@ -681,7 +705,7 @@ func TestJudgeStrictRetryProviderErrorFailsSafeToCONFIRM(t *testing.T) {
 		strictResponse("no verdict here"),
 		nil, // second call errors
 	}, err: errors.New("transport failure")}
-	judge := NewToolJudge(provider, "test-model", 0, nil)
+	judge := NewToolJudge(provider, nil, 0, nil)
 
 	verdict, reason, err := judge.JudgeStrict(context.Background(), StrictJudgeRequest{
 		ToolName: "write_file",
@@ -708,7 +732,7 @@ func TestJudgeStrictDoesNotRetryParseableResponses(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			provider := &mockLLMProvider{response: strictResponse(tc.response)}
-			judge := NewToolJudge(provider, "test-model", 0, nil)
+			judge := NewToolJudge(provider, nil, 0, nil)
 			if _, _, err := judge.JudgeStrict(context.Background(), StrictJudgeRequest{
 				ToolName: "bash_exec",
 				Input:    json.RawMessage(`{"command":"echo hi"}`),
@@ -726,17 +750,18 @@ func TestJudgeStrictDoesNotRetryParseableResponses(t *testing.T) {
 // Deterministic sampling pin (Track D, recommendations §3.4)
 // ─────────────────────────────────────────────────────────────────────────
 
-// TestJudgeStrictPinsDeterministicSampling pins that every strict-judge LLM
-// call (first attempt and parse-failure retry alike) carries the pinned
-// deterministic temperature for its model family — a flat 0.0 would be
-// rejected by endpoints that pin temperature (kimi/google), so the pin is the
-// SDK's family-aware deterministic profile (see judgeSamplingPin).
-func TestJudgeStrictPinsDeterministicSampling(t *testing.T) {
+// TestJudgeStrictDelegatesSamplingToRouter pins that the strict judge sets NO
+// temperature of its own and declares the routing purpose on every call —
+// first attempt and parse-failure nudge alike. The caller (the Router)
+// resolves the deterministic sampling profile from the model catalog and
+// strips sampling for models that authoritatively cannot take the parameter,
+// so a judge-pinned value would defeat both.
+func TestJudgeStrictDelegatesSamplingToRouter(t *testing.T) {
 	provider := &sequencedProvider{responses: []*llm.ChatResponse{
 		strictResponse("unparseable"),
 		strictResponse("VERDICT: CONFIRM\nREASON: needs review"),
 	}}
-	judge := NewToolJudge(provider, "test-model", 0, nil)
+	judge := NewToolJudge(provider, nil, 0, nil)
 
 	if _, _, err := judge.JudgeStrict(context.Background(), StrictJudgeRequest{
 		ToolName: "bash_exec",
@@ -747,51 +772,14 @@ func TestJudgeStrictPinsDeterministicSampling(t *testing.T) {
 
 	requests := provider.snapshot()
 	if len(requests) != 2 {
-		t.Fatalf("expected attempt + retry, got %d calls", len(requests))
-	}
-	want := llm.DeterministicTemperature(string(llm.DetectFamily("test-model")))
-	if want == nil {
-		t.Fatal("DeterministicTemperature returned nil for test-model")
+		t.Fatalf("expected attempt + nudge retry, got %d calls", len(requests))
 	}
 	for i, got := range requests {
-		if got.Temperature == nil || *got.Temperature != *want {
-			t.Fatalf("request %d temperature = %v, want pinned %v", i, got.Temperature, *want)
+		if got.Temperature != nil {
+			t.Errorf("request %d temperature = %v, want nil (the router injects the catalog profile)", i, *got.Temperature)
+		}
+		if got.CallPurpose != llm.CallPurposeRouting {
+			t.Errorf("request %d call purpose = %q, want routing (the deterministic-profile class)", i, got.CallPurpose)
 		}
 	}
-}
-
-// TestJudgePinsDeterministicSamplingOnAllJudgeCalls pins the same pin on the
-// advisory Judge and the step-limit judge: every judge verdict must be
-// reproducible on identical input.
-func TestJudgePinsDeterministicSamplingOnAllJudgeCalls(t *testing.T) {
-	t.Run("advisory judge", func(t *testing.T) {
-		provider := &mockLLMProvider{response: strictResponse("VERDICT: ALLOW\nREASON: safe read")}
-		judge := NewToolJudge(provider, "test-model", 0, nil)
-		ctx := WithWorkspacePath(context.Background(), t.TempDir())
-		if _, _, err := judge.Judge(ctx, "bash_exec", json.RawMessage(`{"command":"echo hi"}`), "run tests"); err != nil {
-			t.Fatalf("Judge returned error: %v", err)
-		}
-		requests := provider.snapshot()
-		if len(requests) != 1 {
-			t.Fatalf("expected one LLM call, got %d", len(requests))
-		}
-		want := llm.DeterministicTemperature(string(llm.DetectFamily("test-model")))
-		if requests[0].Temperature == nil || *requests[0].Temperature != *want {
-			t.Fatalf("advisory judge temperature = %v, want pinned %v", requests[0].Temperature, *want)
-		}
-	})
-
-	t.Run("step-limit judge", func(t *testing.T) {
-		provider := &mockLLMProvider{response: loopJudgeResponse("???")} // any response: the request is what matters
-		judge := NewToolJudge(provider, "test-model", 0, nil)
-		_, _, _ = judge.JudgeStepLimit(context.Background(), StepLimitJudgeRequest{CurrentStep: 3, MaxSteps: 3})
-		requests := provider.snapshot()
-		if len(requests) != 1 {
-			t.Fatalf("expected one LLM call, got %d", len(requests))
-		}
-		want := llm.DeterministicTemperature(string(llm.DetectFamily("test-model")))
-		if requests[0].Temperature == nil || *requests[0].Temperature != *want {
-			t.Fatalf("step-limit judge temperature = %v, want pinned %v", requests[0].Temperature, *want)
-		}
-	})
 }

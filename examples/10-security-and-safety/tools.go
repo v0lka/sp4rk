@@ -169,7 +169,7 @@ func runSecurityDemos() {
 	// network call. Supplying a provider makes every request receive a fresh,
 	// context-aware evaluation (strict mode deliberately has no verdict cache).
 	fmt.Println("\n═══════ (c) Central strict judge fail-safe ═══════")
-	strictJudge := tools.NewToolJudge(nil, "", 0, nil)
+	strictJudge := tools.NewToolJudge(nil, nil, 0, nil)
 	verdict, reason, err := strictJudge.JudgeStrict(ctx, tools.StrictJudgeRequest{
 		ToolName:    "append_log",
 		Input:       json.RawMessage(`{"path":"/etc/passwd","line":"blocked"}`),
