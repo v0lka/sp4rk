@@ -2131,6 +2131,8 @@ func TestApplyKimiReasoning(t *testing.T) {
 		{"kimi-k3 Off is outside the documented set", "kimi-k3", "Off", ""},
 		{"kimi-k3 medium is outside the documented set", "kimi-k3", "medium", ""},
 		{"kimi-k3 unknown effort fails closed", "kimi-k3", "turbo", ""},
+		{"kimi-mk3 is not the K3 series", "kimi-mk3", "low", ""},
+		{"kimi-k30 is not the K3 series", "kimi-k30", "low", ""},
 		{"kimi-k2.7-code has no documented effort field", "kimi-k2.7-code", "low", ""},
 		{"kimi-for-coding has no documented effort field", "kimi-for-coding", "low", ""},
 		{"kimi-k2.6 has no documented effort field", "kimi-k2.6", "low", ""},

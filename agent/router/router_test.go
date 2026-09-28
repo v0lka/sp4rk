@@ -183,6 +183,40 @@ func TestRoute_ParseErrorAfterRepairIsSentinel(t *testing.T) {
 	}
 }
 
+// TestRoute_TransportErrorNotRetriedNotParseSentinel verifies that a
+// transport-level failure of the underlying caller surfaces as a plain
+// "router LLM call failed" error: it is returned immediately (no repair
+// nudges — exactly one LLM call) and does NOT match ErrRoutingParse, which
+// is reserved for exhausted parse-repair cycles, so callers can distinguish
+// "the model answered garbage" from "the provider is down" and e.g. avoid
+// degrading to a default routing decision on a transient outage.
+func TestRoute_TransportErrorNotRetriedNotParseSentinel(t *testing.T) {
+	transportErr := errors.New("connection refused")
+	calls := 0
+	mock := &mockLLMCaller{
+		callFn: func(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
+			calls++
+			return nil, transportErr
+		},
+	}
+
+	r := newTestRouter(mock, 5)
+
+	_, err := r.Route(context.Background(), "do things", nil, nil, nil)
+	if err == nil {
+		t.Fatal("expected error for transport failure")
+	}
+	if errors.Is(err, ErrRoutingParse) {
+		t.Errorf("transport error must not match ErrRoutingParse, got: %v", err)
+	}
+	if !errors.Is(err, transportErr) {
+		t.Errorf("error chain must preserve the transport error, got: %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("transport errors are not retried: expected 1 LLM call, got %d", calls)
+	}
+}
+
 // TestRoute_TwoNudgePolicy verifies the oneshot retry contract end to end:
 // two unparseable responses produce two nudges (each an assistant echo of the
 // failed output followed by a "[System]" user message restating the JSON
