@@ -489,25 +489,61 @@ func applyQwenReasoningChatTemplateKwargs(params *oai.ChatCompletionNewParams, m
 	})
 }
 
-// applyDeepSeekReasoning sets the thinking control for DeepSeek models. The
-// wire contract takes the canonical options "Off"/"High"/"Max" (see
-// FamilyReasoningOptions) verbatim as thinking.type. The disable sentinel is
-// matched case-insensitively — "off" is the value c0wrk stores in its
-// small-LLM config, and sending it verbatim case-mismatches the canonical
-// spelling — and every value outside the canonical set ("low"/"medium" from
-// a host's generic value set, unknown spellings) fails closed to disabled:
-// a strict gateway rejects unknown thinking.type values outright, and
-// silently enabling thinking is the opposite of the configured intent.
+// applyDeepSeekReasoning sets the thinking control for DeepSeek models.
+//
+// The DeepSeek Chat Completions API splits the control across two fields
+// (api-docs.deepseek.com/api/create-chat-completion): the "thinking" object
+// toggles the MODE — thinking.type accepts only "enabled"/"disabled" (the
+// serving enum also carries "adaptive", which the docs do not offer for the
+// current models) — while the effort is a SEPARATE top-level
+// "reasoning_effort" with the documented set none/low/high/max ("none"
+// disables thinking; the default effort is "high"). The family's canonical
+// options "Off"/"High"/"Max" (see FamilyReasoningOptions) are OPTION
+// spellings, not wire values: passing them through verbatim sends an invalid
+// thinking.type and the API answers HTTP 422 "unknown variant `Off`,
+// expected one of `adaptive`, `enabled`, `disabled`" — the failure that
+// broke every c0wrk one-shot service call (title/commit pin the off tier).
+// Everything is therefore normalized here:
+//
+//   - "off"/"none" (case-insensitive; "off" is the value c0wrk stores in
+//     its small-LLM config, "none" the GLM-style disable spelling):
+//     thinking disabled — {"type": "disabled"} with NO reasoning_effort,
+//     the effort field is never sent alongside a disabled mode switch
+//   - "low"/"minimal": thinking enabled at effort low ("minimal" is the
+//     OpenAI spelling the server maps to low; normalized client-side)
+//   - "medium"/"xhigh"/"high": thinking enabled at effort high ("medium"
+//     and "xhigh" are the server's own compat spellings of high; normalized
+//     client-side so the wire only ever carries documented values)
+//   - "max": thinking enabled at effort max
+//
+// Every value outside the documented set ("On", unknown spellings) fails
+// closed to thinking disabled: silently enabling thinking is the opposite
+// of the configured intent, and a strict gateway rejects unknown
+// thinking.type values outright (mirroring applyGLMReasoning).
 func applyDeepSeekReasoning(params *oai.ChatCompletionNewParams, effort string) {
-	switch effort {
-	case "High", "Max":
+	thinkingDisabled := func() {
 		params.SetExtraFields(map[string]any{
-			"thinking": map[string]string{"type": effort},
+			"thinking": map[string]string{"type": "disabled"},
 		})
+	}
+	thinkingAtEffort := func(effort string) {
+		params.SetExtraFields(map[string]any{
+			"thinking":         map[string]string{"type": "enabled"},
+			"reasoning_effort": effort,
+		})
+	}
+	switch {
+	case strings.EqualFold(effort, "off"), strings.EqualFold(effort, "none"):
+		thinkingDisabled()
+	case strings.EqualFold(effort, "low"), strings.EqualFold(effort, "minimal"):
+		thinkingAtEffort("low")
+	case strings.EqualFold(effort, "medium"), strings.EqualFold(effort, "xhigh"),
+		strings.EqualFold(effort, "high"):
+		thinkingAtEffort("high")
+	case strings.EqualFold(effort, "max"):
+		thinkingAtEffort("max")
 	default:
-		params.SetExtraFields(map[string]any{
-			"thinking": map[string]string{"type": "Off"},
-		})
+		thinkingDisabled()
 	}
 }
 

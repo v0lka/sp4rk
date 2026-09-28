@@ -1508,46 +1508,92 @@ func TestOpenAIProvider_BuildChatParams_DeepSeekReasoning(t *testing.T) {
 		return out
 	}
 
-	thinkingType := func(t *testing.T, effort string) string {
+	// assertDisabled pins the full disabled shape: thinking.type is the
+	// normalized wire value "disabled" (never the canonical option "Off",
+	// which the API rejects with HTTP 422) and reasoning_effort is absent —
+	// the effort field is never sent alongside a disabled mode switch.
+	assertDisabled := func(t *testing.T, effort string) {
 		t.Helper()
 		out := build(t, "deepseek-v4-pro", effort)
 		thinking, _ := out["thinking"].(map[string]any)
-		typ, _ := thinking["type"].(string)
-		return typ
+		if thinking["type"] != "disabled" {
+			t.Errorf("thinking.type for effort %q = %v, want disabled (normalized wire value)", effort, thinking["type"])
+		}
+		if got, ok := out["reasoning_effort"]; ok {
+			t.Errorf("reasoning_effort for effort %q = %v, want absent (no effort alongside a disabled mode switch)", effort, got)
+		}
 	}
 
-	t.Run("canonical Off disables thinking verbatim", func(t *testing.T) {
-		if got := thinkingType(t, "Off"); got != "Off" {
-			t.Errorf("thinking.type = %v, want Off", got)
+	// assertEnabledAtEffort pins the full enabled shape: thinking.type is
+	// the wire value "enabled" and the effort rides the SEPARATE top-level
+	// reasoning_effort field (the API has no effort spelling inside the
+	// thinking object).
+	assertEnabledAtEffort := func(t *testing.T, effort, wantEffort string) {
+		t.Helper()
+		out := build(t, "deepseek-v4-pro", effort)
+		thinking, _ := out["thinking"].(map[string]any)
+		if thinking["type"] != "enabled" {
+			t.Errorf("thinking.type for effort %q = %v, want enabled (normalized wire value)", effort, thinking["type"])
+		}
+		if got := out["reasoning_effort"]; got != wantEffort {
+			t.Errorf("reasoning_effort for effort %q = %v, want %q", effort, got, wantEffort)
+		}
+	}
+
+	t.Run("canonical Off disables thinking (normalized wire spelling)", func(t *testing.T) {
+		// The option spelling is "Off"; the wire value is "disabled".
+		// Passing "Off" through verbatim is HTTP 422 "unknown variant".
+		assertDisabled(t, "Off")
+	})
+
+	t.Run("lowercase off (the c0wrk spelling) also disables", func(t *testing.T) {
+		assertDisabled(t, "off")
+	})
+
+	t.Run("uppercase OFF also disables", func(t *testing.T) {
+		assertDisabled(t, "OFF")
+	})
+
+	t.Run("none (the GLM-style disable spelling) also disables", func(t *testing.T) {
+		assertDisabled(t, "none")
+	})
+
+	t.Run("canonical High enables thinking at effort high", func(t *testing.T) {
+		assertEnabledAtEffort(t, "High", "high")
+	})
+
+	t.Run("canonical Max enables thinking at effort max", func(t *testing.T) {
+		assertEnabledAtEffort(t, "Max", "max")
+	})
+
+	t.Run("generic effort spellings normalize to documented values", func(t *testing.T) {
+		// A host's generic value set (c0wrk model profiles allow
+		// low/medium) must honor its intent: thinking ON at the mapped
+		// effort, normalized client-side to the documented enum.
+		assertEnabledAtEffort(t, "low", "low")
+		assertEnabledAtEffort(t, "minimal", "low")
+		assertEnabledAtEffort(t, "medium", "high")
+		assertEnabledAtEffort(t, "xhigh", "high")
+		assertEnabledAtEffort(t, "high", "high")
+	})
+
+	t.Run("non-canonical effort fails closed to disabled", func(t *testing.T) {
+		for _, effort := range []string{"On", "bogus", "turbo"} {
+			assertDisabled(t, effort)
 		}
 	})
 
-	t.Run("lowercase off (the c0wrk spelling) normalizes to canonical Off", func(t *testing.T) {
-		if got := thinkingType(t, "off"); got != "Off" {
-			t.Errorf("thinking.type = %v, want Off (normalized)", got)
+	t.Run("empty effort sends no thinking field (server default applies)", func(t *testing.T) {
+		// An unset effort never reaches the reasoning switch
+		// (buildChatParams guards on a non-empty value), so the request
+		// carries no thinking field at all and the API's documented
+		// default (thinking.type=enabled) applies.
+		out := build(t, "deepseek-v4-pro", "")
+		if _, ok := out["thinking"]; ok {
+			t.Errorf("thinking must be absent for an unset effort, got %v", out["thinking"])
 		}
-	})
-
-	t.Run("uppercase OFF also normalizes to Off", func(t *testing.T) {
-		if got := thinkingType(t, "OFF"); got != "Off" {
-			t.Errorf("thinking.type = %v, want Off (normalized)", got)
-		}
-	})
-
-	t.Run("canonical High and Max pass through verbatim", func(t *testing.T) {
-		if got := thinkingType(t, "High"); got != "High" {
-			t.Errorf("thinking.type = %v, want High", got)
-		}
-		if got := thinkingType(t, "Max"); got != "Max" {
-			t.Errorf("thinking.type = %v, want Max", got)
-		}
-	})
-
-	t.Run("non-canonical effort fails closed to Off", func(t *testing.T) {
-		for _, effort := range []string{"low", "medium", "On", "xhigh"} {
-			if got := thinkingType(t, effort); got != "Off" {
-				t.Errorf("thinking.type for effort %q = %v, want Off (fail-closed)", effort, got)
-			}
+		if _, ok := out["reasoning_effort"]; ok {
+			t.Errorf("reasoning_effort must be absent for an unset effort, got %v", out["reasoning_effort"])
 		}
 	})
 }
