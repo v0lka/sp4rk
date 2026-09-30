@@ -52,3 +52,32 @@ func TestFramework_Streaming_Option(t *testing.T) {
 		t.Error("ExecutionConfig.Streaming = false, want true via WithStreaming(true)")
 	}
 }
+
+// TestFramework_Streaming_ExplicitValueOverridesBaseConfig verifies that an
+// explicit WithStreaming(false) can turn OFF a Streaming: true that arrived
+// from a base WithConfig (and that leaving the option unset preserves the base
+// value) — the explicit option value always wins, in both directions.
+func TestFramework_Streaming_ExplicitValueOverridesBaseConfig(t *testing.T) {
+	base := Config{
+		LLM:       LLMConfig{Providers: []llm.ProviderEntry{dummyProvider()}},
+		Execution: ExecutionConfig{Streaming: true},
+	}
+
+	off, err := NewF().Options(WithConfig(base), WithStreaming(false)).Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	t.Cleanup(func() { _ = off.Shutdown() })
+	if off.cfg.Execution.Streaming {
+		t.Error("ExecutionConfig.Streaming = true, want false via WithStreaming(false) over a Streaming:true base")
+	}
+
+	preserved, err := NewF().Options(WithConfig(base)).Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	t.Cleanup(func() { _ = preserved.Shutdown() })
+	if !preserved.cfg.Execution.Streaming {
+		t.Error("ExecutionConfig.Streaming = false, want the base Streaming:true preserved when no option is set")
+	}
+}

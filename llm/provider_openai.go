@@ -213,7 +213,23 @@ func (p *OpenAIProvider) ChatCompletion(ctx context.Context, req ChatRequest) (*
 	// Opt-in streaming: a non-nil DeltaSink asks the provider to stream text /
 	// reasoning deltas as they arrive, then return the same assembled response.
 	if req.DeltaSink != nil {
-		return p.chatCompletionStream(ctx, req, params)
+		// Ask the endpoint to include a final usage-only chunk so token
+		// accounting matches the synchronous path. Some OpenAI-compatible
+		// servers (older vLLM, certain Azure api-versions, proxies) reject the
+		// unknown stream_options field with an HTTP 400; retry once without it
+		// so enabling streaming stays safe on those endpoints too — usage is
+		// then simply absent (zeros), which the executor tolerates. The retry
+		// cannot duplicate deltas: a 400 is returned before the first chunk,
+		// so no delta reached the sink.
+		params.StreamOptions = oai.ChatCompletionStreamOptionsParam{IncludeUsage: param.NewOpt(true)}
+		resp, err := p.chatCompletionStream(ctx, req, params)
+		if err != nil && isStreamOptionsUnsupported(err) {
+			p.log().Debug("openai: endpoint rejected stream_options; retrying stream without usage accounting",
+				"provider", p.name, "model", req.Model)
+			params.StreamOptions = oai.ChatCompletionStreamOptionsParam{}
+			return p.chatCompletionStream(ctx, req, params)
+		}
+		return resp, err
 	}
 
 	resp, err := p.client.Chat.Completions.New(ctx, params)
@@ -256,14 +272,12 @@ func (p *OpenAIProvider) ChatCompletion(ctx context.Context, req ChatRequest) (*
 // text and reasoning deltas to req.DeltaSink as they arrive off the wire and
 // assembles the same *ChatResponse the synchronous path returns (content,
 // reasoning, tool calls, usage, stop reason). req.DeltaSink is non-nil.
+// params.StreamOptions has been configured by the caller (usage chunk on,
+// unless the endpoint rejected it).
 //
 // A delta sink error aborts the stream immediately (host-side cancellation):
 // the stream is closed and the error is returned to the caller.
 func (p *OpenAIProvider) chatCompletionStream(ctx context.Context, req ChatRequest, params oai.ChatCompletionNewParams) (*ChatResponse, error) {
-	// Ask the endpoint to include a final usage-only chunk so token accounting
-	// matches the synchronous path.
-	params.StreamOptions = oai.ChatCompletionStreamOptionsParam{IncludeUsage: param.NewOpt(true)}
-
 	stream := p.client.Chat.Completions.NewStreaming(ctx, params)
 	defer func() { _ = stream.Close() }()
 
@@ -286,6 +300,14 @@ func (p *OpenAIProvider) chatCompletionStream(ctx context.Context, req ChatReque
 		}
 
 		for _, choice := range chunk.Choices {
+			// A multi-choice stream (n > 1, non-standard gateways) interleaves
+			// fragments of every choice into one chunk stream; the synchronous
+			// path returns Choices[0] only, so consume index 0 alone to keep the
+			// assembled response identical. Servers that omit the index field
+			// decode it as 0 and are unaffected.
+			if choice.Index != 0 {
+				continue
+			}
 			delta := choice.Delta
 			if delta.Content != "" {
 				content.WriteString(delta.Content)
@@ -987,4 +1009,20 @@ func isResponsesEndpointUnsupported(err error) bool {
 		return llmErr.StatusCode == http.StatusNotFound || llmErr.StatusCode == http.StatusMethodNotAllowed
 	}
 	return false
+}
+
+// isStreamOptionsUnsupported reports whether err is an HTTP 400 that names the
+// stream_options request field — the shape older OpenAI-compatible servers
+// (vLLM versions predating stream_options, certain Azure api-versions, proxies)
+// return when asked for stream usage accounting. It gates the single retry
+// without StreamOptions so that enabling streaming ("always safe" per the
+// WithStreaming contract) also holds on those endpoints. A 400 that merely
+// mentions the field for a different reason retries once and, if the retry
+// fails too, surfaces that second error — the real one.
+func isStreamOptionsUnsupported(err error) bool {
+	var llmErr *Error
+	if !errors.As(err, &llmErr) || llmErr.StatusCode != http.StatusBadRequest {
+		return false
+	}
+	return strings.Contains(err.Error(), "stream_options")
 }

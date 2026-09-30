@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 )
 
@@ -89,5 +92,139 @@ func TestOpenAIProvider_ChatCompletionStream_SinkErrorAborts(t *testing.T) {
 	})
 	if !errors.Is(err, boom) {
 		t.Fatalf("err = %v, want the sink error", err)
+	}
+}
+
+// TestOpenAIProvider_ChatCompletionStream_ReasoningDeltas verifies that
+// non-standard reasoning_content deltas (DeepSeek et al.) are forwarded as
+// Reasoning deltas and assembled into the response — the streaming counterpart
+// of the synchronous path's reasoning parity line (ADR-009).
+func TestOpenAIProvider_ChatCompletionStream_ReasoningDeltas(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		sse(t, w, `{"id":"1","object":"chat.completion.chunk","created":1,"model":"deepseek-r1","choices":[{"index":0,"delta":{"reasoning_content":"think"},"finish_reason":""}]}`)
+		sse(t, w, `{"id":"1","object":"chat.completion.chunk","created":1,"model":"deepseek-r1","choices":[{"index":0,"delta":{"content":"ans"},"finish_reason":""}]}`)
+		sse(t, w, `{"id":"1","object":"chat.completion.chunk","created":1,"model":"deepseek-r1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`)
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	t.Cleanup(srv.Close)
+
+	p, err := NewOpenAIProvider(OpenAIProviderConfig{Name: "p", APIKey: "k", BaseURL: srv.URL})
+	if err != nil {
+		t.Fatalf("NewOpenAIProvider: %v", err)
+	}
+
+	var deltas []StreamDelta
+	resp, err := p.ChatCompletion(context.Background(), ChatRequest{
+		Model:     "deepseek-r1",
+		Messages:  []Message{{Role: "user", Content: "hi"}},
+		DeltaSink: func(d StreamDelta) error { deltas = append(deltas, d); return nil },
+	})
+	if err != nil {
+		t.Fatalf("ChatCompletion(stream): %v", err)
+	}
+
+	if resp.Message.ReasoningContent != "think" {
+		t.Errorf("Message.ReasoningContent = %q, want %q", resp.Message.ReasoningContent, "think")
+	}
+	if resp.Reasoning != "think" {
+		t.Errorf("Reasoning = %q, want %q", resp.Reasoning, "think")
+	}
+	if resp.Message.Content != "ans" {
+		t.Errorf("content = %q, want %q", resp.Message.Content, "ans")
+	}
+	if len(deltas) != 2 || deltas[0].Reasoning != "think" || deltas[0].Text != "" || deltas[1].Text != "ans" {
+		t.Errorf("deltas = %+v, want [Reasoning think, Text ans]", deltas)
+	}
+}
+
+// TestOpenAIProvider_ChatCompletionStream_IgnoresNonZeroChoices verifies that a
+// multi-choice stream (n > 1, non-standard gateways) contributes choice 0 only,
+// so the assembled response matches what the synchronous path returns from
+// Choices[0] instead of interleaving every choice into one string.
+func TestOpenAIProvider_ChatCompletionStream_IgnoresNonZeroChoices(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		sse(t, w, `{"id":"1","object":"chat.completion.chunk","created":1,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"A"},"finish_reason":""}]}`)
+		sse(t, w, `{"id":"1","object":"chat.completion.chunk","created":1,"model":"gpt-4o","choices":[{"index":1,"delta":{"content":"X"},"finish_reason":""}]}`)
+		sse(t, w, `{"id":"1","object":"chat.completion.chunk","created":1,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"B"},"finish_reason":"stop"}]}`)
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	t.Cleanup(srv.Close)
+
+	p, err := NewOpenAIProvider(OpenAIProviderConfig{Name: "p", APIKey: "k", BaseURL: srv.URL})
+	if err != nil {
+		t.Fatalf("NewOpenAIProvider: %v", err)
+	}
+
+	var deltas []StreamDelta
+	resp, err := p.ChatCompletion(context.Background(), ChatRequest{
+		Model:     "gpt-4o",
+		Messages:  []Message{{Role: "user", Content: "hi"}},
+		DeltaSink: func(d StreamDelta) error { deltas = append(deltas, d); return nil },
+	})
+	if err != nil {
+		t.Fatalf("ChatCompletion(stream): %v", err)
+	}
+
+	if resp.Message.Content != "AB" {
+		t.Errorf("content = %q, want %q (choice 1 interleaved)", resp.Message.Content, "AB")
+	}
+	if len(deltas) != 2 || deltas[0].Text != "A" || deltas[1].Text != "B" {
+		t.Errorf("deltas = %+v, want [A, B]", deltas)
+	}
+}
+
+// TestOpenAIProvider_ChatCompletionStream_StreamOptionsUnsupported verifies the
+// one-time retry without stream_options: OpenAI-compatible servers that do not
+// know the field (older vLLM, certain Azure api-versions, proxies) answer it
+// with an HTTP 400, and enabling streaming must stay safe on them — the second
+// attempt omits stream_options and succeeds (usage then reports zeros).
+func TestOpenAIProvider_ChatCompletionStream_StreamOptionsUnsupported(t *testing.T) {
+	var mu sync.Mutex
+	var asksUsage []bool // one entry per request: did the body carry stream_options?
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			return
+		}
+		asked := strings.Contains(string(body), "stream_options")
+		mu.Lock()
+		asksUsage = append(asksUsage, asked)
+		mu.Unlock()
+		if asked {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = fmt.Fprint(w, `{"error":{"message":"Unknown parameter: 'stream_options'","type":"invalid_request_error","param":"stream_options","code":"unknown_parameter"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		sse(t, w, `{"id":"1","object":"chat.completion.chunk","created":1,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":""}]}`)
+		sse(t, w, `{"id":"1","object":"chat.completion.chunk","created":1,"model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`)
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	t.Cleanup(srv.Close)
+
+	p, err := NewOpenAIProvider(OpenAIProviderConfig{Name: "p", APIKey: "k", BaseURL: srv.URL})
+	if err != nil {
+		t.Fatalf("NewOpenAIProvider: %v", err)
+	}
+
+	resp, err := p.ChatCompletion(context.Background(), ChatRequest{
+		Model:     "gpt-4o",
+		Messages:  []Message{{Role: "user", Content: "hi"}},
+		DeltaSink: func(StreamDelta) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("ChatCompletion(stream) after stream_options fallback: %v", err)
+	}
+	if resp.Message.Content != "ok" {
+		t.Errorf("content = %q, want %q", resp.Message.Content, "ok")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(asksUsage) != 2 || !asksUsage[0] || asksUsage[1] {
+		t.Errorf("request shapes = %v, want [asked stream_options, omitted stream_options]", asksUsage)
 	}
 }

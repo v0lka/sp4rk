@@ -23,10 +23,11 @@ type options struct {
 	mcpServers map[string]mcp.ServerEntry
 	mcpWorkDir string
 
-	confirmFunc tools.ConfirmFunc
-	hitl        agent.HITLHandler
-	maxSteps    int
-	streaming   bool
+	confirmFunc  tools.ConfirmFunc
+	hitl         agent.HITLHandler
+	maxSteps     int
+	streaming    bool
+	streamingSet bool // a WithStreaming/.Streaming option was applied (see mergeConfig)
 
 	logger *slog.Logger
 
@@ -179,13 +180,17 @@ func (o maxStepsOption) apply(opts *options) { opts.maxSteps = o.steps }
 // sp4rk default (50); a negative value disables the loop.
 func WithMaxSteps(n int) Option { return maxStepsOption{steps: n} }
 
-// streamingOption enables live LLM text streaming for the built Framework.
+// streamingOption sets live LLM text streaming for the built Framework.
 type streamingOption bool
 
-func (o streamingOption) apply(opts *options) { opts.streaming = bool(o) }
+func (o streamingOption) apply(opts *options) {
+	opts.streaming = bool(o)
+	opts.streamingSet = true
+}
 
 // WithStreaming enables live streaming of the LLM's text output (the executor
 // forwards text deltas as AssistantChunk events as they arrive). Off by default.
+// Explicitly passing false overrides a Streaming: true set by a base WithConfig.
 func WithStreaming(stream bool) Option { return streamingOption(stream) }
 
 // loggerOption sets the structured logger.
@@ -267,9 +272,12 @@ func (b *FrameworkBuilder) MaxSteps(n int) *FrameworkBuilder {
 
 // Streaming enables live streaming of the LLM's text output: the executor
 // forwards text deltas as AssistantChunk events as they arrive, instead of a
-// single chunk at finalization. Off by default.
+// single chunk at finalization. Off by default. Passing false overrides a
+// Streaming: true arriving from a base WithConfig — the explicit value always
+// wins.
 func (b *FrameworkBuilder) Streaming(stream bool) *FrameworkBuilder {
 	b.opts.streaming = stream
+	b.opts.streamingSet = true
 	return b
 }
 

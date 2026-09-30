@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/liushuangls/go-anthropic/v2"
 )
@@ -77,13 +78,15 @@ func NewAnthropicProvider(cfg AnthropicProviderConfig) (*AnthropicProvider, erro
 	// empty body) with HTTP 200, which the SDK then silently decodes into an
 	// empty MessagesResponse. Capturing the raw body lets parseResponse include
 	// it in a descriptive error so such failures are observable instead of
-	// surfacing as a silent empty reply. The raw body is read into memory on
-	// every response and re-wrapped so the SDK can still decode it: this is a
-	// transient ~1× body-size allocation per call (acceptable for the
-	// non-streaming CreateMessages path), not a zero-overhead path. The
-	// provided HTTP client is cloned (not mutated) so any shared proxy/TLS/
-	// timeout configuration is preserved and other consumers of the same client
-	// are unaffected.
+	// surfacing as a silent empty reply. The transport tee-wraps the response
+	// body (instead of reading it into memory up front) so it is captured as
+	// the SDK consumes it: streaming responses stay incremental (deltas reach
+	// the DeltaSink as they arrive off the wire) and the synchronous path pays
+	// the same transient ~1× body-size allocation as before. A body the SDK
+	// abandons early (e.g. a cancelled stream) captures partially — enough for
+	// diagnostics. The provided HTTP client is cloned (not mutated) so any
+	// shared proxy/TLS/timeout configuration is preserved and other consumers
+	// of the same client are unaffected.
 	httpClient := &http.Client{}
 	if cfg.HTTPClient != nil {
 		*httpClient = *cfg.HTTPClient
@@ -142,12 +145,42 @@ func normalizeAnthropicBaseURL(base string) string {
 }
 
 // bodyCaptureCtxKey is the context key under which ChatCompletion stashes a
-// *[]byte that the capturingTransport fills with the raw response body.
+// *capturedBody that the capturingTransport fills with the raw response body.
 type bodyCaptureCtxKey struct{}
 
-// capturingTransport is an http.RoundTripper that reads the full response body,
-// copies it into a per-request buffer (when the request context carries one),
-// and re-wraps it so the underlying SDK can still decode it.
+// capturedBody accumulates the raw response bytes while the SDK consumes the
+// response and hands them to the caller once the body is fully read (or
+// abandoned early — then what was read so far). ChatCompletion owns one
+// instance per call and shares it with the transport through the request
+// context, so the caller can inspect the body after either the synchronous or
+// the streaming path completes.
+type capturedBody struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+// write appends bytes read off the wire.
+func (c *capturedBody) write(p []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.buf.Write(p)
+}
+
+// bytes returns everything captured so far. It is safe to call concurrently
+// with writes; the returned slice is a copy so later reads of the stream
+// cannot mutate it under the caller.
+func (c *capturedBody) bytes() []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return bytes.Clone(c.buf.Bytes())
+}
+
+// capturingTransport is an http.RoundTripper that tee-wraps the response body:
+// every byte the SDK reads is mirrored into the per-request capturedBody (when
+// the request context carries one) and passed through unchanged. Because the
+// wrapper never reads the body itself, server-sent events flow through the
+// transport incrementally and streaming callbacks fire live; the synchronous
+// path captures the full body once the SDK reads it to EOF.
 type capturingTransport struct {
 	base http.RoundTripper
 }
@@ -168,16 +201,28 @@ func (t *capturingTransport) RoundTrip(req *http.Request) (*http.Response, error
 		}
 		return nil, err
 	}
-	body, readErr := io.ReadAll(resp.Body)
-	_ = resp.Body.Close() // fully read above; close error is not actionable
-	if readErr != nil {
-		return nil, fmt.Errorf("anthropic: failed to read response body: %w", readErr)
-	}
-	if holder, ok := req.Context().Value(bodyCaptureCtxKey{}).(*[]byte); ok && holder != nil {
-		*holder = body
-	}
-	resp.Body = io.NopCloser(bytes.NewReader(body))
+	capture, _ := req.Context().Value(bodyCaptureCtxKey{}).(*capturedBody)
+	resp.Body = &capturingBody{rc: resp.Body, capture: capture}
 	return resp, nil
+}
+
+// capturingBody mirrors every byte read from the underlying body into the
+// per-request capturedBody while passing it through to the SDK decoder.
+type capturingBody struct {
+	rc      io.ReadCloser
+	capture *capturedBody
+}
+
+func (c *capturingBody) Read(p []byte) (int, error) {
+	n, err := c.rc.Read(p)
+	if n > 0 && c.capture != nil {
+		c.capture.write(p[:n])
+	}
+	return n, err
+}
+
+func (c *capturingBody) Close() error {
+	return c.rc.Close()
 }
 
 // truncateForError returns a trimmed, length-limited view of b suitable for
@@ -203,16 +248,18 @@ func (p *AnthropicProvider) ChatCompletion(ctx context.Context, req ChatRequest)
 		return nil, fmt.Errorf("anthropic: failed to build request: %w", err)
 	}
 
-	// Stash a buffer the capturingTransport fills with the raw response body,
-	// so parseResponse can embed it in an error if the endpoint returns a
-	// non-standard or error response with HTTP 200.
-	var capturedBody []byte
-	ctx = context.WithValue(ctx, bodyCaptureCtxKey{}, &capturedBody)
+	// Stash a capture buffer the capturingTransport fills with the raw response
+	// body (mirrored as the SDK reads it), so parseResponse can embed it in an
+	// error if the endpoint returns a non-standard or error response with HTTP
+	// 200. The streaming path reads the same buffer after CreateMessagesStream
+	// completes, so stream-mode diagnostics see the real body too.
+	capture := &capturedBody{}
+	ctx = context.WithValue(ctx, bodyCaptureCtxKey{}, capture)
 
 	// Opt-in streaming: a non-nil DeltaSink asks the provider to stream text /
 	// reasoning deltas as they arrive, then return the same assembled response.
 	if req.DeltaSink != nil {
-		return p.chatCompletionStream(ctx, req, anthropicReq, capturedBody)
+		return p.chatCompletionStream(ctx, req, anthropicReq, capture)
 	}
 
 	resp, err := p.client.CreateMessages(ctx, *anthropicReq)
@@ -220,7 +267,7 @@ func (p *AnthropicProvider) ChatCompletion(ctx context.Context, req ChatRequest)
 		return nil, p.wrapError(fmt.Errorf("anthropic: API error: %w", err))
 	}
 
-	return p.parseResponse(resp, capturedBody)
+	return p.parseResponse(resp, capture.bytes())
 }
 
 // chatCompletionStream performs a streaming Messages call. The go-anthropic SDK
@@ -229,9 +276,19 @@ func (p *AnthropicProvider) ChatCompletion(ctx context.Context, req ChatRequest)
 // parseResponse used by the synchronous path. req.DeltaSink is non-nil.
 //
 // The SDK streaming callback cannot return an error, so a delta sink error
-// (host-side cancellation) is recorded and surfaced after the stream completes
-// rather than aborting mid-flight.
-func (p *AnthropicProvider) chatCompletionStream(ctx context.Context, req ChatRequest, base *anthropic.MessagesRequest, capturedBody []byte) (*ChatResponse, error) {
+// (host-side cancellation) is recorded and immediately cancels the request
+// context: the HTTP stream read inside the SDK fails with a context error and
+// the provider stops consuming the wire — the endpoint stops generating —
+// instead of paying the full generation cost. The sink error itself (not the
+// resulting transport error) is surfaced to the caller, matching the OpenAI
+// streaming path's observable contract: returning an error from DeltaSink
+// aborts the stream and the caller sees that error.
+func (p *AnthropicProvider) chatCompletionStream(ctx context.Context, req ChatRequest, base *anthropic.MessagesRequest, capture *capturedBody) (*ChatResponse, error) {
+	// Derive a per-call cancellation so a sink error stops the HTTP stream
+	// mid-flight (see above) instead of reading the endpoint's output to EOF.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	streamReq := anthropic.MessagesStreamRequest{MessagesRequest: *base}
 
 	var sinkErr error
@@ -249,16 +306,24 @@ func (p *AnthropicProvider) chatCompletionStream(ctx context.Context, req ChatRe
 				sinkErr = req.DeltaSink(StreamDelta{Reasoning: ev.Delta.Thinking})
 			}
 		}
+		if sinkErr != nil {
+			// Stop reading the wire: cancel the request so the SDK's body read
+			// fails promptly and the endpoint sees a closed connection.
+			cancel()
+		}
 	}
 
 	resp, err := p.client.CreateMessagesStream(ctx, streamReq)
+	if sinkErr != nil {
+		// The stream was aborted on purpose; surface the sink error, not the
+		// transport failure the cancellation produced (context.Canceled or a
+		// truncated-body read error).
+		return nil, sinkErr
+	}
 	if err != nil {
 		return nil, p.wrapError(fmt.Errorf("anthropic: API error: %w", err))
 	}
-	if sinkErr != nil {
-		return nil, sinkErr
-	}
-	return p.parseResponse(resp, capturedBody)
+	return p.parseResponse(resp, capture.bytes())
 }
 
 // buildRequest converts ChatRequest to anthropic.MessagesRequest.

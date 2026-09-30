@@ -123,8 +123,12 @@ func mergeConfig(o options) Config {
 	if o.maxSteps != 0 {
 		cfg.Execution.MaxSteps = o.maxSteps
 	}
-	if o.streaming {
-		cfg.Execution.Streaming = true
+	// streamingSet distinguishes "the option was set" from "set to false":
+	// unlike MaxSteps (whose 0 is a sentinel meaning "keep the default"),
+	// false is a meaningful streaming value that must be able to override a
+	// Streaming: true arriving from a base WithConfig.
+	if o.streamingSet {
+		cfg.Execution.Streaming = o.streaming
 	}
 
 	// Security / hooks
