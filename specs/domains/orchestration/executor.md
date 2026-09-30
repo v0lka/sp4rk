@@ -7,6 +7,7 @@ The ReAct loop primitive (Thought → Action → Observation) with circuit break
 ## Key Files
 
 - `github.com/v0lka/sp4rk/agent` — `Executor`, `NewExecutor`, `Executor.Run`, `ExecutorResult`, `Step`, `FinishTool`, `CircuitBreakerConfig`, `ToolResultBudget`, `ToolResultCache`, `DetectToolCallSyntaxInContent`, configuration setters (`Set*`), context helpers
+- `github.com/v0lka/sp4rk/agent` (streaming) — `WithStreaming` / `Executor.SetStreaming`, the `ChatRequest.DeltaSink` wiring, and the `emitAssistantEvents` finalization
 - `github.com/v0lka/sp4rk/agent` (executor internals) — single-call dispatch, batch meta-tool interception, implicit-finish handling, mutation/checklist gate logic
 - `github.com/v0lka/sp4rk/agent` (checklist helpers) — shared Markdown-checkbox parsing (`ParseTodoLine`, `ParseTodoItems`, `TodoItem`) used by both the executor (checklist diffing) and the `update_checklist` tool
 - `github.com/v0lka/sp4rk/agent` — `ContextManager` / `CompactionStrategy` / `FillCheck` interfaces, `LLMCaller`, `ToolExecutor`, `Events`, `HITLHandler`
@@ -22,7 +23,7 @@ The Executor is **not safe for concurrent use on a single instance** — `Run` m
 func NewExecutor(llmRouter LLMCaller, toolRegistry ToolExecutor, maxSteps int, opts ...Option) *Executor
 ```
 
-The event emitter and the HITL handler are **nil-safe** — `nil` is replaced with `NoopEvents` and `NoopHITLHandler`. Options: `WithTokenCounter`, `WithEvents`, `WithSuppressAssistantEvents` (hides streaming events for sub-steps), `WithToolResultBudget` (defaults to `DefaultToolResultBudget()`), `WithCircuitBreaker` (defaults to `DefaultCircuitBreakerConfig()`), `WithHITL`, `WithResumeSteps` (seeds prior ReAct steps to resume from a checkpoint; see [Resume from a checkpoint](#resume-from-a-checkpoint)), `WithPauseChecker`, and `WithUserMessageSource`. The equivalent runtime setters are available for pause/message hooks; `SetVerifyOnEdit` installs the independent post-edit verifier.
+The event emitter and the HITL handler are **nil-safe** — `nil` is replaced with `NoopEvents` and `NoopHITLHandler`. Options: `WithTokenCounter`, `WithEvents`, `WithSuppressAssistantEvents` (hides streaming events for sub-steps), `WithStreaming` (streams LLM text deltas live as `AssistantChunk` events; see [Streaming](#streaming)), `WithToolResultBudget` (defaults to `DefaultToolResultBudget()`), `WithCircuitBreaker` (defaults to `DefaultCircuitBreakerConfig()`), `WithHITL`, `WithResumeSteps` (seeds prior ReAct steps to resume from a checkpoint; see [Resume from a checkpoint](#resume-from-a-checkpoint)), `WithPauseChecker`, and `WithUserMessageSource`. The equivalent runtime setters are available for pause/message hooks (`SetStreaming` mirrors `WithStreaming`); `SetVerifyOnEdit` installs the independent post-edit verifier.
 
 ### Run
 
@@ -83,6 +84,12 @@ Proactive mid-step nudges (run after tool execution, before compaction, while th
 
 - **Staleness nudge**: once a checklist exists, if the agent makes `checklistStalenessThreshold` (3) or more productive calls since its last successful `update_checklist`, a nudge is injected prompting an immediate incremental update. The counter resets after each successful update, and the nudge is capped at `checklistStaleNudgeCap` (2) injections per step to avoid nudge fatigue. Emits an `ExecutorDiagnostic` with event `checklist_stale_nudge`.
 - **Batching detection**: after each successful `update_checklist`, the new checklist is diffed against the previous one by item text. Marking more than one previously-unchecked item complete in a single call appends a correction suffix to that call's observation; marking exactly one earns brief positive reinforcement. The first update (initialization) is exempt. Emits an `ExecutorDiagnostic` with event `checklist_batched_update` when a batch is detected.
+
+### Streaming
+
+Streaming is opt-in via `WithStreaming(true)` (or `Executor.SetStreaming`). When enabled and assistant events are not suppressed (`WithSuppressAssistantEvents`), the executor installs `ChatRequest.DeltaSink` on every loop LLM call and forwards each non-empty text delta to `Events.AssistantChunk` as it arrives; the flag `runState.assistantStreamed` records whether any delta actually arrived. On finalization the executor emits **only** `AssistantDone` when the text was streamed live (the deltas were the chunks), and falls back to a single full-text `AssistantChunk` + `AssistantDone` when nothing streamed — so a provider that ignores `DeltaSink` (e.g. the Responses or Google paths) degrades gracefully to the pre-streaming behavior. With streaming off (the default) no sink is set and one `AssistantChunk` is emitted at finish, exactly as before. See [../llm-providers.md](../llm-providers.md#streaming) for the transport hook.
+
+Deltas are emitted before the executor knows a response is final, so a response later discarded by a nudge, or re-issued by a reactive-compaction retry, will already have been partially streamed. Streaming affects only event delivery timing — the assembled `ChatResponse` driving the loop is identical to the synchronous result.
 
 ### Implicit finish & failure-mode detection
 
@@ -170,6 +177,7 @@ The `batch` tool lets the model dispatch multiple tool calls in one turn. It is 
 - Every `Step` carries `IsUntrusted` (set after tool execution via `tool.IsUntrusted()` or MCP source check) and `CacheHash` (empty for a non-cacheable tool that was not truncated).
 - No tool — cacheable or non-cacheable — is ever truncated without a retrieval path. When a non-cacheable tool's result is truncated at Stage 1 (line/byte) or Stage 2 (token budget), the executor caches it on demand (`ToolResultCache.Store`) and embeds the resulting hash in the truncation notice so the model can re-read the full result via `tool_result_read`. Only small non-truncated non-cacheable results stay out of the cache.
 - `batch` is intercepted before the registry; its sub-calls are cached individually.
+- Streaming is off by default; when enabled it installs `ChatRequest.DeltaSink`, forwards text deltas to `AssistantChunk`, and emits `AssistantDone` exactly once per finalized response — a provider that streams nothing still yields one full-text `AssistantChunk`.
 
 ## Related Specs
 

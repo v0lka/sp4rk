@@ -69,6 +69,7 @@ no postfix is needed.
 
 ### Execution / misc
 - `.MaxSteps(n)` — per-step ReAct budget (0 = SDK default)
+- `.Streaming(true)` — stream LLM text deltas live as `AssistantChunk` events (off by default)
 - `.Logger(*slog.Logger)` — structured logger
 - `.NoAutoFinish()` — suppress auto-registration of the finish tool
 
@@ -101,6 +102,7 @@ import "github.com/v0lka/sp4rk"  // options live in the root package
 | `WithAutoApprove()` | Security | Install an always-approve callback — convenient for sandboxed workspaces. |
 | `WithHITL(h)` | Security | Set the human-in-the-loop handler ([HITL](hitl.md)). |
 | `WithMaxSteps(n)` | Execution | Per-step ReAct loop budget (`0` = sp4rk default 50, negative = disabled). |
+| `WithStreaming(bool)` | Execution | Stream LLM text deltas live as `AssistantChunk` events (off by default). |
 | `WithLogger(l)` | Misc | Structured logger (defaults to `slog.Default()`). |
 | `WithConfig(cfg)` | Escape hatch | Supply a full `Config` as the base; other options apply on top. |
 

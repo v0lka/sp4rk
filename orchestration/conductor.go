@@ -35,6 +35,11 @@ type ConductorConfig struct {
 	ReasoningEffort   string
 	PreWarningPercent int
 
+	// Streaming enables live LLM text streaming on the main-loop Executor:
+	// text deltas are forwarded as agent.Events.AssistantChunk as they arrive.
+	// Opt-in; the default (false) preserves the non-streaming behavior.
+	Streaming bool
+
 	// VerifyOnEdit installs a mechanical verification hook (tests/linter
 	// command) on the main-loop Executor: after any response group with a
 	// successful write_file/edit_file, the command runs once and its
@@ -343,6 +348,9 @@ func (c *Conductor) Run(
 	}
 	if c.cfg.PreWarningPercent > 0 {
 		executor.SetPreWarningPercent(c.cfg.PreWarningPercent)
+	}
+	if c.cfg.Streaming {
+		executor.SetStreaming(true)
 	}
 	if c.cfg.VerifyOnEdit != nil {
 		executor.SetVerifyOnEdit(c.cfg.VerifyOnEdit, c.cfg.VerifyOnEditMaxOutputChars)

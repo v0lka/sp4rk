@@ -53,6 +53,7 @@ Available options:
 | `WithTokenCounter(c llm.TokenCounter)` | Token counting for context management. |
 | `WithEvents(e Events)` | Lifecycle events (nil → `NoopEvents`). |
 | `WithSuppressAssistantEvents(bool)` | Hide `AssistantChunk`/`AssistantDone` (for sub-steps). |
+| `WithStreaming(bool)` | Stream LLM text deltas live as `AssistantChunk` events as they arrive (opt-in; off by default). |
 | `WithToolResultBudget(b ToolResultBudget)` | Stage 2 token-based truncation. Defaults to `DefaultToolResultBudget()` when unset. |
 | `WithCircuitBreaker(c CircuitBreakerConfig)` | Loop-protection thresholds. Defaults to `DefaultCircuitBreakerConfig()` when unset. |
 | `WithHITL(h HITLHandler)` | Human-in-the-loop hooks (nil → `NoopHITLHandler`). |

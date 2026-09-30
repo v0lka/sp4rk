@@ -10,10 +10,12 @@ import (
 	"log/slog"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 
 	oai "github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
+	"github.com/openai/openai-go/packages/param"
 )
 
 // OpenAIProviderConfig contains configuration for OpenAI-compatible providers.
@@ -208,6 +210,12 @@ func (p *OpenAIProvider) ChatCompletion(ctx context.Context, req ChatRequest) (*
 
 	params := p.buildChatParams(req)
 
+	// Opt-in streaming: a non-nil DeltaSink asks the provider to stream text /
+	// reasoning deltas as they arrive, then return the same assembled response.
+	if req.DeltaSink != nil {
+		return p.chatCompletionStream(ctx, req, params)
+	}
+
 	resp, err := p.client.Chat.Completions.New(ctx, params)
 	if err != nil {
 		return nil, p.wrapError(fmt.Errorf("openai chat completion: %w", err))
@@ -242,6 +250,120 @@ func (p *OpenAIProvider) ChatCompletion(ctx context.Context, req ChatRequest) (*
 			OutputTokens: int(resp.Usage.CompletionTokens),
 		},
 	}, nil
+}
+
+// chatCompletionStream performs a streaming Chat Completions call. It forwards
+// text and reasoning deltas to req.DeltaSink as they arrive off the wire and
+// assembles the same *ChatResponse the synchronous path returns (content,
+// reasoning, tool calls, usage, stop reason). req.DeltaSink is non-nil.
+//
+// A delta sink error aborts the stream immediately (host-side cancellation):
+// the stream is closed and the error is returned to the caller.
+func (p *OpenAIProvider) chatCompletionStream(ctx context.Context, req ChatRequest, params oai.ChatCompletionNewParams) (*ChatResponse, error) {
+	// Ask the endpoint to include a final usage-only chunk so token accounting
+	// matches the synchronous path.
+	params.StreamOptions = oai.ChatCompletionStreamOptionsParam{IncludeUsage: param.NewOpt(true)}
+
+	stream := p.client.Chat.Completions.NewStreaming(ctx, params)
+	defer func() { _ = stream.Close() }()
+
+	var (
+		content   strings.Builder
+		reasoning strings.Builder
+		toolAcc   = map[int]*streamToolCall{}
+		finish    string
+		usage     TokenUsage
+	)
+
+	for stream.Next() {
+		chunk := stream.Current()
+
+		if chunk.JSON.Usage.Valid() {
+			usage = TokenUsage{
+				InputTokens:  int(chunk.Usage.PromptTokens),
+				OutputTokens: int(chunk.Usage.CompletionTokens),
+			}
+		}
+
+		for _, choice := range chunk.Choices {
+			delta := choice.Delta
+			if delta.Content != "" {
+				content.WriteString(delta.Content)
+				if err := req.DeltaSink(StreamDelta{Text: delta.Content}); err != nil {
+					return nil, err
+				}
+			}
+			// reasoning_content is a non-standard extension (DeepSeek et al.);
+			// it is not a typed field on the delta, so read it from the raw JSON.
+			if r := extractReasoningContent(delta.RawJSON()); r != "" {
+				reasoning.WriteString(r)
+				if err := req.DeltaSink(StreamDelta{Reasoning: r}); err != nil {
+					return nil, err
+				}
+			}
+			// Tool-call arguments arrive as per-index fragments across chunks and
+			// must be concatenated in order.
+			for _, tc := range delta.ToolCalls {
+				idx := int(tc.Index)
+				acc := toolAcc[idx]
+				if acc == nil {
+					acc = &streamToolCall{}
+					toolAcc[idx] = acc
+				}
+				if tc.ID != "" {
+					acc.id = tc.ID
+				}
+				if tc.Function.Name != "" {
+					acc.name = tc.Function.Name
+				}
+				acc.args.WriteString(tc.Function.Arguments)
+			}
+			if choice.FinishReason != "" {
+				finish = choice.FinishReason
+			}
+		}
+	}
+	if err := stream.Err(); err != nil {
+		return nil, p.wrapError(fmt.Errorf("openai chat completion (stream): %w", err))
+	}
+
+	// Reassemble tool calls in declaration order (index order).
+	idxs := make([]int, 0, len(toolAcc))
+	for idx := range toolAcc {
+		idxs = append(idxs, idx)
+	}
+	sort.Ints(idxs)
+	var toolCalls []ToolCall
+	for _, idx := range idxs {
+		acc := toolAcc[idx]
+		toolCalls = append(toolCalls, ToolCall{
+			ID:    acc.id,
+			Name:  acc.name,
+			Input: json.RawMessage(acc.args.String()),
+		})
+	}
+
+	message := Message{
+		Role:             "assistant",
+		Content:          content.String(),
+		ReasoningContent: reasoning.String(),
+		ToolCalls:        toolCalls,
+	}
+	logToolCallArguments(p.log(), p.name, message.ToolCalls)
+
+	return &ChatResponse{
+		Message:    message,
+		Reasoning:  message.ReasoningContent,
+		StopReason: MapStopReason(finish, openAIStopReasonMap),
+		Usage:      usage,
+	}, nil
+}
+
+// streamToolCall accumulates the per-index fragments of one streamed tool call.
+type streamToolCall struct {
+	id   string
+	name string
+	args strings.Builder
 }
 
 // buildChatParams converts our ChatRequest to OpenAI ChatCompletionNewParams.

@@ -209,11 +209,55 @@ func (p *AnthropicProvider) ChatCompletion(ctx context.Context, req ChatRequest)
 	var capturedBody []byte
 	ctx = context.WithValue(ctx, bodyCaptureCtxKey{}, &capturedBody)
 
+	// Opt-in streaming: a non-nil DeltaSink asks the provider to stream text /
+	// reasoning deltas as they arrive, then return the same assembled response.
+	if req.DeltaSink != nil {
+		return p.chatCompletionStream(ctx, req, anthropicReq, capturedBody)
+	}
+
 	resp, err := p.client.CreateMessages(ctx, *anthropicReq)
 	if err != nil {
 		return nil, p.wrapError(fmt.Errorf("anthropic: API error: %w", err))
 	}
 
+	return p.parseResponse(resp, capturedBody)
+}
+
+// chatCompletionStream performs a streaming Messages call. The go-anthropic SDK
+// delivers content-block deltas through callbacks and still returns the fully
+// assembled MessagesResponse, so the final response is built by the same
+// parseResponse used by the synchronous path. req.DeltaSink is non-nil.
+//
+// The SDK streaming callback cannot return an error, so a delta sink error
+// (host-side cancellation) is recorded and surfaced after the stream completes
+// rather than aborting mid-flight.
+func (p *AnthropicProvider) chatCompletionStream(ctx context.Context, req ChatRequest, base *anthropic.MessagesRequest, capturedBody []byte) (*ChatResponse, error) {
+	streamReq := anthropic.MessagesStreamRequest{MessagesRequest: *base}
+
+	var sinkErr error
+	streamReq.OnContentBlockDelta = func(ev anthropic.MessagesEventContentBlockDeltaData) {
+		if sinkErr != nil {
+			return
+		}
+		switch ev.Delta.Type {
+		case anthropic.MessagesContentTypeTextDelta:
+			if text := ev.Delta.GetText(); text != "" {
+				sinkErr = req.DeltaSink(StreamDelta{Text: text})
+			}
+		case anthropic.MessagesContentTypeThinkingDelta:
+			if ev.Delta.MessageContentThinking != nil && ev.Delta.Thinking != "" {
+				sinkErr = req.DeltaSink(StreamDelta{Reasoning: ev.Delta.Thinking})
+			}
+		}
+	}
+
+	resp, err := p.client.CreateMessagesStream(ctx, streamReq)
+	if err != nil {
+		return nil, p.wrapError(fmt.Errorf("anthropic: API error: %w", err))
+	}
+	if sinkErr != nil {
+		return nil, sinkErr
+	}
 	return p.parseResponse(resp, capturedBody)
 }
 

@@ -44,6 +44,7 @@ type ConductorConfig struct {
     PerToolTruncation   map[string]agent.ToolTruncationConfig
     ReasoningEffort     string
     PreWarningPercent   int
+    Streaming           bool
     NonCacheableTools   []string
     ConversationHistory       []llm.Message
     ResumeSteps               []agent.Step
@@ -160,6 +161,7 @@ The Conductor is the only top-level execution entry point this domain exposes. D
 | `CompactOnStart` | `false` | Forces one compaction pass on the `ContextManager` right after resume/nudge seeding, before the first LLM call, regardless of fill thresholds — manual compaction of a paused task (see [conductor.md](conductor.md#compact-on-start)). Emits `ContextCompaction` only when the pass reports a result; reactive executor compaction is unaffected. |
 | `VerifyOnEdit` | `nil` | User-configured verifier run once per response group containing a successful `write_file`/`edit_file`; nil disables it. |
 | `VerifyOnEditMaxOutputChars` | `<= 0` → `4000` | Unicode-safe cap for the injected verification output. |
+| `Streaming` | `false` | Enables live LLM text streaming on the main-loop Executor: text deltas are forwarded as `agent.Events.AssistantChunk` as they arrive; `false` preserves the non-streaming behavior (see [executor.md](executor.md#streaming)). |
 | `ConversationHistory` | `nil` | Prior conversation messages (previous exchanges) rendered before the current task via the `ConversationAware` capability. |
 | `ContentBlocks` | `nil` | Structured content blocks (text + images) for the task user message. When non-empty, `Run` calls `SetTaskWithBlocks` via the `BlockTaskAware` capability so providers render a multimodal user message; `nil`/empty preserves the legacy text-only `SetTask` path. |
 | `ContextFactory` / `SystemPrompt` | required | Both must be non-nil or `Run` returns an error. |

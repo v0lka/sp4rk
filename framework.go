@@ -199,6 +199,12 @@ type ExecutionConfig struct {
 	// MaxDependencyContextChars limits the context size for step dependency summaries.
 	// When provided to the LLM as context for a dependent step. 0 means use the default (8000).
 	MaxDependencyContextChars int
+
+	// Streaming enables live streaming of the LLM's text output: the executor
+	// forwards text deltas as agent.Events.AssistantChunk as they arrive from
+	// the provider, instead of a single chunk at finalization. Opt-in; the
+	// default (false) preserves the non-streaming behavior exactly.
+	Streaming bool
 }
 
 // CompactionConfig configures context window compaction.
@@ -401,6 +407,7 @@ func (fw *Framework) NewConductor(systemPrompt orchestration.SystemPromptFactory
 		HITLHandler:       fw.cfg.HITL,
 		PreWarningPercent: fw.cfg.Execution.PreWarningPercent,
 		ToolCache:         fw.toolCache,
+		Streaming:         fw.cfg.Execution.Streaming,
 	}
 
 	return orchestration.NewConductor(conductorCfg), nil

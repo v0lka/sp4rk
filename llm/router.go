@@ -515,10 +515,26 @@ func (r *Router) Call(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 		return nil, err
 	}
 
+	// Streaming is retry-safe only until the first delta is delivered: text
+	// already handed to the host cannot be retracted, so a failed attempt that
+	// emitted at least one delta must NOT be retried (that would replay text the
+	// host has already rendered). Wrap the caller's sink in a per-attempt guard
+	// that records whether any delta was emitted; the retry decision below
+	// consults it. The guard is invoked synchronously on this goroutine by the
+	// provider, so no synchronization is required.
+	var guard *deltaGuard
+	if req.DeltaSink != nil {
+		guard = &deltaGuard{inner: req.DeltaSink}
+		req.DeltaSink = guard.forward
+	}
+
 	var lastErr error
 	backoff := r.initialBackoff
 
 	for attempt := 0; attempt <= r.maxRetries; attempt++ {
+		if guard != nil {
+			guard.reset()
+		}
 		resp, err := provider.ChatCompletion(ctx, req)
 		// Defense in depth: a Provider must never return (nil, nil), but a
 		// buggy or non-conforming provider can (e.g. a JSON `null` body decoded
@@ -544,6 +560,14 @@ func (r *Router) Call(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 
 		lastErr = err
 
+		// Streaming retry guard: never retry after partial delivery — the delta
+		// text is already visible to the host and replaying it would duplicate
+		// output. A retryable error before any delta was emitted is retried as
+		// usual.
+		if guard != nil && guard.emitted {
+			return nil, err
+		}
+
 		// Don't retry if not retryable or this was the last attempt
 		if !IsRetryable(err) || attempt == r.maxRetries {
 			return nil, err
@@ -563,6 +587,26 @@ func (r *Router) Call(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 
 	return nil, lastErr
 }
+
+// deltaGuard wraps a ChatRequest.DeltaSink to make streaming retry-safe. It
+// records whether any delta has been emitted for the CURRENT attempt so the
+// router can refuse to retry after partial delivery (which would duplicate text
+// the host has already rendered). The flag is reset at the start of each
+// attempt; all access happens on the goroutine running Call, so no
+// synchronization is needed.
+type deltaGuard struct {
+	inner   func(StreamDelta) error
+	emitted bool
+}
+
+// forward records that a delta was emitted and delegates to the wrapped sink.
+func (g *deltaGuard) forward(d StreamDelta) error {
+	g.emitted = true
+	return g.inner(d)
+}
+
+// reset clears the emitted flag at the start of each attempt.
+func (g *deltaGuard) reset() { g.emitted = false }
 
 // DefaultProvider returns the active provider.
 // Returns nil if no provider is configured.

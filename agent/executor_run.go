@@ -47,6 +47,7 @@ type runState struct {
 	responseGroup             int64
 	checklistAvailable        bool
 	checklistStaleNudgeCount  int
+	assistantStreamed         bool // the current response's text was delivered live as AssistantChunk deltas
 }
 
 // handleStepLimitBoundary handles the step-limit boundary logic (when stepNum > effectiveMaxSteps).
@@ -128,6 +129,24 @@ func (e *Executor) callLLMWithReactiveCompaction(ctx context.Context, state *run
 		// The main agent loop: the only call class entitled to the full
 		// vendor sampling preset.
 		CallPurpose: llm.CallPurposeExecutor,
+	}
+
+	// Opt-in streaming: when enabled and assistant events are not suppressed,
+	// ask the provider to stream text deltas and forward each one to the host
+	// as an AssistantChunk as it arrives. state.assistantStreamed records
+	// whether any delta actually arrived, so the finalization can emit only
+	// AssistantDone (not a duplicate full-text chunk) — and falls back to a
+	// single chunk when the provider ignored the hook (degraded streaming).
+	state.assistantStreamed = false
+	if e.streaming && !e.suppressAssistantEvents {
+		req.DeltaSink = func(d llm.StreamDelta) error {
+			if d.Text == "" {
+				return nil
+			}
+			state.assistantStreamed = true
+			e.emitter.AssistantChunk(d.Text)
+			return nil
+		}
 	}
 
 	// Call LLM
@@ -437,6 +456,22 @@ func (e *Executor) checklistBatchingSuffix(state *runState, input json.RawMessag
 	return fmt.Sprintf(checklistBatchWarningFmt, newlyChecked)
 }
 
+// emitAssistantEvents emits the final assistant output for a completed response.
+// When the response text was already streamed live (state.assistantStreamed),
+// only AssistantDone is emitted — the deltas were the chunks. Otherwise the full
+// text is emitted as a single AssistantChunk, preserving the non-streaming
+// behavior exactly (including the provider-degraded case where streaming was
+// requested but the provider delivered no deltas).
+func (e *Executor) emitAssistantEvents(state *runState, output string, resp *llm.ChatResponse) {
+	if e.suppressAssistantEvents {
+		return
+	}
+	if !state.assistantStreamed {
+		e.emitter.AssistantChunk(output)
+	}
+	e.emitter.AssistantDone(output, resp.Usage.InputTokens, resp.Usage.OutputTokens)
+}
+
 // handleImplicitFinish handles the "no tool calls" branches: syntax-nudge → finish-nudge → implicit finish.
 //
 // The model can enter a failure-mode where it prints tool-call syntax
@@ -527,11 +562,7 @@ func (e *Executor) handleImplicitFinish(ctx context.Context, resp *llm.ChatRespo
 			output = thought + "\n\n" + note
 		}
 
-		// Emit assistant response events (unless suppressed)
-		if !e.suppressAssistantEvents {
-			e.emitter.AssistantChunk(output)
-			e.emitter.AssistantDone(output, resp.Usage.InputTokens, resp.Usage.OutputTokens)
-		}
+		e.emitAssistantEvents(state, output, resp)
 
 		return &ExecutorResult{
 			Output:   output,
@@ -592,11 +623,7 @@ func (e *Executor) handleImplicitFinish(ctx context.Context, resp *llm.ChatRespo
 		output = thought + "\n\n" + note
 	}
 
-	// Emit assistant response events (unless suppressed)
-	if !e.suppressAssistantEvents {
-		e.emitter.AssistantChunk(output)
-		e.emitter.AssistantDone(output, resp.Usage.InputTokens, resp.Usage.OutputTokens)
-	}
+	e.emitAssistantEvents(state, output, resp)
 
 	return &ExecutorResult{
 		Output:   output,

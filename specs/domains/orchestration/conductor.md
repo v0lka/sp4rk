@@ -146,6 +146,7 @@ The pass covers only the start of the run: the Executor's threshold-driven react
 - Pause is checked before the live-message source at every boundary, so a paused run returns a checkpoint without consuming the next queued message.
 - A pending verify-on-edit run is flushed before a paused or finished result is returned.
 - A Conductor instance is reusable across steps; per-run state lives on the `ContextManager`, not on the Conductor.
+- When `Streaming` is set, `Run` installs `agent.WithStreaming(true)` on the main-loop Executor; streaming is skipped automatically when assistant events are suppressed and degrades gracefully for providers that do not honor `ChatRequest.DeltaSink`.
 
 ## Related Specs
 

@@ -415,6 +415,15 @@ stepCaller := caller.WithContextTracker(stepTracker)
 resp, err := stepCaller.Call(ctx, req)
 ```
 
+## Streaming
+
+Streaming delivers the assistant's text incrementally instead of as one response. It is opt-in and changes no provider, router, or executor contract:
+
+- **Request hook.** Set `ChatRequest.DeltaSink` (a `func(llm.StreamDelta) error`; runtime-only, never serialized) to ask the provider to stream. The provider invokes it for each incremental text/reasoning delta as it arrives, then returns the **same fully-assembled `*ChatResponse`** (tool calls, usage, stop reason) the synchronous path would. A nil `DeltaSink` — the default, and every structured `oneshot` call — selects the unchanged synchronous path. Returning an error from the sink aborts the stream.
+- **Provider support.** The OpenAI Chat Completions path (`Chat.Completions.NewStreaming`) and the Anthropic Messages path (`CreateMessagesStream`) stream; the Responses and Google `generateContent` paths ignore the hook, so the executor falls back to a single full-text chunk.
+- **Retries.** `Router.Call` refuses to retry an attempt that already delivered a delta (replaying would duplicate text the host already rendered); a retryable error before any delta is retried normally.
+- **Turning it on.** At the executor layer via `agent.WithStreaming(true)` / `Executor.SetStreaming`, or at the top level via `ExecutionConfig.Streaming` or the fluent `.Streaming(true)`. Streamed deltas surface as `Events.AssistantChunk`; `AssistantDone` is emitted once per finalized response. See [../agent-executor.md](agent-executor.md) and [../fluent-api.md](fluent-api.md).
+
 ## Retry & backoff
 
 The router retries transient errors with exponential backoff plus ±20% jitter. Retryable errors are classified by `WrapProviderError` and include:
@@ -468,6 +477,7 @@ type ChatRequest struct {
     MaxTokens       int
     Temperature     *float64         // nil = use provider/sampling default
     ReasoningEffort string           // native reasoning value (e.g. "On", "high")
+    DeltaSink       func(StreamDelta) error // optional: non-nil = stream deltas as they arrive (see Streaming)
 }
 
 type ChatResponse struct {

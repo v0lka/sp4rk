@@ -1,0 +1,62 @@
+# ADR-009: Opt-in request-scoped streaming channel
+
+## Status
+
+Accepted
+
+## Context
+
+sp4rk's LLM call path was strictly synchronous: `llm.Provider.ChatCompletion` returns a complete `*ChatResponse`, `agent.LLMCaller.Call` wraps it, and every consumer (the ReAct executor, the Conductor, `oneshot` service calls) assumed the full text arrived at once. Hosts that wanted a live-typing UX had no way to observe assistant text before the response completed, even though the underlying providers (OpenAI Chat Completions, Anthropic Messages) expose server-sent-event streaming and the `agent.Events` interface already carried the `AssistantChunk`/`AssistantDone` hooks.
+
+Adding streaming naively risked breaking the public contracts that downstream host applications and third-party or test providers implement:
+
+- Adding a `ChatCompletionStream` method to the `llm.Provider` interface would force every existing implementation — downstream providers, test doubles, mock LLMs — to implement it or stop compiling. It is a breaking change to a frozen contract.
+- The same applies to `agent.LLMCaller`: a new streaming method would ripple through every caller wrapper (`agent.LoggingLLMCaller`, `agent.NewDumpCaller`, `agent.NewModelOverrideCaller`, `llm.TrackingCaller`).
+- Streaming must stay optional. Most calls have no interest in intermediate text (routing, planning, reflection, judging, subagent service calls), and delivering text before the response is final has correctness implications — a response can be discarded by a nudge or re-issued by a reactive-compaction retry.
+
+The engine needed a way to stream that is additive, preserves the synchronous model exactly for everyone who does not opt in, and introduces no new interface method.
+
+## Decision
+
+1. **The streaming channel is an optional field on the request, not a new method.** `llm.ChatRequest` gains `DeltaSink func(StreamDelta) error` (tagged `json:"-"`) and a transport-neutral `llm.StreamDelta{Text, Reasoning}` value. A non-nil sink asks the provider to invoke it synchronously for each incremental text/reasoning delta as it arrives off the wire. The provider still returns the **same fully-assembled `*ChatResponse`** (content, reasoning, tool calls, usage, stop reason) the synchronous path would. A nil sink — the default — selects the unchanged synchronous path. `llm.Provider.ChatCompletion`, `agent.LLMCaller.Call`, `agent.Events`, and `ChatResponse` are all unchanged.
+2. **The hook rides inside the request and flows through every wrapper untouched.** Because the sink is a request field, existing decorators (`LoggingLLMCaller`, `NewDumpCaller`, `NewModelOverrideCaller`, `TrackingCaller`) forward it without modification; the `json:"-"` tag keeps request dumps (`NewDumpCaller`) serializable, since a function has no wire representation and carries no request semantics of its own.
+3. **Streaming changes delivery timing only.** The assembled response is identical to the synchronous result; consumers parse one response shape whether or not streaming was on.
+4. **Retries are streaming-aware.** `Router.Call` wraps the caller's sink in a per-attempt `deltaGuard`. It resets the guard before each attempt and refuses to retry an attempt that already emitted a delta — text the host has rendered cannot be retracted. A retryable failure before the first delta is retried as usual, preserving the router's existing backoff policy.
+5. **Provider support is opt-in per path, with graceful degradation.** The OpenAI Chat Completions path (`Chat.Completions.NewStreaming`) and the Anthropic Messages path (`CreateMessagesStream` + `OnContentBlockDelta`, which also covers Claude models routed through the OpenAI provider's `ProtocolAnthropic` delegate) implement streaming. The Responses API path and the Google `generateContent` delegate ignore the hook; the executor detects that no delta arrived and falls back to a single full-text chunk, so those providers are unaffected.
+6. **The executor is the opt-in switch and the single point of event emission.** `agent.WithStreaming(bool)` / `Executor.SetStreaming(bool)` (off by default) install the sink on every loop LLM call and forward each non-empty text delta to `Events.AssistantChunk`, recording `runState.assistantStreamed`. On finalization a single `emitAssistantEvents` helper emits `AssistantDone` exactly once and emits the full-text `AssistantChunk` only when nothing streamed — so the non-streaming path is reproduced exactly and a degraded provider yields one chunk. Streaming is skipped when assistant events are suppressed (`WithSuppressAssistantEvents`).
+7. **Configured at every layer through the existing plumbing.** `ExecutionConfig.Streaming` → `ConductorConfig.Streaming` → `executor.SetStreaming(true)`, plus the fluent `FrameworkBuilder.Streaming(bool)` / `sp4rk.WithStreaming(bool)`.
+
+## Consequences
+
+Positive:
+
+- **Zero breaking changes.** No interface gained a method; `Provider`, `LLMCaller`, `Events`, and `ChatResponse` are untouched, so downstream hosts and third-party/test providers keep compiling — the reference consumer builds unchanged.
+- **One response shape.** Streaming does not fork the parsing/assembly contract, so tool-call handling, usage accounting, stop-reason mapping, and event emission stay single-sourced.
+- **Transparent through the wrapper stack.** The request-scoped hook needs no changes to any of the four caller decorators.
+- **Safe by default.** A nil sink is the synchronous path; a provider that ignores the hook degrades to a single chunk rather than erroring. Enabling streaming can never break a host that does not consume deltas.
+- **Retry correctness.** The `deltaGuard` prevents the router from replaying already-delivered text while keeping retries for pre-delta transport failures.
+
+Negative / rules to keep:
+
+- **Two provider code paths.** Each streaming provider duplicates assembly logic (usage from the final `include_usage` chunk, tool-call fragments concatenated by index and sorted, `reasoning_content` read from raw JSON). These must stay parity-equivalent with the synchronous path — the per-provider streaming tests exist to hold that line.
+- **Delta timing precedes finalization.** Deltas are emitted before the executor knows a response is final; a response later discarded by a syntax/finish nudge, or re-issued by a reactive-compaction retry, will already have been partially streamed. This is a delivery-timing artifact only — the assembled response driving the loop is unchanged.
+- **Mid-stream failures are not retried.** Once a delta is delivered, a subsequent retryable error is returned rather than retried, trading a possible recovery for correctness (no duplicated text). Callers see this as a normal `Call` error.
+- **Anthropic abort is deferred.** The go-anthropic streaming callback cannot return an error, so a sink error from host-side cancellation is recorded and surfaced after the stream completes, whereas the OpenAI path aborts immediately. Same observable result (error to the caller), asymmetric mechanism.
+- **Responses and Google are not yet streamed.** They degrade to a single full-text chunk; adding them later needs no interface change — only a new provider streaming path.
+
+## Alternatives Considered
+
+- **Add a `ChatCompletionStream` method to `llm.Provider` (and mirror it on `agent.LLMCaller`).** Rejected: it is a breaking change to a public interface every downstream and test implementation must satisfy, and it would force edits through all four caller wrappers. The request-scoped field keeps streaming purely additive.
+- **Return a `<-chan StreamDelta` from a streaming entry point.** Rejected: it splits the API into two response shapes, complicates error propagation (a channel cannot carry the final error ergonomically), and still has to produce the assembled `ChatResponse`, duplicating the synchronous result.
+- **Introduce dedicated streaming request/response types.** Rejected: it would fork prompt/response mapping and let the streamed result drift from the synchronous one — exactly the divergence the shared `ChatResponse` avoids.
+- **Put the sink on the provider (a provider-level callback).** Rejected: the sink is per-call, not per-provider; a provider-level callback cannot distinguish concurrent or sequential calls and would leak one call's deltas into another.
+- **Make streaming the default whenever a sink-capable provider is used.** Rejected: it would change the timing contract for every existing host and expose the delta-before-finalization artifact to callers who never asked for it. Opt-in preserves the synchronous model exactly.
+- **Route parse-repair/retry through the stream.** Rejected: keep retry policy where it is (transport-level in the router, response-level in `oneshot`); the `deltaGuard` is the minimal streaming-specific concession — no retry after partial delivery.
+
+## Related
+
+- [../domains/llm-providers.md](../domains/llm-providers.md#streaming) — the transport hook, `StreamDelta`, `DeltaSink`, and the `deltaGuard`.
+- [../contracts/llm-providers.md](../contracts/llm-providers.md) — `ChatRequest`/`StreamDelta` in the provider contract and the rule that a streaming provider MUST honor `DeltaSink`.
+- [../domains/orchestration/executor.md](../domains/orchestration/executor.md#streaming) — executor opt-in, `runState.assistantStreamed`, and the `emitAssistantEvents` finalization.
+- [../architecture/data-flow.md](../architecture/data-flow.md) — `AssistantChunk`/`AssistantDone` semantics under streaming.
+- [008-unified-oneshot-service-client.md](./008-unified-oneshot-service-client.md) — the structured service calls that deliberately leave `DeltaSink` nil and take the synchronous path.

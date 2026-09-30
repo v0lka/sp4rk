@@ -12,6 +12,7 @@ Provides LLM provider abstractions, a model registry, and routing for multi-prov
 - `github.com/v0lka/sp4rk/llm` (token accounting) — `TokenCounter`, `SimpleTokenCounter`, `TiktokenCounter`, `NewTokenCounter`, `ContextTokenTracker`, `UsageTracker`, `UsageObserver`, `TimedUsageObserver`, `TrackingCaller`
 - `github.com/v0lka/sp4rk/llm` (request/response) — `ChatRequest`, `ChatResponse`, `Message`, `ContentBlock`, `NormalizeContentBlocks`, `ValidateContentBlocks`, `ToolCall`, `ToolDefinition`, `TokenUsage`
 - `github.com/v0lka/sp4rk/llm` (errors) — `Error`, `ErrKind` (`ErrKindRateLimit`, `ErrKindOverloaded`), `NewError`, `WrapProviderError`, `IsRetryable`, `ErrContextWindowExceeded`
+- `github.com/v0lka/sp4rk/llm` (streaming) — `StreamDelta`, the optional `ChatRequest.DeltaSink` hook, the internal per-attempt retry guard (`deltaGuard`), and provider streaming for the OpenAI Chat Completions path (`OpenAIProvider.chatCompletionStream`) and the Anthropic Messages path (`AnthropicProvider.chatCompletionStream`)
 
 ## Core Types
 
@@ -202,6 +203,26 @@ The protocol cannot be derived from `ModelFamily` alone: `FamilyOpenAIFlagship` 
 
 The Conductor accepts a multimodal task via `ConductorConfig.ContentBlocks`: when non-empty, it type-asserts the `ContextManager` against the `BlockTaskAware` capability (`SetTaskWithBlocks`) — implemented by `memory.ContextWindow` — so `BuildPrompt` emits the user message carrying both the task text and the blocks (see [orchestration/conductor.md](orchestration/conductor.md)). Conversation summarization replaces image blocks with the placeholder `[image attached]` and concatenates text blocks, so a multimodal user turn survives compaction in text form.
 
+## Streaming
+
+Streaming is **opt-in and additive**: the synchronous `Provider.ChatCompletion` / `Router.Call` / `agent.LLMCaller` contracts are unchanged, and no new provider method is introduced. Instead, the delivery channel is a single optional field on the request:
+
+```go
+type StreamDelta struct {
+    Text      string // assistant content text since the previous delta
+    Reasoning string // reasoning / chain-of-thought text since the previous delta
+}
+
+// ChatRequest gains (runtime-only, never serialized — json:"-"):
+DeltaSink func(StreamDelta) error
+```
+
+`Router.Call` with a non-nil `req.DeltaSink` asks the provider to invoke that callback synchronously for each incremental delta as it arrives off the wire; the provider still returns the **same fully-assembled `*ChatResponse`** (tool calls, usage, stop reason) the synchronous path would. A nil `DeltaSink` — the default, and every structured `oneshot` call (routing/planning/reflection/judging) — selects the unchanged synchronous path. Returning an error from the sink aborts the stream (host-side cancellation).
+
+Built-in provider support: the OpenAI Chat Completions path (`Chat.Completions.NewStreaming`) and the Anthropic Messages path (`CreateMessagesStream` with `OnContentBlockDelta` callbacks — which also covers Claude models delegated through the OpenAI provider's `ProtocolAnthropic` route). Providers that do not yet implement streaming (the Responses API path and the Google `generateContent` delegate) simply ignore `DeltaSink`; the executor detects that no delta arrived and falls back to emitting the full text as a single `AssistantChunk`, so behavior for those providers is unchanged. Because the callback lives inside the request, it flows transparently through every caller wrapper (`agent.NewLoggingLLMCaller`, `NewDumpCaller`, `NewModelOverrideCaller`, `llm.TrackingCaller`) without any wrapper changes.
+
+Retry interaction: `Router.Call` wraps the sink in a **per-attempt guard**. A retryable failure that occurs after at least one delta was emitted in the current attempt is returned to the caller instead of being retried — replaying the stream would duplicate text the host has already rendered. A retryable failure before any delta is emitted is retried normally.
+
 ## Invariants
 
 - The Router is safe for concurrent use; `SetModel` takes a write lock, `Call` snapshots under a read lock and releases before backoff.
@@ -218,6 +239,7 @@ The Conductor accepts a multimodal task via `ConductorConfig.ContentBlocks`: whe
 - Retryable errors are classified by `WrapProviderError` (HTTP 408/429/500/502/503/504/520–524/529 — request timeout, rate limit, upstream server/gateway faults, Cloudflare edge errors, Anthropic overload — plus transient network errors); `IsRetryable` reports whether a chain contains a retryable `*Error`.
 - `Error.ErrKind` is the transport-independent failure class (`rate_limit`, `overloaded`, `""` unknown): `NewError` derives it from the HTTP status (429/529), and the Anthropic transport sets it from the SDK's error type field for `APIError` cases, which carry no HTTP status. Callers match on `ErrKind` rather than `StatusCode` to stay transport-agnostic. Hand-built `Error` literals must set it explicitly; it is not derived for them.
 - An explicit `ModelMetadata.Protocol` is always honored over substring `DetectProtocol` detection; the router threads the resolved protocol into `ChatRequest.Protocol`, and the provider honors `req.Protocol` when set.
+- Streaming is opt-in via a non-nil `ChatRequest.DeltaSink` and changes only delivery timing: the returned `*ChatResponse` is identical to the synchronous result, a nil sink preserves the synchronous path exactly, and `DeltaSink` is never serialized (`json:"-"`). `Router.Call` never retries an attempt that already emitted a delta.
 
 ## Configuration
 

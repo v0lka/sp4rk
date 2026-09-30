@@ -33,7 +33,7 @@ At startup the host constructs the execution surface in this order:
 1. Build an `llm.TokenCounter` and an `llm.ModelRegistry`, then create an `llm.Router` (`NewRouter`) which satisfies `LLMCaller`.
 2. Build a `tools.ToolRegistry` (it satisfies `agent.ToolExecutor`) and register built-in and MCP tools.
 3. Construct a `ContextManager` implementation, injecting a `CompactionStrategy` and the token counter.
-4. Construct the executor, wiring `LLMCaller` (the Router), `ToolExecutor` (the registry), `ContextManager`, an `Events` implementation, an `HITLHandler`, and a `CircuitBreakerConfig`. Optional host callbacks install cooperative pause (`WithPauseChecker`/`SetPauseChecker`), live user-message polling (`WithUserMessageSource`/`SetUserMessageSource`), and user-configured post-edit verification (`SetVerifyOnEdit`).
+4. Construct the executor, wiring `LLMCaller` (the Router), `ToolExecutor` (the registry), `ContextManager`, an `Events` implementation, an `HITLHandler`, and a `CircuitBreakerConfig`. Optional host callbacks install cooperative pause (`WithPauseChecker`/`SetPauseChecker`), live user-message polling (`WithUserMessageSource`/`SetUserMessageSource`), and user-configured post-edit verification (`SetVerifyOnEdit`); opt-in live LLM text streaming is enabled with `WithStreaming`/`SetStreaming`, after which each incoming text delta surfaces as an `Events.AssistantChunk`.
 5. The host invokes the executor's `Run` to start the ReAct loop for a task.
 
 The host supplies concrete `Events` and `HITLHandler` implementations; `NoopEvents` and `NoopHITLHandler` exist for embedders that need only a subset of callbacks.
@@ -41,14 +41,14 @@ The host supplies concrete `Events` and `HITLHandler` implementations; `NoopEven
 ## Data Flow Across Boundary
 
 - **Host → executor (in):** task/system context (via the `ContextManager`), the configured `LLMCaller`, `ToolExecutor`, `Events`, `HITLHandler`, circuit-breaker thresholds, and optional pause/user-message/verify callbacks.
-- **executor → LLMCaller:** `llm.ChatRequest` (messages, tools, max tokens, five optional sampling fields, reasoning effort, and `CallPurposeExecutor`).
+- **executor → LLMCaller:** `llm.ChatRequest` (messages, tools, max tokens, five optional sampling fields, reasoning effort, `CallPurposeExecutor`, and — when streaming is enabled — the optional `DeltaSink` the provider invokes with incremental text deltas).
 - **LLMCaller → executor:** `llm.ChatResponse` (message, reasoning, usage, stop reason). After a successful response, an optional `InterjectionConsumer` retires the one-shot resume nudge; an initial context-window failure leaves it pending for the reactive-compaction retry.
 - **executor → ToolExecutor:** tool name + `json.RawMessage` input.
 - **ToolExecutor → executor:** `tools.ToolResult` (`{Content string; IsError bool}`) plus an error.
 - **executor → EditVerifyRunner:** after a response group containing at least one successful `write_file`/`edit_file`, one verification run; its rune-safe capped `[verify_on_edit]` note is appended to the group's last observation. Reads and failed or rejected edits never trigger it.
 - **host user-message source → executor:** at most one non-empty message per step boundary, after the pause check and before the LLM call; it becomes a nudge-only `Step` and the final user message of that request.
 - **executor → ToolExecutor (cache):** `CacheStrategy(ctx, name, input)` returns a `tools.CacheMode` telling the executor how to store the result — `CacheModeDefault` keeps the existing file-backed heuristic, `CacheModeContentBacked` stores the (possibly transformed) result in memory.
-- **executor → Events:** lifecycle callbacks carrying step numbers, tool names/args, result previews, fill percentages, and diagnostics.
+- **executor → Events:** lifecycle callbacks carrying step numbers, tool names/args, result previews, fill percentages, diagnostics, and — when streaming is enabled — incremental assistant-text deltas as they arrive.
 - **executor → HITLHandler:** pre-execution tool call (`OnToolCall`) and budget-exhaustion events (`OnStepLimit`).
 - **executor → host (out):** `ExecutorResult` containing the final output and the full `[]Step` trajectory. Each `Step` carries the `IsUntrusted` flag so the host can treat external-source observations defensively.
 

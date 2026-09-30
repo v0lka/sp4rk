@@ -30,6 +30,7 @@
 | Context window, compaction strategies                         | [domains/memory/compaction.md](domains/memory/compaction.md)                    |
 | Blackboard, shared state, facts, attachments                  | [domains/memory/blackboard.md](domains/memory/blackboard.md)                    |
 | LLM providers, router, model registry, tokens                 | [domains/llm-providers.md](domains/llm-providers.md)                            |
+| LLM response streaming (opt-in delta delivery)                | [domains/llm-providers.md](domains/llm-providers.md), [contracts/llm-providers.md](contracts/llm-providers.md), [domains/orchestration/executor.md](domains/orchestration/executor.md), [decisions/009-opt-in-request-scoped-streaming.md](decisions/009-opt-in-request-scoped-streaming.md) |
 | One-shot structured LLM calls, the parse-repair loop, failure policies | [domains/oneshot.md](domains/oneshot.md), [decisions/008-unified-oneshot-service-client.md](decisions/008-unified-oneshot-service-client.md) |
 | Adding a new structured service call (router/planner/reflector/judge-style) | [domains/oneshot.md](domains/oneshot.md), [contracts/llm-providers.md](contracts/llm-providers.md) |
 | Purpose-aware sampling and provider parameter filtering       | [contracts/llm-providers.md](contracts/llm-providers.md), [domains/llm-providers.md](domains/llm-providers.md), [domains/prompt-building.md](domains/prompt-building.md) |

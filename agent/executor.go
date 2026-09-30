@@ -427,6 +427,7 @@ type Executor struct {
 	maxSteps                int
 	emitter                 Events // event emitter (uses NoopEvents if nil)
 	suppressAssistantEvents bool   // if true, don't emit AssistantChunk/AssistantDone
+	streaming               bool   // if true, stream LLM text deltas live as AssistantChunk events (opt-in)
 	toolResultBudget        ToolResultBudget
 	circuitBreaker          CircuitBreakerConfig
 	hitl                    HITLHandler // human-in-the-loop hooks (uses NoopHITLHandler if nil)
@@ -559,6 +560,7 @@ type executorOptions struct {
 	tokenCounter            llm.TokenCounter
 	emitter                 Events
 	suppressAssistantEvents bool
+	streaming               bool
 	toolResultBudget        ToolResultBudget
 	circuitBreaker          CircuitBreakerConfig
 	hitl                    HITLHandler
@@ -615,6 +617,23 @@ func (o suppressAssistantEventsOption) apply(opts *executorOptions) {
 func WithSuppressAssistantEvents(suppress bool) Option {
 	return suppressAssistantEventsOption(suppress)
 }
+
+type streamingOption bool
+
+func (o streamingOption) apply(opts *executorOptions) { opts.streaming = bool(o) }
+
+// WithStreaming enables live streaming of the LLM's text output: text deltas
+// are forwarded to the event emitter as AssistantChunk events as they arrive
+// from the provider, instead of a single chunk emitted after the response is
+// complete. It is opt-in and off by default; when off, behavior is unchanged.
+//
+// Streaming needs a provider that honors ChatRequest.DeltaSink (the OpenAI Chat
+// Completions and Anthropic Messages paths do). A provider that does not stream
+// simply ignores the hook, and the executor falls back to emitting the full
+// text as one AssistantChunk — so enabling streaming is always safe. Streaming
+// is skipped when assistant events are suppressed
+// (WithSuppressAssistantEvents(true)).
+func WithStreaming(stream bool) Option { return streamingOption(stream) }
 
 type toolResultBudgetOption struct{ Budget ToolResultBudget }
 
@@ -728,6 +747,7 @@ func NewExecutor(llmRouter LLMCaller, toolRegistry ToolExecutor, maxSteps int, o
 		maxSteps:                maxSteps,
 		emitter:                 o.emitter,
 		suppressAssistantEvents: o.suppressAssistantEvents,
+		streaming:               o.streaming,
 		toolResultBudget:        o.toolResultBudget,
 		circuitBreaker:          o.circuitBreaker,
 		hitl:                    o.hitl,
@@ -744,6 +764,10 @@ func (e *Executor) SetLogger(l *slog.Logger) { e.logger = l }
 
 // SetReasoningEffort sets the reasoning effort for LLM calls.
 func (e *Executor) SetReasoningEffort(effort string) { e.reasoningEffort = effort }
+
+// SetStreaming enables or disables live streaming of the LLM's text output
+// (see WithStreaming).
+func (e *Executor) SetStreaming(stream bool) { e.streaming = stream }
 
 // SetMutationRequired configures the mutation gate. When true, the executor
 // will not accept a finish call unless at least one mutating tool (write_file,

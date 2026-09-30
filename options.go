@@ -26,6 +26,7 @@ type options struct {
 	confirmFunc tools.ConfirmFunc
 	hitl        agent.HITLHandler
 	maxSteps    int
+	streaming   bool
 
 	logger *slog.Logger
 
@@ -178,6 +179,15 @@ func (o maxStepsOption) apply(opts *options) { opts.maxSteps = o.steps }
 // sp4rk default (50); a negative value disables the loop.
 func WithMaxSteps(n int) Option { return maxStepsOption{steps: n} }
 
+// streamingOption enables live LLM text streaming for the built Framework.
+type streamingOption bool
+
+func (o streamingOption) apply(opts *options) { opts.streaming = bool(o) }
+
+// WithStreaming enables live streaming of the LLM's text output (the executor
+// forwards text deltas as AssistantChunk events as they arrive). Off by default.
+func WithStreaming(stream bool) Option { return streamingOption(stream) }
+
 // loggerOption sets the structured logger.
 type loggerOption struct{ logger *slog.Logger }
 
@@ -216,6 +226,7 @@ var (
 	_ Option = autoApproveOption{}
 	_ Option = hitlOption{}
 	_ Option = maxStepsOption{}
+	_ Option = streamingOption(false)
 	_ Option = loggerOption{}
 	_ Option = configOption{}
 )
@@ -251,6 +262,14 @@ func (b *FrameworkBuilder) HITL(h agent.HITLHandler) *FrameworkBuilder {
 // default (50); a negative value disables the loop.
 func (b *FrameworkBuilder) MaxSteps(n int) *FrameworkBuilder {
 	b.opts.maxSteps = n
+	return b
+}
+
+// Streaming enables live streaming of the LLM's text output: the executor
+// forwards text deltas as AssistantChunk events as they arrive, instead of a
+// single chunk at finalization. Off by default.
+func (b *FrameworkBuilder) Streaming(stream bool) *FrameworkBuilder {
+	b.opts.streaming = stream
 	return b
 }
 

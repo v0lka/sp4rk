@@ -183,7 +183,7 @@ The `Executor` is **not** thread-safe for concurrent loops on the same instance.
 
 ## Event Flow
 
-The `Events` interface (in `github.com/v0lka/sp4rk/agent`) is the engine's only channel for streaming lifecycle updates. The host application supplies an implementation; `NoopEvents` is the no-op default.
+The `Events` interface (in `github.com/v0lka/sp4rk/agent`) is the engine's only channel for streaming lifecycle updates. The host application supplies an implementation; `NoopEvents` is the no-op default. Assistant-text streaming is opt-in (`agent.WithStreaming(true)` / `ConductorConfig.Streaming` / the fluent `.Streaming(true)`): when enabled, `AssistantChunk` carries each incremental LLM text delta as it arrives; otherwise it carries the full assistant text once, at finalization. `AssistantDone` is emitted exactly once per finalized response in both modes, and both events are suppressed when `suppressAssistantEvents` is set.
 
 ```
 Executor / Conductor / SubAgent (via Events interface)

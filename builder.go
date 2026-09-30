@@ -123,6 +123,9 @@ func mergeConfig(o options) Config {
 	if o.maxSteps != 0 {
 		cfg.Execution.MaxSteps = o.maxSteps
 	}
+	if o.streaming {
+		cfg.Execution.Streaming = true
+	}
 
 	// Security / hooks
 	if o.confirmFunc != nil {

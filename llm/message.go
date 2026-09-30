@@ -174,6 +174,22 @@ type ChatRequest struct {
 	RepetitionPenalty *float64 `json:"repetition_penalty,omitempty"` // nil = use provider default; OpenAI-compatible servers only
 	PresencePenalty   *float64 `json:"presence_penalty,omitempty"`   // nil = use provider default
 	ReasoningEffort   string   `json:"reasoning_effort,omitempty"`   // native reasoning value (e.g. "On", "high", "HIGH")
+
+	// DeltaSink, when non-nil, asks the provider to STREAM the completion: the
+	// provider invokes it synchronously for each incremental text/reasoning
+	// delta as it arrives off the wire, then returns the same fully-assembled
+	// *ChatResponse the non-streaming path would. A nil DeltaSink (the default)
+	// selects the ordinary synchronous path, so existing callers and providers
+	// are unaffected — streaming is purely additive and opt-in.
+	//
+	// Returning an error from DeltaSink ABORTS the stream: the provider stops
+	// reading and returns the error to the caller (host-side cancellation).
+	//
+	// DeltaSink is a runtime-only hook and is never serialized (json:"-"): a
+	// function cannot be represented in JSON, and request dumps must not attempt
+	// to. It is not part of the wire contract and carries no request semantics
+	// of its own — it only changes delivery timing.
+	DeltaSink func(StreamDelta) error `json:"-"`
 }
 
 // ChatResponse — LLM response.

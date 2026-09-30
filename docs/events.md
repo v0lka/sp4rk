@@ -68,7 +68,7 @@ type Events interface {
 
 | Method | Description |
 |--------|-------------|
-| `AssistantChunk(content)` | Fired for each streamed text chunk from the LLM, enabling a live-typing effect. Only emitted when `suppressAssistantEvents` is `false`. |
+| `AssistantChunk(content)` | Assistant output text. With streaming enabled (`agent.WithStreaming(true)`) it carries each incremental text delta as it arrives from the provider, enabling a live-typing effect; otherwise it carries the full text once at finalization. Only emitted when `suppressAssistantEvents` is `false`. |
 | `AssistantDone(content, inputTokens, outputTokens)` | Fired when the full assistant response is finalized. `inputTokens`/`outputTokens` are the provider-reported token counts for the call. |
 
 #### Context window
@@ -127,7 +127,7 @@ func (e *PrintingEvents) Thought(stepNum int, content, reasoning string) {
 
 ## Streaming
 
-`AssistantChunk` and `AssistantDone` together enable a live-typing effect for assistant output. The executor emits `AssistantChunk` for each text chunk as it arrives from the provider, then `AssistantDone` once with the full content and token counts.
+`AssistantChunk` and `AssistantDone` together enable a live-typing effect for assistant output. Streaming is **opt-in**: enable it with `agent.WithStreaming(true)` (or `Executor.SetStreaming(true)`). When enabled, the executor forwards each text delta from the provider as it arrives as an `AssistantChunk`, then emits `AssistantDone` once with the full content and token counts. When streaming is disabled (the default), the executor emits a single `AssistantChunk` carrying the full text at finalization — the same events, delivered at once, so existing hosts are unaffected. A provider that does not support streaming degrades gracefully: no deltas arrive, and the executor falls back to the single full-text chunk. Neither event is emitted when `suppressAssistantEvents` is `true`.
 
 ```go
 func (e *PrintingEvents) AssistantChunk(content string) {
