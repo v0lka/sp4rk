@@ -39,7 +39,7 @@ func DetectFamily(modelID string) ModelFamily {
 	}
 
 	// OpenAI Flagship
-	for _, p := range []string{"gpt-4", "gpt-5", "o1", "o3", "o4"} {
+	for _, p := range []string{"gpt-4", "gpt-5", "gpt-6", "o1", "o3", "o4"} {
 		if strings.Contains(id, p) {
 			return FamilyOpenAIFlagship
 		}

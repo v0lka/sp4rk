@@ -1173,7 +1173,7 @@ func (r *ModelRegistry) fetchFromHuggingFace(ctx context.Context, model string) 
 
 // makeBuiltInRegistry creates the hardcoded model metadata table.
 //
-// Values verified against official provider documentation (August 2026):
+// Values verified against official provider documentation (October 2026):
 //   - OpenAI:    https://platform.openai.com/docs/models
 //   - Anthropic: https://platform.claude.com/docs/en/about-claude/models/overview
 //   - Google:    https://deepmind.google/models/gemini + https://ai.google.dev/gemini-api/docs/models
@@ -1186,11 +1186,48 @@ func (r *ModelRegistry) fetchFromHuggingFace(ctx context.Context, model string) 
 func makeBuiltInRegistry() map[string]ModelMetadata {
 	return map[string]ModelMetadata{
 		// ── OpenAI models ───────────────────────────────────────────────
-		// GPT-5.6 (current frontier, Aug 2026): Sol/Terra/Luna all share
+		// GPT-6 / GPT-6.1 (current frontier, Sep 2026): Astra (flagship),
+		// Sol, and Luna share 1.05M context and 128K max output; GPT-6.1
+		// Sol is the refreshed Sol tier. Reasoning models (no temperature),
+		// Responses API.
+		// GPT-5.6 (previous frontier, Aug 2026): Sol/Terra/Luna all share
 		// 1.05M context and 128K max output; reasoning models (no temperature).
 		// GPT-5.x flagships: 1.05M context, 128K max output.
 		// GPT-5.x mini/nano: 400K context, 128K max output.
+		// GPT-5.x pro: Responses-API-only tier that matches its base
+		// generation's window (5.5-pro/5.4-pro 1.05M, 5.2-pro/5-pro 400K).
+		// gpt-5-pro is the output-limit outlier: 272K max output.
+		// Cyber (Daybreak) variants cap at 400K context regardless of the
+		// base generation's window.
 		// GPT-5: 400K context, 128K max output.
+		"gpt-6-astra": {
+			ContextWindow: 1050000,
+			OutputLimit:   128000,
+			TokenizerType: "tiktoken/o200k_base",
+			Family:        "openai_flagship",
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
+		},
+		"gpt-6.1-sol": {
+			ContextWindow: 1050000,
+			OutputLimit:   128000,
+			TokenizerType: "tiktoken/o200k_base",
+			Family:        "openai_flagship",
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
+		},
+		"gpt-6-sol": {
+			ContextWindow: 1050000,
+			OutputLimit:   128000,
+			TokenizerType: "tiktoken/o200k_base",
+			Family:        "openai_flagship",
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
+		},
+		"gpt-6-luna": {
+			ContextWindow: 1050000,
+			OutputLimit:   128000,
+			TokenizerType: "tiktoken/o200k_base",
+			Family:        "openai_flagship",
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
+		},
 		"gpt-5.6": {
 			ContextWindow: 1050000,
 			OutputLimit:   128000,
@@ -1219,7 +1256,24 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			Family:        "openai_flagship",
 			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
 		},
+		// Daybreak cybersecurity variant (separate program approval): caps at
+		// 400K context even though the 5.6 generation is 1.05M.
+		"gpt-5.6-cyber": {
+			ContextWindow: 400000,
+			OutputLimit:   128000,
+			TokenizerType: "tiktoken/o200k_base",
+			Family:        "openai_flagship",
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
+		},
 		"gpt-5.5": {
+			ContextWindow: 1050000,
+			OutputLimit:   128000,
+			TokenizerType: "tiktoken/o200k_base",
+			Family:        "openai_flagship",
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
+		},
+		// Responses-API-only pro tier of the 5.5 generation.
+		"gpt-5.5-pro": {
 			ContextWindow: 1050000,
 			OutputLimit:   128000,
 			TokenizerType: "tiktoken/o200k_base",
@@ -1247,9 +1301,63 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			Family:        "openai_flagship",
 			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
 		},
+		// Responses-API-only pro tier of the 5.4 generation (1.05M like the
+		// base 5.4, unlike the 400K 5.2-pro / 5-pro).
+		"gpt-5.4-pro": {
+			ContextWindow: 1050000,
+			OutputLimit:   128000,
+			TokenizerType: "tiktoken/o200k_base",
+			Family:        "openai_flagship",
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
+		},
+		// GPT-5.2 / 5.1 (400K context, 128K max output).
+		"gpt-5.2": {
+			ContextWindow: 400000,
+			OutputLimit:   128000,
+			TokenizerType: "tiktoken/o200k_base",
+			Family:        "openai_flagship",
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
+		},
+		"gpt-5.2-pro": {
+			ContextWindow: 400000,
+			OutputLimit:   128000,
+			TokenizerType: "tiktoken/o200k_base",
+			Family:        "openai_flagship",
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
+		},
+		"gpt-5.1": {
+			ContextWindow: 400000,
+			OutputLimit:   128000,
+			TokenizerType: "tiktoken/o200k_base",
+			Family:        "openai_flagship",
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
+		},
 		"gpt-5": {
 			ContextWindow: 400000,
 			OutputLimit:   128000,
+			TokenizerType: "tiktoken/o200k_base",
+			Family:        "openai_flagship",
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
+		},
+		"gpt-5-mini": {
+			ContextWindow: 400000,
+			OutputLimit:   128000,
+			TokenizerType: "tiktoken/o200k_base",
+			Family:        "openai_flagship",
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
+		},
+		"gpt-5-nano": {
+			ContextWindow: 400000,
+			OutputLimit:   128000,
+			TokenizerType: "tiktoken/o200k_base",
+			Family:        "openai_flagship",
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
+		},
+		// Responses-API-only, reasoning.effort pinned to high; the one
+		// GPT-5.x model with a 272K max output.
+		"gpt-5-pro": {
+			ContextWindow: 400000,
+			OutputLimit:   272000,
 			TokenizerType: "tiktoken/o200k_base",
 			Family:        "openai_flagship",
 			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},

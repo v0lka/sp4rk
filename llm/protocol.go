@@ -21,7 +21,7 @@ const (
 	ProtocolChatCompletions APIProtocol = "chat_completions"
 
 	// ProtocolResponses is the OpenAI Responses protocol, served at
-	// POST /responses. Required by GPT-5 and Codex models — both the official
+	// POST /responses. Required by GPT-5, GPT-6 and Codex models — both the official
 	// OpenAI endpoint and compatible gateways (e.g. OpenCode Zen) expose these
 	// exclusively via /responses; /chat/completions returns a degenerate HTTP
 	// 400 with an empty body.
@@ -43,14 +43,14 @@ const (
 //
 // Mapping (derived from each model family's canonical native protocol and the
 // OpenCode Zen published endpoint table):
-//   - contains "gpt-5" or "codex"  → ProtocolResponses
+//   - contains "gpt-5", "gpt-6" or "codex" → ProtocolResponses
 //   - contains "claude"            → ProtocolAnthropic
 //   - contains "gemini" or "gemma" → ProtocolGoogle
 //   - everything else              → ProtocolChatCompletions (default)
 //
 // Note that the protocol cannot be derived from ModelFamily alone: the
 // FamilyOpenAIFlagship family spans both protocols (gpt-4o/o-series use Chat
-// Completions, gpt-5 uses Responses), so independent model-ID detection is
+// Completions, gpt-5/gpt-6 use Responses), so independent model-ID detection is
 // required.
 //
 // Because detection is substring-based, a custom or locally-served model whose
@@ -67,8 +67,8 @@ func DetectProtocol(modelID string) APIProtocol {
 		return ProtocolChatCompletions
 	}
 
-	// GPT-5 and Codex → OpenAI Responses API (/responses).
-	if strings.Contains(id, "gpt-5") || strings.Contains(id, "codex") {
+	// GPT-5, GPT-6 and Codex → OpenAI Responses API (/responses).
+	if strings.Contains(id, "gpt-5") || strings.Contains(id, "gpt-6") || strings.Contains(id, "codex") {
 		return ProtocolResponses
 	}
 

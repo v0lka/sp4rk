@@ -577,7 +577,7 @@ func TestCreateProviderFromConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			p, err := createProviderFromConfig(context.Background(), tt.providerName, tt.provType, tt.apiKey, tt.baseURL, nil, nil, ReasoningWireVendorDefault)
+			p, err := createProviderFromConfig(context.Background(), tt.providerName, tt.provType, tt.apiKey, tt.baseURL, nil, nil, ReasoningWireVendorDefault, nil, false)
 			if tt.wantErr {
 				if err == nil {
 					t.Error("expected error, got nil")

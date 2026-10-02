@@ -121,6 +121,22 @@ type ProviderEntry struct {
 	// ReasoningWire). Zero value = ReasoningWireVendorDefault. Set it to
 	// ReasoningWireChatTemplateKwargs for a llama.cpp-served endpoint.
 	ReasoningWire ReasoningWire
+	// TokenSource optionally supplies per-request bearer credentials for this
+	// provider (see TokenSource). When set, the provider stamps the returned
+	// access token onto the Authorization header — overriding the static
+	// APIKey credential — and applies BearerToken.ExtraHeaders on every
+	// outgoing request. nil = static APIKey only (the historical behavior).
+	TokenSource TokenSource
+	// RequireStreaming marks this provider's endpoint as accepting streaming
+	// calls ONLY on the wire (e.g. a ChatGPT OAuth backend that answers any
+	// non-streaming request with an error) and rejecting the Responses API
+	// output cap (max_output_tokens is dropped from the wire request for
+	// such endpoints) and the "minimal" reasoning effort (clamped to "low").
+	// It is threaded through to OpenAIProviderConfig.RequireStreaming for
+	// the streaming seam to act on.
+	// Zero value = no such requirement; requests follow their historical
+	// streaming/non-streaming shape.
+	RequireStreaming bool
 }
 
 // Router routes LLM calls to the active provider.
@@ -173,7 +189,7 @@ func NewRouter(ctx context.Context, cfg RouterConfig, registry *ModelRegistry) (
 		if providerClient == nil {
 			providerClient = cfg.HTTPClient
 		}
-		provider, err := createProviderFromConfig(ctx, entry.Name, entry.ProviderType, entry.APIKey, entry.BaseURL, providerClient, cfg.Logger, entry.ReasoningWire)
+		provider, err := createProviderFromConfig(ctx, entry.Name, entry.ProviderType, entry.APIKey, entry.BaseURL, providerClient, cfg.Logger, entry.ReasoningWire, entry.TokenSource, entry.RequireStreaming)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create provider %q: %w", entry.Name, err)
 		}
@@ -258,17 +274,23 @@ func NewRouter(ctx context.Context, cfg RouterConfig, registry *ModelRegistry) (
 // hardcoded family name. logger is forwarded to the provider for debug-level
 // diagnostics (nil = slog.Default()). reasoningWire selects the JSON spelling
 // of Qwen-family reasoning controls for this provider (zero value =
-// vendor-default top-level fields; see ReasoningWire).
-func createProviderFromConfig(ctx context.Context, name, provType, apiKey, baseURL string, httpClient *http.Client, logger *slog.Logger, reasoningWire ReasoningWire) (Provider, error) {
+// vendor-default top-level fields; see ReasoningWire). tokenSource optionally
+// supplies per-request bearer credentials (nil = static apiKey only); it is
+// consumed by provider types whose seam supports it (currently "openai") and
+// ignored by the rest. requireStreaming marks the endpoint as
+// streaming-wire-only; likewise consumed only where the seam supports it.
+func createProviderFromConfig(ctx context.Context, name, provType, apiKey, baseURL string, httpClient *http.Client, logger *slog.Logger, reasoningWire ReasoningWire, tokenSource TokenSource, requireStreaming bool) (Provider, error) {
 	switch provType {
 	case "openai":
 		return NewOpenAIProvider(OpenAIProviderConfig{
-			Name:          name,
-			APIKey:        apiKey,
-			BaseURL:       baseURL,
-			HTTPClient:    httpClient,
-			Logger:        logger,
-			ReasoningWire: reasoningWire,
+			Name:             name,
+			APIKey:           apiKey,
+			BaseURL:          baseURL,
+			HTTPClient:       httpClient,
+			Logger:           logger,
+			ReasoningWire:    reasoningWire,
+			TokenSource:      tokenSource,
+			RequireStreaming: requireStreaming,
 		})
 
 	case "anthropic":

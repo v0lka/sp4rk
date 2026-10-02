@@ -13,11 +13,16 @@ func TestDetectProtocol(t *testing.T) {
 		// Empty model ID → default protocol
 		{"", ProtocolChatCompletions},
 
-		// ProtocolResponses — GPT-5 family and Codex
+		// ProtocolResponses — GPT-5, GPT-6 family and Codex
 		{"gpt-5", ProtocolResponses},
 		{"gpt-5.6", ProtocolResponses},
 		{"gpt-5.6-sol", ProtocolResponses},
 		{"gpt-5.4-mini", ProtocolResponses},
+		{"gpt-5-pro", ProtocolResponses},
+		{"gpt-6-astra", ProtocolResponses},
+		{"gpt-6.1-sol", ProtocolResponses},
+		{"gpt-6-sol", ProtocolResponses},
+		{"gpt-6-luna", ProtocolResponses},
 		{"codex-mini-latest", ProtocolResponses},
 		{"gpt-5.3-codex", ProtocolResponses},
 
@@ -35,8 +40,8 @@ func TestDetectProtocol(t *testing.T) {
 		{"gemma-2-27b", ProtocolGoogle},
 
 		// ProtocolChatCompletions — everything else.
-		// OpenAI flagship/standard that are NOT gpt-5 (the critical case:
-		// FamilyOpenAIFlagship spans both protocols).
+		// OpenAI flagship/standard that are NOT gpt-5/gpt-6 (the critical
+		// case: FamilyOpenAIFlagship spans both protocols).
 		{"gpt-4o", ProtocolChatCompletions},
 		{"gpt-4o-mini", ProtocolChatCompletions},
 		{"gpt-4-turbo", ProtocolChatCompletions},
@@ -82,6 +87,7 @@ func TestDetectProtocol_CaseInsensitive(t *testing.T) {
 		expected APIProtocol
 	}{
 		{"GPT-5.6", ProtocolResponses},
+		{"GPT-6-Astra", ProtocolResponses},
 		{"CODEX-Mini-Latest", ProtocolResponses},
 		{"Claude-Opus-5", ProtocolAnthropic},
 		{"GEMINI-2.5-PRO", ProtocolGoogle},

@@ -51,6 +51,20 @@ func TestModelRegistry_BuiltInResolution(t *testing.T) {
 	}{
 		// OpenAI models — verified July 2026 from platform.openai.com/docs/models
 		{"gpt-5.4", 1050000, 128000, "tiktoken/o200k_base"},
+		// OpenAI models — verified October 2026 from developers.openai.com/api/docs/models
+		{"gpt-6-astra", 1050000, 128000, "tiktoken/o200k_base"},
+		{"gpt-6.1-sol", 1050000, 128000, "tiktoken/o200k_base"},
+		{"gpt-6-sol", 1050000, 128000, "tiktoken/o200k_base"},
+		{"gpt-6-luna", 1050000, 128000, "tiktoken/o200k_base"},
+		{"gpt-5.6-cyber", 400000, 128000, "tiktoken/o200k_base"},
+		{"gpt-5.5-pro", 1050000, 128000, "tiktoken/o200k_base"},
+		{"gpt-5.4-pro", 1050000, 128000, "tiktoken/o200k_base"},
+		{"gpt-5.2", 400000, 128000, "tiktoken/o200k_base"},
+		{"gpt-5.2-pro", 400000, 128000, "tiktoken/o200k_base"},
+		{"gpt-5.1", 400000, 128000, "tiktoken/o200k_base"},
+		{"gpt-5-mini", 400000, 128000, "tiktoken/o200k_base"},
+		{"gpt-5-nano", 400000, 128000, "tiktoken/o200k_base"},
+		{"gpt-5-pro", 400000, 272000, "tiktoken/o200k_base"},
 		{"gpt-4o", 128000, 16384, "tiktoken/o200k_base"},
 		{"o3-mini", 200000, 100000, "tiktoken/o200k_base"},
 
@@ -1545,6 +1559,17 @@ func TestResolveFamily_BuiltinModels(t *testing.T) {
 		expectedFamily string
 	}{
 		// OpenAI flagship models
+		{"gpt-6-astra", "openai_flagship"},
+		{"gpt-6.1-sol", "openai_flagship"},
+		{"gpt-6-sol", "openai_flagship"},
+		{"gpt-6-luna", "openai_flagship"},
+		{"gpt-5.6-cyber", "openai_flagship"},
+		{"gpt-5.5-pro", "openai_flagship"},
+		{"gpt-5.4-pro", "openai_flagship"},
+		{"gpt-5.2-pro", "openai_flagship"},
+		{"gpt-5.1", "openai_flagship"},
+		{"gpt-5-pro", "openai_flagship"},
+		{"gpt-5-nano", "openai_flagship"},
 		{"gpt-5.4", "openai_flagship"},
 		{"gpt-5.4-mini", "openai_flagship"},
 		{"gpt-5", "openai_flagship"},
@@ -1619,6 +1644,7 @@ func TestResolveFamily_PatternMatching(t *testing.T) {
 		// OpenAI flagship patterns
 		{"gpt-4-turbo-custom", "openai_flagship"},
 		{"gpt-5-preview", "openai_flagship"},
+		{"gpt-6-preview", "openai_flagship"},
 		{"o1-preview-custom", "openai_flagship"},
 		{"o3-mini-custom", "openai_flagship"},
 		{"o4-model", "openai_flagship"},
@@ -2906,14 +2932,17 @@ func TestResolveProtocol_BuiltinAndPattern(t *testing.T) {
 		model            string
 		expectedProtocol APIProtocol
 	}{
-		// GPT-5 / Codex → Responses (built-in)
+		// GPT-5 / GPT-6 / Codex → Responses (built-in)
 		{"gpt-5", ProtocolResponses},
 		{"gpt-5.6", ProtocolResponses},
+		{"gpt-6-astra", ProtocolResponses},
+		{"gpt-6.1-sol", ProtocolResponses},
 		{"codex-mini-latest", ProtocolResponses},
 
-		// GPT-5 pattern matching → Responses (the family-vs-protocol split:
-		// FamilyOpenAIFlagship, but protocol Responses)
+		// GPT-5 / GPT-6 pattern matching → Responses (the family-vs-protocol
+		// split: FamilyOpenAIFlagship, but protocol Responses)
 		{"gpt-5-preview", ProtocolResponses},
+		{"gpt-6-preview", ProtocolResponses},
 
 		// Claude → Anthropic (built-in + pattern)
 		{"claude-opus-4-6", ProtocolAnthropic},
@@ -2926,7 +2955,7 @@ func TestResolveProtocol_BuiltinAndPattern(t *testing.T) {
 		{"gemini-custom-pro", ProtocolGoogle},
 		{"gemma-4-31b-it", ProtocolGoogle},
 
-		// Chat Completions — OpenAI non-gpt-5 models (built-in)
+		// Chat Completions — OpenAI non-gpt-5/gpt-6 models (built-in)
 		{"gpt-4o", ProtocolChatCompletions},
 		{"gpt-4o-mini", ProtocolChatCompletions},
 		{"gpt-4.1", ProtocolChatCompletions},

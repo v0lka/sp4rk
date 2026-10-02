@@ -33,6 +33,24 @@ type OpenAIProviderConfig struct {
 	// ignores a top-level enable_thinking and only honors the one nested in
 	// chat_template_kwargs. See ReasoningWire for the full contract.
 	ReasoningWire ReasoningWire
+	// TokenSource optionally supplies per-request bearer credentials (see
+	// TokenSource). When set, both SDK clients this provider builds (Chat
+	// Completions and Responses) inject a middleware that stamps the returned
+	// access token onto the Authorization header — overriding the static
+	// APIKey credential — and applies BearerToken.ExtraHeaders, immediately
+	// before every request leaves the process (including SDK-internal
+	// retries). nil = static APIKey only (the historical behavior).
+	TokenSource TokenSource
+	// RequireStreaming marks this endpoint as accepting streaming calls ONLY
+	// on the wire (e.g. a ChatGPT OAuth backend that rejects any
+	// non-streaming request) and rejecting the Responses API output cap
+	// (max_output_tokens is dropped from the wire request for such
+	// endpoints; they answer it with HTTP 400) and the "minimal" reasoning
+	// effort (clamped to "low" on the wire for such endpoints). Seam field:
+	// it is carried on the provider (requireStreaming) for the streaming
+	// path to act on.
+	// Zero value = no such requirement.
+	RequireStreaming bool
 }
 
 // OpenAIProvider implements Provider for OpenAI and compatible APIs.
@@ -46,6 +64,7 @@ type OpenAIProvider struct {
 	httpClient        *http.Client // optional proxy-configured HTTP client (passed to the Google delegate; nil = http.DefaultClient)
 	logger            *slog.Logger
 	reasoningWire     ReasoningWire // Qwen reasoning-control spelling for this endpoint (zero = vendor default)
+	requireStreaming  bool          // endpoint accepts streaming calls only (seam; see OpenAIProviderConfig.RequireStreaming)
 }
 
 // log returns the provider's logger, defaulting to slog.Default() when unset.
@@ -73,9 +92,12 @@ func NewOpenAIProvider(cfg OpenAIProviderConfig) (*OpenAIProvider, error) {
 	if cfg.HTTPClient != nil {
 		opts = append(opts, option.WithHTTPClient(cfg.HTTPClient))
 	}
+	if cfg.TokenSource != nil {
+		opts = append(opts, option.WithMiddleware(tokenSourceMiddleware(cfg.TokenSource)))
+	}
 	client := oai.NewClient(opts...)
 
-	responsesClient := newResponsesClient(cfg.APIKey, cfg.BaseURL, cfg.HTTPClient)
+	responsesClient := newResponsesClient(cfg.APIKey, cfg.BaseURL, cfg.HTTPClient, cfg.TokenSource)
 
 	// Build a co-located Anthropic provider so ProtocolAnthropic models (Claude)
 	// served by an OpenAI-compatible gateway (e.g. Zen) can be delegated to the
@@ -108,7 +130,41 @@ func NewOpenAIProvider(cfg OpenAIProviderConfig) (*OpenAIProvider, error) {
 		httpClient:        cfg.HTTPClient,
 		logger:            cfg.Logger,
 		reasoningWire:     cfg.ReasoningWire,
+		requireStreaming:  cfg.RequireStreaming,
 	}, nil
+}
+
+// tokenSourceMiddleware builds an openai-go request middleware that resolves
+// credentials from ts immediately before every request leaves the process —
+// including each SDK-internal retry attempt, so a refreshed token reaches
+// later attempts of the same call. It stamps the access token onto the
+// Authorization header (overriding the static option.WithAPIKey credential,
+// which the SDK applies before middlewares run) and sets each extra header
+// from BearerToken.ExtraHeaders; an empty extra value removes that header.
+//
+// The middleware deliberately performs no logging: token material (access
+// tokens, header values) must never reach a log sink, and a header-stamping
+// hot path has nothing else worth reporting. A Token failure aborts the
+// request before it hits the wire and is returned to the SDK unwrapped in
+// place of an HTTP response.
+func tokenSourceMiddleware(ts TokenSource) option.Middleware {
+	return func(req *http.Request, next option.MiddlewareNext) (*http.Response, error) {
+		tok, err := ts.Token(req.Context())
+		if err != nil {
+			return nil, fmt.Errorf("llm: token source: %w", err)
+		}
+		if tok.AccessToken != "" {
+			req.Header.Set("Authorization", "Bearer "+tok.AccessToken)
+		}
+		for k, v := range tok.ExtraHeaders {
+			if v == "" {
+				req.Header.Del(k)
+				continue
+			}
+			req.Header.Set(k, v)
+		}
+		return next(req)
+	}
 }
 
 // Name returns the provider name for logging.
@@ -128,11 +184,12 @@ func (p *OpenAIProvider) ChatCompletion(ctx context.Context, req ChatRequest) (*
 
 	// Dispatch each model to the API protocol it speaks. The OpenAI provider
 	// natively handles the two OpenAI protocols:
-	//   - ProtocolResponses (GPT-5.x, Codex) → Responses API (/v1/responses).
-	//     These models are served exclusively via /responses — both the
-	//     official OpenAI endpoint and compatible gateways (e.g. OpenCode Zen
-	//     exposes gpt-5.x / gpt-5.x-codex there) — and sending them to
-	//     /chat/completions returns a degenerate HTTP 400 with an empty body.
+	//   - ProtocolResponses (GPT-5.x, GPT-6, Codex) → Responses API
+	//     (/v1/responses). These models are served exclusively via
+	//     /responses — both the official OpenAI endpoint and compatible
+	//     gateways (e.g. OpenCode Zen exposes gpt-5.x / gpt-5.x-codex
+	//     there) — and sending them to /chat/completions returns a
+	//     degenerate HTTP 400 with an empty body.
 	//     Therefore, when the Responses endpoint is genuinely missing (HTTP
 	//     404/405) we surface a clear "Responses API required but unavailable"
 	//     error instead of silently falling back to a Chat Completions path
@@ -160,13 +217,27 @@ func (p *OpenAIProvider) ChatCompletion(ctx context.Context, req ChatRequest) (*
 	}
 	switch protocol {
 	case ProtocolResponses:
-		resp, err := responsesAPICompletion(ctx, p.responsesClient, p.name, p.baseURL, req, p.logger)
+		var (
+			resp *ChatResponse
+			err  error
+		)
+		// Streaming wire path when the endpoint demands it (requireStreaming —
+		// e.g. a ChatGPT OAuth Codex backend that rejects non-streaming
+		// requests) or the caller opted into delta delivery via DeltaSink.
+		// Both produce the same assembled ChatResponse as the synchronous
+		// path; see responsesAPICompletionStream.
+		if p.requireStreaming || req.DeltaSink != nil {
+			resp, err = responsesAPICompletionStream(ctx, p.responsesClient, p.name, p.baseURL, req, p.requireStreaming, p.logger)
+		} else {
+			resp, err = responsesAPICompletion(ctx, p.responsesClient, p.name, p.baseURL, req, p.logger)
+		}
 		if err == nil {
 			return resp, nil
 		}
-		// GPT-5.x / Codex models require the Responses API: both the official
-		// endpoint and compatible gateways serve them only via /responses, and
-		// /chat/completions returns a degenerate HTTP 400 with an empty body.
+		// GPT-5.x / GPT-6 / Codex models require the Responses API: both the
+		// official endpoint and compatible gateways serve them only via
+		// /responses, and /chat/completions returns a degenerate HTTP 400
+		// with an empty body.
 		// When the endpoint is genuinely missing (404/405), surface a clear,
 		// actionable error instead of silently falling back to Chat Completions
 		// — which would mask the real cause behind an opaque 400 from a path
@@ -999,7 +1070,8 @@ func (p *OpenAIProvider) wrapError(err error) error {
 // Responses API endpoint (/v1/responses) is not implemented by the provider —
 // i.e. HTTP 404 Not Found or 405 Method Not Allowed. It is used to decide
 // whether to surface a clear "Responses API required but unavailable" error for
-// codex/gpt-5.x-family models, which are served exclusively via /responses and
+// codex/gpt-5.x/gpt-6-family models, which are served exclusively via
+// /responses and
 // for which a Chat Completions fallback is known to fail (degenerate HTTP 400
 // with an empty body). Other statuses (400/500/...) mean the endpoint exists but
 // the request or processing failed, so they are NOT treated as "unsupported".

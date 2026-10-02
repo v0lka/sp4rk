@@ -43,6 +43,14 @@ type ContentBlock struct {
 type ReasoningItem struct {
 	ID      string `json:"id"`
 	Summary string `json:"summary"`
+	// EncryptedContent carries the opaque encrypted reasoning payload the
+	// Responses API attaches to a reasoning item when the response was
+	// generated with `include: ["reasoning.encrypted_content"]` (and
+	// `store: false`). Round-tripping it on the next request
+	// (convertToResponsesInput) lets a stateless backend — the Codex backend
+	// keeps no stored responses — reconstruct the reasoning chain across turns.
+	// Empty when the backend returns plain (stored) reasoning items.
+	EncryptedContent string `json:"encrypted_content,omitempty"`
 }
 
 // NormalizeContentBlocks returns the effective content blocks for a message,

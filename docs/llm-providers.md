@@ -145,7 +145,7 @@ if err := router.SetModel(ctx, "claude-sonnet-4-5"); err != nil {
 
 | Model ID contains | Protocol | Endpoint |
 | --- | --- | --- |
-| `gpt-5` or `codex` | `ProtocolResponses` | `POST /responses` |
+| `gpt-5`, `gpt-6` or `codex` | `ProtocolResponses` | `POST /responses` |
 | `claude` | `ProtocolAnthropic` | `POST /messages` |
 | `gemini` or `gemma` | `ProtocolGoogle` | `POST /models/{model}:generateContent` |
 | anything else | `ProtocolChatCompletions` (default) | `POST /chat/completions` |
@@ -154,9 +154,9 @@ if err := router.SetModel(ctx, "claude-sonnet-4-5"); err != nil {
 protocol := llm.DetectProtocol("gpt-5.6") // ProtocolResponses
 ```
 
-The protocol cannot be derived from `ModelFamily` alone: `FamilyOpenAIFlagship` spans both Chat Completions (gpt-4o / o-series) and Responses (gpt-5), so independent model-ID detection is required.
+The protocol cannot be derived from `ModelFamily` alone: `FamilyOpenAIFlagship` spans both Chat Completions (gpt-4o / o-series) and Responses (gpt-5 / gpt-6), so independent model-ID detection is required.
 
-A single OpenAI-compatible `ProviderEntry` dispatches to all four protocols. The OpenAI provider's `Call` honors `req.Protocol` when set (the router fills it from the registry-resolved metadata, which honors an explicit `ModelMetadata.Protocol` override) and otherwise falls back to `DetectProtocol(req.Model)`: Responses → the Responses API; Anthropic → a co-located `AnthropicProvider` (built from the same `BaseURL`/`APIKey`/`HTTPClient`/`Logger`); Google → the `googleCompletion` function (POSTs `{baseURL}/models/{model}:generateContent` with the Google contents/parts format); otherwise Chat Completions. GPT-5.x flagships route to the Responses API (alongside Codex); when `/responses` is genuinely missing (HTTP 404/405) a clear error is surfaced rather than a silent fallback to Chat Completions.
+A single OpenAI-compatible `ProviderEntry` dispatches to all four protocols. The OpenAI provider's `Call` honors `req.Protocol` when set (the router fills it from the registry-resolved metadata, which honors an explicit `ModelMetadata.Protocol` override) and otherwise falls back to `DetectProtocol(req.Model)`: Responses → the Responses API; Anthropic → a co-located `AnthropicProvider` (built from the same `BaseURL`/`APIKey`/`HTTPClient`/`Logger`); Google → the `googleCompletion` function (POSTs `{baseURL}/models/{model}:generateContent` with the Google contents/parts format); otherwise Chat Completions. GPT-5.x and GPT-6 flagships route to the Responses API (alongside Codex); when `/responses` is genuinely missing (HTTP 404/405) a clear error is surfaced rather than a silent fallback to Chat Completions.
 
 `ModelMetadata.Protocol` is an override escape-hatch. `resolveProtocol` honors an explicit `Protocol` value and only falls back to `DetectProtocol` when it is unset — needed for locally-served models whose name contains a family token but speak a different protocol (e.g. a vLLM model named `gemini-finetune` served over `/chat/completions`). Set it via the `NewModelRegistry` overrides map, a registered source, or a built-in entry. The router's `prepareRequest` resolves model metadata once and threads the resolved protocol into `ChatRequest.Protocol`; the OpenAI provider honors `req.Protocol` over its own `DetectProtocol`, so a tier-1 override takes effect for router-driven calls (direct provider use without a router falls back to name-based detection). A protocol-only partial override inherits the model's real `ContextWindow`/`OutputLimit`/`TokenizerType`/`Capabilities` from the lower tiers (see [Partial overrides](#partial-overrides)), so pinning the protocol no longer collapses the context window or disables capabilities.
 
