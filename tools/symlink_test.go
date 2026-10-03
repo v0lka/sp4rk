@@ -1297,12 +1297,13 @@ func TestDetectSymlinks_FieldAwareExcludesContent(t *testing.T) {
 	ctx := WithWorkspacePath(context.Background(), ws)
 
 	t.Run("symlink-escape via path field IS detected", func(t *testing.T) {
+		logger := expectedDiagnostics(t, expectedDiagnostic{message: "symlink detection narrowed by path-field allowlist; non-path string fields not scanned", attrs: map[string]any{"tool": "edit_file", "scanned_path_fields": []string{"path"}, "unscanned_string_fields": []string{"new_string", "old_string"}}})
 		input, _ := json.Marshal(map[string]string{
 			"path":       pathThroughLink,
 			"old_string": "x",
 			"new_string": "y",
 		})
-		_, outsideTrav := DetectSymlinksInToolInput(ctx, "edit_file", input, editSchema, nil)
+		_, outsideTrav := DetectSymlinksInToolInput(ctx, "edit_file", input, editSchema, logger)
 		if len(outsideTrav) == 0 {
 			t.Fatal("expected symlink escape detected via 'path' field")
 		}
@@ -1311,12 +1312,13 @@ func TestDetectSymlinks_FieldAwareExcludesContent(t *testing.T) {
 	t.Run("symlink-escape in old_string is NOT scanned", func(t *testing.T) {
 		normalFile := filepath.Join(ws, "normal.txt")
 		_ = os.WriteFile(normalFile, []byte("x"), 0o644)
+		logger := expectedDiagnostics(t, expectedDiagnostic{message: "symlink detection narrowed by path-field allowlist; non-path string fields not scanned", attrs: map[string]any{"tool": "edit_file", "scanned_path_fields": []string{"path"}, "unscanned_string_fields": []string{"new_string", "old_string"}}})
 		input, _ := json.Marshal(map[string]string{
 			"path":       normalFile,
 			"old_string": "// see " + pathThroughLink + " for details",
 			"new_string": "y",
 		})
-		insideTrav, outsideTrav := DetectSymlinksInToolInput(ctx, "edit_file", input, editSchema, nil)
+		insideTrav, outsideTrav := DetectSymlinksInToolInput(ctx, "edit_file", input, editSchema, logger)
 		if len(insideTrav)+len(outsideTrav) != 0 {
 			t.Fatalf("expected content field (old_string) NOT scanned, got inside=%v outside=%v", insideTrav, outsideTrav)
 		}

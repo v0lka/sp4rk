@@ -122,7 +122,10 @@ func TestAgentManager_InvalidAgentSkipped(t *testing.T) {
 	// An invalid agent (name != dir).
 	writeAgent(t, dir, "bad", "---\nname: not-bad\ndescription: mismatch\n---\nB.\n")
 
-	mgr := NewAgentManager([]string{dir}, nil)
+	logger := expectedDiagnostics(t, expectedDiagnostic{message: "skipped invalid agent", attrs: map[string]any{
+		"dir": filepath.Join(dir, "bad"), "error": func(v any) bool { err, ok := v.(*ParseError); return ok && err != nil },
+	}})
+	mgr := NewAgentManager([]string{dir}, logger)
 	if err := mgr.Scan(); err != nil {
 		t.Fatalf("Scan: %v", err)
 	}

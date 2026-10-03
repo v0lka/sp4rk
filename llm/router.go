@@ -276,8 +276,11 @@ func NewRouter(ctx context.Context, cfg RouterConfig, registry *ModelRegistry) (
 // of Qwen-family reasoning controls for this provider (zero value =
 // vendor-default top-level fields; see ReasoningWire). tokenSource optionally
 // supplies per-request bearer credentials (nil = static apiKey only); it is
-// consumed by provider types whose seam supports it (currently "openai") and
-// ignored by the rest. requireStreaming marks the endpoint as
+// consumed by every built-in provider seam — the "openai" type through the
+// SDK middleware on both OpenAI protocols (plus pre-send resolution in its
+// Anthropic and Google delegates), the "anthropic" type through a wrapping
+// transport (see TokenSource for the full per-protocol contract).
+// requireStreaming marks the endpoint as
 // streaming-wire-only; likewise consumed only where the seam supports it.
 func createProviderFromConfig(ctx context.Context, name, provType, apiKey, baseURL string, httpClient *http.Client, logger *slog.Logger, reasoningWire ReasoningWire, tokenSource TokenSource, requireStreaming bool) (Provider, error) {
 	switch provType {
@@ -295,11 +298,12 @@ func createProviderFromConfig(ctx context.Context, name, provType, apiKey, baseU
 
 	case "anthropic":
 		return NewAnthropicProvider(AnthropicProviderConfig{
-			Name:       name,
-			APIKey:     apiKey,
-			BaseURL:    baseURL,
-			HTTPClient: httpClient,
-			Logger:     logger,
+			Name:        name,
+			APIKey:      apiKey,
+			BaseURL:     baseURL,
+			HTTPClient:  httpClient,
+			Logger:      logger,
+			TokenSource: tokenSource,
 		})
 
 	default:

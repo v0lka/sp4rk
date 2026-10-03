@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -15,6 +16,58 @@ import (
 	"github.com/openai/openai-go/responses"
 	"github.com/openai/openai-go/shared"
 )
+
+// isTransientResponsesSSECode reports whether a Responses SSE event's error
+// code names a TRANSIENT server-side failure — one the router may safely
+// retry. The SSE transport carries no HTTP status, so a bare WrapProviderError
+// with status 0 would classify every event failure as non-retryable and turn
+// a plain server hiccup into a terminal task failure (the synchronous path's
+// HTTP 429/500 equivalents are retryable). Request-shaped errors (invalid
+// prompts, unsupported parameters, exhausted quota) stay non-retryable.
+//
+// The list is curated from the codes OpenAI-compatible gateways emit in
+// pre-delta `error` events and terminal `response.failed` events, plus the
+// OpenAI HTTP-era spellings whose status equivalents are already retryable
+// through classifyHTTPStatus (engine_overloaded ↔ 503, service_unavailable ↔
+// 503). Unknown codes fail CLOSED (non-retryable) — a deliberate choice: a
+// mis-classified request error retried by the router would repeat a doomed
+// request, while a missed transient costs one caller-visible failure the
+// router's higher-level retries can still absorb.
+func isTransientResponsesSSECode(code string) bool {
+	switch code {
+	case "server_error", "server_busy", "timeout", "rate_limit_exceeded", "overloaded_error",
+		"engine_overloaded", "service_unavailable":
+		return true
+	default:
+		return false
+	}
+}
+
+// responsesSSEKindForCode maps a transient SSE error code to its
+// transport-independent ErrKind (mirroring errKindForStatus for the codes
+// that have an HTTP equivalent).
+func responsesSSEKindForCode(code string) ErrKind {
+	switch code {
+	case "rate_limit_exceeded":
+		return ErrKindRateLimit
+	case "server_busy", "overloaded_error":
+		return ErrKindOverloaded
+	default:
+		return ""
+	}
+}
+
+// responsesSSEError builds the *Error for an SSE-level failure event (a flat
+// `error` event or a terminal `response.failed`), classifying transient
+// server-side codes as retryable. kind labels the event shape in the message.
+func responsesSSEError(providerName, kind, code, message string) *Error {
+	return &Error{
+		Provider:  providerName,
+		Retryable: isTransientResponsesSSECode(code),
+		ErrKind:   responsesSSEKindForCode(code),
+		Err:       fmt.Errorf("responses API (stream): %s: %s: %s", kind, code, message),
+	}
+}
 
 // newResponsesClient creates an official OpenAI SDK client for the Responses API.
 // tokenSource optionally injects per-request bearer credentials (nil = static
@@ -30,7 +83,10 @@ func newResponsesClient(apiKey, baseURL string, httpClient *http.Client, tokenSo
 		opts = append(opts, option.WithHTTPClient(httpClient))
 	}
 	if tokenSource != nil {
-		opts = append(opts, option.WithMiddleware(tokenSourceMiddleware(tokenSource)))
+		// Same rationale as the Chat Completions client: a TokenSource
+		// failure must abort the call, not be retried inside the SDK before
+		// the router's policy can classify it (see NewOpenAIProvider).
+		opts = append(opts, option.WithMaxRetries(0), option.WithMiddleware(tokenSourceMiddleware(tokenSource)))
 	}
 	client := oai.NewClient(opts...)
 	return &client
@@ -115,11 +171,11 @@ func responsesAPICompletionStream(ctx context.Context, client *oai.Client, provi
 		// req.MaxTokens keeps its meaning only for endpoints that accept it.
 		params.MaxOutputTokens = param.Opt[int64]{}
 		// They also accept only the low..max effort ladder and reject
-		// "minimal" — valid on api.openai.com — with a retryable=false
-		// HTTP 400 "'minimal' is not supported with the ... model.
+		// "none"/"minimal" with a retryable=false HTTP 400. The public API's
+		// disable option is not an endpoint-level disable option here.
 		// Supported values are: 'low', 'medium', 'high', 'xhigh', 'max'".
 		// Clamp to the nearest supported rung.
-		if params.Reasoning.Effort == "minimal" {
+		if params.Reasoning.Effort == "minimal" || params.Reasoning.Effort == "none" {
 			params.Reasoning.Effort = "low"
 		}
 	}
@@ -161,15 +217,13 @@ func responsesAPICompletionStream(ctx context.Context, client *oai.Client, provi
 			// The flat union carries Code/Message/Param directly; the SDK's
 			// stream layer only bails on a top-level `error` member, which the
 			// error event itself does not carry (its fields are flat).
-			return nil, WrapProviderError(providerName, 0,
-				fmt.Errorf("responses API (stream): error event: %s: %s", ev.Code, ev.Message))
+			return nil, responsesSSEError(providerName, "error event", ev.Code, ev.Message)
 		case "response.completed", "response.incomplete":
 			r := ev.Response
 			terminal = &r
 		case "response.failed":
 			r := ev.Response
-			return nil, WrapProviderError(providerName, 0,
-				fmt.Errorf("responses API (stream): response failed: %s: %s", r.Error.Code, r.Error.Message))
+			return nil, responsesSSEError(providerName, "response failed", string(r.Error.Code), r.Error.Message)
 		}
 	}
 	if err := stream.Err(); err != nil {
@@ -177,7 +231,7 @@ func responsesAPICompletionStream(ctx context.Context, client *oai.Client, provi
 	}
 	if terminal == nil {
 		return nil, WrapProviderError(providerName, 0,
-			errors.New("responses API (stream): stream ended without a terminal response event"))
+			fmt.Errorf("responses API (stream): stream ended without a terminal response event: %w", io.ErrUnexpectedEOF))
 	}
 
 	converted, err := convertResponsesResponse(terminal)
@@ -230,7 +284,8 @@ func buildResponsesParams(req ChatRequest, baseURL string, logger *slog.Logger) 
 
 	// Only send reasoning if the effort value is valid for the OpenAI
 	// Responses API. Invalid values (e.g. "On" from Anthropic/GLM families)
-	// cause a 400 error. Valid values: minimal, low, medium, high, max.
+	// cause a 400 error. Valid values are protocol-wide; model options are
+	// resolved separately by ModelReasoningOptions/ReasoningForCall.
 	if isValidResponsesReasoningEffort(req.ReasoningEffort) {
 		params.Reasoning = shared.ReasoningParam{
 			Effort:  shared.ReasoningEffort(req.ReasoningEffort),
@@ -247,12 +302,13 @@ func buildResponsesParams(req ChatRequest, baseURL string, logger *slog.Logger) 
 
 // isValidResponsesReasoningEffort returns true if the effort string is a valid
 // value for the OpenAI Responses API reasoning.effort parameter. The Responses
-// API accepts: "minimal", "low", "medium", "high", "max" (max for Codex models).
+// API accepts: none, minimal, low, medium, high, xhigh and max. Each
+// model supports only a subset, described by ModelReasoningOptions.
 // Other family-specific values like "On"/"Off" (Anthropic, GLM, Qwen) or
 // "Max"/"High" (DeepSeek) are not accepted by the Responses API.
 func isValidResponsesReasoningEffort(effort string) bool {
 	switch effort {
-	case "minimal", "low", "medium", "high", "max":
+	case "none", "minimal", "low", "medium", "high", "xhigh", "max":
 		return true
 	default:
 		return false

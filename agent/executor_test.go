@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/v0lka/sp4rk/llm"
@@ -745,6 +746,105 @@ func TestExecutor_Run_ContextExceededError_ReactiveCompaction(t *testing.T) {
 	}
 	if cm.compactCalled == 0 {
 		t.Error("expected Compact() to be called for reactive compaction")
+	}
+}
+
+// emitOneDeltaLLM wraps a mockLLMCaller and delivers one live text delta
+// through req.DeltaSink before the call returns the inner caller's outcome
+// (success or failure — the inner mock decides). From the executor's
+// perspective this is "deltas were delivered live, then the call concluded":
+// paired with a failing inner caller it shapes a provider that streamed part
+// of its answer and then failed; paired with a finishing one it shapes a
+// successful finish over a still-open stream.
+type emitOneDeltaLLM struct {
+	inner *mockLLMCaller
+	delta string
+}
+
+func (s *emitOneDeltaLLM) Call(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
+	resp, err := s.inner.Call(ctx, req)
+	if req.DeltaSink != nil && s.delta != "" {
+		_ = req.DeltaSink(llm.StreamDelta{Text: s.delta})
+	}
+	return resp, err
+}
+
+// streamCaptureEvents records the CONTENT of assistant chunks/dones, not just
+// their occurrence.
+type streamCaptureEvents struct {
+	*recordingEvents
+	mu     sync.Mutex
+	chunks []string
+	dones  []string
+}
+
+func (s *streamCaptureEvents) AssistantChunk(c string) {
+	s.mu.Lock()
+	s.chunks = append(s.chunks, c)
+	s.mu.Unlock()
+	s.recordingEvents.AssistantChunk(c)
+}
+
+func (s *streamCaptureEvents) AssistantDone(c string, _, _ int) {
+	s.mu.Lock()
+	s.dones = append(s.dones, c)
+	s.mu.Unlock()
+	s.recordingEvents.AssistantDone(c, 0, 0)
+}
+
+// TestExecutor_Run_ReactiveCompactionSkippedAfterStreamedText pins that a
+// context-exceeded error is NOT retried (compaction + continue) once a text
+// delta of that attempt was already delivered live: a retry would stream a
+// second answer into the same AssistantChunk channel, mixing the visible text
+// of both attempts. The error is returned to the caller instead.
+func TestExecutor_Run_ReactiveCompactionSkippedAfterStreamedText(t *testing.T) {
+	mockLLM := &mockLLMCaller{
+		errors: []error{
+			errors.New("context length exceeded"),
+			nil,
+		},
+		responses: []*llm.ChatResponse{
+			nil,
+			llmResponseFinish("recovered", "done"),
+		},
+	}
+	streaming := &emitOneDeltaLLM{inner: mockLLM, delta: "partial"}
+	cm := newMockContextManager()
+	events := &streamCaptureEvents{recordingEvents: &recordingEvents{}}
+
+	exec := NewExecutor(streaming, newMockToolExecutor(), 10,
+		WithTokenCounter(&mockTokenCounter{}),
+		WithEvents(events),
+		WithStreaming(true),
+	)
+
+	_, err := exec.Run(context.Background(), nil, cm)
+	if err == nil {
+		t.Fatal("expected the context-exceeded error to be returned, not retried after streamed text")
+	}
+	if !strings.Contains(err.Error(), "context length exceeded") {
+		t.Errorf("error = %v, want the original context-exceeded error", err)
+	}
+	mockLLM.mu.Lock()
+	calls := len(mockLLM.calls)
+	mockLLM.mu.Unlock()
+	if calls != 1 {
+		t.Errorf("LLM calls = %d, want 1 (no reactive retry after streamed text)", calls)
+	}
+	if cm.compactCalled != 0 {
+		t.Errorf("Compact() calls = %d, want 0 (no compaction-driven retry after streamed text)", cm.compactCalled)
+	}
+	events.mu.Lock()
+	defer events.mu.Unlock()
+	if len(events.chunks) != 1 || events.chunks[0] != "partial" {
+		t.Errorf("chunks = %v, want exactly [partial] (the single delivered delta)", events.chunks)
+	}
+	// The Run-exit stream finalizer (see finalizeAssistantStream) closes the
+	// failed attempt's open stream with what it accumulated: exactly one
+	// AssistantDone carrying the partial text — never a second streamed
+	// attempt's text, and never left open to pollute the next Run.
+	if len(events.dones) != 1 || events.dones[0] != "partial" {
+		t.Errorf("dones = %v, want exactly [partial] (the failed attempt's stream closed at Run exit)", events.dones)
 	}
 }
 
@@ -3157,4 +3257,112 @@ func TestExecutor_Run_SetToolOverhead(t *testing.T) {
 			t.Error("toolOverhead (no tools) = 0, want > 0 (finish tool reserve)")
 		}
 	})
+}
+
+// accumulatorEvents mirrors the real EventEmitter's streaming contract: an
+// internal accumulator appends every AssistantChunk and resets only on
+// AssistantDone. pending() reports what a NEXT Run over the same consumer
+// would append to — the cross-Run pollution the finalizer must prevent.
+type accumulatorEvents struct {
+	*recordingEvents
+	mu     sync.Mutex
+	acc    strings.Builder
+	dones  []string
+	usages [][2]int
+}
+
+func (a *accumulatorEvents) AssistantChunk(c string) {
+	a.mu.Lock()
+	a.acc.WriteString(c)
+	a.mu.Unlock()
+	a.recordingEvents.AssistantChunk(c)
+}
+
+func (a *accumulatorEvents) AssistantDone(c string, in, out int) {
+	a.mu.Lock()
+	a.dones = append(a.dones, c)
+	a.usages = append(a.usages, [2]int{in, out})
+	a.acc.Reset()
+	a.mu.Unlock()
+	a.recordingEvents.AssistantDone(c, 0, 0)
+}
+
+func (a *accumulatorEvents) pending() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.acc.String()
+}
+
+func (a *accumulatorEvents) doneList() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.dones...)
+}
+
+func (a *accumulatorEvents) usageList() [][2]int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([][2]int(nil), a.usages...)
+}
+
+// TestExecutor_Run_ExplicitFinishClosesLiveStream pins that a successful
+// explicit finish (text streamed live + finish(answer=…)) terminates the
+// open assistant stream: AssistantDone fires for the streamed text, and a
+// SECOND Run over the same Events consumer starts from an empty accumulator
+// instead of inheriting the first Run's text.
+func TestExecutor_Run_ExplicitFinishClosesLiveStream(t *testing.T) {
+	events := &accumulatorEvents{recordingEvents: &recordingEvents{}}
+	cm := newMockContextManager()
+
+	// Run 1: streamed commentary + explicit finish.
+	mockLLM1 := &mockLLMCaller{responses: []*llm.ChatResponse{
+		llmResponseFinish("I will inspect. ", "Actual final answer"),
+	}}
+	exec1 := NewExecutor(&emitOneDeltaLLM{inner: mockLLM1, delta: "I will inspect. "}, newMockToolExecutor(), 10,
+		WithTokenCounter(&mockTokenCounter{}),
+		WithEvents(events),
+		WithStreaming(true),
+	)
+	result, err := exec1.Run(context.Background(), nil, cm)
+	if err != nil {
+		t.Fatalf("Run 1: %v", err)
+	}
+	if !result.Finished {
+		t.Error("Run 1: expected Finished=true on explicit finish")
+	}
+	if got := events.pending(); got != "" {
+		t.Errorf("Run 1 left the stream open: pending = %q, want empty", got)
+	}
+	if dones := events.doneList(); len(dones) != 1 || dones[0] != "I will inspect. " {
+		t.Errorf("Run 1 AssistantDone list = %v, want exactly [I will inspect. ] (the streamed text, closed at Run exit)", dones)
+	}
+	if usage := events.usageList(); len(usage) != 1 || usage[0] != [2]int{100, 50} {
+		t.Errorf("Run 1 AssistantDone usage = %v, want [[100 50]] (the streamed response's usage, not zeros)", usage)
+	}
+
+	// Run 2: plain streamed answer over the SAME consumer — must not inherit
+	// Run 1's text.
+	mockLLM2 := &mockLLMCaller{responses: []*llm.ChatResponse{
+		llmResponseEndTurn("Final answer"),
+	}}
+	exec2 := NewExecutor(&emitOneDeltaLLM{inner: mockLLM2, delta: "Final answer"}, newMockToolExecutor(), 10,
+		WithTokenCounter(&mockTokenCounter{}),
+		WithEvents(events),
+		WithStreaming(true),
+	)
+	if _, err := exec2.Run(context.Background(), nil, newMockContextManager()); err != nil {
+		t.Fatalf("Run 2: %v", err)
+	}
+	dones := events.doneList()
+	if len(dones) != 2 || dones[1] != "Final answer" {
+		t.Errorf("Run 2 AssistantDone list = %v, want the second terminator to carry only [Final answer]", dones)
+	}
+	for _, d := range dones {
+		if strings.Contains(d, "I will inspect. Final answer") {
+			t.Errorf("cross-Run pollution: AssistantDone %q mixes both runs' text", d)
+		}
+	}
+	if got := events.pending(); got != "" {
+		t.Errorf("Run 2 left the stream open: pending = %q, want empty", got)
+	}
 }

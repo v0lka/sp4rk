@@ -34,12 +34,19 @@ type OpenAIProviderConfig struct {
 	// chat_template_kwargs. See ReasoningWire for the full contract.
 	ReasoningWire ReasoningWire
 	// TokenSource optionally supplies per-request bearer credentials (see
-	// TokenSource). When set, both SDK clients this provider builds (Chat
-	// Completions and Responses) inject a middleware that stamps the returned
-	// access token onto the Authorization header — overriding the static
-	// APIKey credential — and applies BearerToken.ExtraHeaders, immediately
-	// before every request leaves the process (including SDK-internal
-	// retries). nil = static APIKey only (the historical behavior).
+	// TokenSource). When set, every protocol this provider serves resolves
+	// credentials through it immediately before a request leaves the process:
+	// the two OpenAI SDK clients (Chat Completions and Responses) via a
+	// middleware that stamps the returned access token onto the Authorization
+	// header — overriding the static APIKey credential — and applies
+	// BearerToken.ExtraHeaders; the Anthropic and Google delegates apply the
+	// same stamping through their transports, clearing the static x-api-key /
+	// ?key= credential so a dynamic token never rides alongside it. A Token
+	// failure aborts the request before any network I/O. The SDK-internal
+	// retry loops are disabled for dynamic-credential clients (a credential
+	// failure must abort, not be retried in-SDK); the router's own retry
+	// policy re-enters the resolution per attempt. nil = static APIKey only
+	// (the historical behavior).
 	TokenSource TokenSource
 	// RequireStreaming marks this endpoint as accepting streaming calls ONLY
 	// on the wire (e.g. a ChatGPT OAuth backend that rejects any
@@ -65,6 +72,7 @@ type OpenAIProvider struct {
 	logger            *slog.Logger
 	reasoningWire     ReasoningWire // Qwen reasoning-control spelling for this endpoint (zero = vendor default)
 	requireStreaming  bool          // endpoint accepts streaming calls only (seam; see OpenAIProviderConfig.RequireStreaming)
+	tokenSource       TokenSource   // dynamic per-request credentials, threaded to the Anthropic/Google delegates too (nil = static key)
 }
 
 // log returns the provider's logger, defaulting to slog.Default() when unset.
@@ -93,7 +101,19 @@ func NewOpenAIProvider(cfg OpenAIProviderConfig) (*OpenAIProvider, error) {
 		opts = append(opts, option.WithHTTPClient(cfg.HTTPClient))
 	}
 	if cfg.TokenSource != nil {
-		opts = append(opts, option.WithMiddleware(tokenSourceMiddleware(cfg.TokenSource)))
+		// The SDK's internal retry loop retries a request whose middleware
+		// returned (nil, error) — shouldRetry(req, nil) is true for a nil
+		// response — so a TokenSource failure would be retried in-SDK, with
+		// its own short backoff, BEFORE the router's policy ever sees it:
+		// the contract's "abort the retry chain" would not hold (the
+		// credentials are re-resolved, a later Token call may even succeed,
+		// and the request leaves anyway), and a persistent failure costs
+		// extra Token calls and sleep. Disable the SDK-internal retries for
+		// dynamic-credential clients and let the ROUTER own the retry
+		// policy: its loop re-enters the middleware per attempt (fresh
+		// credentials on permitted HTTP retries) and a credential failure is
+		// classified non-retryable by WrapProviderError, so it aborts there.
+		opts = append(opts, option.WithMaxRetries(0), option.WithMiddleware(tokenSourceMiddleware(cfg.TokenSource)))
 	}
 	client := oai.NewClient(opts...)
 
@@ -108,13 +128,17 @@ func NewOpenAIProvider(cfg OpenAIProviderConfig) (*OpenAIProvider, error) {
 	// from the shared connection fields explicitly (rather than via a direct
 	// type conversion) so that adding Anthropic-specific fields to
 	// AnthropicProviderConfig later cannot silently drop or mis-map a field.
+	// TokenSource threads through too, so a dynamic-credential gateway
+	// authenticates Claude exactly like GPT models (see the TokenSource
+	// contract) instead of silently falling back to the static key.
 	//nolint:staticcheck // S1016: explicit field copy is deliberate — see comment above; survives future divergent fields.
 	anthropicDelegate, err := NewAnthropicProvider(AnthropicProviderConfig{
-		Name:       cfg.Name,
-		APIKey:     cfg.APIKey,
-		BaseURL:    cfg.BaseURL,
-		HTTPClient: cfg.HTTPClient,
-		Logger:     cfg.Logger,
+		Name:        cfg.Name,
+		APIKey:      cfg.APIKey,
+		BaseURL:     cfg.BaseURL,
+		HTTPClient:  cfg.HTTPClient,
+		Logger:      cfg.Logger,
+		TokenSource: cfg.TokenSource,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("openai: failed to build anthropic delegate: %w", err)
@@ -131,13 +155,17 @@ func NewOpenAIProvider(cfg OpenAIProviderConfig) (*OpenAIProvider, error) {
 		logger:            cfg.Logger,
 		reasoningWire:     cfg.ReasoningWire,
 		requireStreaming:  cfg.RequireStreaming,
+		tokenSource:       cfg.TokenSource,
 	}, nil
 }
 
 // tokenSourceMiddleware builds an openai-go request middleware that resolves
-// credentials from ts immediately before every request leaves the process —
-// including each SDK-internal retry attempt, so a refreshed token reaches
-// later attempts of the same call. It stamps the access token onto the
+// credentials from ts immediately before every request leaves the process.
+// For dynamic-credential clients the constructor disables the SDK-internal
+// retry loop (option.WithMaxRetries(0)), so the only re-entry into this
+// middleware comes from the ROUTER's retry policy — which re-enters per
+// attempt, so a refreshed token reaches each new attempt of the call. The
+// middleware stamps the access token onto the
 // Authorization header (overriding the static option.WithAPIKey credential,
 // which the SDK applies before middlewares run) and sets each extra header
 // from BearerToken.ExtraHeaders; an empty extra value removes that header.
@@ -153,16 +181,7 @@ func tokenSourceMiddleware(ts TokenSource) option.Middleware {
 		if err != nil {
 			return nil, fmt.Errorf("llm: token source: %w", err)
 		}
-		if tok.AccessToken != "" {
-			req.Header.Set("Authorization", "Bearer "+tok.AccessToken)
-		}
-		for k, v := range tok.ExtraHeaders {
-			if v == "" {
-				req.Header.Del(k)
-				continue
-			}
-			req.Header.Set(k, v)
-		}
+		applyBearerToken(req, tok, "")
 		return next(req)
 	}
 }
@@ -268,12 +287,16 @@ func (p *OpenAIProvider) ChatCompletion(ctx context.Context, req ChatRequest) (*
 		// with the Google contents/parts format. The delegate reuses this
 		// provider's baseURL/apiKey/httpClient; error wrapping and body capture
 		// happen inside the delegate, with the provider name inherited here.
+		// TokenSource threads through, so a dynamic-credential gateway
+		// authenticates Gemini exactly like GPT models instead of silently
+		// falling back to the static ?key= credential.
 		return googleCompletion(ctx, googleCompletionConfig{
 			HTTPClient:   p.httpClient,
 			BaseURL:      p.baseURL,
 			APIKey:       p.apiKey,
 			ProviderName: p.name,
 			Logger:       p.logger,
+			TokenSource:  p.tokenSource,
 		}, req)
 	case ProtocolChatCompletions:
 		// Handled by the shared Chat Completions path below.
@@ -395,7 +418,12 @@ func (p *OpenAIProvider) chatCompletionStream(ctx context.Context, req ChatReque
 				}
 			}
 			// Tool-call arguments arrive as per-index fragments across chunks and
-			// must be concatenated in order.
+			// must be concatenated in order. The function NAME is concatenated
+			// too: some OpenAI-compatible gateways fragment it across chunks
+			// exactly like the arguments (the official openai-go accumulator
+			// concatenates both), so an overwrite here would drop all but the
+			// last fragment and hand the executor a wrong or nonexistent tool
+			// name ("get_" + "weather" must not become "weather").
 			for _, tc := range delta.ToolCalls {
 				idx := int(tc.Index)
 				acc := toolAcc[idx]
@@ -406,9 +434,7 @@ func (p *OpenAIProvider) chatCompletionStream(ctx context.Context, req ChatReque
 				if tc.ID != "" {
 					acc.id = tc.ID
 				}
-				if tc.Function.Name != "" {
-					acc.name = tc.Function.Name
-				}
+				acc.name += tc.Function.Name
 				acc.args.WriteString(tc.Function.Arguments)
 			}
 			if choice.FinishReason != "" {
@@ -418,6 +444,16 @@ func (p *OpenAIProvider) chatCompletionStream(ctx context.Context, req ChatReque
 	}
 	if err := stream.Err(); err != nil {
 		return nil, p.wrapError(fmt.Errorf("openai chat completion (stream): %w", err))
+	}
+	// A stream that ended (plain EOF, no SDK-level transport error) without a
+	// terminal finish_reason on choice 0 is a truncated response: a
+	// compatible gateway that closes the chunked/SSE stream after a few
+	// deltas would otherwise be accepted as a successful (short) answer —
+	// the empty finish reason must not silently map to end_turn. Surface it
+	// as an unexpected-EOF error so the router's classifier sees a transient
+	// failure and the caller does not persist a truncated reply.
+	if finish == "" {
+		return nil, p.wrapError(fmt.Errorf("openai chat completion (stream): %w", io.ErrUnexpectedEOF))
 	}
 
 	// Reassemble tool calls in declaration order (index order).
@@ -762,52 +798,41 @@ func applyDeepSeekReasoning(params *oai.ChatCompletionNewParams, effort string) 
 	}
 }
 
-// applyGLMReasoning sets the reasoning-related extra fields for GLM models.
+// applyGLMReasoning encodes the model's reasoning option set. GLM 5.2
+// supports none/max/high; GLM 5.3+ (flagship and Flash) supports only
+// max/high/low. The same ModelReasoningOptions drives the picker, service
+// tiers, and this encoder so disabling a thinking-locked model is impossible.
 //
-// GLM 5.2+ supports the reasoning_effort parameter (values "max"/"high") which
-// is honored when thinking is enabled:
-//
-//   - "none"/"off": thinking disabled, no reasoning_effort ("off" is the
-//     value c0wrk stores in its small-LLM config; BOTH sentinels are
-//     matched case-insensitively ahead of the switch, like in
-//     applyQwenReasoning, so the fail-closed default branch below can never
-//     re-enable thinking for a differently-cased sentinel)
-//   - "max":  thinking enabled,  reasoning_effort=max
-//   - "high": thinking enabled,  reasoning_effort=high
-//   - "On":   thinking enabled at the GLM default (max) — the family-level
-//     spelling a host config stored before the model-level option set
-//
-// The call site guarantees a non-empty effort. Every OTHER value fails
-// closed to thinking disabled: a strict gateway rejects unknown
-// thinking.type values outright, and silently enabling thinking is the
-// opposite of the configured intent (mirroring applyDeepSeekReasoning).
-//
-// Older GLM models (< 5.2) keep the legacy binary thinking.type control,
-// whose wire values are "enabled"/"disabled". The family options spell them
-// "On"/"Off" and c0wrk stores "off", so both spellings of both sentinels
-// are normalized to their wire values instead of being passed through
-// verbatim — and any non-canonical value ("none", "max", an unknown
-// spelling) fails closed to "disabled" for the same reason as above.
+// Off/none and unknown efforts select the cheapest legal posture: disabled
+// when available, otherwise the minimal enabled effort. On selects the model
+// default for legacy host settings. Option matching is case-insensitive but
+// the wire receives the canonical spelling. Pre-5.2 models retain binary
+// On/Off thinking.type control; an empty effort is omitted by the call site.
 func applyGLMReasoning(params *oai.ChatCompletionNewParams, model, effort string) {
 	if IsGLM52OrLater(model) {
-		switch {
-		case strings.EqualFold(effort, "none"), strings.EqualFold(effort, "off"):
+		options, preferred, _ := ModelReasoningOptions("glm", model)
+		native := reasoningDisableSpelling(options)
+		if native == "" {
+			native = minimalReasoningEffort(options)
+		}
+		if strings.EqualFold(effort, "on") {
+			native = preferred
+		} else {
+			for _, option := range options {
+				if strings.EqualFold(effort, option) {
+					native = option
+					break
+				}
+			}
+		}
+		if strings.EqualFold(native, "none") || strings.EqualFold(native, "off") {
 			params.SetExtraFields(map[string]any{
 				"thinking": map[string]string{"type": "disabled"},
 			})
-		case effort == "max", strings.EqualFold(effort, "on"):
+		} else {
 			params.SetExtraFields(map[string]any{
 				"thinking":         map[string]string{"type": "enabled"},
-				"reasoning_effort": "max",
-			})
-		case effort == "high":
-			params.SetExtraFields(map[string]any{
-				"thinking":         map[string]string{"type": "enabled"},
-				"reasoning_effort": "high",
-			})
-		default:
-			params.SetExtraFields(map[string]any{
-				"thinking": map[string]string{"type": "disabled"},
+				"reasoning_effort": native,
 			})
 		}
 		return

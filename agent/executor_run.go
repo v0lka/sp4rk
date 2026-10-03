@@ -48,6 +48,20 @@ type runState struct {
 	checklistAvailable        bool
 	checklistStaleNudgeCount  int
 	assistantStreamed         bool // the current response's text was delivered live as AssistantChunk deltas
+	// assistantStreamOpen/assistantStreamText mirror the Events consumer's
+	// open live stream: text deltas append to the builder and open the flag;
+	// a terminator (AssistantDone) closes it. A Run must never return with
+	// the stream open — the consumer's accumulator would leak its text into
+	// the NEXT Run (see finalizeAssistantStream).
+	assistantStreamOpen bool
+	assistantStreamText strings.Builder
+	// assistantStreamUsageIn/Out accumulate the usage of the COMPLETED
+	// responses whose text is in the open stream mirror, so the Run-exit
+	// finalizer's AssistantDone reports what the streamed text actually
+	// cost. A response aborted mid-stream contributes nothing — its usage
+	// never arrives, and the finalizer reports the sum of what did.
+	assistantStreamUsageIn  int
+	assistantStreamUsageOut int
 }
 
 // handleStepLimitBoundary handles the step-limit boundary logic (when stepNum > effectiveMaxSteps).
@@ -144,6 +158,8 @@ func (e *Executor) callLLMWithReactiveCompaction(ctx context.Context, state *run
 				return nil
 			}
 			state.assistantStreamed = true
+			state.assistantStreamOpen = true
+			state.assistantStreamText.WriteString(d.Text)
 			e.emitter.AssistantChunk(d.Text)
 			return nil
 		}
@@ -152,6 +168,19 @@ func (e *Executor) callLLMWithReactiveCompaction(ctx context.Context, state *run
 	// Call LLM
 	resp, err := e.llm.Call(ctx, req)
 	if err != nil {
+		// Reactive retry is allowed ONLY while nothing was delivered live:
+		// once a text delta reached the host (state.assistantStreamed), a
+		// retry would stream a second, divergent answer into the SAME
+		// AssistantChunk channel — the visible text of the failed attempt
+		// would mix with the new one and AssistantDone would describe only
+		// the last attempt. The router already refuses its own retries past
+		// a delivered delta (deltaGuard); this guard extends the same rule
+		// to the executor's compaction-driven retry. The error is returned
+		// to the caller instead.
+		if isContextExceededError(err) && state.assistantStreamed {
+			e.emitter.ExecutorDiagnostic(state.stepNum, "reactive_compaction_skipped_streamed", map[string]any{"error": err.Error()})
+			return nil, actionNone, err
+		}
 		if isContextExceededError(err) && !state.reactiveCompactAttempted {
 			state.reactiveCompactAttempted = true
 			if result := cw.Compact(ctx); result != nil {
@@ -165,6 +194,21 @@ func (e *Executor) callLLMWithReactiveCompaction(ctx context.Context, state *run
 
 	if resp == nil {
 		return nil, actionNone, fmt.Errorf("llm returned empty response at step %d", state.stepNum)
+	}
+
+	// A response whose text was delivered live leaves the stream mirror
+	// open (a tool-call turn carries no terminator): record its usage so
+	// the Run-exit finalizer's AssistantDone reports what the streamed
+	// text actually cost. The implicit-finish path closes the mirror
+	// (discarding the accumulated sum) after emitting its own terminator,
+	// which carries the FINAL response's usage only — so the two
+	// terminators are not usage-equivalent when the open stream spanned
+	// more than one response; the summed accounting is the finalizer's
+	// alone, and the implicit-finish turn keeps the last response's
+	// numbers, matching the pre-streaming event shape.
+	if state.assistantStreamed {
+		state.assistantStreamUsageIn += resp.Usage.InputTokens
+		state.assistantStreamUsageOut += resp.Usage.OutputTokens
 	}
 
 	// Signal proximity to the server's KV-cache limit based on the real
@@ -470,6 +514,38 @@ func (e *Executor) emitAssistantEvents(state *runState, output string, resp *llm
 		e.emitter.AssistantChunk(output)
 	}
 	e.emitter.AssistantDone(output, resp.Usage.InputTokens, resp.Usage.OutputTokens)
+	// The terminator closed the Events consumer's live stream (its
+	// accumulator resets on AssistantDone); mirror that here so the Run-exit
+	// finalizer knows nothing is left open.
+	e.closeAssistantStream(state)
+}
+
+// closeAssistantStream marks the live assistant stream closed after a
+// terminator (AssistantDone) has been emitted for it. Idempotent.
+func (e *Executor) closeAssistantStream(state *runState) {
+	state.assistantStreamOpen = false
+	state.assistantStreamText.Reset()
+	state.assistantStreamUsageIn = 0
+	state.assistantStreamUsageOut = 0
+}
+
+// finalizeAssistantStream closes any still-open live assistant stream at the
+// end of a Run: a successful explicit finish (whose answer travels in the
+// ExecutorResult, not in an implicit assistant response) and the error /
+// pause / step-limit exits would otherwise leave the Events consumer's
+// accumulator holding this Run's text, and the NEXT Run over the same
+// consumer would append to it — cross-Run pollution. The terminator carries
+// exactly what the open stream accumulated, including the usage of the
+// responses that produced it; a response aborted mid-stream contributes no
+// usage (it never completed, so none is attributable).
+func (e *Executor) finalizeAssistantStream(state *runState) {
+	if e.suppressAssistantEvents || !state.assistantStreamOpen {
+		return
+	}
+	text := state.assistantStreamText.String()
+	in, out := state.assistantStreamUsageIn, state.assistantStreamUsageOut
+	e.closeAssistantStream(state)
+	e.emitter.AssistantDone(text, in, out)
 }
 
 // handleImplicitFinish handles the "no tool calls" branches: syntax-nudge → finish-nudge → implicit finish.
@@ -651,6 +727,17 @@ func (e *Executor) handleTruncationStopReason(ctx context.Context, resp *llm.Cha
 					reprieve = "let you continue"
 				}
 				nudgeStep := Step{
+					Thought: thought,
+					// The reprieve step is the ONLY step materialized for
+					// this response (the loop continues without running
+					// processToolCalls; it renders standalone, where
+					// buildStandaloneMessages reads its items directly), so
+					// the response's reasoning must ride it — the same carry
+					// the truncation_detected branch below uses — or the
+					// encrypted reasoning chain is lost for the truncated
+					// turn.
+					ReasoningItems:   resp.Message.ReasoningItems,
+					ReasoningContent: resp.Message.ReasoningContent,
 					UserNudge: "[System] The user acknowledged the truncation circuit breaker and " + reprieve + ". " +
 						"You MUST use smaller operations to avoid hitting the output token limit.",
 				}
@@ -661,7 +748,12 @@ func (e *Executor) handleTruncationStopReason(ctx context.Context, resp *llm.Cha
 			case StepLimitAllowAlways:
 				e.consecutiveTruncationCount = 0
 				e.circuitBreaker.TruncationAbortThreshold = 1 << 30 // disable
+				// Same standalone reasoning carry as the allow-once reprieve
+				// above: the response's only materialized step.
 				nudgeStep := Step{
+					Thought:          thought,
+					ReasoningItems:   resp.Message.ReasoningItems,
+					ReasoningContent: resp.Message.ReasoningContent,
 					UserNudge: "[System] The user has overridden the truncation circuit breaker. " +
 						"You may continue, but try to produce smaller outputs.",
 				}
@@ -684,7 +776,15 @@ func (e *Executor) handleTruncationStopReason(ctx context.Context, resp *llm.Cha
 	e.emitter.ExecutorDiagnostic(state.stepNum, "truncation_detected", map[string]any{"tool": truncAction.Name, "consecutive": e.consecutiveTruncationCount})
 
 	step := Step{
-		Thought:          thought,
+		Thought: thought,
+		// This step is the ONLY step materialized for its response (the loop
+		// continues; processToolCalls never runs for it), so it is the step
+		// BuildPrompt consumes reasoning items from — it renders standalone
+		// (ResponseGroup 0), where buildStandaloneMessages reads its items
+		// directly, not via a groupSteps[0] slot. The response's items must
+		// ride it or the encrypted reasoning chain is silently lost for
+		// every max_tokens-truncated tool-call turn.
+		ReasoningItems:   resp.Message.ReasoningItems,
 		ReasoningContent: resp.Message.ReasoningContent,
 		Action:           truncAction,
 		Observation:      truncObs,
@@ -773,10 +873,22 @@ func (e *Executor) processSingleToolCall(
 		// retry instead of accepting finish.
 		if e.finishGuard != nil {
 			if guardErr := e.finishGuard(ctx); guardErr != nil {
+				// The nudge renders standalone (ResponseGroup 0). Carry the
+				// response's reasoning items exactly when finish is the
+				// group's FIRST call — then this nudge is the response's only
+				// materialized step, and buildStandaloneMessages reads its
+				// items directly, so the encrypted chain survives. With
+				// earlier siblings, groupSteps[0] already carries the items,
+				// and a copy here would re-emit the same reasoning-item IDs
+				// to the backend.
+				var nudgeItems []llm.ReasoningItem
+				if callIdx == 0 {
+					nudgeItems = resp.Message.ReasoningItems
+				}
 				nudgeStep := Step{
 					Thought:        thought,
 					UserNudge:      guardErr.Error(),
-					ReasoningItems: resp.Message.ReasoningItems,
+					ReasoningItems: nudgeItems,
 					TokensUsed:     resp.Usage.InputTokens + resp.Usage.OutputTokens,
 				}
 				state.allSteps = append(state.allSteps, nudgeStep)
@@ -805,10 +917,19 @@ func (e *Executor) processSingleToolCall(
 		// orchestrator triggers reflection/replan instead of recording success.
 		if e.mutationRequired && !e.hasMutatingToolExecuted(state) && !e.mutationNudgeAttempted {
 			e.mutationNudgeAttempted = true
+			// Same standalone-carry rule as the finish-guard nudge above:
+			// items ride the nudge only when finish is the group's first
+			// call (the nudge is then the response's only step); with
+			// earlier siblings groupSteps[0] already carries them, and a
+			// copy would re-emit the same reasoning-item IDs.
+			var nudgeItems []llm.ReasoningItem
+			if callIdx == 0 {
+				nudgeItems = resp.Message.ReasoningItems
+			}
 			nudgeStep := Step{
 				Thought:        thought,
 				UserNudge:      executorMutationNudge,
-				ReasoningItems: resp.Message.ReasoningItems,
+				ReasoningItems: nudgeItems,
 				TokensUsed:     resp.Usage.InputTokens + resp.Usage.OutputTokens,
 			}
 			state.allSteps = append(state.allSteps, nudgeStep)
@@ -828,10 +949,19 @@ func (e *Executor) processSingleToolCall(
 			e.countProductiveToolCalls(state) > checklistTrivialThreshold &&
 			!e.checklistMissingNudgeAttempted {
 			e.checklistMissingNudgeAttempted = true
+			// Same standalone-carry rule as the finish-guard nudge above:
+			// items ride the nudge only when finish is the group's first
+			// call (the nudge is then the response's only step); with
+			// earlier siblings groupSteps[0] already carries them, and a
+			// copy would re-emit the same reasoning-item IDs.
+			var nudgeItems []llm.ReasoningItem
+			if callIdx == 0 {
+				nudgeItems = resp.Message.ReasoningItems
+			}
 			nudgeStep := Step{
 				Thought:        thought,
 				UserNudge:      executorChecklistMissingNudge,
-				ReasoningItems: resp.Message.ReasoningItems,
+				ReasoningItems: nudgeItems,
 				TokensUsed:     resp.Usage.InputTokens + resp.Usage.OutputTokens,
 			}
 			state.allSteps = append(state.allSteps, nudgeStep)
@@ -848,10 +978,19 @@ func (e *Executor) processSingleToolCall(
 			!e.checklistUncheckedNudgeAttempted {
 			if unchecked := e.lastChecklistUnchecked(state); unchecked > 0 {
 				e.checklistUncheckedNudgeAttempted = true
+				// Same standalone-carry rule as the finish-guard nudge above:
+				// items ride the nudge only when finish is the group's first
+				// call (the nudge is then the response's only step); with
+				// earlier siblings groupSteps[0] already carries them, and a
+				// copy would re-emit the same reasoning-item IDs.
+				var nudgeItems []llm.ReasoningItem
+				if callIdx == 0 {
+					nudgeItems = resp.Message.ReasoningItems
+				}
 				nudgeStep := Step{
 					Thought:        thought,
 					UserNudge:      fmt.Sprintf(executorChecklistUncheckedNudge, unchecked),
-					ReasoningItems: resp.Message.ReasoningItems,
+					ReasoningItems: nudgeItems,
 					TokensUsed:     resp.Usage.InputTokens + resp.Usage.OutputTokens,
 				}
 				state.allSteps = append(state.allSteps, nudgeStep)
@@ -949,13 +1088,25 @@ func (e *Executor) processSingleToolCall(
 		// the next boundary cannot discard the verification result.
 		obs = e.runVerifyOnEditHook(ctx, action.Name, true, callIdx == len(toolCalls)-1, state, obs)
 		e.emitter.ToolResult(state.stepNum, callIdx, len(obs), obs, true)
+		// The rejected first call's step materializes as groupSteps[0]: the
+		// response's reasoning (content and items — the encrypted chain a
+		// stateless Responses backend re-emits) must ride it, exactly as the
+		// executed path would carry them.
+		var rejectReasoningItems []llm.ReasoningItem
+		rejectReasoning := ""
+		if callIdx == 0 {
+			rejectReasoning = resp.Message.ReasoningContent
+			rejectReasoningItems = resp.Message.ReasoningItems
+		}
 		step := Step{
-			Thought:       thought,
-			Action:        action,
-			Observation:   obs,
-			IsError:       true,
-			TokensUsed:    resp.Usage.InputTokens + resp.Usage.OutputTokens,
-			ResponseGroup: responseGroup,
+			Thought:          thought,
+			ReasoningContent: rejectReasoning,
+			ReasoningItems:   rejectReasoningItems,
+			Action:           action,
+			Observation:      obs,
+			IsError:          true,
+			TokensUsed:       resp.Usage.InputTokens + resp.Usage.OutputTokens,
+			ResponseGroup:    responseGroup,
 		}
 		state.allSteps = append(state.allSteps, step)
 		cw.AddStep(step)
@@ -1142,10 +1293,16 @@ func (e *Executor) stopToolTermination(
 	if e.finishGuard != nil {
 		if guardErr := e.finishGuard(ctx); guardErr != nil {
 			nudgeStep := Step{
-				Thought:        thought,
-				UserNudge:      guardErr.Error(),
-				ReasoningItems: resp.Message.ReasoningItems,
-				TokensUsed:     resp.Usage.InputTokens + resp.Usage.OutputTokens,
+				Thought:   thought,
+				UserNudge: guardErr.Error(),
+				// ReasoningItems deliberately NOT carried: the step for the
+				// stop tool itself was already appended (carrying the
+				// response's items whenever it is the group's first step), or
+				// an earlier sibling already carries them as groupSteps[0] —
+				// this nudge renders standalone (ResponseGroup 0), so a copy
+				// here would re-emit the same reasoning-item IDs to the
+				// backend.
+				TokensUsed: resp.Usage.InputTokens + resp.Usage.OutputTokens,
 			}
 			state.allSteps = append(state.allSteps, nudgeStep)
 			cw.AddStep(nudgeStep)
@@ -1194,9 +1351,16 @@ func (e *Executor) processBatchTool(
 		obs := fmt.Sprintf("batch parse error: %v", err)
 		e.emitter.ToolCall(state.stepNum, callIdx, action.Name, string(action.Input), e.tools.GetToolSource(action.Name))
 		e.emitter.ToolResult(state.stepNum, callIdx, len(obs), obs, true)
+		// The reasoning carry is deliberately UNGATED: safe whether or not
+		// this step ends up first — buildGroupedMessages reads items only
+		// from groupSteps[0] and ignores a non-first step's items, so a
+		// later-call batch's carry is inert, while a first-call batch (or a
+		// standalone one) NEEDS it as the group's only source of the
+		// response's items.
 		step := Step{
 			Thought:          thought,
 			ReasoningContent: resp.Message.ReasoningContent,
+			ReasoningItems:   resp.Message.ReasoningItems,
 			Action:           action,
 			Observation:      obs,
 			IsError:          true,
@@ -1213,9 +1377,13 @@ func (e *Executor) processBatchTool(
 		obs := "batch: no calls provided (empty calls array)"
 		e.emitter.ToolCall(state.stepNum, callIdx, action.Name, string(action.Input), e.tools.GetToolSource(action.Name))
 		e.emitter.ToolResult(state.stepNum, callIdx, len(obs), obs, true)
+		// Ungated reasoning carry — same read-only-when-not-first rationale
+		// as the parse-error branch above: needed when this step is the
+		// group's first, inert otherwise.
 		step := Step{
 			Thought:          thought,
 			ReasoningContent: resp.Message.ReasoningContent,
+			ReasoningItems:   resp.Message.ReasoningItems,
 			Action:           action,
 			Observation:      obs,
 			IsError:          true,
@@ -1251,14 +1419,26 @@ func (e *Executor) processBatchTool(
 			batchedName := "batch (batched)"
 			e.emitter.ToolCall(state.stepNum, effectiveIdx, batchedName, string(sub.Input), e.tools.GetToolSource(sub.Tool))
 			e.emitter.ToolResult(state.stepNum, effectiveIdx, len(obs), obs, true)
+			// The first step of the batch group carries the response's
+			// reasoning items (see the success path below) — a rejected
+			// FIRST sub-call still materializes as groupSteps[0], so the
+			// encrypted reasoning chain must ride it.
+			var guardReasoningItems []llm.ReasoningItem
+			guardReasoning := ""
+			if subIdx == 0 && callIdx == 0 {
+				guardReasoning = resp.Message.ReasoningContent
+				guardReasoningItems = resp.Message.ReasoningItems
+			}
 			step := Step{
-				Thought:       thought,
-				Action:        subCall,
-				Observation:   obs,
-				IsUntrusted:   false,
-				IsError:       true,
-				TokensUsed:    resp.Usage.InputTokens + resp.Usage.OutputTokens,
-				ResponseGroup: responseGroup,
+				Thought:          thought,
+				ReasoningContent: guardReasoning,
+				ReasoningItems:   guardReasoningItems,
+				Action:           subCall,
+				Observation:      obs,
+				IsUntrusted:      false,
+				IsError:          true,
+				TokensUsed:       resp.Usage.InputTokens + resp.Usage.OutputTokens,
+				ResponseGroup:    responseGroup,
 			}
 			state.allSteps = append(state.allSteps, step)
 			cw.AddStep(step)
@@ -1306,14 +1486,26 @@ func (e *Executor) processBatchTool(
 				lastCallInGroup := subIdx == len(batchInput.Calls)-1 && callIdx == len(toolCalls)-1
 				obs = e.runVerifyOnEditHook(ctx, subCall.Name, true, lastCallInGroup, state, obs)
 				e.emitter.ToolResult(state.stepNum, effectiveIdx, len(obs), obs, true)
+				// The first step of the batch group carries the response's
+				// reasoning (see the success path below): a rejected FIRST
+				// sub-call still materializes as groupSteps[0], so the
+				// encrypted reasoning chain must ride it.
+				var rejectReasoningItems []llm.ReasoningItem
+				rejectReasoning := ""
+				if subIdx == 0 && callIdx == 0 {
+					rejectReasoning = resp.Message.ReasoningContent
+					rejectReasoningItems = resp.Message.ReasoningItems
+				}
 				step := Step{
-					Thought:       thought,
-					Action:        subCall,
-					Observation:   obs,
-					IsUntrusted:   false,
-					IsError:       true,
-					TokensUsed:    resp.Usage.InputTokens + resp.Usage.OutputTokens,
-					ResponseGroup: responseGroup,
+					Thought:          thought,
+					ReasoningContent: rejectReasoning,
+					ReasoningItems:   rejectReasoningItems,
+					Action:           subCall,
+					Observation:      obs,
+					IsUntrusted:      false,
+					IsError:          true,
+					TokensUsed:       resp.Usage.InputTokens + resp.Usage.OutputTokens,
+					ResponseGroup:    responseGroup,
 				}
 				state.allSteps = append(state.allSteps, step)
 				cw.AddStep(step)
@@ -1382,13 +1574,23 @@ func (e *Executor) processBatchTool(
 		// Create step — only first sub-call in the first response group call carries thought.
 		stepThought := ""
 		stepReasoning := ""
+		var stepReasoningItems []llm.ReasoningItem
 		if subIdx == 0 && callIdx == 0 {
 			stepThought = thought
 			stepReasoning = resp.Message.ReasoningContent
+			// Mirror the standalone tool-call path: the response's reasoning
+			// items (including the EncryptedContent a stateless Responses
+			// backend attaches for cross-turn reasoning) ride the FIRST step
+			// of the batch group, so the next BuildPrompt re-emits them via
+			// the assistant message and convertToResponsesInput round-trips
+			// the encrypted payload. Dropping them here would silently lose
+			// the reasoning chain for every batched turn.
+			stepReasoningItems = resp.Message.ReasoningItems
 		}
 		step := Step{
 			Thought:          stepThought,
 			ReasoningContent: stepReasoning,
+			ReasoningItems:   stepReasoningItems,
 			Action:           subCall,
 			Observation:      observation,
 			IsUntrusted:      isUntrusted,
@@ -1596,13 +1798,20 @@ func (e *Executor) checkRepeatIdenticalTool(
 		e.emitter.ToolResult(state.stepNum, callIdx, len(nudgeMsg), nudgeMsg, true)
 		stepThought := ""
 		stepReasoning := ""
+		var stepReasoningItems []llm.ReasoningItem
 		if callIdx == 0 {
 			stepThought = thought
 			stepReasoning = resp.Message.ReasoningContent
+			// The intercepted first call's step materializes as groupSteps[0]:
+			// the response's reasoning items (the encrypted chain a stateless
+			// Responses backend re-emits) must ride it, exactly as the executed
+			// path would carry them.
+			stepReasoningItems = resp.Message.ReasoningItems
 		}
 		step := Step{
 			Thought:          stepThought,
 			ReasoningContent: stepReasoning,
+			ReasoningItems:   stepReasoningItems,
 			Action:           action,
 			Observation:      nudgeMsg,
 			// IsError marks this as a non-result: the tool call was NOT executed

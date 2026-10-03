@@ -815,3 +815,166 @@ func TestOpenAIProvider_ResponsesStream_SanitizesHallucinatedFunctionCallNames(t
 		t.Errorf("function_call input items = %+v, want %+v", got, want)
 	}
 }
+
+// TestOpenAIProvider_ResponsesStream_TransientFailureCodes pins the SSE
+// failure-classification contract: a server-side failure event that arrives
+// BEFORE any delta (nothing delivered, nothing to replay) is classified
+// retryable so the router's backoff loop can recover it — exactly as the
+// synchronous path's HTTP 500 would be. The replay guard itself stays in the
+// router (deltaGuard): a transient failure AFTER deltas is never retried.
+func TestOpenAIProvider_ResponsesStream_TransientFailureCodes(t *testing.T) {
+	cases := []struct {
+		name    string
+		code    string
+		wantRet bool
+	}{
+		{"server_error_is_retryable", "server_error", true},
+		{"rate_limit_is_retryable", "rate_limit_exceeded", true},
+		{"timeout_is_retryable", "timeout", true},
+		{"engine_overloaded_is_retryable", "engine_overloaded", true},
+		{"service_unavailable_is_retryable", "service_unavailable", true},
+		{"request_error_is_terminal", "invalid_prompt", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				respSSE(w, `{"type":"response.failed","response":{"id":"resp_t","object":"response","status":"failed","error":{"code":"`+tc.code+`","message":"boom"}}}`)
+			}))
+			t.Cleanup(srv.Close)
+
+			p, _ := NewOpenAIProvider(OpenAIProviderConfig{
+				Name:    "sub",
+				APIKey:  "k",
+				BaseURL: srv.URL,
+				// RequireStreaming forces the SSE wire path without a sink,
+				// the exact shape of a subscription provider call.
+				RequireStreaming: true,
+			})
+
+			_, err := p.ChatCompletion(context.Background(), ChatRequest{
+				Model:    "gpt-5.6",
+				Protocol: ProtocolResponses,
+				Messages: []Message{{Role: "user", Content: "hi"}},
+			})
+			if err == nil {
+				t.Fatal("expected an error from a response.failed stream")
+			}
+			if got := IsRetryable(err); got != tc.wantRet {
+				t.Errorf("IsRetryable(%s) = %t, want %t (err = %v)", tc.code, got, tc.wantRet, err)
+			}
+		})
+	}
+}
+
+// TestOpenAIProvider_ResponsesStream_TruncatedByEOF pins that a stream which
+// ends with a plain EOF and no terminal event is surfaced as an
+// unexpected-EOF error with retryable classification — not as a successful
+// (empty) response and not as a terminal failure.
+func TestOpenAIProvider_ResponsesStream_TruncatedByEOF(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		respSSE(w, `{"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"par"}`)
+		// End of body: no response.completed / response.incomplete / failed.
+	}))
+	t.Cleanup(srv.Close)
+
+	p, _ := NewOpenAIProvider(OpenAIProviderConfig{
+		Name:             "sub",
+		APIKey:           "k",
+		BaseURL:          srv.URL,
+		RequireStreaming: true,
+	})
+
+	_, err := p.ChatCompletion(context.Background(), ChatRequest{
+		Model:    "gpt-5.6",
+		Protocol: ProtocolResponses,
+		Messages: []Message{{Role: "user", Content: "hi"}},
+	})
+	if err == nil {
+		t.Fatal("expected an error from a stream without a terminal event")
+	}
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Errorf("err = %v, want an error wrapping io.ErrUnexpectedEOF", err)
+	}
+	if !IsRetryable(err) {
+		t.Errorf("err = %v, want retryable classification (transient truncation)", err)
+	}
+}
+
+// TestOpenAIProvider_ResponsesStream_TruncatedByEOFShapes pins the OTHER two
+// truncation shapes a dying gateway produces: a stream that closes before
+// ANY event arrived (headers + immediate EOF), and a stream cut in the
+// MIDDLE of an SSE event (a partial data line). Neither may be accepted as
+// a successful (empty) response; both must surface an error.
+func TestOpenAIProvider_ResponsesStream_TruncatedByEOFShapes(t *testing.T) {
+	t.Run("empty stream", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			// SSE headers, then the connection closes: zero events.
+			w.Header().Set("Content-Type", "text/event-stream")
+		}))
+		t.Cleanup(srv.Close)
+
+		p, _ := NewOpenAIProvider(OpenAIProviderConfig{
+			Name:             "sub",
+			APIKey:           "k",
+			BaseURL:          srv.URL,
+			RequireStreaming: true,
+		})
+
+		resp, err := p.ChatCompletion(context.Background(), ChatRequest{
+			Model:    "gpt-5.6",
+			Protocol: ProtocolResponses,
+			Messages: []Message{{Role: "user", Content: "hi"}},
+		})
+		if err == nil {
+			t.Fatalf("ChatCompletion = %+v, want an error for a stream that closed before any event", resp)
+		}
+		if !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Errorf("err = %v, want an error wrapping io.ErrUnexpectedEOF", err)
+		}
+		if !IsRetryable(err) {
+			t.Errorf("err = %v, want retryable classification (transient truncation)", err)
+		}
+	})
+
+	t.Run("cut mid-event", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			respSSE(w, `{"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"par"}`)
+			// A partial data line: the connection dies mid-JSON, before the
+			// event separator arrived.
+			_, _ = w.Write([]byte(`data: {"type":"response.output_text.delta","item_i`))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}))
+		t.Cleanup(srv.Close)
+
+		p, _ := NewOpenAIProvider(OpenAIProviderConfig{
+			Name:             "sub",
+			APIKey:           "k",
+			BaseURL:          srv.URL,
+			RequireStreaming: true,
+		})
+
+		resp, err := p.ChatCompletion(context.Background(), ChatRequest{
+			Model:    "gpt-5.6",
+			Protocol: ProtocolResponses,
+			Messages: []Message{{Role: "user", Content: "hi"}},
+		})
+		if err == nil {
+			t.Fatalf("ChatCompletion = %+v, want an error for a stream cut mid-event", resp)
+		}
+		// The partial final data line has no trailing newline, so the SDK's
+		// scanner drops it and the stream ends as a clean EOF with no
+		// terminal event — deterministically the unexpected-EOF wrap, same
+		// classification as the empty-stream shape.
+		if !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Errorf("err = %v, want an error wrapping io.ErrUnexpectedEOF", err)
+		}
+		if !IsRetryable(err) {
+			t.Errorf("err = %v, want retryable classification (transient truncation)", err)
+		}
+	})
+}

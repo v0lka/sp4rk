@@ -220,16 +220,23 @@ func TestOpenAIProvider_TokenSource_ErrorAbortsRequest(t *testing.T) {
 	}
 }
 
-// TestOpenAIProvider_TokenSource_FreshTokenPerRetryAttempt verifies the
-// middleware re-resolves credentials for every SDK-internal retry attempt:
-// a 429-then-200 endpoint sees the freshly generated token of attempt two
-// from a single ChatCompletion call.
+// TestOpenAIProvider_TokenSource_FreshTokenPerRetryAttempt verifies that a
+// permitted HTTP retry carries a freshly resolved credential: with the
+// TokenSource seam active, SDK-internal retries are disabled (a credential
+// failure must abort, not be retried in-SDK — see NewOpenAIProvider), so the
+// ROUTER owns the retry loop and re-enters the provider per attempt, which
+// re-resolves the token through the middleware each time. A 429-then-200
+// endpoint served through Router.Call (MaxRetries=1) sees the freshly
+// generated token of attempt two from a single call.
 func TestOpenAIProvider_TokenSource_FreshTokenPerRetryAttempt(t *testing.T) {
 	var attempt atomic.Int64
-	var lastAuth atomic.Value // string
+	var mu sync.Mutex
+	var auths []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n := attempt.Add(1)
-		lastAuth.Store(r.Header.Get("Authorization"))
+		mu.Lock()
+		auths = append(auths, r.Header.Get("Authorization"))
+		mu.Unlock()
 		if n == 1 {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusTooManyRequests)
@@ -245,23 +252,95 @@ func TestOpenAIProvider_TokenSource_FreshTokenPerRetryAttempt(t *testing.T) {
 	src := tokenSourceFunc(func(context.Context) (BearerToken, error) {
 		return BearerToken{AccessToken: "tok-gen-" + strconv.FormatInt(generation.Add(1), 10)}, nil
 	})
-	p, err := NewOpenAIProvider(OpenAIProviderConfig{
-		Name:        "chatgpt",
-		APIKey:      "static-key",
-		BaseURL:     srv.URL,
-		TokenSource: src,
-	})
+	r, err := NewRouter(context.Background(), RouterConfig{
+		Providers: []ProviderEntry{{
+			Name:         "chatgpt",
+			ProviderType: "openai",
+			APIKey:       "static-key",
+			BaseURL:      srv.URL,
+			Models:       []string{"gpt-4o"},
+			TokenSource:  src,
+		}},
+		MaxRetries:     1,
+		InitialBackoff: time.Millisecond,
+	}, nil)
 	if err != nil {
-		t.Fatalf("NewOpenAIProvider: %v", err)
+		t.Fatalf("NewRouter: %v", err)
 	}
-	if _, err := p.ChatCompletion(context.Background(), tokenSourceRequest("gpt-4o")); err != nil {
-		t.Fatalf("ChatCompletion: %v", err)
+	if _, err := r.Call(context.Background(), tokenSourceRequest("gpt-4o")); err != nil {
+		t.Fatalf("Router.Call: %v", err)
 	}
 	if got := attempt.Load(); got != 2 {
 		t.Fatalf("server attempts = %d, want 2 (one 429, one success)", got)
 	}
-	if auth, _ := lastAuth.Load().(string); auth != "Bearer tok-gen-2" {
-		t.Errorf("retry attempt Authorization = %q, want freshly resolved %q", auth, "Bearer tok-gen-2")
+	if got := generation.Load(); got != 2 {
+		t.Fatalf("token resolutions = %d, want 2 (fresh credential per router attempt)", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(auths) != 2 || auths[0] != "Bearer tok-gen-1" || auths[1] != "Bearer tok-gen-2" {
+		t.Errorf("Authorization per attempt = %v, want [Bearer tok-gen-1, Bearer tok-gen-2]", auths)
+	}
+}
+
+// TestOpenAIProvider_TokenSource_ErrorAbortsRetryChain pins the TokenSource
+// contract's abort semantics end to end: a failing Token() call must surface
+// as the ORIGINAL error from ONE provider call — the SDK-internal retry loop
+// (which retries a nil-response middleware error and could mask it with a
+// later success) is disabled for dynamic-credential clients, the router
+// classifies the wrapped credential failure non-retryable, and no HTTP
+// request ever reaches the wire.
+func TestOpenAIProvider_TokenSource_ErrorAbortsRetryChain(t *testing.T) {
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	var calls atomic.Int64
+	src := tokenSourceFunc(func(context.Context) (BearerToken, error) {
+		calls.Add(1)
+		if calls.Load() == 1 {
+			return BearerToken{}, errors.New("refresh failed")
+		}
+		// A subsequent resolution WOULD succeed — the failure must still be
+		// terminal for this call (no in-SDK re-resolution).
+		return BearerToken{AccessToken: "late"}, nil
+	})
+	r, err := NewRouter(context.Background(), RouterConfig{
+		Providers: []ProviderEntry{{
+			Name:         "chatgpt",
+			ProviderType: "openai",
+			APIKey:       "static-key",
+			BaseURL:      srv.URL,
+			Models:       []string{"gpt-4o"},
+			TokenSource:  src,
+		}},
+		MaxRetries:     2,
+		InitialBackoff: time.Millisecond,
+	}, nil)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
+	_, err = r.Call(context.Background(), tokenSourceRequest("gpt-4o"))
+	if err == nil {
+		t.Fatal("Router.Call must fail when Token() fails")
+	}
+	if !strings.Contains(err.Error(), "token source") {
+		t.Errorf("error = %v, want it to name the token source", err)
+	}
+	if !strings.Contains(err.Error(), "refresh failed") {
+		t.Errorf("error = %v, want the ORIGINAL token source error preserved", err)
+	}
+	if IsRetryable(err) {
+		t.Errorf("error = %v, want non-retryable classification (credential failure aborts the retry chain)", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("token resolutions = %d, want 1 (the failure is terminal, no re-resolution)", got)
+	}
+	if hits.Load() != 0 {
+		t.Errorf("server hits = %d, want 0 (failed token resolution must not reach the wire)", hits.Load())
 	}
 }
 
@@ -339,4 +418,195 @@ func TestNewRouter_ProviderEntryTokenSourcePlumbing(t *testing.T) {
 	if len(*body2) == 0 {
 		t.Error("plain entry request body missing")
 	}
+}
+
+// TestOpenAIProvider_TokenSource_DelegateProtocols pins the auth-seam matrix
+// for the delegated protocols: with a TokenSource configured, the
+// ProtocolAnthropic (Claude via the co-located Anthropic delegate) and
+// ProtocolGoogle (Gemini via googleCompletion) dispatch paths carry the
+// resolved bearer + extra headers and NEVER the static key (x-api-key is
+// cleared; the ?key= query parameter is dropped), while a failing Token
+// aborts with zero wire requests — exactly like the two native OpenAI
+// protocols.
+func TestOpenAIProvider_TokenSource_DelegateProtocols(t *testing.T) {
+	t.Run("router_anthropic_entry_threads_the_token_source", func(t *testing.T) {
+		var mu sync.Mutex
+		var auth, apiKey string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			auth = r.Header.Get("Authorization")
+			apiKey = r.Header.Get("x-api-key")
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant","model":"claude-3-haiku-20240307","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}`))
+		}))
+		t.Cleanup(srv.Close)
+
+		// The ROUTER's anthropic-typed entry (not the OpenAI provider's
+		// internal delegate): a TokenSource here must reach the provider —
+		// before the wiring it was silently dropped and the request rode the
+		// static API key.
+		r, err := NewRouter(context.Background(), RouterConfig{
+			Providers: []ProviderEntry{{
+				Name:         "anthropic-gw",
+				ProviderType: "anthropic",
+				APIKey:       "static-key",
+				BaseURL:      srv.URL,
+				Models:       []string{"claude-3-haiku-20240307"},
+				TokenSource:  &staticTokenSource{token: BearerToken{AccessToken: "tok-router"}},
+			}},
+		}, nil)
+		if err != nil {
+			t.Fatalf("NewRouter: %v", err)
+		}
+		resp, err := r.Call(context.Background(), ChatRequest{
+			Model:    "claude-3-haiku-20240307",
+			Messages: []Message{{Role: "user", Content: "hi"}},
+		})
+		if err != nil {
+			t.Fatalf("router Call: %v", err)
+		}
+		if resp == nil || resp.Message.Content != "ok" {
+			t.Fatalf("response = %+v, want the endpoint's reply", resp)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if auth != "Bearer tok-router" {
+			t.Errorf("Authorization = %q, want %q (the entry's TokenSource must reach the anthropic-typed provider)", auth, "Bearer tok-router")
+		}
+		if apiKey != "" {
+			t.Errorf("x-api-key = %q, want empty (static key cleared by the dynamic credential)", apiKey)
+		}
+	})
+
+	t.Run("anthropic_bearer_and_no_static_key", func(t *testing.T) {
+		var mu sync.Mutex
+		var auth, apiKey string
+		var acct string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			auth = r.Header.Get("Authorization")
+			apiKey = r.Header.Get("x-api-key")
+			acct = r.Header.Get("ChatGPT-Account-Id")
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant","model":"claude-3-haiku-20240307","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}`))
+		}))
+		t.Cleanup(srv.Close)
+
+		p, err := NewOpenAIProvider(OpenAIProviderConfig{
+			Name:    "zen",
+			APIKey:  "static-key",
+			BaseURL: srv.URL,
+			TokenSource: &staticTokenSource{token: BearerToken{
+				AccessToken:  "tok-delegate",
+				ExtraHeaders: map[string]string{"ChatGPT-Account-Id": "acct-1"},
+			}},
+		})
+		if err != nil {
+			t.Fatalf("NewOpenAIProvider: %v", err)
+		}
+		if _, err := p.ChatCompletion(context.Background(), ChatRequest{
+			Model:    "claude-3-haiku-20240307",
+			Protocol: ProtocolAnthropic,
+			Messages: []Message{{Role: "user", Content: "hi"}},
+		}); err != nil {
+			t.Fatalf("ChatCompletion(anthropic): %v", err)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if auth != "Bearer tok-delegate" {
+			t.Errorf("Authorization = %q, want %q", auth, "Bearer tok-delegate")
+		}
+		if apiKey != "" {
+			t.Errorf("x-api-key = %q, want empty (static key cleared by the dynamic credential)", apiKey)
+		}
+		if acct != "acct-1" {
+			t.Errorf("ChatGPT-Account-Id = %q, want %q", acct, "acct-1")
+		}
+	})
+
+	t.Run("google_bearer_and_no_static_key", func(t *testing.T) {
+		var mu sync.Mutex
+		var auth string
+		var keyParam string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			auth = r.Header.Get("Authorization")
+			keyParam = r.URL.Query().Get("key")
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"candidates":[{"content":{"parts":[{"text":"ok"}],"role":"model"}}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1}}`))
+		}))
+		t.Cleanup(srv.Close)
+
+		p, err := NewOpenAIProvider(OpenAIProviderConfig{
+			Name:        "zen",
+			APIKey:      "static-key",
+			BaseURL:     srv.URL,
+			TokenSource: &staticTokenSource{token: BearerToken{AccessToken: "tok-google"}},
+		})
+		if err != nil {
+			t.Fatalf("NewOpenAIProvider: %v", err)
+		}
+		if _, err := p.ChatCompletion(context.Background(), ChatRequest{
+			Model:    "gemini-2.5-pro",
+			Protocol: ProtocolGoogle,
+			Messages: []Message{{Role: "user", Content: "hi"}},
+		}); err != nil {
+			t.Fatalf("ChatCompletion(google): %v", err)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if auth != "Bearer tok-google" {
+			t.Errorf("Authorization = %q, want %q", auth, "Bearer tok-google")
+		}
+		if keyParam != "" {
+			t.Errorf("?key= = %q, want empty (static key dropped by the dynamic credential)", keyParam)
+		}
+	})
+
+	t.Run("token_error_aborts_delegates_without_wire", func(t *testing.T) {
+		for _, tc := range []struct {
+			name     string
+			model    string
+			protocol APIProtocol
+		}{
+			{"anthropic", "claude-3-haiku-20240307", ProtocolAnthropic},
+			{"google", "gemini-2.5-pro", ProtocolGoogle},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				var hits atomic.Int64
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					hits.Add(1)
+					_, _ = w.Write([]byte(`{}`))
+				}))
+				t.Cleanup(srv.Close)
+
+				p, err := NewOpenAIProvider(OpenAIProviderConfig{
+					Name:        "zen",
+					APIKey:      "static-key",
+					BaseURL:     srv.URL,
+					TokenSource: erroringTokenSource{err: errors.New("refresh failed")},
+				})
+				if err != nil {
+					t.Fatalf("NewOpenAIProvider: %v", err)
+				}
+				_, err = p.ChatCompletion(context.Background(), ChatRequest{
+					Model:    tc.model,
+					Protocol: tc.protocol,
+					Messages: []Message{{Role: "user", Content: "hi"}},
+				})
+				if err == nil {
+					t.Fatal("ChatCompletion must fail when Token() fails")
+				}
+				if !strings.Contains(err.Error(), "token source") {
+					t.Errorf("error = %v, want it to name the token source", err)
+				}
+				if hits.Load() != 0 {
+					t.Errorf("server hits = %d, want 0 (failed token resolution must not reach the wire)", hits.Load())
+				}
+			})
+		}
+	})
 }

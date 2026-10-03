@@ -157,15 +157,15 @@ func TestModelReasoningOptions(t *testing.T) {
 			name:        "glm 5.3 flash is always thinking",
 			family:      "glm",
 			model:       "zai-org/glm-5.3-flash",
-			wantOptions: []string{"max", "high"},
+			wantOptions: []string{"max", "high", "low"},
 			wantDefault: "max",
 			wantOK:      true,
 		},
 		{
-			name:        "glm 5.3 non-flash offers disable",
+			name:        "glm 5.3 non-flash is always thinking",
 			family:      "glm",
 			model:       "glm-5.3",
-			wantOptions: []string{"none", "max", "high"},
+			wantOptions: []string{"max", "high", "low"},
 			wantDefault: "max",
 			wantOK:      true,
 		},
@@ -319,9 +319,13 @@ func TestReasoningForCall(t *testing.T) {
 		{"qwen alias composite id minimal is low", "qwen", "embedded/Bonsai 2 27B", ReasoningTierMinimal, "low"},
 		// OpenAI — effort-only API, no disable spelling: both tiers land on
 		// the cheapest effort.
-		{"openai minimal", "openai_flagship", "gpt-5.6", ReasoningTierMinimal, "minimal"},
-		{"openai off degrades to minimal", "openai_flagship", "gpt-5.6", ReasoningTierOff, "minimal"},
-		{"openai codex minimal", "openai_codex", "gpt-5.3-codex", ReasoningTierMinimal, "minimal"},
+		{"openai minimal", "openai_flagship", "gpt-5.6", ReasoningTierMinimal, "low"},
+		{"openai off disables", "openai_flagship", "gpt-5.6", ReasoningTierOff, "none"},
+		{"openai codex minimal", "openai_codex", "gpt-5.3-codex", ReasoningTierMinimal, "low"},
+		{"openai codex off degrades to low", "openai_codex", "gpt-5.3-codex", ReasoningTierOff, "low"},
+		{"openai pro floor is high", "openai_flagship", "gpt-5-pro", ReasoningTierOff, "high"},
+		{"openai 5.2 pro floor is medium", "openai_flagship", "gpt-5.2-pro", ReasoningTierMinimal, "medium"},
+		{"openai o3 off degrades to low", "openai_flagship", "o3", ReasoningTierOff, "low"},
 		// Google — uppercase spellings preserved verbatim, no disable.
 		{"google minimal keeps MINIMAL spelling", "google", "gemini-2.5-pro", ReasoningTierMinimal, "MINIMAL"},
 		{"google off degrades to MINIMAL", "google", "gemini-2.5-pro", ReasoningTierOff, "MINIMAL"},
@@ -337,10 +341,12 @@ func TestReasoningForCall(t *testing.T) {
 		// GLM 5.2+ — reasoning_effort with the "none" disable spelling.
 		{"glm 5.2 off is none", "glm", "glm-5.2", ReasoningTierOff, "none"},
 		{"glm 5.2 minimal is high", "glm", "glm-5.2", ReasoningTierMinimal, "high"},
-		// GLM-flash — always thinking, no disable spelling: both tiers land
-		// on the weaker of the two enable efforts.
-		{"glm flash off degrades to high", "glm", "zai-org/glm-5.3-flash", ReasoningTierOff, "high"},
-		{"glm flash minimal is high", "glm", "zai-org/glm-5.3-flash", ReasoningTierMinimal, "high"},
+		// GLM 5.3 (including Flash) — always thinking: both tiers land on low.
+		{"glm off degrades to low", "glm", "glm-5.3", ReasoningTierOff, "low"},
+		{"glm minimal is low", "glm", "glm-5.3", ReasoningTierMinimal, "low"},
+		{"glm flash off degrades to low", "glm", "zai-org/glm-5.3-flash", ReasoningTierOff, "low"},
+		{"glm flash minimal is low", "glm", "zai-org/glm-5.3-flash", ReasoningTierMinimal, "low"},
+		{"glm prefixed uppercase off", "glm", "Z-ai-API/GLM-5.3", ReasoningTierOff, "low"},
 		// Kimi — thinking-locked, no declared option set: the documented
 		// effort floor of the K3-style models serves both tiers.
 		{"kimi minimal is low", "kimi", "kimi-k3", ReasoningTierMinimal, "low"},

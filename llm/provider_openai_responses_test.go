@@ -712,7 +712,7 @@ func TestBuildResponsesParams_ReasoningEffort(t *testing.T) {
 		{Role: "user", Content: "Hello"},
 	}
 
-	validEfforts := []string{"minimal", "low", "medium", "high", "max"}
+	validEfforts := []string{"none", "minimal", "low", "medium", "high", "xhigh", "max"}
 	for _, effort := range validEfforts {
 		t.Run("valid effort: "+effort, func(t *testing.T) {
 			req := ChatRequest{
@@ -756,7 +756,7 @@ func TestBuildResponsesParams_ReasoningEffort(t *testing.T) {
 
 // TestIsValidResponsesReasoningEffort verifies the validation helper.
 func TestIsValidResponsesReasoningEffort(t *testing.T) {
-	valid := []string{"minimal", "low", "medium", "high", "max"}
+	valid := []string{"none", "minimal", "low", "medium", "high", "xhigh", "max"}
 	for _, v := range valid {
 		if !isValidResponsesReasoningEffort(v) {
 			t.Errorf("expected %q to be valid", v)

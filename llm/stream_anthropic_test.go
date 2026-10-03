@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -243,5 +244,46 @@ func TestAnthropicProvider_ChatCompletionStream_LiveDelivery(t *testing.T) {
 	}
 	if len(deltas) != 2 || deltas[0].Text != "Hel" || deltas[1].Text != "lo" {
 		t.Errorf("deltas = %+v, want [Hel, lo]", deltas)
+	}
+}
+
+// TestAnthropicProvider_ChatCompletionStream_TruncatedByEOF pins that a
+// Messages stream which ends with a plain EOF (no SDK-level transport error)
+// and never delivered the terminal message_stop event is rejected as an
+// unexpected-EOF error instead of being parsed into a successful partial
+// response.
+func TestAnthropicProvider_ChatCompletionStream_TruncatedByEOF(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		sseAnthropic(t, w, "message_start",
+			`{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-3-haiku-20240307","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":12,"output_tokens":0}}}`)
+		sseAnthropic(t, w, "content_block_start",
+			`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`)
+		sseAnthropic(t, w, "content_block_delta",
+			`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}`)
+		// End of body: no content_block_stop, no message_delta, no
+		// message_stop — a gateway that closed the stream mid-generation.
+	}))
+	t.Cleanup(srv.Close)
+
+	p, err := NewAnthropicProvider(AnthropicProviderConfig{APIKey: "k", BaseURL: srv.URL})
+	if err != nil {
+		t.Fatalf("NewAnthropicProvider: %v", err)
+	}
+
+	resp, err := p.ChatCompletion(context.Background(), ChatRequest{
+		Model:     "claude-3-haiku-20240307",
+		MaxTokens: 16,
+		Messages:  []Message{{Role: "user", Content: "hi"}},
+		DeltaSink: func(StreamDelta) error { return nil },
+	})
+	if err == nil {
+		t.Fatalf("ChatCompletion(stream) = %+v, want an unexpected-EOF error for a stream with no message_stop", resp)
+	}
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Errorf("error = %v, want an error wrapping io.ErrUnexpectedEOF", err)
+	}
+	if !IsRetryable(err) {
+		t.Errorf("error = %v, want retryable classification (transient truncation)", err)
 	}
 }

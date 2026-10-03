@@ -7,6 +7,7 @@ Provides LLM provider abstractions, a model registry, and routing for multi-prov
 ## Key Files
 
 - `github.com/v0lka/sp4rk/llm` — `Router`, `RouterConfig`, `SamplingDefaults`, `SamplingFunc`, `CallPurpose`, `DeterministicTemperature`, `NewRouter`, `SetModel`/`ActiveModel`/`Call`, `Provider` interface, `ProviderEntry`
+- `github.com/v0lka/sp4rk/llm/reasoning.go`, `reasoning_openai.go` — model-aware native option sets, Off/Minimal per-call resolution, and OpenAI's model-specific restrictions
 - `github.com/v0lka/sp4rk/llm` (metadata) — `ModelRegistry`, `ModelMetadata`, `ModelCapabilities`, `DetectFamily`, `FamilyReasoningOptions`, `ResolveBuiltInModel`, `ResolveLocal`, `SetCachedMetadata`, `SetRuntimeMetadata`, `RuntimeMetadata`
 - `github.com/v0lka/sp4rk/llm` (protocol) — `APIProtocol`, `DetectProtocol`, and the four protocol constants (`ProtocolChatCompletions`, `ProtocolResponses`, `ProtocolAnthropic`, `ProtocolGoogle`)
 - `github.com/v0lka/sp4rk/llm` (token accounting) — `TokenCounter`, `SimpleTokenCounter`, `TiktokenCounter`, `NewTokenCounter`, `ContextTokenTracker`, `UsageTracker`, `UsageObserver`, `TimedUsageObserver`, `TrackingCaller`
@@ -171,6 +172,14 @@ Each provider serializes only its wire protocol's supported subset:
 
 Nil and unsupported fields are omitted rather than sent with zero values.
 
+### Model-aware reasoning budgets
+
+`ModelReasoningOptions(family, model)` is the model-specific source for native effort options; family defaults apply only when no model-specific rule exists. `ReasoningForCall` maps Off to the disable option when present, otherwise to the cheapest enabled option; Minimal always picks the cheapest enabled option. Authoritative no-reasoning models yield an empty effort. This resolution is shared by routing, planning, reflection, judges, and host service calls.
+
+GLM 5.2 accepts `none/max/high`; GLM 5.3 and Flash accept only `max/high/low`. The GLM Chat encoder consumes the same option set: stale Off/none or unknown efforts select the cheapest legal posture, so thinking-locked models receive `thinking.type=enabled` and `reasoning_effort=low`. Older GLM models retain binary On/Off.
+
+OpenAI effort sets are model-dependent: original GPT-5 retains `minimal`; GPT-5.1+ non-Pro models expose `none` and an enabled floor of `low`; Codex/o-series and GPT-6 use an enabled floor of `low`; GPT-5 Pro requires `high`; GPT-5.2/5.4/5.5 Pro have a `medium` floor. Responses serializes the protocol-wide native enum including `none` and `xhigh`. A `RequireStreaming` endpoint upgrades `none`/`minimal` to `low`, preserving its endpoint restriction independently of the model's public-API options.
+
 ## Token counting & usage tracking
 
 Two counters: `SimpleTokenCounter` (~4 chars = 1 token approximation) and `TiktokenCounter` (accurate, tiktoken-go, mutex-guarded). `NewTokenCounter(tokenizerType)` selects by metadata type (`tiktoken/*` → Tiktoken; `anthropic-api`/`approximate`/unknown → Simple; always returns a valid counter).
@@ -264,7 +273,7 @@ Retry interaction: `Router.Call` wraps the sink in a **per-attempt guard**. A re
 
 `ProviderEntry.HTTPClient` (optional) overrides the router-level client for that one provider — e.g. a host app giving a single self-signed endpoint its own TLS configuration. Resolution order per entry: `ProviderEntry.HTTPClient` → `RouterConfig.HTTPClient` → SDK default. A zero-value entry behaves exactly as before (shared router-level client).
 
-`ProviderEntry.TokenSource` (optional) resolves the bearer credential immediately before every outgoing request (including each SDK-internal retry attempt), overriding the static `APIKey` credential; `BearerToken.ExtraHeaders` ride along (an empty value removes the header). `nil` keeps the static-key behavior. `ProviderEntry.RequireStreaming` (optional) marks an endpoint that accepts streaming calls only on the wire — e.g. a ChatGPT OAuth Codex backend that answers any non-streaming request with an error. It is honored on the Responses protocol path, where it selects `responsesAPICompletionStream` for every call (sink or not) and pins `store: false` plus `include reasoning.encrypted_content` (see [Streaming](#streaming)); the Anthropic branch of the provider ignores it.
+`ProviderEntry.TokenSource` (optional) resolves the bearer credential immediately before every request leaves the process — on every protocol it serves (the two OpenAI protocols through an SDK middleware, the Anthropic and Google delegates through a wrapping transport / pre-send resolution) — overriding the static `APIKey` credential; `BearerToken.ExtraHeaders` ride along (an empty value removes the header). With a TokenSource configured the OpenAI SDK's internal retries are disabled, so the router's own retry policy owns every attempt: each router retry re-resolves the credential, and a Token failure aborts the call instead of being retried in-SDK. `nil` keeps the static-key behavior. `ProviderEntry.RequireStreaming` (optional) marks an endpoint that accepts streaming calls only on the wire — e.g. a ChatGPT OAuth Codex backend that answers any non-streaming request with an error. It is honored on the Responses protocol path, where it selects `responsesAPICompletionStream` for every call (sink or not) and pins `store: false` plus `include reasoning.encrypted_content` (see [Streaming](#streaming)); the Anthropic branch of the provider ignores it.
 
 ## Extension Points
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
@@ -1353,6 +1354,181 @@ func TestProcessBatchTool_EmptyCalls(t *testing.T) {
 	}
 }
 
+// TestProcessBatchTool_CarriesReasoningItems pins that the batch path carries
+// the response's ReasoningItems (including EncryptedContent from a stateless
+// Responses backend) onto the FIRST step of the batch group — exactly like
+// the standalone tool-call path — so the next BuildPrompt round-trips the
+// reasoning chain through the assistant message.
+func TestProcessBatchTool_CarriesReasoningItems(t *testing.T) {
+	mockTools := newMockToolExecutor()
+	mockTools.results["search"] = tools.ToolResult{Content: "search result"}
+
+	exec := newExecutorDefaultHITL(&mockLLMCaller{}, mockTools, &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+	exec.emitter = &NoopEvents{}
+
+	subInput, _ := json.Marshal(map[string]string{"query": "test"})
+	type batchCall struct {
+		Tool  string          `json:"tool"`
+		Input json.RawMessage `json:"input"`
+	}
+	batchInput, _ := json.Marshal(map[string][]batchCall{
+		"calls": {
+			{Tool: "search", Input: subInput},
+			{Tool: "search", Input: subInput},
+		},
+	})
+
+	reasoning := []llm.ReasoningItem{
+		{ID: "rs_1", Summary: "committed plan", EncryptedContent: "gAAAA-encrypted"},
+	}
+	action := llm.ToolCall{ID: "batch_1", Name: "batch", Input: batchInput}
+	resp := &llm.ChatResponse{
+		Message: llm.Message{
+			Role:           "assistant",
+			ToolCalls:      []llm.ToolCall{action},
+			ReasoningItems: reasoning,
+		},
+		Usage:      llm.TokenUsage{InputTokens: 100, OutputTokens: 50},
+		StopReason: "tool_use",
+	}
+	state := &runState{effectiveMaxSteps: 10}
+	cw := newMockContextManager()
+
+	if _, _, err := exec.processSingleToolCall(context.Background(), action, 0, resp.Message.ToolCalls, resp, "thinking", state, cw); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(state.allSteps) != 2 {
+		t.Fatalf("steps = %d, want 2 (one per sub-call)", len(state.allSteps))
+	}
+	first := state.allSteps[0]
+	if len(first.ReasoningItems) != 1 || first.ReasoningItems[0].ID != "rs_1" ||
+		first.ReasoningItems[0].EncryptedContent != "gAAAA-encrypted" {
+		t.Errorf("first batch step ReasoningItems = %+v, want the response's reasoning item (with encrypted content) to ride it", first.ReasoningItems)
+	}
+	if first.Thought != "thinking" {
+		t.Errorf("first batch step Thought = %q, want the response thought", first.Thought)
+	}
+	second := state.allSteps[1]
+	if len(second.ReasoningItems) != 0 {
+		t.Errorf("second batch step ReasoningItems = %+v, want none (only the first step carries them)", second.ReasoningItems)
+	}
+}
+
+// TestProcessBatchTool_InterceptedPathsCarryReasoningItems pins the
+// interception branches of the batch path: a rejected (HITL-denied) FIRST
+// sub-call, a nested-batch FIRST sub-call and an unparseable batch input all
+// materialize their step as groupSteps[0] — the step BuildPrompt reads the
+// response's reasoning items from — so each must carry them instead of
+// silently losing the encrypted reasoning chain for every batched turn.
+func TestProcessBatchTool_InterceptedPathsCarryReasoningItems(t *testing.T) {
+	newResp := func(action llm.ToolCall) *llm.ChatResponse {
+		return &llm.ChatResponse{
+			Message: llm.Message{
+				Role: "assistant",
+				ToolCalls: []llm.ToolCall{
+					{ID: "batch_1", Name: "batch", Input: action.Input},
+				},
+				ReasoningItems: []llm.ReasoningItem{
+					{ID: "rs_1", Summary: "committed plan", EncryptedContent: "gAAAA-encrypted"},
+				},
+			},
+			Usage:      llm.TokenUsage{InputTokens: 100, OutputTokens: 50},
+			StopReason: "tool_use",
+		}
+	}
+
+	t.Run("hitl-rejected first sub-call", func(t *testing.T) {
+		mockTools := newMockToolExecutor()
+		exec := NewExecutor(&mockLLMCaller{}, mockTools, 10,
+			WithTokenCounter(&mockTokenCounter{}),
+			WithCircuitBreaker(defaultCircuitBreakerConfig),
+			WithHITL(&denyingHITLHandler{}),
+		)
+		exec.emitter = &NoopEvents{}
+
+		subInput, _ := json.Marshal(map[string]string{"query": "test"})
+		type batchCall struct {
+			Tool  string          `json:"tool"`
+			Input json.RawMessage `json:"input"`
+		}
+		batchInput, _ := json.Marshal(map[string][]batchCall{
+			"calls": {
+				{Tool: "search", Input: subInput},
+				{Tool: "search", Input: subInput},
+			},
+		})
+		action := llm.ToolCall{ID: "batch_1", Name: "batch", Input: batchInput}
+		state := &runState{effectiveMaxSteps: 10}
+		cw := newMockContextManager()
+
+		if _, _, err := exec.processSingleToolCall(context.Background(), action, 0, []llm.ToolCall{action}, newResp(action), "thinking", state, cw); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(state.allSteps) != 2 {
+			t.Fatalf("steps = %d, want 2 (one rejected step per sub-call)", len(state.allSteps))
+		}
+		first := state.allSteps[0]
+		if len(first.ReasoningItems) != 1 || first.ReasoningItems[0].EncryptedContent != "gAAAA-encrypted" {
+			t.Errorf("rejected first sub-call ReasoningItems = %+v, want the response's reasoning item to ride it", first.ReasoningItems)
+		}
+		if len(state.allSteps[1].ReasoningItems) != 0 {
+			t.Errorf("rejected second sub-call ReasoningItems = %+v, want none (only the first step carries them)", state.allSteps[1].ReasoningItems)
+		}
+	})
+
+	t.Run("nested batch first sub-call", func(t *testing.T) {
+		mockTools := newMockToolExecutor()
+		exec := newExecutorDefaultHITL(&mockLLMCaller{}, mockTools, &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+		exec.emitter = &NoopEvents{}
+
+		innerInput, _ := json.Marshal(map[string]any{"calls": []any{}})
+		type batchCall struct {
+			Tool  string          `json:"tool"`
+			Input json.RawMessage `json:"input"`
+		}
+		batchInput, _ := json.Marshal(map[string][]batchCall{
+			"calls": {
+				{Tool: "batch", Input: innerInput},
+			},
+		})
+		action := llm.ToolCall{ID: "batch_1", Name: "batch", Input: batchInput}
+		state := &runState{effectiveMaxSteps: 10}
+		cw := newMockContextManager()
+
+		if _, _, err := exec.processSingleToolCall(context.Background(), action, 0, []llm.ToolCall{action}, newResp(action), "thinking", state, cw); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(state.allSteps) != 1 {
+			t.Fatalf("steps = %d, want 1 (the nested-batch guard step)", len(state.allSteps))
+		}
+		first := state.allSteps[0]
+		if len(first.ReasoningItems) != 1 || first.ReasoningItems[0].EncryptedContent != "gAAAA-encrypted" {
+			t.Errorf("nested-guard first sub-call ReasoningItems = %+v, want the response's reasoning item to ride it", first.ReasoningItems)
+		}
+	})
+
+	t.Run("unparseable batch input", func(t *testing.T) {
+		mockTools := newMockToolExecutor()
+		exec := newExecutorDefaultHITL(&mockLLMCaller{}, mockTools, &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+		exec.emitter = &NoopEvents{}
+
+		action := llm.ToolCall{ID: "batch_1", Name: "batch", Input: json.RawMessage(`{"calls": [}`)}
+		state := &runState{effectiveMaxSteps: 10}
+		cw := newMockContextManager()
+
+		if _, _, err := exec.processSingleToolCall(context.Background(), action, 0, []llm.ToolCall{action}, newResp(action), "thinking", state, cw); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(state.allSteps) != 1 {
+			t.Fatalf("steps = %d, want 1 (the parse-error step)", len(state.allSteps))
+		}
+		first := state.allSteps[0]
+		if len(first.ReasoningItems) != 1 || first.ReasoningItems[0].EncryptedContent != "gAAAA-encrypted" {
+			t.Errorf("parse-error step ReasoningItems = %+v, want the response's reasoning item to ride it", first.ReasoningItems)
+		}
+	})
+}
+
 func TestProcessBatchTool_SubCalls(t *testing.T) {
 	mockTools := newMockToolExecutor()
 	mockTools.results["search"] = tools.ToolResult{Content: "search result"}
@@ -1433,4 +1609,365 @@ func TestProcessBatchTool_NestedBatch(t *testing.T) {
 	if act != actionNone {
 		t.Errorf("expected actionNone, got %v", act)
 	}
+}
+
+// reasoningItemsFixture builds a response whose message carries one
+// encrypted reasoning item — the shape every ReasoningItems carry test
+// starts from.
+func reasoningItemsFixture(action llm.ToolCall) *llm.ChatResponse {
+	return &llm.ChatResponse{
+		Message: llm.Message{
+			Role: "assistant",
+			ToolCalls: []llm.ToolCall{
+				{ID: "call_1", Name: "batch", Input: action.Input},
+				action,
+			},
+			ReasoningItems: []llm.ReasoningItem{
+				{ID: "rs_1", Summary: "committed plan", EncryptedContent: "gAAAA-encrypted"},
+			},
+		},
+		Usage:      llm.TokenUsage{InputTokens: 100, OutputTokens: 50},
+		StopReason: "tool_use",
+	}
+}
+
+// TestNonBatchPathsCarryReasoningItems pins the non-batch ReasoningItems
+// carries and the one deliberate non-carry: the truncation step (below
+// threshold AND both reprieve branches), the repeat-identical interception at
+// callIdx 0 (and its absence at callIdx > 0), the standalone HITL-reject at
+// callIdx 0, and the stop-tool guard nudge carrying NOTHING while the stop
+// tool's own step carries them.
+func TestNonBatchPathsCarryReasoningItems(t *testing.T) {
+	wantItems := func(t *testing.T, step Step, where string) {
+		t.Helper()
+		if len(step.ReasoningItems) != 1 || step.ReasoningItems[0].EncryptedContent != "gAAAA-encrypted" {
+			t.Errorf("%s ReasoningItems = %+v, want the response's reasoning item to ride it", where, step.ReasoningItems)
+		}
+	}
+	noItems := func(t *testing.T, step Step, where string) {
+		t.Helper()
+		if len(step.ReasoningItems) != 0 {
+			t.Errorf("%s ReasoningItems = %+v, want none", where, step.ReasoningItems)
+		}
+	}
+	action := llm.ToolCall{ID: "call_1", Name: "search", Input: []byte(`{"query":"test"}`)}
+
+	t.Run("truncation below threshold", func(t *testing.T) {
+		exec := newExecutorDefaultHITL(&mockLLMCaller{}, newMockToolExecutor(), &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+		exec.emitter = &NoopEvents{}
+		resp := reasoningItemsFixture(action)
+		resp.StopReason = "max_tokens"
+		state := &runState{effectiveMaxSteps: 10}
+		cw := newMockContextManager()
+
+		_, act := exec.handleTruncationStopReason(context.Background(), resp, "thinking", state, cw)
+		if act != actionContinue {
+			t.Fatalf("act = %v, want actionContinue", act)
+		}
+		if len(state.allSteps) != 1 {
+			t.Fatalf("steps = %d, want 1", len(state.allSteps))
+		}
+		wantItems(t, state.allSteps[0], "truncation step")
+	})
+
+	t.Run("truncation reprieve", func(t *testing.T) {
+		for _, tc := range []struct {
+			name    string
+			slResp  StepLimitResponse
+			wantNud int
+		}{
+			{"allow_once", StepLimitAllowOnce, 1},
+			{"allow_always", StepLimitAllowAlways, 1},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				cfg := defaultCircuitBreakerConfig
+				cfg.TruncationAbortThreshold = 1
+				exec := newExecutorDefaultHITL(&mockLLMCaller{}, newMockToolExecutor(), &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, cfg)
+				exec.emitter = &NoopEvents{}
+				exec.SetHITLHandler(&testStepLimitAdapter{fn: func(context.Context, int, int, string) (StepLimitResponse, error) {
+					return tc.slResp, nil
+				}})
+				resp := reasoningItemsFixture(action)
+				resp.StopReason = "max_tokens"
+				state := &runState{effectiveMaxSteps: 10}
+				cw := newMockContextManager()
+
+				_, act := exec.handleTruncationStopReason(context.Background(), resp, "thinking", state, cw)
+				if act != actionContinue {
+					t.Fatalf("act = %v, want actionContinue (reprieve)", act)
+				}
+				if len(state.allSteps) != tc.wantNud {
+					t.Fatalf("steps = %d, want %d", len(state.allSteps), tc.wantNud)
+				}
+				wantItems(t, state.allSteps[0], "truncation reprieve step")
+			})
+		}
+	})
+
+	t.Run("repeat-identical interception first call", func(t *testing.T) {
+		cfg := defaultCircuitBreakerConfig
+		cfg.RepeatNudgeThreshold = 1
+		exec := newExecutorDefaultHITL(&mockLLMCaller{}, newMockToolExecutor(), &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, cfg)
+		exec.emitter = &NoopEvents{}
+		resp := reasoningItemsFixture(action)
+		state := &runState{effectiveMaxSteps: 10}
+		cw := newMockContextManager()
+
+		_, _, err := exec.checkRepeatIdenticalTool(context.Background(), action, 0, "thinking", resp, state, cw)
+		if err != nil {
+			t.Fatalf("checkRepeatIdenticalTool: %v", err)
+		}
+		if len(state.allSteps) != 1 {
+			t.Fatalf("steps = %d, want 1 (the intercepted call's step)", len(state.allSteps))
+		}
+		wantItems(t, state.allSteps[0], "repeat-intercept first-call step")
+	})
+
+	t.Run("repeat-identical interception later call carries none", func(t *testing.T) {
+		cfg := defaultCircuitBreakerConfig
+		cfg.RepeatNudgeThreshold = 1
+		exec := newExecutorDefaultHITL(&mockLLMCaller{}, newMockToolExecutor(), &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, cfg)
+		exec.emitter = &NoopEvents{}
+		resp := reasoningItemsFixture(action)
+		state := &runState{effectiveMaxSteps: 10}
+		cw := newMockContextManager()
+
+		_, _, err := exec.checkRepeatIdenticalTool(context.Background(), action, 2, "thinking", resp, state, cw)
+		if err != nil {
+			t.Fatalf("checkRepeatIdenticalTool: %v", err)
+		}
+		if len(state.allSteps) != 1 {
+			t.Fatalf("steps = %d, want 1 (the intercepted call's step)", len(state.allSteps))
+		}
+		noItems(t, state.allSteps[0], "repeat-intercept later-call step")
+	})
+
+	t.Run("standalone HITL-reject first call", func(t *testing.T) {
+		exec := NewExecutor(&mockLLMCaller{}, newMockToolExecutor(), 10,
+			WithTokenCounter(&mockTokenCounter{}),
+			WithCircuitBreaker(defaultCircuitBreakerConfig),
+			WithHITL(&denyingHITLHandler{}),
+		)
+		exec.emitter = &NoopEvents{}
+		resp := reasoningItemsFixture(action)
+		state := &runState{effectiveMaxSteps: 10}
+		cw := newMockContextManager()
+
+		if _, _, err := exec.processSingleToolCall(context.Background(), action, 0, []llm.ToolCall{action}, resp, "thinking", state, cw); err != nil {
+			t.Fatalf("processSingleToolCall: %v", err)
+		}
+		if len(state.allSteps) != 1 {
+			t.Fatalf("steps = %d, want 1 (the rejected call's step)", len(state.allSteps))
+		}
+		wantItems(t, state.allSteps[0], "standalone HITL-reject first-call step")
+	})
+
+	t.Run("stop-tool guard nudge carries none while the tool step carries them", func(t *testing.T) {
+		mockTools := newMockToolExecutor()
+		mockTools.results["verdict"] = tools.ToolResult{Content: "done"}
+		exec := newExecutorDefaultHITL(&mockLLMCaller{}, mockTools, &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+		exec.emitter = &NoopEvents{}
+		exec.SetStopTools("verdict")
+		exec.finishGuard = func(context.Context) error { return errors.New("pending delegations") }
+
+		stopAction := llm.ToolCall{ID: "call_1", Name: "verdict", Input: []byte(`{"v":"ok"}`)}
+		resp := reasoningItemsFixture(stopAction)
+		state := &runState{effectiveMaxSteps: 10}
+		cw := newMockContextManager()
+
+		if _, _, err := exec.processSingleToolCall(context.Background(), stopAction, 0, []llm.ToolCall{stopAction}, resp, "thinking", state, cw); err != nil {
+			t.Fatalf("processSingleToolCall: %v", err)
+		}
+		if len(state.allSteps) != 2 {
+			t.Fatalf("steps = %d, want 2 (the stop tool's step + the guard nudge)", len(state.allSteps))
+		}
+		wantItems(t, state.allSteps[0], "stop tool step")
+		noItems(t, state.allSteps[1], "stop-tool guard nudge")
+	})
+
+	// The four finish-path nudges (guard, mutation gate, both checklist
+	// gates) render standalone: they carry the response's items exactly when
+	// finish is the group's FIRST call (the nudge is then the response's
+	// only step) and carry NONE with earlier siblings, whose groupSteps[0]
+	// is already the single carrier.
+	t.Run("finish-guard nudge first call carries them", func(t *testing.T) {
+		exec := newExecutorDefaultHITL(&mockLLMCaller{}, newMockToolExecutor(), &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+		exec.emitter = &NoopEvents{}
+		exec.finishGuard = func(context.Context) error { return errors.New("pending delegations") }
+
+		finishAction := llm.ToolCall{ID: "call_1", Name: "finish", Input: []byte(`{"answer":"done"}`)}
+		resp := reasoningItemsFixture(finishAction)
+		resp.Message.ToolCalls = []llm.ToolCall{finishAction}
+		state := &runState{effectiveMaxSteps: 10}
+		cw := newMockContextManager()
+
+		if _, _, err := exec.processSingleToolCall(context.Background(), finishAction, 0, []llm.ToolCall{finishAction}, resp, "thinking", state, cw); err != nil {
+			t.Fatalf("processSingleToolCall: %v", err)
+		}
+		if len(state.allSteps) != 1 {
+			t.Fatalf("steps = %d, want 1 (the guard nudge alone)", len(state.allSteps))
+		}
+		wantItems(t, state.allSteps[0], "finish-guard nudge (first call)")
+	})
+
+	t.Run("finish-guard nudge later call carries none", func(t *testing.T) {
+		mockTools := newMockToolExecutor()
+		mockTools.results["search"] = tools.ToolResult{Content: "found"}
+		exec := newExecutorDefaultHITL(&mockLLMCaller{}, mockTools, &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+		exec.emitter = &NoopEvents{}
+		exec.finishGuard = func(context.Context) error { return errors.New("pending delegations") }
+
+		searchAction := llm.ToolCall{ID: "call_1", Name: "search", Input: []byte(`{"query":"test"}`)}
+		finishAction := llm.ToolCall{ID: "call_2", Name: "finish", Input: []byte(`{"answer":"done"}`)}
+		resp := reasoningItemsFixture(searchAction)
+		resp.Message.ToolCalls = []llm.ToolCall{searchAction, finishAction}
+		state := &runState{effectiveMaxSteps: 10}
+		cw := newMockContextManager()
+
+		if _, _, err := exec.processToolCalls(context.Background(), resp, "thinking", state, cw); err != nil {
+			t.Fatalf("processToolCalls: %v", err)
+		}
+		if len(state.allSteps) != 2 {
+			t.Fatalf("steps = %d, want 2 (the search step + the guard nudge)", len(state.allSteps))
+		}
+		wantItems(t, state.allSteps[0], "search step (group's first)")
+		noItems(t, state.allSteps[1], "finish-guard nudge (later call)")
+	})
+
+	t.Run("mutation-gate nudge first call carries them, later call carries none", func(t *testing.T) {
+		mockTools := newMockToolExecutor()
+		mockTools.results["search"] = tools.ToolResult{Content: "found"}
+		for _, tc := range []struct {
+			name      string
+			toolCalls []llm.ToolCall
+			wantSteps int
+		}{
+			{"first call", []llm.ToolCall{{ID: "call_1", Name: "finish", Input: []byte(`{"answer":"done"}`)}}, 1},
+			{"later call", []llm.ToolCall{
+				{ID: "call_1", Name: "search", Input: []byte(`{"query":"test"}`)},
+				{ID: "call_2", Name: "finish", Input: []byte(`{"answer":"done"}`)},
+			}, 2},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				exec := newExecutorDefaultHITL(&mockLLMCaller{}, mockTools, &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+				exec.emitter = &NoopEvents{}
+				exec.SetMutationRequired(true)
+
+				resp := reasoningItemsFixture(tc.toolCalls[0])
+				resp.Message.ToolCalls = tc.toolCalls
+				state := &runState{effectiveMaxSteps: 10}
+				cw := newMockContextManager()
+
+				if _, _, err := exec.processToolCalls(context.Background(), resp, "thinking", state, cw); err != nil {
+					t.Fatalf("processToolCalls: %v", err)
+				}
+				if len(state.allSteps) != tc.wantSteps {
+					t.Fatalf("steps = %d, want %d", len(state.allSteps), tc.wantSteps)
+				}
+				wantItems(t, state.allSteps[0], "group's first step")
+				if tc.wantSteps == 2 {
+					noItems(t, state.allSteps[1], "mutation-gate nudge (later call)")
+				}
+			})
+		}
+	})
+
+	t.Run("checklist-missing nudge first call carries them, later call carries none", func(t *testing.T) {
+		mockTools := newMockToolExecutor()
+		mockTools.results["search"] = tools.ToolResult{Content: "found"}
+		for _, tc := range []struct {
+			name      string
+			toolCalls []llm.ToolCall
+			wantSteps int
+		}{
+			{"first call", []llm.ToolCall{{ID: "call_1", Name: "finish", Input: []byte(`{"answer":"done"}`)}}, 1},
+			{"later call", []llm.ToolCall{
+				{ID: "call_1", Name: "search", Input: []byte(`{"query":"test"}`)},
+				{ID: "call_2", Name: "finish", Input: []byte(`{"answer":"done"}`)},
+			}, 2},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				exec := newExecutorDefaultHITL(&mockLLMCaller{}, mockTools, &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+				exec.emitter = &NoopEvents{}
+				// checklistGateEnabled is true by default; make the gate
+				// active and the step non-trivial (3 productive calls).
+				seed := &runState{effectiveMaxSteps: 10, checklistAvailable: true}
+				for i := 0; i < checklistTrivialThreshold+1; i++ {
+					seed.allSteps = append(seed.allSteps, Step{
+						Action:      llm.ToolCall{ID: fmt.Sprintf("seed_%d", i), Name: "search", Input: []byte(`{}`)},
+						Observation: "found",
+					})
+				}
+
+				resp := reasoningItemsFixture(tc.toolCalls[0])
+				resp.Message.ToolCalls = tc.toolCalls
+				state := seed
+				cw := newMockContextManager()
+
+				if _, _, err := exec.processToolCalls(context.Background(), resp, "thinking", state, cw); err != nil {
+					t.Fatalf("processToolCalls: %v", err)
+				}
+				// Seed steps + this response's steps.
+				if got := len(state.allSteps) - (checklistTrivialThreshold + 1); got != tc.wantSteps {
+					t.Fatalf("steps this response = %d, want %d", got, tc.wantSteps)
+				}
+				wantItems(t, state.allSteps[checklistTrivialThreshold+1], "group's first step")
+				if tc.wantSteps == 2 {
+					noItems(t, state.allSteps[checklistTrivialThreshold+2], "checklist-missing nudge (later call)")
+				}
+			})
+		}
+	})
+
+	t.Run("checklist-unchecked nudge first call carries them, later call carries none", func(t *testing.T) {
+		mockTools := newMockToolExecutor()
+		mockTools.results["search"] = tools.ToolResult{Content: "found"}
+		for _, tc := range []struct {
+			name      string
+			toolCalls []llm.ToolCall
+			wantSteps int
+		}{
+			{"first call", []llm.ToolCall{{ID: "call_1", Name: "finish", Input: []byte(`{"answer":"done"}`)}}, 1},
+			{"later call", []llm.ToolCall{
+				{ID: "call_1", Name: "search", Input: []byte(`{"query":"test"}`)},
+				{ID: "call_2", Name: "finish", Input: []byte(`{"answer":"done"}`)},
+			}, 2},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				exec := newExecutorDefaultHITL(&mockLLMCaller{}, mockTools, &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+				exec.emitter = &NoopEvents{}
+				// A last checklist with unchecked items (0/2 done) plus the
+				// productive-call seed that makes Enf-1 pass so only Enf-2
+				// fires.
+				seed := &runState{effectiveMaxSteps: 10, checklistAvailable: true}
+				seed.allSteps = append(seed.allSteps, Step{
+					Action:      llm.ToolCall{ID: "seed_cl", Name: "update_checklist", Input: []byte(`{}`)},
+					Observation: "0/2 done",
+				})
+				for i := 0; i < checklistTrivialThreshold+1; i++ {
+					seed.allSteps = append(seed.allSteps, Step{
+						Action:      llm.ToolCall{ID: fmt.Sprintf("seed_%d", i), Name: "search", Input: []byte(`{}`)},
+						Observation: "found",
+					})
+				}
+
+				resp := reasoningItemsFixture(tc.toolCalls[0])
+				resp.Message.ToolCalls = tc.toolCalls
+				state := seed
+				cw := newMockContextManager()
+
+				if _, _, err := exec.processToolCalls(context.Background(), resp, "thinking", state, cw); err != nil {
+					t.Fatalf("processToolCalls: %v", err)
+				}
+				seedLen := 1 + checklistTrivialThreshold + 1
+				if got := len(state.allSteps) - seedLen; got != tc.wantSteps {
+					t.Fatalf("steps this response = %d, want %d", got, tc.wantSteps)
+				}
+				wantItems(t, state.allSteps[seedLen], "group's first step")
+				if tc.wantSteps == 2 {
+					noItems(t, state.allSteps[seedLen+1], "checklist-unchecked nudge (later call)")
+				}
+			})
+		}
+	})
 }

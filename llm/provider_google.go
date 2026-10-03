@@ -138,6 +138,12 @@ type googleCompletionConfig struct {
 	APIKey       string
 	ProviderName string
 	Logger       *slog.Logger
+	// TokenSource optionally supplies per-request bearer credentials (see
+	// TokenSource). When set, the resolved access token overrides the
+	// Authorization header and the static ?key= query parameter is dropped
+	// from the URL, and a Token failure aborts the request before any
+	// network I/O. nil = static APIKey only (the historical behavior).
+	TokenSource TokenSource
 }
 
 // googleCompletion calls the Google Generative Language API (Gemini) and
@@ -182,6 +188,24 @@ func googleCompletion(ctx context.Context, cfg googleCompletionConfig, req ChatR
 		q := httpReq.URL.Query()
 		q.Set("key", cfg.APIKey)
 		httpReq.URL.RawQuery = q.Encode()
+	}
+	// Dynamic credentials (TokenSource) are applied immediately before the
+	// request leaves the process, mirroring tokenSourceMiddleware: the
+	// resolved access token overrides the Authorization header, the static
+	// ?key= parameter is dropped so a dynamic credential never rides
+	// alongside a stale static key, and a Token failure aborts the call —
+	// zero wire requests — with the "llm: token source:" cause preserved.
+	if cfg.TokenSource != nil {
+		tok, tokErr := cfg.TokenSource.Token(ctx)
+		if tokErr != nil {
+			return nil, WrapProviderError(providerName, 0, fmt.Errorf("llm: token source: %w", tokErr))
+		}
+		applyBearerToken(httpReq, tok, "")
+		if tok.AccessToken != "" {
+			q := httpReq.URL.Query()
+			q.Del("key")
+			httpReq.URL.RawQuery = q.Encode()
+		}
 	}
 
 	resp, err := httpClient.Do(httpReq)

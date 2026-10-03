@@ -129,7 +129,11 @@ func TestStepDumpTracker_NonexistentDir(t *testing.T) {
 	}
 	badDir := filepath.Join(filePath, "sub", "deep")
 
-	tracker := NewStepDumpTracker(badDir, slog.Default())
+	logger := expectedDiagnostics(t,
+		expectedDiagnostic{message: "step_dump_tracker: failed to create directory", attrs: map[string]any{"dir": badDir, "error": func(v any) bool { err, ok := v.(*os.PathError); return ok && err.Op == "mkdir" }}},
+		expectedDiagnostic{message: "step_dump_tracker: failed to open dump file", attrs: map[string]any{"filename": "step_step-1.jsonl", "error": func(v any) bool { err, ok := v.(*os.PathError); return ok && err.Op == "open" }}},
+	)
+	tracker := NewStepDumpTracker(badDir, logger)
 	w := tracker.OpenStepDump("step-1")
 	if w != nil {
 		t.Error("expected nil when directory creation fails")

@@ -228,3 +228,145 @@ func TestOpenAIProvider_ChatCompletionStream_StreamOptionsUnsupported(t *testing
 		t.Errorf("request shapes = %v, want [asked stream_options, omitted stream_options]", asksUsage)
 	}
 }
+
+// TestOpenAIProvider_ChatCompletionStream_TruncatedByEOF pins that a stream
+// which ends with a plain EOF (no SDK-level transport error) and never carries
+// a terminal finish_reason on choice 0 is rejected as an unexpected-EOF error
+// instead of being accepted as a successful short answer with a synthesized
+// end_turn stop reason.
+func TestOpenAIProvider_ChatCompletionStream_TruncatedByEOF(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		sse(t, w, `{"id":"1","object":"chat.completion.chunk","created":1,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","content":"partial"},"finish_reason":""}]}`)
+		// End of body: no finish_reason chunk, no [DONE] sentinel — a
+		// compatible gateway that closed the stream mid-generation.
+	}))
+	t.Cleanup(srv.Close)
+
+	p, err := NewOpenAIProvider(OpenAIProviderConfig{Name: "p", APIKey: "k", BaseURL: srv.URL})
+	if err != nil {
+		t.Fatalf("NewOpenAIProvider: %v", err)
+	}
+
+	resp, err := p.ChatCompletion(context.Background(), ChatRequest{
+		Model:     "gpt-4o",
+		Messages:  []Message{{Role: "user", Content: "hi"}},
+		DeltaSink: func(StreamDelta) error { return nil },
+	})
+	if err == nil {
+		t.Fatalf("ChatCompletion(stream) = %+v, want an unexpected-EOF error for a stream with no terminal finish_reason", resp)
+	}
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Errorf("error = %v, want an error wrapping io.ErrUnexpectedEOF", err)
+	}
+	if !IsRetryable(err) {
+		t.Errorf("error = %v, want retryable classification (transient truncation)", err)
+	}
+}
+
+// TestOpenAIProvider_ChatCompletionStream_TruncatedByEOFShapes pins the
+// OTHER two truncation shapes a dying gateway produces: a stream that closes
+// before ANY chunk arrived (headers + immediate EOF), and a stream cut in
+// the MIDDLE of an SSE event (a partial data line). Neither may be accepted
+// as a successful (empty/partial) response; both must surface an error.
+func TestOpenAIProvider_ChatCompletionStream_TruncatedByEOFShapes(t *testing.T) {
+	newProvider := func(t *testing.T, url string) *OpenAIProvider {
+		t.Helper()
+		p, err := NewOpenAIProvider(OpenAIProviderConfig{Name: "p", APIKey: "k", BaseURL: url})
+		if err != nil {
+			t.Fatalf("NewOpenAIProvider: %v", err)
+		}
+		return p
+	}
+	call := func(p *OpenAIProvider) (*ChatResponse, error) {
+		return p.ChatCompletion(context.Background(), ChatRequest{
+			Model:     "gpt-4o",
+			Messages:  []Message{{Role: "user", Content: "hi"}},
+			DeltaSink: func(StreamDelta) error { return nil },
+		})
+	}
+
+	t.Run("empty stream", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			// SSE headers, then the connection closes: zero chunks.
+			w.Header().Set("Content-Type", "text/event-stream")
+		}))
+		t.Cleanup(srv.Close)
+
+		resp, err := call(newProvider(t, srv.URL))
+		if err == nil {
+			t.Fatalf("ChatCompletion(stream) = %+v, want an error for a stream that closed before any chunk", resp)
+		}
+		if !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Errorf("error = %v, want an error wrapping io.ErrUnexpectedEOF", err)
+		}
+		if !IsRetryable(err) {
+			t.Errorf("error = %v, want retryable classification (transient truncation)", err)
+		}
+	})
+
+	t.Run("cut mid-event", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			sse(t, w, `{"id":"1","object":"chat.completion.chunk","created":1,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","content":"partial"},"finish_reason":""}]}`)
+			// A partial data line: the connection dies mid-JSON, before the
+			// event separator arrived.
+			_, _ = w.Write([]byte(`data: {"id":"2","object":"chat.completion.chunk","choices":[{"index":0,"del`))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}))
+		t.Cleanup(srv.Close)
+
+		resp, err := call(newProvider(t, srv.URL))
+		if err == nil {
+			t.Fatalf("ChatCompletion(stream) = %+v, want an error for a stream cut mid-event", resp)
+		}
+		// The partial final data line has no trailing newline, so the SDK's
+		// scanner drops it and the stream ends as a clean EOF with no
+		// terminal finish_reason — deterministically the unexpected-EOF
+		// wrap, same classification as the empty-stream shape.
+		if !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Errorf("error = %v, want an error wrapping io.ErrUnexpectedEOF", err)
+		}
+		if !IsRetryable(err) {
+			t.Errorf("error = %v, want retryable classification (transient truncation)", err)
+		}
+	})
+}
+
+// TestOpenAIProvider_ChatCompletionStream_ToolNameFragments pins that a tool
+// call whose function NAME is fragmented across chunks (like the arguments)
+// is reassembled by concatenation — the official openai-go accumulator's
+// behavior — instead of keeping only the last fragment.
+func TestOpenAIProvider_ChatCompletionStream_ToolNameFragments(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		sse(t, w, `{"id":"1","object":"chat.completion.chunk","created":1,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":""}]}`)
+		sse(t, w, `{"id":"1","object":"chat.completion.chunk","created":1,"model":"gpt-4o","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"get_","arguments":""}}]},"finish_reason":""}]}`)
+		sse(t, w, `{"id":"1","object":"chat.completion.chunk","created":1,"model":"gpt-4o","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"weather","arguments":"{\"q\":\"x\"}"}}]},"finish_reason":""}]}`)
+		sse(t, w, `{"id":"1","object":"chat.completion.chunk","created":1,"model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`)
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	t.Cleanup(srv.Close)
+
+	p, err := NewOpenAIProvider(OpenAIProviderConfig{Name: "p", APIKey: "k", BaseURL: srv.URL})
+	if err != nil {
+		t.Fatalf("NewOpenAIProvider: %v", err)
+	}
+
+	resp, err := p.ChatCompletion(context.Background(), ChatRequest{
+		Model:     "gpt-4o",
+		Messages:  []Message{{Role: "user", Content: "weather?"}},
+		DeltaSink: func(StreamDelta) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("ChatCompletion(stream): %v", err)
+	}
+	if len(resp.Message.ToolCalls) != 1 {
+		t.Fatalf("tool calls = %d, want 1", len(resp.Message.ToolCalls))
+	}
+	if got := resp.Message.ToolCalls[0].Name; got != "get_weather" {
+		t.Errorf("tool call name = %q, want %q (concatenated fragments)", got, "get_weather")
+	}
+}

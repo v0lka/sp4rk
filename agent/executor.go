@@ -1291,6 +1291,13 @@ func (e *Executor) Run(ctx context.Context, taskTools []tools.ToolDescriptor, cw
 		startStep = len(e.resumeSteps) + 1
 	}
 
+	// Close any still-open live assistant stream when this Run exits —
+	// a successful explicit finish, an error, a pause or the step limit
+	// must not leave the Events consumer's accumulator holding this
+	// Run's text for the NEXT Run to append to (see
+	// finalizeAssistantStream).
+	defer e.finalizeAssistantStream(state)
+
 	for state.stepNum = startStep; state.unlimitedSteps || state.stepNum <= state.effectiveMaxSteps+1; state.stepNum++ {
 		// Sync trajectory to the store so tools (e.g. reflect) can access it.
 		if ts := TrajectoryStoreFromContext(ctx); ts != nil {

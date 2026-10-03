@@ -45,8 +45,9 @@ func FamilyReasoningOptions(family string) (options []string, preferred string, 
 var glmVersionRe = regexp.MustCompile(`^glm-(\d+)(?:\.(\d+))?`)
 
 // IsGLM52OrLater reports whether model is a GLM model version 5.2 or later.
-// GLM 5.2+ introduced the reasoning_effort parameter (values "max"/"high"),
-// which is honored when thinking is enabled. The model argument may be a bare
+// GLM 5.2+ introduced the reasoning_effort parameter. GLM 5.2 offers
+// max/high and permits disabling; GLM 5.3+ is always-thinking with low/high/max.
+// The model argument may be a bare
 // name ("glm-5.2") or a composite "provider/name" identifier.
 func IsGLM52OrLater(model string) bool {
 	bare := strings.ToLower(strings.TrimSpace(BareModel(model)))
@@ -136,15 +137,15 @@ func IsQwen38OrLater(model string) bool {
 // when the model version matters (e.g. GLM 5.2+), and falls back to the
 // family-level options otherwise.
 //
-// GLM 5.2+ exposes three options:
+// GLM 5.2 exposes three options:
 //
 //   - "none": thinking disabled
 //   - "max":  thinking enabled with reasoning_effort=max (the GLM default)
 //   - "high": thinking enabled with reasoning_effort=high
 //
-// GLM-5.3-Flash and later flash variants are always-thinking — the API
-// offers no disable spelling — so they expose only the enable tiers
-// "max"/"high". Older GLM models keep the family-level "On"/"Off" options.
+// GLM 5.3 and its Flash variant are always-thinking and expose only
+// "max"/"high"/"low". GLM 5.2 retains "none"/"max"/"high"; older
+// GLM models keep the family-level "On"/"Off" options.
 //
 // Qwen follows the same version split: Qwen 3.8+ exposes the native
 // "xhigh"/"medium"/"low"/"Off" set, while pre-3.8 Qwen models (qwen3-*,
@@ -152,9 +153,14 @@ func IsQwen38OrLater(model string) bool {
 // offering them the native efforts would silently no-op (or be rejected) on
 // serving stacks that predate the parameter.
 func ModelReasoningOptions(family, model string) (options []string, preferred string, ok bool) {
+	if strings.HasPrefix(family, "openai_") {
+		if options, preferred, ok := openAIModelReasoningOptions(model); ok {
+			return options, preferred, true
+		}
+	}
 	if family == "glm" && IsGLM52OrLater(model) {
-		if glmFlashAlwaysThinking(model) {
-			return []string{"max", "high"}, "max", true
+		if glmAlwaysThinking(model) {
+			return []string{"max", "high", "low"}, "max", true
 		}
 		return []string{"none", "max", "high"}, "max", true
 	}
@@ -164,11 +170,10 @@ func ModelReasoningOptions(family, model string) (options []string, preferred st
 	return FamilyReasoningOptions(family)
 }
 
-// glmFlashAlwaysThinking reports whether model is a GLM "flash" variant whose
-// thinking mode is always on and cannot be disabled — GLM-5.3-Flash and later
-// flash releases (see the registry entry). Such a model must not be offered a
-// disable option: the API has no spelling for it.
-func glmFlashAlwaysThinking(model string) bool {
+// glmAlwaysThinking reports whether model uses the GLM 5.3+ reasoning
+// contract. Both flagship and Flash variants require thinking to stay enabled.
+// Source: https://docs.z.ai/guides/llm/glm-5.3 (Feature Changes).
+func glmAlwaysThinking(model string) bool {
 	bare := strings.ToLower(strings.TrimSpace(BareModel(model)))
 	m := glmVersionRe.FindStringSubmatch(bare)
 	if m == nil {
@@ -184,10 +189,7 @@ func glmFlashAlwaysThinking(model string) bool {
 			minor = 0
 		}
 	}
-	if major < 5 || (major == 5 && minor < 3) {
-		return false
-	}
-	return strings.Contains(bare, "flash")
+	return major > 5 || (major == 5 && minor >= 3)
 }
 
 // ReasoningTier is the family-agnostic reasoning level a caller wants for a
@@ -195,15 +197,15 @@ func glmFlashAlwaysThinking(model string) bool {
 // sites can request a reasoning BUDGET ("as cheap as this model allows") or
 // an OFF without knowing which family serves the request:
 //
-//   - ReasoningTierOff: reasoning disabled — maps to the family's disable
-//     spelling ("Off" for the binary families, "none" for GLM 5.2+). When the
-//     resolved option set carries no disable spelling (GLM-flash, Kimi, and
-//     effort-only families like OpenAI/Google whose APIs have no off), the
-//     tier degrades to the minimal available effort — the closest the
-//     provider can get.
-//   - ReasoningTierMinimal: the cheapest non-disabled effort of the family
-//     ("minimal" for OpenAI, "low" for Qwen 3.8+, "High" for DeepSeek, "On"
-//     for the binary families, "high" for GLM-flash, …).
+//   - ReasoningTierOff: reasoning disabled — maps to the model's disable
+//     spelling ("Off" for binary models, "none" for GLM 5.2 and newer
+//     non-Pro GPT models). When the option set carries no disable spelling
+//     (GLM 5.3+, Kimi, Codex, Pro and other thinking-locked models), the tier
+//     degrades to the minimal available effort — the closest the provider
+//     can get.
+//   - ReasoningTierMinimal: the cheapest non-disabled effort of the model
+//     ("minimal" for original GPT-5, "low" for GLM 5.3+/Codex/Qwen 3.8+,
+//     "High" for DeepSeek, "On" for binary models, …).
 //
 // The zero value and any unrecognized tier fail closed to "" (no field).
 type ReasoningTier string
@@ -297,8 +299,8 @@ const kimiMinimalReasoningEffort = "low"
 // ModelReasoningOptions): those describe what a family CAN express, this
 // resolves what to actually PUT ON THE WIRE for a desired budget. Version
 // awareness rides on ModelReasoningOptions, so GLM 5.2+ (reasoning_effort
-// with the "none" disable spelling), GLM-flash (always thinking — no disable
-// spelling) and Qwen 3.8+ / qwen38ArchitectureAliases (native efforts;
+// with the "none" disable spelling), GLM 5.3+ (always thinking, floor low)
+// and Qwen 3.8+ / qwen38ArchitectureAliases (native efforts;
 // pre-3.8 models binary "On"/"Off") are handled without extra logic here.
 //
 // The empty-string contract: "" means "send no reasoning field at all" and is

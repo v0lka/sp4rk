@@ -40,6 +40,14 @@ type AnthropicProviderConfig struct {
 	BaseURL    string       // empty = default Anthropic; otherwise custom endpoint (Anthropic-compatible proxy)
 	HTTPClient *http.Client // optional proxy-configured HTTP client (nil = default)
 	Logger     *slog.Logger // optional structured logger (nil = slog.Default())
+	// TokenSource optionally supplies per-request bearer credentials (see
+	// TokenSource). The go-anthropic SDK has no middleware hook, so the
+	// credentials are applied through a wrapping http.RoundTripper installed
+	// on the provider's client: the resolved access token overrides the
+	// Authorization header and clears the SDK's static x-api-key, and a
+	// Token failure aborts the request before any bytes reach the wire.
+	// nil = static APIKey only (the historical behavior).
+	TokenSource TokenSource
 }
 
 // AnthropicProvider implements LLM Provider using Anthropic's Claude API.
@@ -104,7 +112,19 @@ func NewAnthropicProvider(cfg AnthropicProviderConfig) (*AnthropicProvider, erro
 	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
-	httpClient.Transport = &capturingTransport{base: httpClient.Transport}
+	// Dynamic credentials (TokenSource) are applied beneath the capturing
+	// transport: every captured body corresponds to a request that already
+	// carries the resolved bearer (and no stale static x-api-key), and a
+	// Token failure aborts before any network I/O.
+	transportBase := httpClient.Transport
+	if cfg.TokenSource != nil {
+		transportBase = &tokenSourceRoundTripper{
+			ts:           cfg.TokenSource,
+			next:         transportBase,
+			staticHeader: "x-api-key",
+		}
+	}
+	httpClient.Transport = &capturingTransport{base: transportBase}
 	opts = append(opts, anthropic.WithHTTPClient(httpClient))
 
 	client := anthropic.NewClient(cfg.APIKey, opts...)
@@ -292,6 +312,14 @@ func (p *AnthropicProvider) chatCompletionStream(ctx context.Context, req ChatRe
 	streamReq := anthropic.MessagesStreamRequest{MessagesRequest: *base}
 
 	var sinkErr error
+	// messageStop tracks whether the stream delivered its terminal
+	// message_stop event. The SDK surfaces a plain EOF as a successful
+	// (short) response, so without this flag a gateway that closes the
+	// SSE stream mid-generation would be accepted as a complete answer.
+	messageStop := false
+	streamReq.OnMessageStop = func(anthropic.MessagesEventMessageStopData) {
+		messageStop = true
+	}
 	streamReq.OnContentBlockDelta = func(ev anthropic.MessagesEventContentBlockDeltaData) {
 		if sinkErr != nil {
 			return
@@ -322,6 +350,13 @@ func (p *AnthropicProvider) chatCompletionStream(ctx context.Context, req ChatRe
 	}
 	if err != nil {
 		return nil, p.wrapError(fmt.Errorf("anthropic: API error: %w", err))
+	}
+	// The stream ended without the terminal message_stop event: a truncated
+	// response, not a success. Return an unexpected-EOF error (classified
+	// transient by the router) instead of letting the parser accept the
+	// partial content as a complete answer.
+	if !messageStop {
+		return nil, p.wrapError(fmt.Errorf("anthropic: API error: %w", io.ErrUnexpectedEOF))
 	}
 	return p.parseResponse(resp, capture.bytes())
 }

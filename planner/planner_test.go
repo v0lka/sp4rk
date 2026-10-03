@@ -776,6 +776,8 @@ func TestPlanDirect_Success(t *testing.T) {
 func TestPlanDirect_LLMError(t *testing.T) {
 	caller := &mockLLMCaller{err: errors.New("llm unavailable")}
 	cfg := makeTestConfig("Plan: {MODE-PREAMBLE}")
+	cfg.Logger = expectedDiagnostics(t, expectedDiagnostic{message: "oneshot: LLM call failed", attrs: map[string]any{"kind": "plan_generation", "model": "", "attempt": int64(1), "outcome": "transport_error", "duration": func(v any) bool { d, ok := v.(time.Duration); return ok && d >= 0 }}})
+
 	p := &Planner{llm: caller, Cfg: cfg}
 
 	mode := p.multiStepMode()
@@ -793,6 +795,8 @@ func TestPlanDirect_SingleStepTruncation(t *testing.T) {
 	cfg.Prompts.SingleStepPreamble = "single"
 	cfg.Prompts.SingleStepToT = ""
 	cfg.Prompts.SingleStepGuidance = ""
+	cfg.Logger = expectedDiagnostics(t, expectedDiagnostic{message: "planner: single-step mode returned multiple steps, truncating", attrs: map[string]any{"count": int64(2)}})
+
 	p := &Planner{llm: caller, Cfg: cfg}
 
 	mode := p.singleStepMode()
@@ -846,6 +850,8 @@ func TestReplan_LLMError(t *testing.T) {
 	caller := &mockLLMCaller{err: errors.New("llm down")}
 	cfg := makeTestConfig("REPLAN")
 	cfg.Prompts.ReplanPrompt = "REPLAN"
+	cfg.Logger = expectedDiagnostics(t, expectedDiagnostic{message: "oneshot: LLM call failed", attrs: map[string]any{"kind": "plan_generation", "model": "", "attempt": int64(1), "outcome": "transport_error", "duration": func(v any) bool { d, ok := v.(time.Duration); return ok && d >= 0 }}})
+
 	p := &Planner{llm: caller, Cfg: cfg}
 
 	_, err := p.Replan(context.Background(), &orchestration.Plan{}, nil, orchestration.CompletedStep{}, nil, nil, nil)
@@ -887,6 +893,8 @@ func TestPlanContinuation_SingleStepTruncation(t *testing.T) {
 	cfg.Prompts.ContinuationSingleStep = "csp"
 	cfg.Prompts.SingleStepToT = ""
 	cfg.Prompts.SingleStepGuidance = ""
+	cfg.Logger = expectedDiagnostics(t, expectedDiagnostic{message: "planner: single-step continuation returned multiple steps, truncating", attrs: map[string]any{"count": int64(2)}})
+
 	p := &Planner{llm: caller, Cfg: cfg}
 
 	plan, err := p.PlanContinuation(context.Background(), "original", &orchestration.Plan{}, nil, "continue", nil, nil, true, nil, true)
@@ -1226,6 +1234,8 @@ func TestPlan_ExplorationPath_NilContextFactory(t *testing.T) {
 	}
 	cfg.PlannerToolNames = map[string]bool{"read_file": true, "glob": true}
 	// ContextFactory is nil => fallback to planDirect inside planWithExploration
+	cfg.Logger = expectedDiagnostics(t, expectedDiagnostic{message: "planner: ContextFactory is nil, falling back to direct planning"})
+
 	p := &Planner{llm: caller, Cfg: cfg}
 
 	plan, err := p.Plan(context.Background(), "explore this task", nil, nil, nil, false, nil)
@@ -1316,6 +1326,8 @@ func TestPlanContinuation_LLMError(t *testing.T) {
 	caller := &mockLLMCaller{err: errors.New("llm down")}
 	cfg := makeTestConfig("CONT: {ORIGINAL-REQUEST} | {COMPLETED-PLAN-SUMMARY}")
 	cfg.Prompts.ContinuationPreamble = "cont-preamble"
+	cfg.Logger = expectedDiagnostics(t, expectedDiagnostic{message: "oneshot: LLM call failed", attrs: map[string]any{"kind": "plan_generation", "model": "", "attempt": int64(1), "outcome": "transport_error", "duration": func(v any) bool { d, ok := v.(time.Duration); return ok && d >= 0 }}})
+
 	p := &Planner{llm: caller, Cfg: cfg}
 
 	_, err := p.PlanContinuation(context.Background(), "original", &orchestration.Plan{}, nil, "continue", nil, nil, false, nil, true)
@@ -1334,6 +1346,8 @@ func TestPlanContinuation_ParseError(t *testing.T) {
 	}
 	cfg := makeTestConfig("CONT: {ORIGINAL-REQUEST} | {COMPLETED-PLAN-SUMMARY}")
 	cfg.Prompts.ContinuationPreamble = "cont-preamble"
+	cfg.Logger = expectedDiagnostics(t, expectedDiagnostic{message: "oneshot: response unparseable after all attempts", attrs: map[string]any{"kind": "plan_generation", "model": "", "attempt": int64(3), "outcome": "error", "duration": func(v any) bool { d, ok := v.(time.Duration); return ok && d >= 0 }}})
+
 	p := &Planner{llm: caller, Cfg: cfg}
 
 	_, err := p.PlanContinuation(context.Background(), "original", &orchestration.Plan{}, nil, "continue", nil, nil, false, nil, true)
@@ -1351,6 +1365,8 @@ func TestPlanDirect_ParseError(t *testing.T) {
 		resp: newPlanResponse(`garbage response`),
 	}
 	cfg := makeTestConfig("Plan: {MODE-PREAMBLE}")
+	cfg.Logger = expectedDiagnostics(t, expectedDiagnostic{message: "oneshot: response unparseable after all attempts", attrs: map[string]any{"kind": "plan_generation", "model": "", "attempt": int64(3), "outcome": "error", "duration": func(v any) bool { d, ok := v.(time.Duration); return ok && d >= 0 }}})
+
 	p := &Planner{llm: caller, Cfg: cfg}
 
 	mode := p.multiStepMode()
@@ -1370,6 +1386,8 @@ func TestReplan_ParseError(t *testing.T) {
 	}
 	cfg := makeTestConfig("REPLAN")
 	cfg.Prompts.ReplanPrompt = "REPLAN: {ORIGINAL-PLAN} | {COMPLETED-STEPS} | {FAILED-STEP} | {PREVIOUS-SESSION-REFLECTIONS} | {CURRENT-REFLECTION} | {AVAILABLE-SKILLS} | {WORKSPACE-PATH}"
+	cfg.Logger = expectedDiagnostics(t, expectedDiagnostic{message: "oneshot: response unparseable after all attempts", attrs: map[string]any{"kind": "plan_generation", "model": "", "attempt": int64(3), "outcome": "error", "duration": func(v any) bool { d, ok := v.(time.Duration); return ok && d >= 0 }}})
+
 	p := &Planner{llm: caller, Cfg: cfg}
 
 	_, err := p.Replan(context.Background(), &orchestration.Plan{}, nil, orchestration.CompletedStep{}, nil, nil, nil)
@@ -1834,6 +1852,8 @@ func TestCallAndParsePlan_FinalRefusalAfterThreeAttempts(t *testing.T) {
 	}}
 	p := &Planner{llm: caller, Cfg: makeTestConfig("Plan")}
 
+	p.Cfg.Logger = expectedDiagnostics(t, expectedDiagnostic{message: "oneshot: response unparseable after all attempts", attrs: map[string]any{"kind": "plan_generation", "model": "", "attempt": int64(3), "outcome": "error", "duration": func(v any) bool { d, ok := v.(time.Duration); return ok && d >= 0 }}})
+
 	_, err := p.callAndParsePlan(context.Background(), testCallMessages(), nil)
 	if err == nil {
 		t.Fatal("expected final parse refusal after three attempts")
@@ -1853,6 +1873,8 @@ func TestCallAndParsePlan_FinalRefusalAfterThreeAttempts(t *testing.T) {
 // surface immediately (no nudge retries) wrapped as LLM call failures.
 func TestCallAndParsePlan_TransportErrorNotRetried(t *testing.T) {
 	p := &Planner{llm: &failingPlanCaller{err: errors.New("llm down")}, Cfg: makeTestConfig("Plan")}
+
+	p.Cfg.Logger = expectedDiagnostics(t, expectedDiagnostic{message: "oneshot: LLM call failed", attrs: map[string]any{"kind": "plan_generation", "model": "", "attempt": int64(1), "outcome": "transport_error", "duration": func(v any) bool { d, ok := v.(time.Duration); return ok && d >= 0 }}})
 
 	_, err := p.callAndParsePlan(context.Background(), testCallMessages(), nil)
 	if err == nil {

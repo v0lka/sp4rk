@@ -2582,9 +2582,11 @@ func TestJudgeReasoningTierOff(t *testing.T) {
 		// Catalog-family alias (name-based detection cannot resolve it): the
 		// built-in catalog must supply the qwen family.
 		{"bonsai alias", "provA/Bonsai 2 27B", "Off"},
-		// OpenAI reasoning models have no disable spelling — degrade to the
-		// cheapest effort.
-		{"openai degrade", "provA/gpt-5.6", "minimal"},
+		// Model-specific options decide whether Off disables or degrades.
+		{"openai off", "provA/gpt-5.6", "none"},
+		{"codex degrade", "provA/gpt-5.3-codex", "low"},
+		{"pro degrade", "provA/gpt-5-pro", "high"},
+		{"glm53 degrade", "provA/glm-5.3", "low"},
 		// Anthropic: the binary disable spelling.
 		{"anthropic", "provA/claude-sonnet-4-5", "Off"},
 		// GLM 5.2+: the "none" disable spelling.
