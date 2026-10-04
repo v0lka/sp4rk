@@ -76,6 +76,50 @@ func TestExecuteNamespacedDiagnostic(t *testing.T) {
 	}
 }
 
+func TestExecuteNamespacedDiagnosticCatalogScope(t *testing.T) {
+	reg := NewToolRegistry()
+	executions := 0
+	tool := newMockTool("bash_exec", "executes commands")
+	tool.execFn = func(context.Context, json.RawMessage) (ToolResult, error) {
+		executions++
+		return ToolResult{Content: "executed"}, nil
+	}
+	reg.Register(tool)
+
+	// A run-scoped catalog that excludes the globally registered candidate
+	// (e.g. a read-only delegation's TaskTools): the hint must never point
+	// outside the run's grant.
+	excludedCtx := WithCatalogScope(context.Background(), []string{"read_file", "list_directory", "finish"})
+	result, err := reg.Execute(excludedCtx, "functions.bash_exec", json.RawMessage(`{}`))
+	if err != nil || !result.IsError || result.Content != "tool not found: functions.bash_exec" {
+		t.Errorf("Execute(functions.bash_exec, excluded scope) = %+v, %v, want generic not-found without catalog hint", result, err)
+	}
+
+	// An empty catalog scope is a valid empty grant: nothing is recommended.
+	emptyCtx := WithCatalogScope(context.Background(), nil)
+	result, err = reg.Execute(emptyCtx, "functions.bash_exec", json.RawMessage(`{}`))
+	if err != nil || !result.IsError || result.Content != "tool not found: functions.bash_exec" {
+		t.Errorf("Execute(functions.bash_exec, empty scope) = %+v, %v, want generic not-found without catalog hint", result, err)
+	}
+
+	// The same registry under a scope that grants the candidate: the
+	// actionable hint returns.
+	grantedCtx := WithCatalogScope(context.Background(), []string{"bash_exec"})
+	result, err = reg.Execute(grantedCtx, "functions.bash_exec", json.RawMessage(`{}`))
+	if err != nil || !result.IsError || !strings.Contains(result.Content, `"bash_exec"`) || !strings.Contains(result.Content, "batch.calls[].tool") {
+		t.Errorf("Execute(functions.bash_exec, granted scope) = %+v, %v, want actionable catalog hint", result, err)
+	}
+
+	// Without a scope an unrestricted caller keeps registry-level availability.
+	result, err = reg.Execute(context.Background(), "functions.bash_exec", json.RawMessage(`{}`))
+	if err != nil || !result.IsError || !strings.Contains(result.Content, `"bash_exec"`) {
+		t.Errorf("Execute(functions.bash_exec, unscoped) = %+v, %v, want actionable catalog hint", result, err)
+	}
+	if executions != 0 {
+		t.Errorf("executions = %d, want 0 (the hint path never dispatches)", executions)
+	}
+}
+
 func TestExecuteExactNamespacedName(t *testing.T) {
 	reg := NewToolRegistry()
 	candidate := newMockTool("echo", "candidate")

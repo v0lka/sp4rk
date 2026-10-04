@@ -254,7 +254,7 @@ func (r *ToolRegistry) ListFiltered(excludeNames map[string]bool) []ToolDescript
 func (r *ToolRegistry) Execute(ctx context.Context, name string, input json.RawMessage) (ToolResult, error) {
 	tool, ok := r.Get(name)
 	if !ok {
-		return ToolNotFoundResult(name, func(candidate string) bool {
+		return ToolNotFoundResult(ctx, name, func(candidate string) bool {
 			_, available := r.Get(candidate)
 			return available
 		}), nil

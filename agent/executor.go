@@ -1253,6 +1253,24 @@ var ErrPaused = errors.New("executor paused at step boundary")
 // The caller is responsible for setting the task context (via tools.WithTaskContext)
 // before calling Run.
 func (e *Executor) Run(ctx context.Context, taskTools []tools.ToolDescriptor, cw ContextManager) (*ExecutorResult, error) {
+	// Scope the namespaced tool-not-found diagnostic (tools.ToolNotFoundResult)
+	// to this run's effective catalog. taskTools is the grant the caller handed
+	// this Run — for a delegation it is the delegation's TaskTools — so a
+	// namespaced miss such as "functions.bash_exec" may only recommend a
+	// candidate this run can actually call. Without the scope, a tool that is
+	// registered globally but excluded from the grant (e.g. bash_exec under a
+	// read-only delegation) would be recommended, pointing error recovery
+	// outside the task-scoped grant. The scope is diagnostic-only: exact-name
+	// dispatch, validation, policy, and confirmation are unchanged. finish is
+	// appended to mirror buildToolDefinitions (it is intercepted inline before
+	// dispatch, so its presence in the scope is inert).
+	scope := make([]string, 0, len(taskTools)+1)
+	for _, t := range taskTools {
+		scope = append(scope, t.Name)
+	}
+	scope = append(scope, "finish")
+	ctx = tools.WithCatalogScope(ctx, scope)
+
 	// Build tool definitions from taskTools
 	toolDefs := e.buildToolDefinitions(taskTools)
 

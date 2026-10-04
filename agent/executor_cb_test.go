@@ -1568,6 +1568,126 @@ func TestProcessBatchTool_NamespacedMissingContinues(t *testing.T) {
 	}
 }
 
+// TestRunNamespacedHintScopedToTaskTools is the regression for the
+// catalog-scoped tool-not-found hint: Executor.Run attaches the run's
+// effective catalog (taskTools) as the diagnostic scope, so a namespaced
+// miss recommends the un-prefixed candidate ONLY when that candidate is part
+// of the run's grant. A globally registered tool excluded from taskTools
+// (e.g. an execute-group tool under a read-only delegation) must get the
+// neutral not-found error — never a hint pointing outside the task-scoped
+// grant.
+func TestRunNamespacedHintScopedToTaskTools(t *testing.T) {
+	newRegistry := func() (*tools.ToolRegistry, *batchRegistryProbe) {
+		registry := tools.NewToolRegistry()
+		probe := &batchRegistryProbe{BaseTool: tools.BaseTool{
+			ToolName: "echo", ToolGroup: tools.GroupLocalRead,
+			Schema: json.RawMessage(`{"type":"object"}`), Policy: tools.PolicyAlwaysAllow,
+		}}
+		registry.Register(probe)
+		return registry, probe
+	}
+	runNamespacedMiss := func(registry *tools.ToolRegistry, taskTools []tools.ToolDescriptor) []Step {
+		mockLLM := &mockLLMCaller{responses: []*llm.ChatResponse{
+			llmResponseWithToolCall("thinking", "functions.echo", json.RawMessage(`{}`)),
+			llmResponseFinish("done", "recovered"),
+		}}
+		exec := newExecutorDefaultHITL(mockLLM, registry, &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+		exec.emitter = &NoopEvents{}
+		result, err := exec.Run(context.Background(), taskTools, newMockContextManager())
+		if err != nil || !result.Finished {
+			t.Fatalf("Run() = %+v, %v, want finished run", result, err)
+		}
+		if len(result.Steps) == 0 || result.Steps[0].Action.Name != "functions.echo" || !result.Steps[0].IsError {
+			t.Fatalf("Run() steps = %+v, want first step literal functions.echo error", result.Steps)
+		}
+		return result.Steps
+	}
+
+	t.Run("excluded candidate gets no hint", func(t *testing.T) {
+		registry, probe := newRegistry()
+		steps := runNamespacedMiss(registry, []tools.ToolDescriptor{
+			{Name: "read_file", InputSchema: json.RawMessage(`{}`)},
+		})
+		if obs := steps[0].Observation; obs != "tool not found: functions.echo" {
+			t.Errorf("observation = %q, want neutral not-found without catalog hint", obs)
+		}
+		if probe.executions != 0 {
+			t.Errorf("probe executions = %d, want 0", probe.executions)
+		}
+	})
+
+	t.Run("granted candidate gets hint", func(t *testing.T) {
+		registry, probe := newRegistry()
+		steps := runNamespacedMiss(registry, []tools.ToolDescriptor{
+			{Name: "echo", InputSchema: json.RawMessage(`{}`)},
+		})
+		obs := steps[0].Observation
+		for _, hint := range []string{`"echo"`, "batch.calls[].tool", "direct tool call name"} {
+			if !strings.Contains(obs, hint) {
+				t.Errorf("observation = %q, want hint %q", obs, hint)
+			}
+		}
+		if probe.executions != 0 {
+			t.Errorf("probe executions = %d, want 0 (the hint never dispatches)", probe.executions)
+		}
+	})
+
+	t.Run("excluded candidate in batch gets no hint", func(t *testing.T) {
+		registry, probe := newRegistry()
+		mockLLM := &mockLLMCaller{responses: []*llm.ChatResponse{
+			llmResponseWithToolCall("thinking", "batch", json.RawMessage(`{"calls":[{"tool":"functions.echo","input":{}}]}`)),
+			llmResponseFinish("done", "recovered"),
+		}}
+		exec := newExecutorDefaultHITL(mockLLM, registry, &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+		exec.emitter = &NoopEvents{}
+		result, err := exec.Run(context.Background(), []tools.ToolDescriptor{
+			{Name: "batch", InputSchema: json.RawMessage(`{}`)},
+			{Name: "read_file", InputSchema: json.RawMessage(`{}`)},
+		}, newMockContextManager())
+		if err != nil || !result.Finished {
+			t.Fatalf("Run() = %+v, %v, want finished run", result, err)
+		}
+		if len(result.Steps) == 0 || result.Steps[0].Action.Name != "functions.echo" || !result.Steps[0].IsError {
+			t.Fatalf("Run() steps = %+v, want first batch sub-step literal functions.echo error", result.Steps)
+		}
+		if obs := result.Steps[0].Observation; obs != "tool not found: functions.echo" {
+			t.Errorf("batch observation = %q, want neutral not-found without catalog hint", obs)
+		}
+		if probe.executions != 0 {
+			t.Errorf("probe executions = %d, want 0", probe.executions)
+		}
+	})
+
+	t.Run("granted candidate in batch gets hint", func(t *testing.T) {
+		registry, probe := newRegistry()
+		mockLLM := &mockLLMCaller{responses: []*llm.ChatResponse{
+			llmResponseWithToolCall("thinking", "batch", json.RawMessage(`{"calls":[{"tool":"functions.echo","input":{}}]}`)),
+			llmResponseFinish("done", "recovered"),
+		}}
+		exec := newExecutorDefaultHITL(mockLLM, registry, &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+		exec.emitter = &NoopEvents{}
+		result, err := exec.Run(context.Background(), []tools.ToolDescriptor{
+			{Name: "batch", InputSchema: json.RawMessage(`{}`)},
+			{Name: "echo", InputSchema: json.RawMessage(`{}`)},
+		}, newMockContextManager())
+		if err != nil || !result.Finished {
+			t.Fatalf("Run() = %+v, %v, want finished run", result, err)
+		}
+		if len(result.Steps) == 0 || result.Steps[0].Action.Name != "functions.echo" || !result.Steps[0].IsError {
+			t.Fatalf("Run() steps = %+v, want first batch sub-step literal functions.echo error", result.Steps)
+		}
+		obs := result.Steps[0].Observation
+		for _, hint := range []string{`"echo"`, "batch.calls[].tool", "direct tool call name"} {
+			if !strings.Contains(obs, hint) {
+				t.Errorf("batch observation = %q, want hint %q", obs, hint)
+			}
+		}
+		if probe.executions != 0 {
+			t.Errorf("probe executions = %d, want 0 (the hint never dispatches)", probe.executions)
+		}
+	})
+}
+
 func TestProcessBatchTool_SubCalls(t *testing.T) {
 	mockTools := newMockToolExecutor()
 	mockTools.results["search"] = tools.ToolResult{Content: "search result"}
