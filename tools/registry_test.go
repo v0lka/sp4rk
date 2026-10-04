@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -28,6 +29,71 @@ func newMockTool(name, desc string) *mockTool {
 			Schema:          json.RawMessage(`{"type":"object"}`),
 			Policy:          PolicyAlwaysAllow,
 		},
+	}
+}
+
+func TestExecuteNamespacedDiagnostic(t *testing.T) {
+	reg := NewToolRegistry()
+	tool := newMockTool("echo", "echoes")
+	executions, confirmations := 0, 0
+	tool.Policy = PolicyUserConfirm
+	tool.execFn = func(context.Context, json.RawMessage) (ToolResult, error) {
+		executions++
+		return ToolResult{Content: "executed"}, nil
+	}
+	reg.Register(tool)
+	response := ConfirmDeny
+	reg.SetConfirmFunc(func(context.Context, ConfirmationRequest) (ConfirmationResponse, error) {
+		confirmations++
+		return response, nil
+	})
+	for _, name := range []string{"functions.echo", "functions.missing", "other.echo", "echo.extra", "functions."} {
+		result, err := reg.Execute(context.Background(), name, json.RawMessage(`{}`))
+		if err != nil || !result.IsError || !strings.HasPrefix(result.Content, "tool not found: "+name) {
+			t.Errorf("Execute(%q) = %+v, %v, want not-found error result", name, result, err)
+		}
+		if name == "functions.echo" {
+			for _, hint := range []string{`"echo"`, "batch.calls[].tool", "direct tool call name"} {
+				if !strings.Contains(result.Content, hint) {
+					t.Errorf("Execute(%q).Content = %q, want hint %q", name, result.Content, hint)
+				}
+			}
+		} else if result.Content != "tool not found: "+name {
+			t.Errorf("Execute(%q).Content = %q, want generic not-found error", name, result.Content)
+		}
+	}
+	if executions != 0 || confirmations != 0 {
+		t.Errorf("Execute(missing names) executions/confirmations = %d/%d, want 0/0", executions, confirmations)
+	}
+	result, err := reg.Execute(context.Background(), "echo", json.RawMessage(`{}`))
+	if err != nil || !result.IsError || executions != 0 || confirmations != 1 {
+		t.Errorf("Execute(echo, denied retry) = %+v, %v, executions/confirmations %d/%d, want error and 0/1", result, err, executions, confirmations)
+	}
+	response = ConfirmAllowOnce
+	result, err = reg.Execute(context.Background(), "echo", json.RawMessage(`{}`))
+	if err != nil || result.IsError || executions != 1 || confirmations != 2 {
+		t.Errorf("Execute(echo, approved retry) = %+v, %v, executions/confirmations %d/%d, want success and 1/2", result, err, executions, confirmations)
+	}
+}
+
+func TestExecuteExactNamespacedName(t *testing.T) {
+	reg := NewToolRegistry()
+	candidate := newMockTool("echo", "candidate")
+	candidate.execFn = func(context.Context, json.RawMessage) (ToolResult, error) {
+		t.Error("Execute(functions.echo) reached echo, want exact name only")
+		return ToolResult{}, nil
+	}
+	reg.Register(candidate)
+	exact := newMockTool("functions.echo", "exact")
+	reg.Register(exact)
+	result, err := reg.Execute(context.Background(), "functions.echo", json.RawMessage(`{}`))
+	if err != nil || result.IsError || result.Content != "ok" {
+		t.Errorf("Execute(functions.echo) = %+v, %v, want exact tool success", result, err)
+	}
+	reg.SetPolicyOverride("functions.echo", PolicyAlwaysDeny)
+	result, err = reg.Execute(context.Background(), "functions.echo", json.RawMessage(`{}`))
+	if err != nil || !result.IsError || !strings.Contains(result.Content, "blocked by security policy") {
+		t.Errorf("Execute(functions.echo, deny) = %+v, %v, want policy denial", result, err)
 	}
 }
 

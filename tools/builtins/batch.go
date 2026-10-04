@@ -10,9 +10,9 @@ import (
 
 const batchDescription = `Purpose: execute multiple independent tool calls sequentially in a single round-trip.
 Use when: you already know several calls you want to make and none depends on another's output (e.g. read three files, check two paths). Calls run in order and all execute even if some fail — errors are captured per call and never abort the batch.
-Inputs: calls — an array of {"tool": name, "input": {...}} objects.
+Inputs: calls — an array of {"tool": name, "input": {...}} objects. Each tool must be the exact name from the available-tools catalog, e.g. "read_file", not "functions.read_file". Do not add a namespace such as "functions.".
 Outputs: one result per call, in order, including per-call errors.
-Example: calls=[read_file a.go, read_file b.go, list_directory src/] in one invocation.
+Example: {"calls":[{"tool":"read_file","input":{"path":"a.go"}},{"tool":"list_directory","input":{"path":"src/"}}]}
 Anti-example: not for dependent chains (read then edit must be separate turns — later calls cannot use earlier results); a single call does not need batch — invoke the tool directly.`
 
 // BatchTool allows the LLM to batch multiple independent tool calls.
@@ -36,7 +36,7 @@ func NewBatchTool() *BatchTool {
 					"items": {
 						"type": "object",
 						"properties": {
-							"tool": {"type": "string", "description": "Name of the tool to call"},
+							"tool": {"type": "string", "description": "Exact tool name from the available-tools catalog, e.g. read_file, not functions.read_file. Do not add a namespace such as functions."},
 							"input": {"type": "object", "description": "Arguments to pass to the tool"}
 						},
 						"required": ["tool", "input"]

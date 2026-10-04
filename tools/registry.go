@@ -254,7 +254,10 @@ func (r *ToolRegistry) ListFiltered(excludeNames map[string]bool) []ToolDescript
 func (r *ToolRegistry) Execute(ctx context.Context, name string, input json.RawMessage) (ToolResult, error) {
 	tool, ok := r.Get(name)
 	if !ok {
-		return ToolResult{Content: "tool not found: " + name, IsError: true}, nil
+		return ToolNotFoundResult(name, func(candidate string) bool {
+			_, available := r.Get(candidate)
+			return available
+		}), nil
 	}
 
 	// Pre-dispatch input validation (fail-open, before any policy or

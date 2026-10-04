@@ -17,6 +17,68 @@ import (
 
 // --- Name tests for individual tools ---
 
+func TestBatchTool_ExactNameContract(t *testing.T) {
+	tool := NewBatchTool()
+	for _, hint := range []string{"exact name", "available-tools catalog", "functions.read_file"} {
+		if !strings.Contains(tool.Description(), hint) {
+			t.Errorf("BatchTool.Description() = %q, want hint %q", tool.Description(), hint)
+		}
+	}
+	var schema struct {
+		Properties struct {
+			Calls struct {
+				Items struct {
+					Properties struct {
+						Tool struct {
+							Description string `json:"description"`
+						} `json:"tool"`
+					} `json:"properties"`
+				} `json:"items"`
+			} `json:"calls"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(tool.InputSchema(), &schema); err != nil {
+		t.Fatalf("BatchTool.InputSchema() decode = %v, want valid JSON", err)
+	}
+	for _, hint := range []string{"Exact tool name", "available-tools catalog", "not functions.read_file"} {
+		if !strings.Contains(schema.Properties.Calls.Items.Properties.Tool.Description, hint) {
+			t.Errorf("batch.calls[].tool description = %q, want hint %q", schema.Properties.Calls.Items.Properties.Tool.Description, hint)
+		}
+	}
+	_, after, found := strings.Cut(tool.Description(), "Example: ")
+	if !found {
+		t.Fatal("BatchTool.Description() has no Example:, want complete JSON example")
+	}
+	example, _, _ := strings.Cut(after, "\n")
+	if err := tools.ValidateToolInput(tool.Name(), tool.InputSchema(), json.RawMessage(example)); err != nil {
+		t.Fatalf("ValidateToolInput(batch, %q) = %v, want valid example", example, err)
+	}
+	var input struct {
+		Calls []struct {
+			Tool  string          `json:"tool"`
+			Input json.RawMessage `json:"input"`
+		} `json:"calls"`
+	}
+	if err := json.Unmarshal([]byte(example), &input); err != nil {
+		t.Fatalf("BatchTool example decode = %v, want complete JSON", err)
+	}
+	registry := tools.NewToolRegistry()
+	registry.Register(NewReadFileTool())
+	registry.Register(NewListDirectoryTool())
+	if len(input.Calls) != 2 {
+		t.Fatalf("BatchTool example calls = %d, want 2", len(input.Calls))
+	}
+	for _, call := range input.Calls {
+		referenced, ok := registry.Get(call.Tool)
+		if !ok {
+			t.Fatalf("BatchTool example name %q not registered, want exact catalog name", call.Tool)
+		}
+		if err := tools.ValidateToolInput(call.Tool, referenced.InputSchema(), call.Input); err != nil {
+			t.Errorf("ValidateToolInput(%q, %s) = %v, want valid example arguments", call.Tool, call.Input, err)
+		}
+	}
+}
+
 func TestReadFileTool_Name(t *testing.T) {
 	tool := NewReadFileTool()
 	if tool.Name() != "read_file" {

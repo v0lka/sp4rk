@@ -1529,6 +1529,45 @@ func TestProcessBatchTool_InterceptedPathsCarryReasoningItems(t *testing.T) {
 	})
 }
 
+// batchRegistryProbe records real-registry dispatch for batch integration tests.
+type batchRegistryProbe struct {
+	tools.BaseTool
+	executions int
+}
+
+func (p *batchRegistryProbe) Execute(context.Context, json.RawMessage) (tools.ToolResult, error) {
+	p.executions++
+	return tools.ToolResult{Content: "sibling executed"}, nil
+}
+
+func TestProcessBatchTool_NamespacedMissingContinues(t *testing.T) {
+	registry := tools.NewToolRegistry()
+	probe := &batchRegistryProbe{BaseTool: tools.BaseTool{
+		ToolName: "echo", ToolGroup: tools.GroupLocalRead,
+		Schema: json.RawMessage(`{"type":"object"}`), Policy: tools.PolicyAlwaysAllow,
+	}}
+	registry.Register(probe)
+	exec := newExecutorDefaultHITL(&mockLLMCaller{}, registry, &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+	exec.emitter = &NoopEvents{}
+	action := llm.ToolCall{ID: "batch_1", Name: "batch", Input: json.RawMessage(`{"calls":[{"tool":"functions.echo","input":{}},{"tool":"echo","input":{}}]}`)}
+	resp := &llm.ChatResponse{Message: llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{action}}}
+	state := &runState{effectiveMaxSteps: 10}
+	result, act, err := exec.processSingleToolCall(context.Background(), action, 0, resp.Message.ToolCalls, resp, "thinking", state, newMockContextManager())
+	if err != nil || result != nil || act != actionNone {
+		t.Fatalf("processSingleToolCall(batch) = %v, %v, %v, want nil/actionNone/nil", result, act, err)
+	}
+	if len(state.allSteps) != 2 {
+		t.Fatalf("processSingleToolCall(batch) steps = %d, want 2", len(state.allSteps))
+	}
+	first, second := state.allSteps[0], state.allSteps[1]
+	if first.Action.Name != "functions.echo" || !first.IsError || !strings.Contains(first.Observation, "batch.calls[].tool") {
+		t.Errorf("batch first step = %+v, want literal functions.echo and actionable error", first)
+	}
+	if second.Action.Name != "echo" || second.IsError || second.Observation != "sibling executed" || probe.executions != 1 {
+		t.Errorf("batch sibling = %+v, executions %d, want echo success and exactly 1 execution", second, probe.executions)
+	}
+}
+
 func TestProcessBatchTool_SubCalls(t *testing.T) {
 	mockTools := newMockToolExecutor()
 	mockTools.results["search"] = tools.ToolResult{Content: "search result"}
