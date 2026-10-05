@@ -1209,6 +1209,19 @@ func TestNewRouter_ProviderEntryOmitReasoningHistoryPlumbing(t *testing.T) {
 		}
 	}
 
+	// requestToolTurn answers request()'s captured assistant tool call with a
+	// tool-role message BEFORE the closing user turn — the complete
+	// post-tool-call history a multi-turn loop submits on its next request.
+	requestToolTurn := func() ChatRequest {
+		req := request()
+		answered := make([]Message, 0, len(req.Messages)+1)
+		answered = append(answered, req.Messages[0], req.Messages[1])
+		answered = append(answered, Message{Role: "tool", ToolCallID: "call-1", Content: `{"hits":1}`})
+		answered = append(answered, req.Messages[2])
+		req.Messages = answered
+		return req
+	}
+
 	// assistantHistory digs the single assistant message out of a recorded
 	// request body.
 	assistantHistory := func(t *testing.T, body []byte) map[string]any {
@@ -1229,8 +1242,8 @@ func TestNewRouter_ProviderEntryOmitReasoningHistoryPlumbing(t *testing.T) {
 	}
 
 	// routed builds a one-provider router from the given entry flag and
-	// returns the constructed OpenAIProvider plus the recorded body.
-	routed := func(t *testing.T, omit bool) (*OpenAIProvider, *[]byte) {
+	// returns it with the constructed OpenAIProvider plus the recorded body.
+	routed := func(t *testing.T, omit bool) (*Router, *OpenAIProvider, *[]byte) {
 		t.Helper()
 		body, srv := chatBodyRecorder(t)
 		r, err := NewRouter(context.Background(), RouterConfig{
@@ -1250,11 +1263,11 @@ func TestNewRouter_ProviderEntryOmitReasoningHistoryPlumbing(t *testing.T) {
 		if !ok {
 			t.Fatalf("router provider type = %T, want *OpenAIProvider", r.providers["embedded"])
 		}
-		return p, body
+		return r, p, body
 	}
 
 	t.Run("opted-in entry omits reasoning_content on the wire", func(t *testing.T) {
-		p, body := routed(t, true)
+		_, p, body := routed(t, true)
 		if !p.omitReasoningHistory {
 			t.Error("provider omitReasoningHistory = false, want true (threaded from ProviderEntry)")
 		}
@@ -1272,7 +1285,7 @@ func TestNewRouter_ProviderEntryOmitReasoningHistoryPlumbing(t *testing.T) {
 	})
 
 	t.Run("default entry keeps the DeepSeek V4 echo", func(t *testing.T) {
-		p, body := routed(t, false)
+		_, p, body := routed(t, false)
 		if p.omitReasoningHistory {
 			t.Error("provider omitReasoningHistory = true, want the zero value false")
 		}
@@ -1282,6 +1295,85 @@ func TestNewRouter_ProviderEntryOmitReasoningHistoryPlumbing(t *testing.T) {
 		assistant := assistantHistory(t, *body)
 		if got := assistant["reasoning_content"]; got != "I considered it." {
 			t.Errorf("assistant history reasoning_content = %v, want %q (DeepSeek V4 echo contract)", got, "I considered it.")
+		}
+	})
+
+	// The end-to-end shape a multi-turn agent loop actually submits: the
+	// assistant's tool call is answered by a tool-role message BEFORE the next
+	// user turn, and the whole exchange travels through Router.Call — not the
+	// extracted provider — so the test proves the router's request
+	// preparation (with no registry and no sampling func, prepareRequest
+	// injects the deterministic temperature fallback) composes with the
+	// provider's history encoding into a correlated tool turn with the
+	// reasoning field still omitted. Context-window validation is
+	// registry-gated and therefore SKIPPED here — that path has its own
+	// coverage in TestRouter_ContextWindowValidation, and this turn claims
+	// no context-window coverage.
+	t.Run("a complete routed tool turn correlates the result through Router.Call", func(t *testing.T) {
+		r, _, body := routed(t, true)
+		resp, err := r.Call(context.Background(), requestToolTurn())
+		if err != nil {
+			t.Fatalf("Router.Call: %v", err)
+		}
+		if resp.Message.Content != "ok" {
+			t.Errorf("response content = %q, want the recorder's %q", resp.Message.Content, "ok")
+		}
+
+		var payload struct {
+			Messages []map[string]any `json:"messages"`
+		}
+		if err := json.Unmarshal(*body, &payload); err != nil {
+			t.Fatalf("unmarshal request body: %v", err)
+		}
+		// The replay must preserve the submitted sequence exactly — user,
+		// assistant tool-call turn, tool result, user — with no message
+		// dropped, duplicated or reordered: a serialization that moved the
+		// tool result ahead of its call would still correlate by id and pass
+		// the presence checks below, so order and count are asserted first.
+		if len(payload.Messages) != 4 {
+			t.Fatalf("recorded body replays %d messages, want the 4 submitted: %s", len(payload.Messages), *body)
+		}
+		for i, want := range []string{"user", "assistant", "tool", "user"} {
+			if got := payload.Messages[i]["role"]; got != want {
+				t.Errorf("messages[%d].role = %v, want %q (replay must preserve order)", i, got, want)
+			}
+		}
+		assistant, tool := payload.Messages[1], payload.Messages[2]
+		if got, present := assistant["reasoning_content"]; present {
+			t.Errorf("assistant history reasoning_content = %v, want absent (OmitReasoningHistory set)", got)
+		}
+		if got := assistant["content"]; got != "done" {
+			t.Errorf("assistant history content = %v, want %q", got, "done")
+		}
+		calls, ok := assistant["tool_calls"].([]any)
+		if !ok || len(calls) != 1 {
+			t.Fatalf("assistant history tool_calls = %v, want the 1 replayed call", assistant["tool_calls"])
+		}
+		call, ok := calls[0].(map[string]any)
+		if !ok {
+			t.Fatalf("tool_calls[0] = %T, want an object", calls[0])
+		}
+		if got := call["id"]; got != "call-1" {
+			t.Errorf("tool_calls[0].id = %v, want %q", got, "call-1")
+		}
+		if got := call["type"]; got != "function" {
+			t.Errorf("tool_calls[0].type = %v, want the %q discriminator the wire schema requires", got, "function")
+		}
+		fn, ok := call["function"].(map[string]any)
+		if !ok {
+			t.Fatalf("tool_calls[0].function = %T, want an object", call["function"])
+		}
+		if got := fn["name"]; got != "search" {
+			t.Errorf("tool_calls[0].function.name = %v, want %q", got, "search")
+		}
+		if got := fn["arguments"]; got != `{"q":"test"}` {
+			t.Errorf("tool_calls[0].function.arguments = %v, want the raw %q", got, `{"q":"test"}`)
+		}
+		if got := tool["tool_call_id"]; got != "call-1" {
+			t.Errorf("tool message tool_call_id = %v, want %q (the result must correlate with the replayed call)", got, "call-1")
+		}
+		if got := tool["content"]; got != `{"hits":1}` {
+			t.Errorf("tool message content = %v, want %q", got, `{"hits":1}`)
 		}
 	})
 }
