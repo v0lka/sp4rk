@@ -137,6 +137,15 @@ type ProviderEntry struct {
 	// Zero value = no such requirement; requests follow their historical
 	// streaming/non-streaming shape.
 	RequireStreaming bool
+	// OmitReasoningHistory stops the provider from echoing assistant
+	// ReasoningContent back to the endpoint as the "reasoning_content" extra
+	// field on subsequent request messages. Zero value = echo (the DeepSeek
+	// V4 contract, preserved for every existing deployment). Set it for an
+	// endpoint whose chat template rejects the unknown field (e.g. a
+	// llama.cpp-served model without a DeepSeek-style template).
+	// It is threaded through to OpenAIProviderConfig.OmitReasoningHistory
+	// for the request-building seam to act on.
+	OmitReasoningHistory bool
 }
 
 // Router routes LLM calls to the active provider.
@@ -189,7 +198,7 @@ func NewRouter(ctx context.Context, cfg RouterConfig, registry *ModelRegistry) (
 		if providerClient == nil {
 			providerClient = cfg.HTTPClient
 		}
-		provider, err := createProviderFromConfig(ctx, entry.Name, entry.ProviderType, entry.APIKey, entry.BaseURL, providerClient, cfg.Logger, entry.ReasoningWire, entry.TokenSource, entry.RequireStreaming)
+		provider, err := createProviderFromConfig(ctx, entry.Name, entry.ProviderType, entry.APIKey, entry.BaseURL, providerClient, cfg.Logger, entry.ReasoningWire, entry.TokenSource, entry.RequireStreaming, entry.OmitReasoningHistory)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create provider %q: %w", entry.Name, err)
 		}
@@ -282,18 +291,21 @@ func NewRouter(ctx context.Context, cfg RouterConfig, registry *ModelRegistry) (
 // transport (see TokenSource for the full per-protocol contract).
 // requireStreaming marks the endpoint as
 // streaming-wire-only; likewise consumed only where the seam supports it.
-func createProviderFromConfig(ctx context.Context, name, provType, apiKey, baseURL string, httpClient *http.Client, logger *slog.Logger, reasoningWire ReasoningWire, tokenSource TokenSource, requireStreaming bool) (Provider, error) {
+// omitReasoningHistory stops the provider from echoing reasoning_content on
+// request assistant messages (see OpenAIProviderConfig.OmitReasoningHistory).
+func createProviderFromConfig(ctx context.Context, name, provType, apiKey, baseURL string, httpClient *http.Client, logger *slog.Logger, reasoningWire ReasoningWire, tokenSource TokenSource, requireStreaming, omitReasoningHistory bool) (Provider, error) {
 	switch provType {
 	case "openai":
 		return NewOpenAIProvider(OpenAIProviderConfig{
-			Name:             name,
-			APIKey:           apiKey,
-			BaseURL:          baseURL,
-			HTTPClient:       httpClient,
-			Logger:           logger,
-			ReasoningWire:    reasoningWire,
-			TokenSource:      tokenSource,
-			RequireStreaming: requireStreaming,
+			Name:                 name,
+			APIKey:               apiKey,
+			BaseURL:              baseURL,
+			HTTPClient:           httpClient,
+			Logger:               logger,
+			ReasoningWire:        reasoningWire,
+			TokenSource:          tokenSource,
+			RequireStreaming:     requireStreaming,
+			OmitReasoningHistory: omitReasoningHistory,
 		})
 
 	case "anthropic":

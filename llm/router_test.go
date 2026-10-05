@@ -577,7 +577,7 @@ func TestCreateProviderFromConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			p, err := createProviderFromConfig(context.Background(), tt.providerName, tt.provType, tt.apiKey, tt.baseURL, nil, nil, ReasoningWireVendorDefault, nil, false)
+			p, err := createProviderFromConfig(context.Background(), tt.providerName, tt.provType, tt.apiKey, tt.baseURL, nil, nil, ReasoningWireVendorDefault, nil, false, false)
 			if tt.wantErr {
 				if err == nil {
 					t.Error("expected error, got nil")
@@ -1174,6 +1174,114 @@ func TestNewRouter_ProviderEntryReasoningWirePlumbing(t *testing.T) {
 		}
 		if strings.Contains(string(*body), "chat_template_kwargs") {
 			t.Errorf("an entry without ReasoningWire must not emit chat_template_kwargs, got %s", *body)
+		}
+	})
+}
+
+// TestNewRouter_ProviderEntryOmitReasoningHistoryPlumbing proves the
+// OmitReasoningHistory switch travels the whole way — RouterConfig →
+// ProviderEntry → createProviderFromConfig → OpenAIProviderConfig →
+// OpenAIProvider → request body. An entry that opts in replays assistant
+// history with NO reasoning_content field (an endpoint whose chat template
+// rejects the unknown field would fail the whole request); an entry that
+// does not opt in keeps the DeepSeek V4 echo contract.
+func TestNewRouter_ProviderEntryOmitReasoningHistoryPlumbing(t *testing.T) {
+	const model = "Bonsai 2 27B"
+
+	// history replays a captured assistant turn (reasoning + tool call),
+	// exactly what a multi-turn loop submits on the next request.
+	request := func() ChatRequest {
+		return ChatRequest{
+			Model:       model,
+			ModelFamily: "qwen",
+			Messages: []Message{
+				{Role: "user", Content: "hi"},
+				{
+					Role:             "assistant",
+					Content:          "done",
+					ReasoningContent: "I considered it.",
+					ToolCalls: []ToolCall{
+						{ID: "call-1", Name: "search", Input: json.RawMessage(`{"q":"test"}`)},
+					},
+				},
+				{Role: "user", Content: "again"},
+			},
+		}
+	}
+
+	// assistantHistory digs the single assistant message out of a recorded
+	// request body.
+	assistantHistory := func(t *testing.T, body []byte) map[string]any {
+		t.Helper()
+		var payload struct {
+			Messages []map[string]any `json:"messages"`
+		}
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Fatalf("unmarshal request body: %v", err)
+		}
+		for _, m := range payload.Messages {
+			if m["role"] == "assistant" {
+				return m
+			}
+		}
+		t.Fatalf("no assistant message in recorded body: %s", body)
+		return nil
+	}
+
+	// routed builds a one-provider router from the given entry flag and
+	// returns the constructed OpenAIProvider plus the recorded body.
+	routed := func(t *testing.T, omit bool) (*OpenAIProvider, *[]byte) {
+		t.Helper()
+		body, srv := chatBodyRecorder(t)
+		r, err := NewRouter(context.Background(), RouterConfig{
+			Providers: []ProviderEntry{{
+				Name:                 "embedded",
+				ProviderType:         "openai",
+				BaseURL:              srv.URL,
+				Models:               []string{model},
+				OmitReasoningHistory: omit,
+			}},
+			MaxRetries: -1, // retries disabled: the recorder answers once
+		}, nil)
+		if err != nil {
+			t.Fatalf("NewRouter: %v", err)
+		}
+		p, ok := r.providers["embedded"].(*OpenAIProvider)
+		if !ok {
+			t.Fatalf("router provider type = %T, want *OpenAIProvider", r.providers["embedded"])
+		}
+		return p, body
+	}
+
+	t.Run("opted-in entry omits reasoning_content on the wire", func(t *testing.T) {
+		p, body := routed(t, true)
+		if !p.omitReasoningHistory {
+			t.Error("provider omitReasoningHistory = false, want true (threaded from ProviderEntry)")
+		}
+		if _, err := p.ChatCompletion(context.Background(), request()); err != nil {
+			t.Fatalf("ChatCompletion: %v", err)
+		}
+		assistant := assistantHistory(t, *body)
+		if got, present := assistant["reasoning_content"]; present {
+			t.Errorf("assistant history reasoning_content = %v, want absent (OmitReasoningHistory set)", got)
+		}
+		toolCalls, ok := assistant["tool_calls"].([]any)
+		if !ok || len(toolCalls) != 1 {
+			t.Errorf("assistant history tool_calls = %v, want the 1 replayed call", assistant["tool_calls"])
+		}
+	})
+
+	t.Run("default entry keeps the DeepSeek V4 echo", func(t *testing.T) {
+		p, body := routed(t, false)
+		if p.omitReasoningHistory {
+			t.Error("provider omitReasoningHistory = true, want the zero value false")
+		}
+		if _, err := p.ChatCompletion(context.Background(), request()); err != nil {
+			t.Fatalf("ChatCompletion: %v", err)
+		}
+		assistant := assistantHistory(t, *body)
+		if got := assistant["reasoning_content"]; got != "I considered it." {
+			t.Errorf("assistant history reasoning_content = %v, want %q (DeepSeek V4 echo contract)", got, "I considered it.")
 		}
 	})
 }

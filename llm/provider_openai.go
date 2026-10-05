@@ -58,21 +58,34 @@ type OpenAIProviderConfig struct {
 	// path to act on.
 	// Zero value = no such requirement.
 	RequireStreaming bool
+	// OmitReasoningHistory stops the provider from echoing assistant
+	// ReasoningContent back to the endpoint as the "reasoning_content" extra
+	// field on subsequent request messages. Zero value = echo (the DeepSeek
+	// V4 contract: reasoning_content must ride EVERY assistant message in
+	// thinking mode, even an empty one, or the endpoint answers 400). Set it
+	// for endpoints whose chat template rejects an unknown
+	// "reasoning_content" message field (e.g. a llama.cpp server without a
+	// DeepSeek-style template, which fails the request on strict template
+	// rendering).
+	// Seam field: it is carried on the provider (omitReasoningHistory) for
+	// the request-building path to act on.
+	OmitReasoningHistory bool
 }
 
 // OpenAIProvider implements Provider for OpenAI and compatible APIs.
 type OpenAIProvider struct {
-	client            *oai.Client        // official SDK for Chat Completions API
-	responsesClient   *oai.Client        // official SDK for Responses API
-	anthropicDelegate *AnthropicProvider // serves ProtocolAnthropic models (Claude) via a co-located Anthropic provider using the same baseURL/APIKey/HTTPClient/Logger
-	name              string
-	baseURL           string       // empty = default OpenAI; non-empty = compatible provider
-	apiKey            string       // API key (passed to the Google delegate; empty for local backends)
-	httpClient        *http.Client // optional proxy-configured HTTP client (passed to the Google delegate; nil = http.DefaultClient)
-	logger            *slog.Logger
-	reasoningWire     ReasoningWire // Qwen reasoning-control spelling for this endpoint (zero = vendor default)
-	requireStreaming  bool          // endpoint accepts streaming calls only (seam; see OpenAIProviderConfig.RequireStreaming)
-	tokenSource       TokenSource   // dynamic per-request credentials, threaded to the Anthropic/Google delegates too (nil = static key)
+	client               *oai.Client        // official SDK for Chat Completions API
+	responsesClient      *oai.Client        // official SDK for Responses API
+	anthropicDelegate    *AnthropicProvider // serves ProtocolAnthropic models (Claude) via a co-located Anthropic provider using the same baseURL/APIKey/HTTPClient/Logger
+	name                 string
+	baseURL              string       // empty = default OpenAI; non-empty = compatible provider
+	apiKey               string       // API key (passed to the Google delegate; empty for local backends)
+	httpClient           *http.Client // optional proxy-configured HTTP client (passed to the Google delegate; nil = http.DefaultClient)
+	logger               *slog.Logger
+	reasoningWire        ReasoningWire // Qwen reasoning-control spelling for this endpoint (zero = vendor default)
+	requireStreaming     bool          // endpoint accepts streaming calls only (seam; see OpenAIProviderConfig.RequireStreaming)
+	tokenSource          TokenSource   // dynamic per-request credentials, threaded to the Anthropic/Google delegates too (nil = static key)
+	omitReasoningHistory bool          // stop echoing reasoning_content on request assistant messages (seam; see OpenAIProviderConfig.OmitReasoningHistory)
 }
 
 // log returns the provider's logger, defaulting to slog.Default() when unset.
@@ -145,17 +158,18 @@ func NewOpenAIProvider(cfg OpenAIProviderConfig) (*OpenAIProvider, error) {
 	}
 
 	return &OpenAIProvider{
-		client:            &client,
-		responsesClient:   responsesClient,
-		anthropicDelegate: anthropicDelegate,
-		name:              cfg.Name,
-		baseURL:           cfg.BaseURL,
-		apiKey:            cfg.APIKey,
-		httpClient:        cfg.HTTPClient,
-		logger:            cfg.Logger,
-		reasoningWire:     cfg.ReasoningWire,
-		requireStreaming:  cfg.RequireStreaming,
-		tokenSource:       cfg.TokenSource,
+		client:               &client,
+		responsesClient:      responsesClient,
+		anthropicDelegate:    anthropicDelegate,
+		name:                 cfg.Name,
+		baseURL:              cfg.BaseURL,
+		apiKey:               cfg.APIKey,
+		httpClient:           cfg.HTTPClient,
+		logger:               cfg.Logger,
+		reasoningWire:        cfg.ReasoningWire,
+		requireStreaming:     cfg.RequireStreaming,
+		tokenSource:          cfg.TokenSource,
+		omitReasoningHistory: cfg.OmitReasoningHistory,
 	}, nil
 }
 
@@ -982,10 +996,15 @@ func (p *OpenAIProvider) convertRequestMessage(msg Message) oai.ChatCompletionMe
 		// DeepSeek V4 requires reasoning_content to be echoed back for ALL
 		// assistant messages in thinking mode, even when empty. Constructed
 		// assistant messages (e.g., nudges without tool calls) must also
-		// include the field to avoid 400 errors.
-		assistantParam.SetExtraFields(map[string]any{
-			"reasoning_content": msg.ReasoningContent,
-		})
+		// include the field to avoid 400 errors. OmitReasoningHistory opts
+		// an endpoint out of the echo: a server whose chat template rejects
+		// the unknown field (e.g. llama.cpp without a DeepSeek-style
+		// template) fails the whole request on it.
+		if !p.omitReasoningHistory {
+			assistantParam.SetExtraFields(map[string]any{
+				"reasoning_content": msg.ReasoningContent,
+			})
+		}
 		return oai.ChatCompletionMessageParamUnion{
 			OfAssistant: &assistantParam,
 		}

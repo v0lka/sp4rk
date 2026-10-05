@@ -403,6 +403,53 @@ func TestOpenAIProvider_ConvertRequestMessage_ReasoningContent(t *testing.T) {
 	}
 }
 
+// TestOpenAIProvider_ConvertRequestMessage_OmitReasoningHistory proves the
+// OmitReasoningHistory switch stops the reasoning_content echo at the
+// conversion seam: an endpoint opted out (a llama.cpp server whose chat
+// template rejects the unknown field) gets an assistant message with NO
+// reasoning_content key, tool calls intact. The default echo contract for a
+// zero-value config is covered by TestOpenAIProvider_ConvertRequestMessage_ReasoningContent
+// and its sibling tests above.
+func TestOpenAIProvider_ConvertRequestMessage_OmitReasoningHistory(t *testing.T) {
+	p, err := NewOpenAIProvider(OpenAIProviderConfig{Name: "embedded", APIKey: "k", OmitReasoningHistory: true})
+	if err != nil {
+		t.Fatalf("NewOpenAIProvider: %v", err)
+	}
+
+	msg := Message{
+		Role:             "assistant",
+		Content:          "Let me think.",
+		ReasoningContent: "This is my internal reasoning.",
+		ToolCalls: []ToolCall{
+			{ID: "call-1", Name: "search", Input: json.RawMessage(`{"q":"test"}`)},
+		},
+	}
+
+	result := p.convertRequestMessage(msg)
+
+	if result.OfAssistant == nil {
+		t.Fatalf("expected assistant message, got nil")
+	}
+
+	jsonBytes, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("failed to marshal union: %v", err)
+	}
+
+	var parsed map[string]any
+	if err := json.Unmarshal(jsonBytes, &parsed); err != nil {
+		t.Fatalf("failed to unmarshal JSON: %v", err)
+	}
+
+	if _, ok := parsed["reasoning_content"]; ok {
+		t.Errorf("reasoning_content = %v, want absent (OmitReasoningHistory set)", parsed["reasoning_content"])
+	}
+	toolCalls, ok := parsed["tool_calls"].([]any)
+	if !ok || len(toolCalls) != 1 {
+		t.Fatalf("expected 1 tool call to survive the omission, got %v", parsed["tool_calls"])
+	}
+}
+
 func TestOpenAIProvider_ConvertRequestMessage_ReasoningContentWithToolCalls(t *testing.T) {
 	p, _ := NewOpenAIProvider(OpenAIProviderConfig{Name: "deepseek", APIKey: "k"})
 

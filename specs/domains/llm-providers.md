@@ -27,6 +27,7 @@ type ProviderEntry struct {
     HTTPClient   *http.Client // optional per-provider client override (nil = router-level client)
     TokenSource  TokenSource  // optional per-request bearer credentials (nil = static APIKey)
     RequireStreaming bool     // endpoint accepts streaming calls only (Responses wire path)
+    OmitReasoningHistory bool // Chat Completions assistant replay: false echoes reasoning_content, true omits it
 }
 
 type ModelMetadata struct {
@@ -253,6 +254,7 @@ Retry interaction: `Router.Call` wraps the sink in a **per-attempt guard**. A re
 - `Error.ErrKind` is the transport-independent failure class (`rate_limit`, `overloaded`, `""` unknown): `NewError` derives it from the HTTP status (429/529), and the Anthropic transport sets it from the SDK's error type field for `APIError` cases, which carry no HTTP status. Callers match on `ErrKind` rather than `StatusCode` to stay transport-agnostic. Hand-built `Error` literals must set it explicitly; it is not derived for them.
 - An explicit `ModelMetadata.Protocol` is always honored over substring `DetectProtocol` detection; the router threads the resolved protocol into `ChatRequest.Protocol`, and the provider honors `req.Protocol` when set.
 - Streaming is opt-in via a non-nil `ChatRequest.DeltaSink` and changes only delivery timing: the returned `*ChatResponse` is identical to the synchronous result, a nil sink preserves the synchronous path exactly, and `DeltaSink` is never serialized (`json:"-"`). `Router.Call` never retries an attempt that already emitted a delta.
+- Chat Completions assistant replay honors the per-provider `OmitReasoningHistory` policy: its zero value emits `reasoning_content` for every assistant message, including empty reasoning and constructed nudges; an opted-in provider omits only that field while preserving content and tool calls.
 - On the Responses API path the streaming wire mode is selected by a non-nil `req.DeltaSink` **or** the provider entry's `RequireStreaming`; the assembled `*ChatResponse` always comes from the terminal event via the synchronous path's converter, and `RequireStreaming` requests always carry `store: false` plus `include reasoning.encrypted_content` so `ReasoningItem.EncryptedContent` round-trips across turns.
 
 ## Configuration
@@ -274,6 +276,8 @@ Retry interaction: `Router.Call` wraps the sink in a **per-attempt guard**. A re
 `ProviderEntry.HTTPClient` (optional) overrides the router-level client for that one provider — e.g. a host app giving a single self-signed endpoint its own TLS configuration. Resolution order per entry: `ProviderEntry.HTTPClient` → `RouterConfig.HTTPClient` → SDK default. A zero-value entry behaves exactly as before (shared router-level client).
 
 `ProviderEntry.TokenSource` (optional) resolves the bearer credential immediately before every request leaves the process — on every protocol it serves (the two OpenAI protocols through an SDK middleware, the Anthropic and Google delegates through a wrapping transport / pre-send resolution) — overriding the static `APIKey` credential; `BearerToken.ExtraHeaders` ride along (an empty value removes the header). With a TokenSource configured the OpenAI SDK's internal retries are disabled, so the router's own retry policy owns every attempt: each router retry re-resolves the credential, and a Token failure aborts the call instead of being retried in-SDK. `nil` keeps the static-key behavior. `ProviderEntry.RequireStreaming` (optional) marks an endpoint that accepts streaming calls only on the wire — e.g. a ChatGPT OAuth Codex backend that answers any non-streaming request with an error. It is honored on the Responses protocol path, where it selects `responsesAPICompletionStream` for every call (sink or not) and pins `store: false` plus `include reasoning.encrypted_content` (see [Streaming](#streaming)); the Anthropic branch of the provider ignores it.
+
+`ProviderEntry.OmitReasoningHistory` is a per-provider Chat Completions serialization policy, threaded through `createProviderFromConfig` to `OpenAIProviderConfig.OmitReasoningHistory` and the provider's `convertRequestMessage`. The zero value (`false`) echoes `Message.ReasoningContent` as `reasoning_content` on every replayed assistant message, even when empty; this preserves the DeepSeek V4 thinking-mode contract for tool-call messages and constructed nudges alike. `true` opts an endpoint whose chat template rejects that field (e.g. llama.cpp) out of the echo. Content and tool calls are preserved, and received reasoning remains in `ChatResponse` / message history; the setting changes only outbound assistant replay, not reasoning-effort encoding or Responses API encrypted reasoning replay. Hosts select it per endpoint rather than globally by model family.
 
 ## Extension Points
 
