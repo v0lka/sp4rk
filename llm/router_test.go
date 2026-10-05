@@ -1215,9 +1215,12 @@ func TestNewRouter_ProviderEntryOmitReasoningHistoryPlumbing(t *testing.T) {
 	requestToolTurn := func() ChatRequest {
 		req := request()
 		answered := make([]Message, 0, len(req.Messages)+1)
-		answered = append(answered, req.Messages[0], req.Messages[1])
-		answered = append(answered, Message{Role: "tool", ToolCallID: "call-1", Content: `{"hits":1}`})
-		answered = append(answered, req.Messages[2])
+		answered = append(answered,
+			req.Messages[0],
+			req.Messages[1],
+			Message{Role: "tool", ToolCallID: "call-1", Content: `{"hits":1}`},
+			req.Messages[2],
+		)
 		req.Messages = answered
 		return req
 	}
