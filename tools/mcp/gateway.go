@@ -58,11 +58,46 @@ func (g *Gateway) log() *slog.Logger {
 	return slog.Default()
 }
 
-// SetDefaultWorkDir updates the default working directory for new stdio server connections.
+// SetDefaultWorkDir updates the default working directory that a stdio server
+// with no explicit WorkDir inherits, and re-baselines the recorded diff state
+// so the move does not spuriously reconnect already-connected servers.
+//
+// By contract this is a pure field write: it retargets the directory that
+// servers spawned or restarted AFTERWARDS will use — c0wrk calls it on every
+// project switch, and it must not tear down the live connections. But the
+// inherited directory is baked into each connected server's expandedConfigs
+// entry, the snapshot Reconfigure diffs against. Leaving it stale would make
+// the next Reconfigure resolve every inheriting server to the NEW default, see
+// a WorkDir diff, and reconnect ALL of them — precisely the churn the contract
+// excludes (and, before the benign-exit fix in closeClientBounded, an error on
+// any unrelated mode change). Rewriting the inheriting entries here keeps the
+// recorded state consistent with the live servers: those keep running in the
+// old directory (their real cwd) until something else restarts them, and
+// Reconfigure no longer mistakes the default move for a per-server edit. This
+// mirrors why Reconfigure applies newConfig.DefaultWorkDir before its loop —
+// the comparison must reflect the directory in force at the next call.
+//
+// Only entries whose recorded WorkDir equals the previous default are rewritten
+// — those are the servers that inherited it. An explicit WorkDir is the
+// server's own directory and is left untouched. (A server whose explicit
+// WorkDir happens to equal the previous default is indistinguishable from an
+// inherited one here and is rewritten too; the cost is at most one redundant
+// reconnect, never a wrong directory.)
 func (g *Gateway) SetDefaultWorkDir(dir string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+
+	old := g.defaultWorkDir
 	g.defaultWorkDir = dir
+	if old == dir {
+		return
+	}
+	for name, cfg := range g.expandedConfigs {
+		if cfg.WorkDir == old {
+			cfg.WorkDir = dir
+			g.expandedConfigs[name] = cfg
+		}
+	}
 }
 
 // defaultWorkDirForLocked returns dir if non-empty, otherwise g.defaultWorkDir.

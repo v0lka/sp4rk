@@ -923,7 +923,7 @@ func closeClientBounded(client *mcpclient.Client, cmd *exec.Cmd, grace time.Dura
 	defer timer.Stop()
 	select {
 	case err := <-closeDone:
-		return err
+		return normalizeCloseError(err)
 	case <-timer.C:
 	}
 
@@ -938,6 +938,30 @@ func closeClientBounded(client *mcpclient.Client, cmd *exec.Cmd, grace time.Dura
 		return fmt.Errorf("server did not exit within %s of stdin close; killed", grace)
 	}
 	return fmt.Errorf("server close did not return within %s; abandoned", grace)
+}
+
+// normalizeCloseError classifies the result of an MCP client Close. A stdio
+// server that exits with a NON-ZERO status after its stdin is closed has still
+// disconnected cleanly: closing stdin IS the MCP shutdown request, the child
+// was reaped, and the transport is done — the process's own exit code says
+// nothing about whether the close succeeded. cmd.Wait surfaces that code as a
+// bare *exec.ExitError, and real launchers emit non-zero teardown codes
+// routinely (`gh mcp` exits 255; a SIGPIPE-killed child reports "signal: broken
+// pipe"). Returning it would turn an ordinary teardown into a spurious error on
+// every Reconfigure that reconnects the server (surfaced to the user as a mode
+// change failing) and on every shutdown ("N servers failed to stop cleanly").
+// Any other close failure — a stdin/stderr close error, or a wait that failed
+// for a reason other than the child's exit status — is returned unchanged.
+//
+// The kill and abandon paths above do NOT funnel through here: they build their
+// own "did not exit within ...; killed" / "abandoned" errors, which stay errors
+// because it is the server (not its exit code) that is the anomaly there.
+func normalizeCloseError(err error) error {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return nil
+	}
+	return err
 }
 
 // IsConnected returns whether the server is currently connected.

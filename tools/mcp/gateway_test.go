@@ -1517,3 +1517,99 @@ func TestGateway_StartAppliesDefaultWorkDir(t *testing.T) {
 		t.Errorf("expected defaultWorkDir %q, got %q", "/updated/workspace", dir)
 	}
 }
+
+// TestGateway_SetDefaultWorkDir_RebaselinesInheritedWorkDir pins the D1 fix at
+// the unit level: SetDefaultWorkDir must rewrite the recorded WorkDir of every
+// server that INHERITED the default, so the next Reconfigure does not diff them
+// as changed, while leaving a server with an explicit WorkDir untouched.
+func TestGateway_SetDefaultWorkDir_RebaselinesInheritedWorkDir(t *testing.T) {
+	gw := newGateway()
+	gw.defaultWorkDir = "/old"
+	gw.expandedConfigs["inherited"] = ServerConfig{Command: "cmd", WorkDir: "/old"}
+	gw.expandedConfigs["explicit"] = ServerConfig{Command: "cmd", WorkDir: "/own"}
+
+	gw.SetDefaultWorkDir("/new")
+
+	if got := gw.expandedConfigs["inherited"].WorkDir; got != "/new" {
+		t.Errorf("inherited expandedConfigs WorkDir = %q, want %q", got, "/new")
+	}
+	if got := gw.expandedConfigs["explicit"].WorkDir; got != "/own" {
+		t.Errorf("explicit expandedConfigs WorkDir = %q, want %q (an explicit WorkDir must not be rebaselined)", got, "/own")
+	}
+
+	// The reconfigure-time resolution of the inherited server (empty entry
+	// WorkDir → the current default) must now compare equal: no spurious diff.
+	if gw.configChanged("inherited", ServerConfig{Command: "cmd", WorkDir: gw.defaultWorkDirForLocked("")}) {
+		t.Error("configChanged = true for an inherited server after a default move, want false (spurious reconnect)")
+	}
+}
+
+// TestGateway_Reconfigure_AfterDefaultWorkDirMove_NoReconnect is the end-to-end
+// regression for finding D1. c0wrk calls SetDefaultWorkDir on every project
+// switch — a "pure field write" that by contract only affects servers spawned
+// or restarted afterwards. Before the fix the move was invisible to
+// expandedConfigs, so the NEXT Reconfigure resolved every inheriting server
+// against the new default, saw a WorkDir diff, and reconnected ALL of them —
+// which, combined with D2, surfaced as an error on any mode change. This test
+// drives a real stdio server: after the move an UNCHANGED reconfigure must
+// preserve the live connection, while a genuine per-server edit must still
+// reconnect (guarding against an over-fix that never reconnects).
+func TestGateway_Reconfigure_AfterDefaultWorkDirMove_NoReconnect(t *testing.T) {
+	ctx := context.Background()
+	registry := sdktools.NewToolRegistry()
+	expand := func(s string) string { return s }
+
+	// The default work dir is applied to the stdio child as its cwd, so it must
+	// name an existing directory (a project workspace does).
+	projA := t.TempDir()
+	projB := t.TempDir()
+
+	entry := ServerEntry{
+		Transport:   "stdio",
+		Command:     stdioHelperCommand(t),
+		Env:         map[string]string{stdioHelperEnvVar: stdioHelperWedge},
+		Timeout:     10 * time.Second,
+		CallTimeout: 10 * time.Second,
+	}
+
+	gw, err := StartGateway(ctx, GatewayConfig{
+		Servers:        map[string]ServerEntry{"helper": entry},
+		DefaultWorkDir: projA,
+	}, registry, expand, nil)
+	if err != nil {
+		t.Fatalf("StartGateway: %v", err)
+	}
+	t.Cleanup(func() { _ = gw.Stop() })
+
+	before := gw.GetServer("helper")
+	if before == nil {
+		t.Fatal("helper did not connect")
+	}
+
+	// Simulate a project switch: retarget the default out of band, exactly as
+	// SetMCPWorkDir does when the active project changes.
+	gw.SetDefaultWorkDir(projB)
+
+	// A reconfigure with the SAME config (DefaultWorkDir empty, as a mode
+	// change sends) must not reconnect: nothing about the server changed.
+	if err := gw.Reconfigure(ctx, GatewayConfig{
+		Servers: map[string]ServerEntry{"helper": entry},
+	}, registry, expand); err != nil {
+		t.Fatalf("Reconfigure after an out-of-band default-workdir move: %v", err)
+	}
+	if after := gw.GetServer("helper"); after != before {
+		t.Error("unchanged server was reconnected after a default-workdir move; the live connection must be preserved")
+	}
+
+	// Guard against over-fixing: a genuine per-server edit must still reconnect.
+	edited := entry
+	edited.Env = map[string]string{stdioHelperEnvVar: stdioHelperWedge, "SP4RK_MCP_EXTRA": "1"}
+	if err := gw.Reconfigure(ctx, GatewayConfig{
+		Servers: map[string]ServerEntry{"helper": edited},
+	}, registry, expand); err != nil {
+		t.Fatalf("Reconfigure after a genuine edit: %v", err)
+	}
+	if after := gw.GetServer("helper"); after == before {
+		t.Error("server was not reconnected after a genuine config edit")
+	}
+}

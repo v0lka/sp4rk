@@ -569,6 +569,12 @@ const (
 	// stdioHelperSleep is a plain long-lived process that ignores every signal
 	// but SIGKILL — the grandchild spawned by stdioHelperTree.
 	stdioHelperSleep = "sleep"
+	// stdioHelperExitNonZero answers the handshake like the well-behaved
+	// default, but exits with a NON-ZERO status the moment stdin closes — the
+	// launcher-propagated teardown code (e.g. `gh mcp` exits 255) that
+	// cmd.Wait surfaces as *exec.ExitError. Server.Close must treat that as a
+	// clean disconnect, not a close failure (finding D2).
+	stdioHelperExitNonZero = "exitnonzero"
 )
 
 // stdioHelperPidFileEnv names the file the tree helper writes its grandchild's
@@ -655,6 +661,16 @@ func runStdioHelper(mode string) {
 
 	dec := json.NewDecoder(os.Stdin)
 	enc := json.NewEncoder(os.Stdout)
+	// teardownExitCode is the status this helper exits with once stdin closes.
+	// Zero for the well-behaved modes; non-zero for stdioHelperExitNonZero,
+	// which models a server whose launcher propagates a non-zero teardown code
+	// (`gh mcp` exits 255). The child still terminates promptly on EOF — no
+	// kill needed — so only cmd.Wait's *exec.ExitError distinguishes it from a
+	// clean exit; Server.Close must treat both as a clean disconnect (D2).
+	teardownExitCode := 0
+	if mode == stdioHelperExitNonZero {
+		teardownExitCode = 3
+	}
 	for {
 		var req struct {
 			ID     json.RawMessage `json:"id"`
@@ -662,7 +678,11 @@ func runStdioHelper(mode string) {
 			Params json.RawMessage `json:"params"`
 		}
 		if err := dec.Decode(&req); err != nil {
-			return // EOF (or broken pipe): the client is gone, exit.
+			// EOF (or broken pipe): the client is gone, exit.
+			if teardownExitCode != 0 {
+				os.Exit(teardownExitCode)
+			}
+			return
 		}
 		if len(req.ID) == 0 {
 			continue // notification (e.g. notifications/initialized)
@@ -832,6 +852,33 @@ func TestServer_Close_PoliteServerReturnsNilError(t *testing.T) {
 	s := connectStdioHelper(t, time.Second)
 	if err := s.Close(); err != nil {
 		t.Fatalf("close of a server that exits on stdin EOF returned an error: %v", err)
+	}
+}
+
+// TestServer_Close_NonZeroExitIsClean pins finding D2: a stdio server that
+// exits with a NON-ZERO status after stdin EOF has still disconnected cleanly.
+// stdin close is the MCP shutdown request, the child was reaped, the transport
+// is done — the process's own exit code is not a close failure. Real servers
+// do this constantly: `gh mcp` exits 255 on teardown and a SIGPIPE-killed
+// child reports "signal: broken pipe", both surfacing as the raw
+// *exec.ExitError from cmd.Wait. Returning that error would make every
+// Reconfigure that reconnects the server — and every app shutdown — report a
+// benign teardown as a failure (the reported symptom: a mode change on ANY MCP
+// server errors out).
+func TestServer_Close_NonZeroExitIsClean(t *testing.T) {
+	s := newServer("exitnonzero")
+	if err := s.Connect(context.Background(), stdioHelperServerConfig(t, stdioHelperExitNonZero, time.Second, time.Second)); err != nil {
+		t.Fatalf("Connect to scripted stdio helper: %v", err)
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("close of a server that exited non-zero on stdin EOF returned an error: %v", err)
+	}
+	if s.IsConnected() {
+		t.Error("server must be disconnected after Close")
+	}
+	if got := s.Status().Error; got != "" {
+		t.Errorf("Status().Error = %q, want empty after a clean disconnect", got)
 	}
 }
 
