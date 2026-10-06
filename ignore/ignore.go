@@ -234,6 +234,11 @@ func (r *Resolver) matchOne(path string, isDir bool, origin string) bool {
 // directory that is itself ignored by the patterns collected so far is pruned
 // too — once a directory is ignored, ignore files beneath it are irrelevant.
 //
+// Only regular files are read: an ignore-named entry that is a FIFO, socket,
+// or device is skipped rather than opened, because a read-open of a FIFO
+// blocks until a writer appears and would hang the walk (see the guard in the
+// callback). Symlinks are followed to their target, matching os.Open.
+//
 // The walk is cooperatively cancellable via ctx: once ctx is done, the walk
 // abandons the rest of the tree and returns an error wrapping ctx's error.
 // The check happens on every entry, which is negligible next to the
@@ -249,6 +254,18 @@ func (r *Resolver) load(ctx context.Context) error {
 		if !d.IsDir() {
 			if !ignoreFileNames[d.Name()] {
 				return nil
+			}
+			// Only regular files are read. A read-open (O_RDONLY) of a FIFO
+			// blocks until a writer appears, and of a socket/device can block
+			// too; the context check above runs only between entries, so it
+			// cannot interrupt a goroutine blocked inside the open(2) syscall.
+			// A single leftover FIFO named ".gitignore" beneath a root is
+			// therefore enough to hang the whole walk — and any shutdown join
+			// waiting on it — indefinitely. os.Stat follows a symlink (keeping
+			// the previous behaviour of reading a symlinked ignore file) and
+			// itself never blocks on a FIFO.
+			if info, statErr := os.Stat(path); statErr != nil || !info.Mode().IsRegular() {
+				return nil //nolint:nilerr // skip non-regular/unstattable entries; continue the walk
 			}
 			relDir, relErr := filepath.Rel(r.root, filepath.Dir(path))
 			if relErr != nil {
