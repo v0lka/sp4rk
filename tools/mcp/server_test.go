@@ -553,6 +553,11 @@ const (
 	// any other tool (notably "wedge") so that call can only end via
 	// timeout or cancellation.
 	stdioHelperWedge = "wedge"
+	// stdioHelperIgnoreEOF answers initialize so a connection can be
+	// established, then deliberately refuses to exit on stdin EOF for a long
+	// time — the field-observed "draining server" that a bounded Close must
+	// kill at the grace boundary instead of waiting for.
+	stdioHelperIgnoreEOF = "ignoreseof"
 )
 
 // TestMain lets the same test binary act as a scripted stdio MCP server when it
@@ -580,6 +585,42 @@ func runStdioHelper(mode string) {
 		// only be ended by the client's timeout.
 		_, _ = io.Copy(io.Discard, os.Stdin)
 		return
+	}
+
+	if mode == stdioHelperIgnoreEOF {
+		// Answer the handshake so a connection can be established, then hold
+		// the process alive long after stdin EOF: Close must kill this
+		// process at the grace boundary rather than wait out the sleep. (The
+		// sleep only ever completes if the test failed before reaching the
+		// kill, in which case the helper lingers briefly — the same class of
+		// residue as noinit's forever-copy.)
+		dec := json.NewDecoder(os.Stdin)
+		enc := json.NewEncoder(os.Stdout)
+		for {
+			var req struct {
+				ID     json.RawMessage `json:"id"`
+				Method string          `json:"method"`
+			}
+			if err := dec.Decode(&req); err != nil {
+				time.Sleep(30 * time.Second) // kill target: refuses stdin EOF
+				return
+			}
+			if len(req.ID) == 0 {
+				continue // notification (e.g. notifications/initialized)
+			}
+			if req.Method == "initialize" {
+				writeHelperResult(enc, req.ID, map[string]any{
+					"protocolVersion": mcp.LATEST_PROTOCOL_VERSION,
+					"capabilities":    map[string]any{},
+					"serverInfo": map[string]any{
+						"name":    "stdio-helper",
+						"version": "1.0.0",
+					},
+				})
+			}
+			// Every other request is left unanswered: the Close test needs
+			// only a completed handshake.
+		}
 	}
 
 	dec := json.NewDecoder(os.Stdin)
@@ -686,6 +727,51 @@ func connectStdioHelper(t *testing.T, callTimeout time.Duration) *Server {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 	return s
+}
+
+// TestServer_Close_KillsServerThatIgnoresStdinEOF verifies the bounded close:
+// a stdio server that refuses to exit after stdin EOF — the field-observed
+// draining behavior that once stalled app shutdown for the server's full
+// drain time — is killed at the grace boundary instead of being waited for
+// indefinitely, the kill is reaped inside Close, and the error reports it.
+func TestServer_Close_KillsServerThatIgnoresStdinEOF(t *testing.T) {
+	const grace = 300 * time.Millisecond
+
+	s := newServer("ignoreseof")
+	s.closeGrace = grace
+	if err := s.Connect(context.Background(), stdioHelperServerConfig(t, stdioHelperIgnoreEOF, 10*time.Second, 10*time.Second)); err != nil {
+		t.Fatalf("Connect to scripted stdio helper: %v", err)
+	}
+
+	start := time.Now()
+	err := s.Close()
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected the bounded close to report a killed server, got nil")
+	}
+	if !strings.Contains(err.Error(), "killed") {
+		t.Errorf("close error should report the kill, got: %v", err)
+	}
+	if elapsed < grace-50*time.Millisecond {
+		t.Errorf("close returned before the %v grace elapsed (%v)", grace, elapsed)
+	}
+	if elapsed > grace+5*time.Second {
+		t.Errorf("close did not kill at the grace boundary (took %v)", elapsed)
+	}
+	if s.IsConnected() {
+		t.Error("server must be disconnected after Close")
+	}
+}
+
+// TestServer_Close_PoliteServerReturnsNilError keeps the common path honest:
+// a server that exits on stdin EOF within the grace still closes with a nil
+// error — the kill path must not leak into well-behaved teardown.
+func TestServer_Close_PoliteServerReturnsNilError(t *testing.T) {
+	s := connectStdioHelper(t, time.Second)
+	if err := s.Close(); err != nil {
+		t.Fatalf("close of a server that exits on stdin EOF returned an error: %v", err)
+	}
 }
 
 // TestServer_Connect_StdioHandshakeTimeout verifies that a server which reads

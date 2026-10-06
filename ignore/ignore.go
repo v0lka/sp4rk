@@ -13,6 +13,7 @@ package ignore
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -75,7 +76,31 @@ type Resolver struct {
 // longest-existing-prefix resolution (rather than a strict EvalSymlinks on the
 // whole path) so a root that does not fully exist yet still loads cleanly.
 // A failure to resolve, read, or walk returns a wrapping error.
+//
+// It is NewResolverContext over context.Background(): the walk cannot be
+// abandoned. Callers that build resolvers on goroutines a shutdown must join
+// should prefer NewResolverContext.
 func NewResolver(root string) (*Resolver, error) {
+	return NewResolverContext(context.Background(), root)
+}
+
+// NewResolverContext is NewResolver with cooperative cancellation: the walk
+// checks ctx on every directory entry and, once it is done, abandons the rest
+// of the tree and returns a nil Resolver with an error wrapping ctx's error
+// (detect via errors.Is(err, context.Canceled)). A nil ctx means
+// context.Background.
+//
+// It exists because the walk cost is unbounded: a root with hundreds of
+// thousands of entries (a Go module cache, a monorepo vendor tree) takes
+// minutes to walk, and a caller that joins such a walk on shutdown would
+// otherwise stay quiescing for its whole join budget with no way to shorten
+// it. With the context, the joiner cancels first and the walk returns at the
+// next entry. The partial result is discarded — a cancelled build never
+// publishes a half-collected resolver.
+func NewResolverContext(ctx context.Context, root string) (*Resolver, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	absRoot, err := filepath.Abs(filepath.Clean(root))
 	if err != nil {
 		return nil, fmt.Errorf("ignore: resolve root %q: %w", root, err)
@@ -92,7 +117,7 @@ func NewResolver(root string) (*Resolver, error) {
 		root:            absRoot,
 		caseInsensitive: pathutil.DetectCaseInsensitive(absRoot),
 	}
-	if err := r.load(); err != nil {
+	if err := r.load(ctx); err != nil {
 		return nil, fmt.Errorf("ignore: load root %q: %w", absRoot, err)
 	}
 	return r, nil
@@ -208,8 +233,16 @@ func (r *Resolver) matchOne(path string, isDir bool, origin string) bool {
 // source we want to honour ignore files for, and it can be enormous), and any
 // directory that is itself ignored by the patterns collected so far is pruned
 // too — once a directory is ignored, ignore files beneath it are irrelevant.
-func (r *Resolver) load() error {
+//
+// The walk is cooperatively cancellable via ctx: once ctx is done, the walk
+// abandons the rest of the tree and returns an error wrapping ctx's error.
+// The check happens on every entry, which is negligible next to the
+// readdir/stat work each entry already costs.
+func (r *Resolver) load(ctx context.Context) error {
 	return filepath.WalkDir(r.root, func(path string, d fs.DirEntry, err error) error {
+		if cerr := ctx.Err(); cerr != nil {
+			return fmt.Errorf("ignore: walk of %q cancelled: %w", r.root, cerr)
+		}
 		if err != nil {
 			return err
 		}

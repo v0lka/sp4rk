@@ -116,8 +116,20 @@ type Server struct {
 	// server. A subsequent successful call clears it, as do Connect and Close
 	// (a closed connection can no longer be slow). Guarded by mu.
 	unhealthy bool
-	logger    *slog.Logger
-	mu        sync.RWMutex
+	// stdioCmd is the child process handle captured by the stdio command
+	// factory during connectStdio (nil for HTTP transports, and cleared once a
+	// close has consumed it). Close uses it as the last-resort kill switch for
+	// a server that ignores stdin EOF instead of waiting for it indefinitely.
+	// Guarded by mu (written during Connect, read during Close — both hold the
+	// lock).
+	stdioCmd *exec.Cmd
+	// closeGrace bounds how long Close waits for a server to exit voluntarily
+	// after its stdin is closed before the child is killed. Zero means
+	// defaultServerCloseGrace. Test hook — production code leaves it zero.
+	// Guarded by mu.
+	closeGrace time.Duration
+	logger     *slog.Logger
+	mu         sync.RWMutex
 }
 
 // ToolInfo holds metadata about a tool discovered from an MCP server.
@@ -362,6 +374,10 @@ func (s *Server) connectStdio(ctx context.Context, cfg ServerConfig) (*mcpclient
 					cmd.Dir = workDir
 				}
 				sysproc.HideConsole(cmd)
+				// Record the child handle: Close needs it to kill a server
+				// that ignores stdin EOF instead of waiting for it forever
+				// (see closeClientBounded).
+				s.stdioCmd = cmd
 				return cmd, nil
 			},
 		),
@@ -374,7 +390,11 @@ func (s *Server) connectStdio(ctx context.Context, cfg ServerConfig) (*mcpclient
 	}
 
 	if err := s.initializeClient(ctx, client); err != nil {
-		if closeErr := client.Close(); closeErr != nil {
+		// The child was already spawned by Start, so the handshake-failure
+		// cleanup needs the same bounded close as a live connection: a server
+		// that ignores stdin EOF must not stall the connect-failure path
+		// either.
+		if closeErr := s.closeClientLocked(client); closeErr != nil {
 			s.log().Debug("failed to close MCP client after connection failure", "error", closeErr)
 		}
 		return nil, err
@@ -816,7 +836,30 @@ func (s *Server) CallTool(ctx context.Context, name string, arguments map[string
 	return result, nil
 }
 
+// defaultServerCloseGrace bounds how long Close waits for a server to exit
+// voluntarily after its stdin is closed before the child is killed. Freshly
+// connected stdio servers exit in milliseconds; a server draining in-flight
+// work can take many seconds (observed in the field: ~10s), which is exactly
+// the stall this bound exists to cap.
+const defaultServerCloseGrace = 2 * time.Second
+
+// effectiveCloseGrace resolves the close grace period. Callers hold mu.
+func (s *Server) effectiveCloseGrace() time.Duration {
+	if s.closeGrace > 0 {
+		return s.closeGrace
+	}
+	return defaultServerCloseGrace
+}
+
 // Close shuts down the MCP server connection.
+//
+// The underlying stdio close closes the child's stdin and then blocks in
+// cmd.Wait until the process exits — without a bound of its own. A server
+// that ignores stdin EOF (draining in-flight work, or wedged) would stall
+// whatever goroutine closes it — during app shutdown, the main thread — for
+// as long as it pleases. Close therefore waits at most closeGrace for a
+// voluntary exit and then kills the child: stdin EOF already delivered the
+// polite shutdown request, the kill only reaps what refused it.
 func (s *Server) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -825,7 +868,7 @@ func (s *Server) Close() error {
 		return nil
 	}
 
-	err := s.client.Close()
+	client := s.client
 	s.client = nil
 	s.tools = nil
 	// A closed connection can no longer be slow: drop the advisory unhealthy
@@ -835,10 +878,51 @@ func (s *Server) Close() error {
 	s.consecutiveTimeouts = 0
 	s.unhealthy = false
 	s.lastError = ""
+
+	err := s.closeClientLocked(client)
 	if err != nil {
 		s.lastError = err.Error()
 	}
 	return err
+}
+
+// closeClientLocked closes the transport client with the bounded-close
+// semantics documented on Close, consuming the recorded stdio child handle.
+// Callers hold mu.
+func (s *Server) closeClientLocked(client *mcpclient.Client) error {
+	cmd := s.stdioCmd
+	s.stdioCmd = nil
+	return closeClientBounded(client, cmd, s.effectiveCloseGrace())
+}
+
+// closeClientBounded closes the mcp-go client, killing the recorded stdio
+// child if it has not exited voluntarily within grace. The close runs in its
+// own goroutine because mcp-go's stdio Close blocks in cmd.Wait without a
+// deadline. After a kill that wait unblocks promptly, so the goroutine is
+// always drained and the child is reaped. Without a child handle (HTTP
+// transports) the close result is abandoned to the goroutine on timeout — the
+// Server is discarded by the caller either way, and the HTTP transports carry
+// network timeouts of their own.
+func closeClientBounded(client *mcpclient.Client, cmd *exec.Cmd, grace time.Duration) error {
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- client.Close() }()
+
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case err := <-closeDone:
+		return err
+	case <-timer.C:
+	}
+
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
+		// The kill unblocks client.Close's cmd.Wait, so draining the result
+		// here is bounded and reaps the child instead of leaving a zombie.
+		closeErr := <-closeDone
+		return fmt.Errorf("server did not exit within %s of stdin close; killed (%v)", grace, closeErr)
+	}
+	return fmt.Errorf("server close did not return within %s; abandoned", grace)
 }
 
 // IsConnected returns whether the server is currently connected.

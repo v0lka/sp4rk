@@ -1,9 +1,13 @@
 package ignore
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/v0lka/sp4rk/pathutil"
 )
@@ -711,4 +715,63 @@ func TestNewMultiFromResolvers(t *testing.T) {
 		t.Fatalf("NewMultiFromResolvers(nil, ra) = nil, want non-nil")
 	}
 	assertIgnored(t, m, joinRel(a, "x.secret"), false)
+}
+
+func TestNewResolverContext_PreCancelledContextReturnsCanceled(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, ".gitignore", "build/\n")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	r, err := NewResolverContext(ctx, root)
+	if err == nil {
+		t.Fatal("expected an error from a pre-cancelled context")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error must wrap context.Canceled, got %v", err)
+	}
+	if r != nil {
+		t.Fatal("a cancelled build must not publish a resolver")
+	}
+}
+
+func TestNewResolverContext_CancelDuringWalkAborts(t *testing.T) {
+	root := t.TempDir()
+	// A tree large enough that walking it takes far longer than the 1ms
+	// cancel delay even on a RAM-cached filesystem (10k entries, at least
+	// one syscall each), so the cancellation deterministically lands
+	// mid-walk rather than before the walk starts.
+	for i := 0; i < 100; i++ {
+		dir := fmt.Sprintf("d%03d", i)
+		for j := 0; j < 100; j++ {
+			touchFile(t, root, dir+fmt.Sprintf("/f%03d.txt", j))
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	time.AfterFunc(time.Millisecond, cancel)
+
+	r, err := NewResolverContext(ctx, root)
+	if err == nil {
+		t.Fatal("expected the walk to be aborted by the mid-walk cancellation")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error must wrap context.Canceled, got %v", err)
+	}
+	if r != nil {
+		t.Fatal("a cancelled build must not publish a resolver")
+	}
+}
+
+func TestNewResolverContext_NilContextMeansBackground(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, ".gitignore", "build/\n")
+
+	r, err := NewResolverContext(nil, root)
+	if err != nil {
+		t.Fatalf("NewResolverContext(nil, %q): %v", root, err)
+	}
+	assertIgnored(t, r, joinRel(root, "build/out.o"), true)
 }
