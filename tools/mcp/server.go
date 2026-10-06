@@ -374,6 +374,12 @@ func (s *Server) connectStdio(ctx context.Context, cfg ServerConfig) (*mcpclient
 					cmd.Dir = workDir
 				}
 				sysproc.HideConsole(cmd)
+				// Place the child in its own process group so the whole tree
+				// it spawns can be reaped on close (see closeClientBounded):
+				// `command` is frequently a launcher (npx, pnpm dlx, bunx)
+				// whose real server is a grandchild, so killing just the
+				// direct child would orphan it.
+				sysproc.SetProcessGroup(cmd)
 				// Record the child handle: Close needs it to kill a server
 				// that ignores stdin EOF instead of waiting for it forever
 				// (see closeClientBounded).
@@ -903,6 +909,12 @@ func (s *Server) closeClientLocked(client *mcpclient.Client) error {
 // transports) the close result is abandoned to the goroutine on timeout — the
 // Server is discarded by the caller either way, and the HTTP transports carry
 // network timeouts of their own.
+//
+// The kill reaps the whole process tree (sysproc.KillTree, which targets the
+// child's process group on Unix and uses taskkill /T on Windows), not just the
+// direct child: a stdio server launched through a package runner (npx, pnpm
+// dlx, bunx) is a grandchild of the launcher, and killing only the launcher
+// would leave the server running as an orphan.
 func closeClientBounded(client *mcpclient.Client, cmd *exec.Cmd, grace time.Duration) error {
 	closeDone := make(chan error, 1)
 	go func() { closeDone <- client.Close() }()
@@ -916,11 +928,14 @@ func closeClientBounded(client *mcpclient.Client, cmd *exec.Cmd, grace time.Dura
 	}
 
 	if cmd != nil && cmd.Process != nil {
-		_ = cmd.Process.Kill()
+		_ = sysproc.KillTree(cmd)
 		// The kill unblocks client.Close's cmd.Wait, so draining the result
 		// here is bounded and reaps the child instead of leaving a zombie.
 		closeErr := <-closeDone
-		return fmt.Errorf("server did not exit within %s of stdin close; killed (%v)", grace, closeErr)
+		if closeErr != nil {
+			return fmt.Errorf("server did not exit within %s of stdin close; killed: %w", grace, closeErr)
+		}
+		return fmt.Errorf("server did not exit within %s of stdin close; killed", grace)
 	}
 	return fmt.Errorf("server close did not return within %s; abandoned", grace)
 }

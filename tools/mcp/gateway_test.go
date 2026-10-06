@@ -34,6 +34,29 @@ func TestNewGateway(t *testing.T) {
 	}
 }
 
+// TestGateway_ReconfigureAfterStopRefused pins the shutdown guard: a stopped
+// gateway must not be resurrected by a reconfigure that races Stop. Stop clears
+// the server map, so an unguarded Reconfigure would treat every configured
+// server as new and re-dial it — leaking processes after shutdown.
+func TestGateway_ReconfigureAfterStopRefused(t *testing.T) {
+	gateway := newGateway()
+	if err := gateway.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	err := gateway.Reconfigure(context.Background(), GatewayConfig{
+		Servers: map[string]ServerEntry{
+			"reborn": {Transport: "stdio", Command: "/nonexistent/c0wrk-reconfigure-after-stop"},
+		},
+	}, sdktools.NewToolRegistry(), func(s string) string { return s })
+	if err == nil {
+		t.Fatal("Reconfigure on a stopped gateway must be refused")
+	}
+	if len(gateway.ServerNames()) != 0 {
+		t.Errorf("stopped gateway must stay empty, got servers %v", gateway.ServerNames())
+	}
+}
+
 func TestNewServer(t *testing.T) {
 	server := newServer("test-server")
 	if server == nil {

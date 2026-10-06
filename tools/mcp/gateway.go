@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -32,7 +33,13 @@ type Gateway struct {
 	defaultWorkDir  string
 	schemaSanitizer SchemaSanitizer
 	logger          *slog.Logger
-	mu              sync.RWMutex
+	// stopped is set by Stop: the gateway's connections are gone and it must
+	// not be resurrected. Reconfigure refuses once it is set, so a reconfigure
+	// racing shutdown cannot re-dial servers nothing will stop (Stop clears
+	// servers to an empty map, which Reconfigure would otherwise read as "all
+	// servers new" and reconnect). Guarded by mu.
+	stopped bool
+	mu      sync.RWMutex
 }
 
 // newGateway creates a new Gateway instance.
@@ -77,6 +84,15 @@ func (g *Gateway) Start(ctx context.Context, configs map[string]ServerConfig) er
 	var errs []error
 
 	for name, cfg := range configs {
+		// Stop spawning once the caller's context is done (e.g. an aborted
+		// startup at shutdown): the remaining servers would each be spawned
+		// only to fail their handshake and be torn down again, delaying the
+		// abort. Already-connected servers stay in g.servers and are reaped by
+		// Stop.
+		if ctx.Err() != nil {
+			errs = append(errs, fmt.Errorf("gateway start aborted: %w", ctx.Err()))
+			break
+		}
 		// Apply default working directory if not explicitly set
 		cfg.WorkDir = g.defaultWorkDirForLocked(cfg.WorkDir)
 		server := newServer(name)
@@ -151,6 +167,7 @@ func (g *Gateway) Stop() error {
 	g.servers = make(map[string]*Server)
 	g.expandedConfigs = make(map[string]ServerConfig)
 	g.failedServers = make(map[string]ServerStatus)
+	g.stopped = true
 
 	if len(errs) > 0 {
 		return &StopError{Errors: errs}
@@ -165,6 +182,15 @@ func (g *Gateway) Reconfigure(ctx context.Context, newConfig GatewayConfig,
 	registry *sdktools.ToolRegistry, expandEnv func(string) string) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+
+	// A stopped gateway must not be resurrected. Stop clears g.servers to an
+	// empty map, so without this guard the add/change loop below would treat
+	// every configured server as new and re-dial it — leaking server processes
+	// (and their stdio children) after shutdown. Refusing keeps a reconfigure
+	// that races Stop from undoing it.
+	if g.stopped {
+		return errors.New("mcp gateway: reconfigure rejected: gateway has been stopped")
+	}
 
 	var errs []error
 

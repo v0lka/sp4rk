@@ -769,6 +769,7 @@ func TestNewResolverContext_NilContextMeansBackground(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, root, ".gitignore", "build/\n")
 
+	//nolint:staticcheck // SA1012: passing a nil ctx is the exact behavior under test (nil means context.Background).
 	r, err := NewResolverContext(nil, root)
 	if err != nil {
 		t.Fatalf("NewResolverContext(nil, %q): %v", root, err)

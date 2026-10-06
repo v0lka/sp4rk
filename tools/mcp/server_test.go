@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -558,7 +560,20 @@ const (
 	// time — the field-observed "draining server" that a bounded Close must
 	// kill at the grace boundary instead of waiting for.
 	stdioHelperIgnoreEOF = "ignoreseof"
+	// stdioHelperTree is stdioHelperIgnoreEOF preceded by spawning a
+	// long-lived grandchild and publishing its pid: it models an MCP server
+	// launched through a package runner (npx, pnpm dlx, bunx), where the
+	// client's direct child is the launcher and the real server is a
+	// grandchild only a process-GROUP kill can reap.
+	stdioHelperTree = "tree"
+	// stdioHelperSleep is a plain long-lived process that ignores every signal
+	// but SIGKILL — the grandchild spawned by stdioHelperTree.
+	stdioHelperSleep = "sleep"
 )
+
+// stdioHelperPidFileEnv names the file the tree helper writes its grandchild's
+// pid to, so the test can assert the grandchild dies with the process group.
+const stdioHelperPidFileEnv = "SP4RK_MCP_STDIO_HELPER_PIDFILE"
 
 // TestMain lets the same test binary act as a scripted stdio MCP server when it
 // is re-executed with stdioHelperEnvVar set.
@@ -580,6 +595,21 @@ func TestMain(m *testing.M) {
 // (no reply) rather than a blocked handler: the helper stays responsive to the
 // other requests, and still terminates the instant the client goes away.
 func runStdioHelper(mode string) {
+	if mode == stdioHelperSleep {
+		// A long-lived process that ignores everything but SIGKILL: it only
+		// dies if the whole process group is signalled.
+		time.Sleep(60 * time.Second)
+		return
+	}
+
+	if mode == stdioHelperTree {
+		// Model a package-runner launcher: spawn the real server as a
+		// grandchild (never the client's direct child), publish its pid, then
+		// behave like the ignores-EOF server so Close must kill the group.
+		spawnTreeGrandchild()
+		mode = stdioHelperIgnoreEOF
+	}
+
 	if mode == stdioHelperNoInit {
 		// Read (and discard) forever without ever answering: initialize can
 		// only be ended by the client's timeout.
@@ -673,6 +703,37 @@ func runStdioHelper(mode string) {
 		default:
 			writeHelperError(enc, req.ID, -32601, "method not found")
 		}
+	}
+}
+
+// spawnTreeGrandchild spawns a long-lived grandchild of the MCP client (a
+// child of this helper, which is the client's direct child) and writes its pid
+// to the file named by stdioHelperPidFileEnv. The grandchild models the real
+// MCP server behind a package-runner launcher, so the test can assert a
+// process-GROUP kill reaps it — a direct-child kill would leave it orphaned.
+func spawnTreeGrandchild() {
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	// Rebuild the environment without any inherited helper-mode variable so
+	// the grandchild starts in the "sleep" mode rather than re-entering this
+	// branch.
+	env := make([]string, 0, len(os.Environ())+1)
+	for _, e := range os.Environ() {
+		if strings.HasPrefix(e, stdioHelperEnvVar+"=") {
+			continue
+		}
+		env = append(env, e)
+	}
+	grand := exec.CommandContext(context.Background(), exe)
+	env = append(env, stdioHelperEnvVar+"="+stdioHelperSleep)
+	grand.Env = env
+	if err := grand.Start(); err != nil {
+		return
+	}
+	if pidFile := os.Getenv(stdioHelperPidFileEnv); pidFile != "" {
+		_ = os.WriteFile(pidFile, []byte(strconv.Itoa(grand.Process.Pid)), 0o644)
 	}
 }
 
