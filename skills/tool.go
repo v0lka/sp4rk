@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 
+	"github.com/v0lka/sp4rk/safeio"
 	sdktools "github.com/v0lka/sp4rk/tools"
 )
 
@@ -89,8 +90,9 @@ func (t *ReadSkillResourceTool) Execute(ctx context.Context, input json.RawMessa
 		return sdktools.ErrorResult("invalid resource path: %v", err), nil
 	}
 
-	// Read the file
-	data, err := os.ReadFile(absPath)
+	// Read the file. safeio.ReadFile refuses a non-regular path (a FIFO or
+	// device planted inside a skill directory) without blocking the open.
+	data, err := safeio.ReadFile(absPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return sdktools.ErrorResult("resource %q not found in skill %q", parsed.Path, parsed.Skill), nil

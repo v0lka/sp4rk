@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/v0lka/sp4rk/safeio"
 	"github.com/v0lka/sp4rk/tools"
 )
 
@@ -78,6 +79,13 @@ func (t *EditFileTool) Judge(ctx context.Context, input json.RawMessage) tools.J
 // guarantees readers never observe a partially-written file. The original
 // file's permission bits are preserved (falling back to 0o644 when the file
 // cannot be stat'ed).
+//
+// It is FIFO-safe by construction: the target at path is never open()ed — a
+// fresh regular temporary file is created next to it (os.CreateTemp) and
+// renamed over the target (os.Rename replaces the directory entry without
+// opening it). A FIFO planted at path therefore cannot block this write; the
+// rename simply replaces it with the new regular file. The os.Stat above is
+// used only to copy permission bits and never blocks on a FIFO.
 func atomicWriteFile(path string, data []byte) error {
 	perm := os.FileMode(0o644)
 	if info, err := os.Stat(path); err == nil {
@@ -151,7 +159,10 @@ func (t *EditFileTool) Execute(ctx context.Context, input json.RawMessage) (tool
 		defer checker.Unlock(writePath)
 	}
 
-	data, err := os.ReadFile(writePath)
+	// safeio.ReadFile refuses a non-regular target (FIFO/socket/device) via
+	// fstat on the O_NONBLOCK descriptor, so editing through a path that a
+	// FIFO was planted at returns a clean error instead of hanging the open.
+	data, err := safeio.ReadFile(writePath)
 	if err != nil {
 		return tools.ToolResult{Content: fmt.Sprintf("failed to read file: %v", err), IsError: true}, nil
 	}

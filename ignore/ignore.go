@@ -24,6 +24,7 @@ import (
 
 	"github.com/bmatcuk/doublestar/v4"
 	"github.com/v0lka/sp4rk/pathutil"
+	"github.com/v0lka/sp4rk/safeio"
 )
 
 // ignoreFileNames is the set of files, in any directory, whose patterns are
@@ -277,6 +278,13 @@ func (r *Resolver) load(ctx context.Context) error {
 			}
 			pats, err := readIgnoreFile(path, relDir, d.Name())
 			if err != nil {
+				// A non-regular target swapped in after the os.Stat guard
+				// (the Stat→Open race) is skipped by safeio's fstat instead
+				// of erroring the whole walk, matching the guard's skip
+				// semantics.
+				if errors.Is(err, safeio.ErrNotRegular) {
+					return nil //nolint:nilerr // skip non-regular entry; continue the walk
+				}
 				return fmt.Errorf("read %s: %w", path, err)
 			}
 			r.patterns = append(r.patterns, pats...)
@@ -308,7 +316,12 @@ func (r *Resolver) load(ctx context.Context) error {
 // is the ignore file's base name (".gitignore" or ".aiignore"); it is stamped
 // onto each compiled pattern so callers can later query patterns by origin.
 func readIgnoreFile(absPath, relDir, source string) ([]pattern, error) {
-	f, err := os.Open(absPath)
+	// safeio.Open is O_NONBLOCK and fstat-checks the already-open descriptor,
+	// so a FIFO/socket/device at absPath is refused without blocking. Because
+	// the open itself is guarded, a FIFO swapped in after the walk's os.Stat
+	// guard (a Stat→Open TOCTOU) can no longer defeat the check: the open is
+	// now its own authority, not a second trust of the earlier Stat.
+	f, err := safeio.Open(absPath)
 	if err != nil {
 		return nil, err
 	}

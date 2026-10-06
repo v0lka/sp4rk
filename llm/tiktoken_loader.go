@@ -77,6 +77,15 @@ func init() {
 // URL of a vocabulary file (e.g.
 // https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken);
 // non-URL values are treated as local file paths, mirroring the library.
+//
+// The os.ReadFile calls below are deliberately NOT routed through safeio: the
+// paths are app-owned, never caller- or workspace-controlled. A non-URL value
+// originates from tiktoken-go's own registry of encoding filenames (a constant
+// table baked into the library), and the cache path is synthesised here from
+// TIKTOKEN_CACHE_DIR/DATA_GYM_CACHE_DIR or <TempDir>/data-gym-cache keyed by
+// the sha1 of a tiktoken-go encoding URL. No model output, user message, or
+// workspace entry can supply these paths, so a FIFO cannot be planted at one
+// by an untrusted caller and the FIFO-hang class safeio closes does not apply.
 func (l *boundedBpeLoader) LoadTiktokenBpe(tiktokenBpeFile string) (map[string]int, error) {
 	if !strings.HasPrefix(tiktokenBpeFile, "http://") && !strings.HasPrefix(tiktokenBpeFile, "https://") {
 		// Local path: read directly, no caching — same observable result as

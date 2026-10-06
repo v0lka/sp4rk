@@ -4,8 +4,9 @@ import (
 	"bufio"
 	"fmt"
 	"io"
-	"os"
 	"strings"
+
+	"github.com/v0lka/sp4rk/safeio"
 )
 
 // FileReadParams controls a streaming line-range read from a file.
@@ -63,7 +64,10 @@ func ReadFileRange(params FileReadParams) (*FileReadResult, error) {
 		windowCapped = true
 	}
 
-	f, err := os.Open(params.Path)
+	// safeio.Open refuses a non-regular target (FIFO/socket/device) via fstat
+	// on the already-open, O_NONBLOCK descriptor: a FIFO planted at the path
+	// can never block the open(2) syscall, so a read_file call cannot hang.
+	f, err := safeio.Open(params.Path)
 	if err != nil {
 		return nil, err
 	}
@@ -168,7 +172,9 @@ func ReadSingleLine(path string, lineNum int) (line string, totalLines int, err 
 		return "", 0, fmt.Errorf("lineNum must be >= 1, got %d", lineNum)
 	}
 
-	f, openErr := os.Open(path)
+	// safeio.Open refuses a non-regular target without blocking, so the
+	// tool_result_read escape hatch cannot hang on a FIFO either.
+	f, openErr := safeio.Open(path)
 	if openErr != nil {
 		return "", 0, openErr
 	}

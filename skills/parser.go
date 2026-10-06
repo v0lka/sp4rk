@@ -3,10 +3,10 @@ package skills
 import (
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"regexp"
 
+	"github.com/v0lka/sp4rk/safeio"
 	"gopkg.in/yaml.v3"
 )
 
@@ -28,7 +28,9 @@ func (e *ParseError) Error() string {
 // ParseSkill reads and validates a SKILL.md file, returning a Skill.
 // dirPath is the absolute path to the skill directory (used for DirPath and name validation).
 func ParseSkill(skillMDPath, dirPath string) (*Skill, error) {
-	data, err := os.ReadFile(skillMDPath)
+	// safeio.ReadFile refuses a non-regular SKILL.md (a FIFO planted under
+	// <workspace>/.agents/skills/<name>/) without blocking the open.
+	data, err := safeio.ReadFile(skillMDPath)
 	if err != nil {
 		return nil, fmt.Errorf("read SKILL.md: %w", err)
 	}

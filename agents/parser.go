@@ -3,10 +3,10 @@ package agents
 import (
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"regexp"
 
+	"github.com/v0lka/sp4rk/safeio"
 	"gopkg.in/yaml.v3"
 )
 
@@ -29,7 +29,9 @@ func (e *ParseError) Error() string {
 // agentMDPath is the path to AGENT.md; dirPath is the absolute path to the
 // agent directory (used for DirPath and to validate that name == dir name).
 func ParseAgent(agentMDPath, dirPath string) (*Agent, error) {
-	data, err := os.ReadFile(agentMDPath)
+	// safeio.ReadFile refuses a non-regular AGENT.md (a FIFO planted under
+	// <workspace>/.agents/agents/<name>/) without blocking the open.
+	data, err := safeio.ReadFile(agentMDPath)
 	if err != nil {
 		return nil, fmt.Errorf("read AGENT.md: %w", err)
 	}
