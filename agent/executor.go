@@ -538,6 +538,14 @@ type Executor struct {
 	// pausing (default, backward-compatible behavior).
 	pauseChecker func(context.Context) bool
 
+	// toolCallTimeout bounds a single tool call. When positive, executeToolCall
+	// abandons its wait for e.tools.Execute after this duration and returns
+	// ErrToolTimeout (wrapped with the tool name by the dispatch site), so a
+	// stuck tool cannot block the ReAct loop indefinitely. Zero (the default)
+	// disables the bound, preserving the pre-watchdog behavior. Set via
+	// WithToolCallTimeout or SetToolCallTimeout.
+	toolCallTimeout time.Duration
+
 	// userMessageSource, when non-nil, is invoked at every step boundary in
 	// Run, immediately after the pause check and before the LLM call. A
 	// non-empty return is appended to the trajectory as a nudge-only step
@@ -566,6 +574,7 @@ type executorOptions struct {
 	hitl                    HITLHandler
 	resumeSteps             []Step
 	pauseChecker            func(context.Context) bool
+	toolCallTimeout         time.Duration
 	userMessageSource       func(context.Context) string
 }
 
@@ -585,6 +594,7 @@ var (
 	_ Option = hitlOption{}
 	_ Option = resumeStepsOption{}
 	_ Option = pauseCheckerOption{}
+	_ Option = toolCallTimeoutOption{}
 	_ Option = userMessageSourceOption{}
 )
 
@@ -702,6 +712,20 @@ func WithPauseChecker(checker func(context.Context) bool) Option {
 	return pauseCheckerOption{Checker: checker}
 }
 
+type toolCallTimeoutOption struct{ Timeout time.Duration }
+
+func (o toolCallTimeoutOption) apply(opts *executorOptions) { opts.toolCallTimeout = o.Timeout }
+
+// WithToolCallTimeout installs the per-tool-call ceiling at construction time.
+// When positive, executeToolCall abandons its wait for a tool that exceeds the
+// duration and Run returns an error wrapping ErrToolTimeout (naming the tool),
+// so a stuck tool cannot block the ReAct loop indefinitely. A zero value (the
+// default, fully backward-compatible behavior) disables the bound. See
+// DefaultToolCallTimeout for the recommended value.
+func WithToolCallTimeout(timeout time.Duration) Option {
+	return toolCallTimeoutOption{Timeout: timeout}
+}
+
 type userMessageSourceOption struct{ Source func(context.Context) string }
 
 func (o userMessageSourceOption) apply(opts *executorOptions) { opts.userMessageSource = o.Source }
@@ -755,6 +779,7 @@ func NewExecutor(llmRouter LLMCaller, toolRegistry ToolExecutor, maxSteps int, o
 		nonCacheableTools:       copyNonCacheableTools(defaultNonCacheableTools),
 		resumeSteps:             o.resumeSteps,
 		pauseChecker:            o.pauseChecker,
+		toolCallTimeout:         o.toolCallTimeout,
 		userMessageSource:       o.userMessageSource,
 	}
 }
@@ -824,6 +849,15 @@ func (e *Executor) SetStopTools(names ...string) {
 // ErrPaused sentinel. Pass nil to clear a previously installed checker and
 // restore the default non-pausing behavior. Must be called before Run.
 func (e *Executor) SetPauseChecker(fn func(context.Context) bool) { e.pauseChecker = fn }
+
+// SetToolCallTimeout installs the per-tool-call ceiling. When positive,
+// executeToolCall abandons its wait for a tool that exceeds the duration and
+// Run returns an error wrapping ErrToolTimeout (wrapped with the tool name), so
+// a stuck tool cannot block the ReAct loop indefinitely — pause and cancel
+// remain observable while the tool is in flight. A zero value (the default)
+// disables the bound and restores the pre-watchdog behavior. See
+// DefaultToolCallTimeout for the recommended value. Must be called before Run.
+func (e *Executor) SetToolCallTimeout(timeout time.Duration) { e.toolCallTimeout = timeout }
 
 // SetUserMessageSource installs a live user-message source polled at every
 // step boundary in Run, immediately after the pause check and before the LLM
@@ -1242,12 +1276,30 @@ func isPathWithinWorkspace(ctx context.Context, path, workspaceRoot string) bool
 }
 
 // ErrPaused is returned by Executor.Run when a cooperative pause signal trips
-// at a step boundary. It accompanies a non-nil *ExecutorResult whose Steps hold
-// the trajectory collected so far (including the last completed tool result);
+// at a step boundary (or, since the tool-call watchdog, while a tool call is in
+// flight). It accompanies a non-nil *ExecutorResult whose Steps hold the
+// trajectory collected so far (including the last completed tool result);
 // Finished is false. Callers should errors.Is-check for ErrPaused to distinguish
 // a recoverable checkpoint from cancellation (context.Canceled) or a genuine
 // failure, and may resume the run via WithResumeSteps using the returned Steps.
 var ErrPaused = errors.New("executor paused at step boundary")
+
+// ErrToolTimeout is returned by Executor.Run when a single tool call does not
+// complete within the per-call ceiling configured by SetToolCallTimeout /
+// WithToolCallTimeout. The dispatch sites wrap it with the tool name, so a
+// surfaced error reads `tool "name": tool call timed out`. The run returns
+// promptly with a nil result instead of blocking the ReAct loop indefinitely on
+// a stuck tool; the underlying tool keeps running in its detached goroutine.
+// errors.Is-check for ErrToolTimeout to distinguish it from cancellation or a
+// genuine tool failure.
+var ErrToolTimeout = errors.New("tool call timed out")
+
+// DefaultToolCallTimeout is the recommended per-tool-call ceiling: five
+// minutes. A zero value passed to SetToolCallTimeout / WithToolCallTimeout
+// DISABLES the timeout (the default executor behavior, fully backward
+// compatible). Callers that want the class-wide "no single tool call may block
+// the loop indefinitely" guarantee install this value (or a smaller one).
+const DefaultToolCallTimeout = 5 * time.Minute
 
 // Run executes the ReAct loop for the given task tools and context manager.
 // The caller is responsible for setting the task context (via tools.WithTaskContext)
@@ -1409,6 +1461,13 @@ func (e *Executor) Run(ctx context.Context, taskTools []tools.ToolDescriptor, cw
 
 		// Process tool calls
 		if result, act, toolErr := e.processToolCalls(ctx, resp, thought, state, cw); toolErr != nil {
+			// A cooperative pause observed while a tool call was in flight
+			// carries a resumable, unfinished checkpoint in result; preserve
+			// it exactly as the step-boundary pause does. Every other error
+			// keeps the historical nil-result shape.
+			if errors.Is(toolErr, ErrPaused) {
+				return result, toolErr
+			}
 			return nil, toolErr
 		} else if result != nil {
 			return result, nil

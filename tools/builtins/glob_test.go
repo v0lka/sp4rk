@@ -7,7 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/v0lka/sp4rk/tools"
 )
@@ -283,5 +285,145 @@ func TestGlobTool_NoPathNoWorkspace(t *testing.T) {
 	}
 	if !result.IsError {
 		t.Error("expected error when no path and no workspace")
+	}
+}
+
+// cancelOnFirstIgnore is a test IgnoreChecker that cancels a context the first
+// time it is consulted, simulating a mid-walk cancellation deterministically
+// (no sleeps): the walk's next filesystem access observes the cancellation.
+type cancelOnFirstIgnore struct {
+	once   sync.Once
+	cancel context.CancelFunc
+}
+
+func (c *cancelOnFirstIgnore) Ignored(string, bool) bool {
+	c.once.Do(c.cancel)
+	return false
+}
+
+// TestGlobTool_SymlinkLoopTerminates is the regression repro for the FS-walk
+// runaway that hung `glob`. A root containing a self-referential symlink
+// (`self -> .`) and a second root containing a symlink to the filesystem root
+// (`link -> /`) must not hang the walk: it is non-following
+// (doublestar.WithNoFollow) and bounded (entries budget + timeout), so it
+// returns within the 2s deadline and never escapes the search root.
+func TestGlobTool_SymlinkLoopTerminates(t *testing.T) {
+	selfRoot := t.TempDir()
+	if err := os.Symlink(".", filepath.Join(selfRoot, "self")); err != nil {
+		t.Skipf("symlinks unsupported on this filesystem: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(selfRoot, "root.go"), []byte("package x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	escapeRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(escapeRoot, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(escapeRoot, "sub", "keep.go"), []byte("package x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/", filepath.Join(escapeRoot, "link")); err != nil {
+		t.Skipf("symlinks unsupported on this filesystem: %v", err)
+	}
+
+	cases := []struct {
+		name    string
+		root    string
+		pattern string
+		want    string
+	}{
+		{"self-loop **/*", selfRoot, "**/*", "root.go"},
+		{"self-loop incident pattern", selfRoot, "**/flowsh@*", ""},
+		{"root-escape **/*", escapeRoot, "**/*", "sub/keep.go"},
+		{"root-escape incident pattern", escapeRoot, "**/flowsh@*", ""},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tool := NewGlobTool()
+			input, _ := json.Marshal(GlobInput{Pattern: tc.pattern, Path: tc.root, Type: "all"})
+
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			type outcome struct {
+				result tools.ToolResult
+				err    error
+			}
+			// Buffered so the worker never blocks even if the deadline branch
+			// below wins the select.
+			done := make(chan outcome, 1)
+			go func() {
+				res, err := tool.Execute(ctx, input)
+				done <- outcome{result: res, err: err}
+			}()
+
+			var got outcome
+			select {
+			case got = <-done:
+			case <-ctx.Done():
+				t.Fatalf("glob did not terminate within the 2s deadline (pattern %q)", tc.pattern)
+			}
+
+			if got.err != nil {
+				t.Fatalf("unexpected error: %v", got.err)
+			}
+			if got.result.IsError {
+				t.Fatalf("unexpected error result: %s", got.result.Content)
+			}
+
+			// Every returned path must stay inside the search root: a following
+			// walk would have emitted paths from outside it (e.g. under /).
+			for _, line := range strings.Split(got.result.Content, "\n") {
+				line = strings.TrimSpace(line)
+				if line == "" || line == "no matching files found" {
+					continue
+				}
+				if filepath.IsAbs(line) || strings.HasPrefix(line, "..") {
+					t.Errorf("result %q escapes the search root %q", line, tc.root)
+				}
+			}
+
+			if tc.want != "" && !ignoreResultHas(got.result.Content, tc.want) {
+				t.Errorf("expected %q in results, got: %s", tc.want, got.result.Content)
+			}
+		})
+	}
+}
+
+// TestGlobTool_ContextCancelMidWalk verifies that a context canceled while the
+// walk is in progress interrupts it promptly and reports a clear error instead
+// of hanging.
+func TestGlobTool_ContextCancelMidWalk(t *testing.T) {
+	base := t.TempDir()
+	// Several sibling directories guarantee further directory reads after the
+	// first callback fires, so the cancellation is observed mid-walk.
+	for i := 0; i < 16; i++ {
+		dir := filepath.Join(base, fmt.Sprintf("d%02d", i))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "file.go"), []byte("package x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tool := NewGlobTool()
+	input, _ := json.Marshal(GlobInput{Pattern: "**/*", Path: base, Type: "all"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctx = tools.WithIgnoreChecker(ctx, &cancelOnFirstIgnore{cancel: cancel})
+
+	result, err := tool.Execute(ctx, input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("expected an error result after mid-walk cancellation, got: %s", result.Content)
+	}
+	if !strings.Contains(result.Content, "glob canceled") {
+		t.Errorf("expected a cancellation message, got: %s", result.Content)
 	}
 }

@@ -44,6 +44,24 @@ func DefaultRipgrepLimits() RipgrepLimits {
 	}
 }
 
+// GlobLimits holds configurable limits for the glob tool. Together they make a
+// single glob walk bounded: a filesystem runaway (a symlink loop or an
+// enormous directory tree) must neither hang the tool nor exhaust memory.
+type GlobLimits struct {
+	MaxEntries int           // max filesystem entries visited (Open/ReadDir/Stat calls) before the walk is aborted (0 = no entry budget)
+	MaxResults int           // max matching paths collected before the walk is aborted (0 = unlimited)
+	Timeout    time.Duration // wall-clock timeout for a single glob walk (0 = no timeout)
+}
+
+// DefaultGlobLimits returns the default limits for glob.
+func DefaultGlobLimits() GlobLimits {
+	return GlobLimits{
+		MaxEntries: 500000,
+		MaxResults: 10000,
+		Timeout:    30 * time.Second,
+	}
+}
+
 // WebFetchLimits holds configurable limits for the web_fetch tool.
 type WebFetchLimits struct {
 	Timeout time.Duration // timeout for HTTP requests; doubled on each retry attempt

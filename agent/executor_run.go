@@ -820,7 +820,11 @@ func (e *Executor) processToolCalls(ctx context.Context, resp *llm.ChatResponse,
 	for callIdx, action := range toolCalls {
 		result, act, err := e.processSingleToolCall(ctx, action, callIdx, toolCalls, resp, thought, state, cw)
 		if err != nil {
-			return nil, actionNone, err
+			// Propagate any result alongside the error so a cooperative pause
+			// observed mid-tool-call can carry its resumable checkpoint up to
+			// Run (which preserves it for ErrPaused). For every other error
+			// the result is nil and Run discards it as before.
+			return result, actionNone, err
 		}
 		if result != nil {
 			return result, actionNone, nil
@@ -1124,9 +1128,22 @@ func (e *Executor) processSingleToolCall(
 		execCtx = WithToolResultCache(ctx, e.toolCache)
 		execCtx = WithPerToolTruncation(execCtx, e.perToolTruncation)
 	}
-	result, err := e.tools.Execute(execCtx, action.Name, input)
+	result, err := e.executeToolCall(execCtx, action.Name, input)
 	if err != nil {
-		// Infrastructure error
+		// Cooperative pause observed while the tool was in flight: the tool
+		// blocked long enough for the pause checker to trip at a watchdog
+		// tick. Return the same resumable, unfinished checkpoint the
+		// step-boundary pause produces (see the boundary case in Run), so a
+		// paused task can be resumed from state.allSteps.
+		if isPauseError(err) {
+			return &ExecutorResult{Steps: state.allSteps, Finished: false}, actionNone, ErrPaused
+		}
+		// A tool that exceeded its per-call ceiling: surface an error naming
+		// the tool (errors.Is-matchable against ErrToolTimeout).
+		if isToolTimeoutError(err) {
+			return nil, actionNone, fmt.Errorf("tool %q: %w", action.Name, ErrToolTimeout)
+		}
+		// Infrastructure error (including context cancellation/deadline).
 		return nil, actionNone, err
 	}
 
@@ -1517,9 +1534,24 @@ func (e *Executor) processBatchTool(
 			}
 		}
 		if !result.IsError && result.Content == "" {
-			result, execErr = e.tools.Execute(execCtx, subCall.Name, subInput)
+			result, execErr = e.executeToolCall(execCtx, subCall.Name, subInput)
 		}
 		if execErr != nil {
+			// Cooperative pause observed while the sub-call's tool was in
+			// flight: return the resumable, unfinished checkpoint (mirroring
+			// the step-boundary pause and the single-call path above).
+			if isPauseError(execErr) {
+				return &ExecutorResult{Steps: state.allSteps, Finished: false}, actionNone, ErrPaused
+			}
+			// Per-call ceiling exceeded: surface an error naming the tool.
+			if isToolTimeoutError(execErr) {
+				return nil, actionNone, fmt.Errorf("tool %q: %w", subCall.Name, ErrToolTimeout)
+			}
+			// Context cancellation/deadline: propagate rather than swallow as
+			// an error result, so a cancelled run stops promptly.
+			if isContextError(execErr) {
+				return nil, actionNone, execErr
+			}
 			// Infrastructure error — capture as error result, continue.
 			result = tools.ToolResult{Content: fmt.Sprintf("error executing %q: %v", subCall.Name, execErr), IsError: true}
 		}

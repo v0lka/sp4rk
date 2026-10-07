@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/v0lka/sp4rk/agent"
 	"github.com/v0lka/sp4rk/llm"
@@ -122,6 +123,16 @@ type ConductorConfig struct {
 	// ANY conductor run — normal or specialized — can be paused at a step
 	// boundary.
 	PauseChecker func(context.Context) bool
+
+	// ToolCallTimeout, when positive, is installed on the Executor via
+	// SetToolCallTimeout. It bounds a SINGLE tool call: a tool that does not
+	// return within the duration has its wait abandoned and the run returns an
+	// error wrapping agent.ErrToolTimeout (naming the tool), so a stuck tool
+	// cannot block the ReAct loop indefinitely while pause/cancel stay
+	// observable. Zero (the default) disables the bound and is fully
+	// backward-compatible. Install agent.DefaultToolCallTimeout (or a smaller
+	// value) for the class-wide guarantee.
+	ToolCallTimeout time.Duration
 
 	// UserMessageSource, when non-nil, is installed on the Executor via
 	// SetUserMessageSource. It is invoked at every step boundary (immediately
@@ -372,6 +383,12 @@ func (c *Conductor) Run(
 	if c.cfg.PauseChecker != nil {
 		executor.SetPauseChecker(c.cfg.PauseChecker)
 	}
+
+	// Per-tool-call watchdog ceiling: bound a single tool call so a stuck tool
+	// cannot block the loop indefinitely. Installed unconditionally (a zero
+	// value clears/disables it), mirroring how a nil PauseChecker leaves the
+	// loop non-pausing. See ConductorConfig.ToolCallTimeout.
+	executor.SetToolCallTimeout(c.cfg.ToolCallTimeout)
 
 	// Live user message source: install it on the executor so Run polls it at
 	// every step boundary (right after the pause check). A non-empty return
