@@ -3,6 +3,7 @@ package builtins
 import (
 	"context"
 	"errors"
+	"io"
 	"io/fs"
 )
 
@@ -22,9 +23,17 @@ var (
 	errGlobResultsLimited = errors.New("glob results limited")
 )
 
+// readDirBatch is the number of directory entries read per fs.ReadDirFile
+// ReadDir call while streaming a directory. Reading in bounded batches keeps a
+// single huge directory interruptible (the walk context is re-checked on every
+// entry) and memory-bounded (the entry budget aborts the read instead of
+// materializing the whole directory slice at once).
+const readDirBatch = 256
+
 // Compile-time interface checks: boundedFS must satisfy every fs interface
-// doublestar consults. It reads directories via fs.ReadDir (fs.ReadDirFS) and
-// stats paths via fs.Stat (fs.StatFS), falling back to Open otherwise.
+// doublestar consults. It reads directories incrementally via fs.ReadDirFile
+// (fs.ReadDirFS) and stats paths via fs.Stat (fs.StatFS), falling back to Open
+// otherwise.
 var (
 	_ fs.FS        = (*boundedFS)(nil)
 	_ fs.ReadDirFS = (*boundedFS)(nil)
@@ -38,6 +47,11 @@ var (
 // no longer hang or exhaust the walk: the access returns errGlobCanceled
 // (context done) or errGlobEntryBudget (budget spent) instead, which surfaces
 // through doublestar.WithFailOnIOErrors.
+//
+// Directory entries are charged one at a time as the directory is streamed
+// (ReadDir reads in readDirBatch-sized batches), so the budget counts entries,
+// not directory accesses: a single directory holding more entries than the
+// budget is aborted mid-read rather than read whole.
 //
 // Symbolic links are not followed because the walk is run with
 // doublestar.WithNoFollow, so a self-referential or escaping symlink is never
@@ -58,15 +72,15 @@ func newBoundedFS(ctx context.Context, inner fs.FS, lim GlobLimits) *boundedFS {
 	return &boundedFS{ctx: ctx, inner: inner, lim: lim}
 }
 
-// charge enforces both guards before a filesystem access: it returns
-// errGlobCanceled as soon as the context is done, then errGlobEntryBudget once
-// the configured number of entries has been visited (a non-positive MaxEntries
-// disables the entry budget).
-func (b *boundedFS) charge() error {
+// charge enforces both guards: it returns errGlobCanceled as soon as the
+// context is done, then errGlobEntryBudget once more than the configured
+// number of entries has been visited (a non-positive MaxEntries disables the
+// entry budget). n is the number of entries this access represents.
+func (b *boundedFS) charge(n int) error {
 	if err := b.ctx.Err(); err != nil {
 		return errGlobCanceled
 	}
-	b.seen++
+	b.seen += n
 	if b.lim.MaxEntries > 0 && b.seen > b.lim.MaxEntries {
 		return errGlobEntryBudget
 	}
@@ -75,24 +89,63 @@ func (b *boundedFS) charge() error {
 
 // Open implements fs.FS.
 func (b *boundedFS) Open(name string) (fs.File, error) {
-	if err := b.charge(); err != nil {
+	if err := b.charge(1); err != nil {
 		return nil, err
 	}
 	return b.inner.Open(name)
 }
 
-// ReadDir implements fs.ReadDirFS.
-func (b *boundedFS) ReadDir(name string) ([]fs.DirEntry, error) {
-	if err := b.charge(); err != nil {
-		return nil, err
-	}
-	return fs.ReadDir(b.inner, name)
-}
-
 // Stat implements fs.StatFS.
 func (b *boundedFS) Stat(name string) (fs.FileInfo, error) {
-	if err := b.charge(); err != nil {
+	if err := b.charge(1); err != nil {
 		return nil, err
 	}
 	return fs.Stat(b.inner, name)
+}
+
+// ReadDir implements fs.ReadDirFS. Instead of a one-shot fs.ReadDir it streams
+// the directory through fs.ReadDirFile.ReadDir in readDirBatch-sized reads,
+// charging each entry against the entry budget, so a single huge directory is
+// bounded and interruptible rather than materialized into one uncancellable
+// slice.
+func (b *boundedFS) ReadDir(name string) ([]fs.DirEntry, error) {
+	if err := b.ctx.Err(); err != nil {
+		return nil, errGlobCanceled
+	}
+	f, err := b.inner.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+
+	rdf, ok := f.(fs.ReadDirFile)
+	if !ok {
+		// The filesystem cannot stream directory reads; fall back to a
+		// one-shot read, still charged against the budget after the fact.
+		entries, err := fs.ReadDir(b.inner, name)
+		if err != nil {
+			return nil, err
+		}
+		if err := b.charge(len(entries)); err != nil {
+			return nil, err
+		}
+		return entries, nil
+	}
+
+	var all []fs.DirEntry
+	for {
+		batch, err := rdf.ReadDir(readDirBatch)
+		for _, entry := range batch {
+			if cerr := b.charge(1); cerr != nil {
+				return nil, cerr
+			}
+			all = append(all, entry)
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return all, nil
+			}
+			return nil, err
+		}
+	}
 }

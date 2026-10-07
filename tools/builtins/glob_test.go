@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -306,7 +308,11 @@ func (c *cancelOnFirstIgnore) Ignored(string, bool) bool {
 // (`self -> .`) and a second root containing a symlink to the filesystem root
 // (`link -> /`) must not hang the walk: it is non-following
 // (doublestar.WithNoFollow) and bounded (entries budget + timeout), so it
-// returns within the 2s deadline and never escapes the search root.
+// returns within the 2s deadline. Containment is proven by asserting the exact
+// result set: a following walk would have traversed `self`/`link` and emitted
+// paths under them (e.g. `link/etc/hosts`), which — slash-relative and without a
+// `..` prefix — would not trip an IsAbs/`..` check, so the concrete set is the
+// assertion that can actually fail.
 func TestGlobTool_SymlinkLoopTerminates(t *testing.T) {
 	selfRoot := t.TempDir()
 	if err := os.Symlink(".", filepath.Join(selfRoot, "self")); err != nil {
@@ -331,12 +337,14 @@ func TestGlobTool_SymlinkLoopTerminates(t *testing.T) {
 		name    string
 		root    string
 		pattern string
-		want    string
+		want    []string // exact expected result set (order-insensitive)
 	}{
-		{"self-loop **/*", selfRoot, "**/*", "root.go"},
-		{"self-loop incident pattern", selfRoot, "**/flowsh@*", ""},
-		{"root-escape **/*", escapeRoot, "**/*", "sub/keep.go"},
-		{"root-escape incident pattern", escapeRoot, "**/flowsh@*", ""},
+		// The symlink entry itself is listed, but neither loop is traversed:
+		// no `self/...` or `link/...` path is ever emitted.
+		{"self-loop **/*", selfRoot, "**/*", []string{"root.go", "self"}},
+		{"self-loop incident pattern", selfRoot, "**/flowsh@*", nil},
+		{"root-escape **/*", escapeRoot, "**/*", []string{"link", "sub", "sub/keep.go"}},
+		{"root-escape incident pattern", escapeRoot, "**/flowsh@*", nil},
 	}
 
 	for _, tc := range cases {
@@ -373,23 +381,89 @@ func TestGlobTool_SymlinkLoopTerminates(t *testing.T) {
 				t.Fatalf("unexpected error result: %s", got.result.Content)
 			}
 
-			// Every returned path must stay inside the search root: a following
-			// walk would have emitted paths from outside it (e.g. under /).
-			for _, line := range strings.Split(got.result.Content, "\n") {
-				line = strings.TrimSpace(line)
-				if line == "" || line == "no matching files found" {
-					continue
-				}
-				if filepath.IsAbs(line) || strings.HasPrefix(line, "..") {
-					t.Errorf("result %q escapes the search root %q", line, tc.root)
-				}
-			}
-
-			if tc.want != "" && !ignoreResultHas(got.result.Content, tc.want) {
-				t.Errorf("expected %q in results, got: %s", tc.want, got.result.Content)
+			if diff := diffGlobResultSet(got.result.Content, tc.want); diff != "" {
+				t.Errorf("unexpected result set for pattern %q: %s (content: %s)", tc.pattern, diff, got.result.Content)
 			}
 		})
 	}
+}
+
+// TestGlobTool_LiteralSymlinkPrefixIsFollowed pins the documented caveat of
+// doublestar.WithNoFollow: a symlink named before the pattern's first meta
+// character (here `alias/**`) is still followed, so non-traversal applies to
+// symlinked directories *encountered during* the walk, not to a literal
+// symlink prefix. Both halves are asserted against the concrete result set.
+func TestGlobTool_LiteralSymlinkPrefixIsFollowed(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "real"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "real", "keep.go"), []byte("package x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "top.go"), []byte("package x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("real", filepath.Join(root, "alias")); err != nil {
+		t.Skipf("symlinks unsupported on this filesystem: %v", err)
+	}
+
+	tool := NewGlobTool()
+	run := func(pattern string) string {
+		t.Helper()
+		input, _ := json.Marshal(GlobInput{Pattern: pattern, Path: root, Type: "all"})
+		res, err := tool.Execute(context.Background(), input)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if res.IsError {
+			t.Fatalf("unexpected error result: %s", res.Content)
+		}
+		return res.Content
+	}
+
+	// `**/*` does not traverse the symlinked directory `alias`.
+	if diff := diffGlobResultSet(run("**/*"), []string{"alias", "top.go", "real", "real/keep.go"}); diff != "" {
+		t.Errorf("`**/*` must not traverse the symlinked dir: %s", diff)
+	}
+	// A literal symlink prefix is followed (the documented doublestar caveat).
+	if diff := diffGlobResultSet(run("alias/**"), []string{"alias", "alias/keep.go"}); diff != "" {
+		t.Errorf("`alias/**` must follow the literal symlink prefix: %s", diff)
+	}
+}
+
+// diffGlobResultSet compares a glob output against the exact expected set
+// (order-insensitive) and returns "" on a match, or a human-readable difference
+// otherwise. An empty expected set renders as the glob's "no matching files
+// found" placeholder.
+func diffGlobResultSet(content string, want []string) string {
+	got := globResultLines(content)
+	sort.Strings(got)
+	sort.Strings(want)
+	if slices.Equal(got, want) {
+		return ""
+	}
+	return fmt.Sprintf("got %v, want %v", got, want)
+}
+
+// globResultLines splits a glob output into result lines, dropping blank lines,
+// the "no matching files found" placeholder, and any trailing warning suffix a
+// bound abort appends (the warning follows the matches after a blank line, and a
+// match-less abort renders the warning alone).
+func globResultLines(content string) []string {
+	body := content
+	if i := strings.Index(content, "\n\n"); i >= 0 {
+		body = content[:i]
+	}
+	var out []string
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || line == "no matching files found" || strings.HasPrefix(line, "warning:") {
+			continue
+		}
+		out = append(out, line)
+	}
+	return out
 }
 
 // TestGlobTool_ContextCancelMidWalk verifies that a context canceled while the

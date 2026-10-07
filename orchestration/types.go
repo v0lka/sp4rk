@@ -94,7 +94,8 @@ const (
 	ExecutionStatusAborted ExecutionStatus = "aborted"
 	// ExecutionStatusCancelled — the context was cancelled mid-execution.
 	ExecutionStatusCancelled ExecutionStatus = "cancelled"
-	// ExecutionStatusPaused — the executor stopped at a step boundary because a
+	// ExecutionStatusPaused — the executor stopped at a step boundary (or,
+	// since the tool-call watchdog, while a tool call was in flight) because a
 	// cooperative pause signal tripped (agent.ErrPaused). The trajectory so far
 	// is preserved in the result's Steps; execution may be resumed. Distinct
 	// from cancelled (user/interrupt) and partial (budget exhausted): a pause is

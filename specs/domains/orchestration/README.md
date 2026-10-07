@@ -51,6 +51,7 @@ type ConductorConfig struct {
     PendingUserInterjection   string
     PauseChecker              func(context.Context) bool
     UserMessageSource         func(context.Context) string
+    ToolCallTimeout           time.Duration
     CompactOnStart            bool
     VerifyOnEdit              agent.EditVerifyRunner
     VerifyOnEditMaxOutputChars int
@@ -157,7 +158,8 @@ The Conductor is the only top-level execution entry point this domain exposes. D
 | `CircuitBreaker` | `DefaultCircuitBreakerConfig()` | Loop-protection thresholds (see [executor.md](executor.md)). |
 | `ResumeSteps` | `nil` | Prior ReAct steps to resume from a checkpoint. When non-empty, `Run` seeds the `ContextManager` (via `StepSeedable`) and the `Executor` (via `WithResumeSteps`); the steps count against `MaxSteps`. Requires a `StepSeedable` `ContextManager` (see [conductor.md](conductor.md)). |
 | `PendingUserInterjection` | `""` | One-shot resume nudge appended after seeded history; retained through reactive-compaction retries and consumed after the first successful LLM response. |
-| `PauseChecker` / `UserMessageSource` | `nil` | Optional step-boundary callbacks. Pause is checked first; one live message is polled only when the run continues. |
+| `PauseChecker` / `UserMessageSource` | `nil` | Optional step-boundary callbacks. Pause is checked first; one live message is polled only when the run continues. The pause checker is additionally polled mid-tool-call on the executor's `toolWatchdogInterval` ticker. |
+| `ToolCallTimeout` | `0` (disabled) | Per-tool-call ceiling installed via `SetToolCallTimeout`: a single tool call whose wait exceeds it is abandoned and the run returns an error wrapping `agent.ErrToolTimeout` (naming the tool). Interactive/long-running tools can be exempted via `SetToolCallTimeoutExempt` (see [executor.md](executor.md#per-tool-call-ceiling-and-watchdog)). |
 | `CompactOnStart` | `false` | Forces one compaction pass on the `ContextManager` right after resume/nudge seeding, before the first LLM call, regardless of fill thresholds — manual compaction of a paused task (see [conductor.md](conductor.md#compact-on-start)). Emits `ContextCompaction` only when the pass reports a result; reactive executor compaction is unaffected. |
 | `VerifyOnEdit` | `nil` | User-configured verifier run once per response group containing a successful `write_file`/`edit_file`; nil disables it. |
 | `VerifyOnEditMaxOutputChars` | `<= 0` → `4000` | Unicode-safe cap for the injected verification output. |

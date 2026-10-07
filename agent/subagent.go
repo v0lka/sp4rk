@@ -233,7 +233,8 @@ func RunSubAgentsParallel(ctx context.Context, agents []SubAgentTask, opts ...Ru
 }
 
 // isPaused reports whether err is the cooperative pause sentinel (ErrPaused)
-// returned by Executor.Run when a PauseChecker trips at a step boundary. A
+// returned by Executor.Run when a PauseChecker trips at a step boundary — or,
+// since the tool-call watchdog, while a tool call is in flight. A
 // paused sub-agent is a recoverable checkpoint, not a failure: hosts receive
 // the SubAgentPaused event (instead of SubAgentComplete(success=false)) and
 // the preserved trajectory in SubAgentResult for a later resume.

@@ -414,13 +414,17 @@ func (a *testStepLimitAdapter) OnStepLimit(ctx context.Context, currentStep, max
 }
 
 // newExecutorDefaultHITL creates an Executor with a nil HITLHandler (uses NoopHITLHandler default).
-// Convenience wrapper for tests that don't need custom HITL behavior.
-func newExecutorDefaultHITL(llmCaller LLMCaller, toolRegistry ToolExecutor, counter llm.TokenCounter, maxSteps int, emitter Events, suppressAssistantEvents bool, toolResultBudget ToolResultBudget, circuitBreaker CircuitBreakerConfig) *Executor {
-	return NewExecutor(llmCaller, toolRegistry, maxSteps,
+// Convenience wrapper for tests that don't need custom HITL behavior. Any extra
+// options (e.g. withToolWatchdogInterval) are appended after the standard set.
+func newExecutorDefaultHITL(llmCaller LLMCaller, toolRegistry ToolExecutor, counter llm.TokenCounter, maxSteps int, emitter Events, suppressAssistantEvents bool, toolResultBudget ToolResultBudget, circuitBreaker CircuitBreakerConfig, extra ...Option) *Executor {
+	opts := make([]Option, 0, 5+len(extra))
+	opts = append(opts,
 		WithTokenCounter(counter),
 		WithEvents(emitter),
 		WithSuppressAssistantEvents(suppressAssistantEvents),
 		WithToolResultBudget(toolResultBudget),
 		WithCircuitBreaker(circuitBreaker),
 	)
+	opts = append(opts, extra...)
+	return NewExecutor(llmCaller, toolRegistry, maxSteps, opts...)
 }

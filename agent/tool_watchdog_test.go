@@ -78,16 +78,6 @@ func (d *delayedToolExecutor) CacheStrategy(context.Context, string, json.RawMes
 	return tools.CacheModeDefault
 }
 
-// withToolWatchdogInterval shortens the pause-poll cadence for one test and
-// restores it on cleanup. The executor's watchdog reads this package var; tests
-// are not parallel, so the override cannot race.
-func withToolWatchdogInterval(t *testing.T, d time.Duration) {
-	t.Helper()
-	prev := toolWatchdogInterval
-	toolWatchdogInterval = d
-	t.Cleanup(func() { toolWatchdogInterval = prev })
-}
-
 // blockToolDescriptors is the single-tool catalog handed to Run by the watchdog
 // tests.
 func blockToolDescriptors() []tools.ToolDescriptor {
@@ -97,7 +87,7 @@ func blockToolDescriptors() []tools.ToolDescriptor {
 // runExecutorBounded runs exec.Run in a goroutine and fails the test if it does
 // not return within the deadline. It proves the executor loop cannot be wedged
 // by a stuck tool (no goroutine-driven hang).
-func runExecutorBounded(t *testing.T, exec *Executor, ctx context.Context, defs []tools.ToolDescriptor) (*ExecutorResult, error) {
+func runExecutorBounded(ctx context.Context, t *testing.T, exec *Executor, defs []tools.ToolDescriptor) (*ExecutorResult, error) {
 	t.Helper()
 	type outcome struct {
 		result *ExecutorResult
@@ -118,8 +108,6 @@ func runExecutorBounded(t *testing.T, exec *Executor, ctx context.Context, defs 
 }
 
 func TestExecutor_Run_ToolCallTimeout_BlockingToolReturns(t *testing.T) {
-	withToolWatchdogInterval(t, 5*time.Millisecond)
-
 	blocking := newBlockingToolExecutor()
 	t.Cleanup(func() { close(blocking.release) }) // unblock the detached goroutine
 
@@ -128,10 +116,10 @@ func TestExecutor_Run_ToolCallTimeout_BlockingToolReturns(t *testing.T) {
 			llmResponseWithToolCall("call the blocking tool", "block_tool", json.RawMessage(`{}`)),
 		},
 	}
-	exec := newExecutorDefaultHITL(mockLLM, blocking, &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+	exec := newExecutorDefaultHITL(mockLLM, blocking, &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig, withToolWatchdogInterval(5*time.Millisecond))
 	exec.SetToolCallTimeout(40 * time.Millisecond)
 
-	result, err := runExecutorBounded(t, exec, context.Background(), blockToolDescriptors())
+	result, err := runExecutorBounded(context.Background(), t, exec, blockToolDescriptors())
 
 	if !errors.Is(err, ErrToolTimeout) {
 		t.Fatalf("expected ErrToolTimeout, got %v", err)
@@ -148,8 +136,6 @@ func TestExecutor_Run_ToolCallTimeout_BlockingToolReturns(t *testing.T) {
 }
 
 func TestExecutor_Run_ToolCallWatchdog_PauseWhileToolBlocked(t *testing.T) {
-	withToolWatchdogInterval(t, 5*time.Millisecond)
-
 	blocking := newBlockingToolExecutor()
 	t.Cleanup(func() { close(blocking.release) })
 
@@ -158,7 +144,7 @@ func TestExecutor_Run_ToolCallWatchdog_PauseWhileToolBlocked(t *testing.T) {
 			llmResponseWithToolCall("call the blocking tool", "block_tool", json.RawMessage(`{}`)),
 		},
 	}
-	exec := newExecutorDefaultHITL(mockLLM, blocking, &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+	exec := newExecutorDefaultHITL(mockLLM, blocking, &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig, withToolWatchdogInterval(5*time.Millisecond))
 
 	// The checker only trips once the tool has actually started, so the
 	// step-boundary check (which runs BEFORE dispatch) cannot fire first —
@@ -176,7 +162,7 @@ func TestExecutor_Run_ToolCallWatchdog_PauseWhileToolBlocked(t *testing.T) {
 		}
 	})
 
-	result, err := runExecutorBounded(t, exec, context.Background(), blockToolDescriptors())
+	result, err := runExecutorBounded(context.Background(), t, exec, blockToolDescriptors())
 
 	if !errors.Is(err, ErrPaused) {
 		t.Fatalf("expected ErrPaused, got %v", err)
@@ -195,8 +181,6 @@ func TestExecutor_Run_ToolCallWatchdog_PauseWhileToolBlocked(t *testing.T) {
 func TestExecutor_Run_ToolCallTimeoutDisabled_RunCompletes(t *testing.T) {
 	// With no timeout configured (the default) a slow-but-finite tool must run
 	// to completion: the watchdog is strictly opt-in.
-	withToolWatchdogInterval(t, 5*time.Millisecond)
-
 	delayed := &delayedToolExecutor{delay: 20 * time.Millisecond, result: tools.ToolResult{Content: "hello world"}}
 	mockLLM := &mockLLMCaller{
 		responses: []*llm.ChatResponse{
@@ -204,10 +188,10 @@ func TestExecutor_Run_ToolCallTimeoutDisabled_RunCompletes(t *testing.T) {
 			llmResponseFinish("got it", "file content here"),
 		},
 	}
-	exec := newExecutorDefaultHITL(mockLLM, delayed, &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+	exec := newExecutorDefaultHITL(mockLLM, delayed, &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig, withToolWatchdogInterval(5*time.Millisecond))
 	// Deliberately no SetToolCallTimeout: the zero value disables the ceiling.
 
-	result, err := runExecutorBounded(t, exec, context.Background(), []tools.ToolDescriptor{
+	result, err := runExecutorBounded(context.Background(), t, exec, []tools.ToolDescriptor{
 		{Name: "read_file", Description: "read a file", Source: "core"},
 	})
 	if err != nil {
@@ -240,6 +224,62 @@ func TestExecutor_ExecuteToolCall_ContextCancellationUnblocks(t *testing.T) {
 	_, err := exec.executeToolCall(ctx, "block_tool", json.RawMessage(`{}`))
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+}
+
+// TestExecutor_ExecuteToolCall_CancelWinsOverPauseTick pins the watchdog's
+// cancellation precedence: when a tool is in flight and BOTH the context is
+// cancelled AND the pause checker trips on the same tick, the run must report
+// the cancellation (mirroring the step-boundary check), never a resumable
+// pause. Without the ctx-first ordering in the tick arm, the two ready select
+// cases are chosen uniformly at random, so an already-cancelled run could be
+// misreported as a pause.
+func TestExecutor_ExecuteToolCall_CancelWinsOverPauseTick(t *testing.T) {
+	blocking := newBlockingToolExecutor()
+	t.Cleanup(func() { close(blocking.release) })
+
+	exec := NewExecutor(&mockLLMCaller{}, blocking, 10, withToolWatchdogInterval(2*time.Millisecond))
+	// A checker that always trips: the pause tick is permanently ready, so the
+	// ctx-first check is the only thing that keeps cancellation authoritative.
+	exec.SetPauseChecker(func(context.Context) bool { return true })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-blocking.started
+		cancel()
+	}()
+
+	_, err := exec.executeToolCall(ctx, "block_tool", json.RawMessage(`{}`))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation must win over a simultaneously-ready pause tick: got %v, want context.Canceled", err)
+	}
+}
+
+// TestExecutor_ExecuteToolCall_CancelWinsOverTimeoutArm pins the timeout arm's
+// cancellation precedence: a run cancelled while a tool is in flight must report
+// the cancellation, not ErrToolTimeout, even when the per-call ceiling fires on
+// the same selection (mirroring the pause-tick arm).
+func TestExecutor_ExecuteToolCall_CancelWinsOverTimeoutArm(t *testing.T) {
+	blocking := newBlockingToolExecutor()
+	t.Cleanup(func() { close(blocking.release) })
+
+	exec := NewExecutor(&mockLLMCaller{}, blocking, 10, withToolWatchdogInterval(time.Millisecond))
+	exec.SetToolCallTimeout(time.Millisecond)
+	// A checker that always trips, so the pause tick is permanently ready too:
+	// every arm must agree on the cancellation.
+	exec.SetPauseChecker(func(context.Context) bool { return true })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-blocking.started
+		cancel()
+	}()
+
+	_, err := exec.executeToolCall(ctx, "block_tool", json.RawMessage(`{}`))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation must win over a simultaneously-ready timeout arm: got %v, want context.Canceled", err)
 	}
 }
 

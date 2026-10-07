@@ -115,13 +115,16 @@ type ConductorConfig struct {
 
 	// PauseChecker, when non-nil, is installed on the Executor via
 	// SetPauseChecker. It is invoked at every step boundary (immediately after
-	// the context-cancellation check); a true return causes Run to stop
-	// cooperatively, returning the trajectory so far together with ErrPaused
-	// (which the Conductor maps to ExecutionStatusPaused). A nil checker means
-	// the loop never pauses on its own (the default, backward-compatible
-	// behavior). The host application threads a universal pause signal here so
-	// ANY conductor run — normal or specialized — can be paused at a step
-	// boundary.
+	// the context-cancellation check) — and, since the tool-call watchdog, also
+	// polled on the toolWatchdogInterval ticker while a tool call is in flight,
+	// so a long tool reaches its pause checkpoint without waiting for the next
+	// boundary; a true return causes Run to stop cooperatively, returning the
+	// trajectory so far together with ErrPaused (which the Conductor maps to
+	// ExecutionStatusPaused). The checker must therefore be cheap and
+	// idempotent. A nil checker means the loop never pauses on its own (the
+	// default, backward-compatible behavior). The host application threads a
+	// universal pause signal here so ANY conductor run — normal or specialized —
+	// can be paused at a step boundary.
 	PauseChecker func(context.Context) bool
 
 	// ToolCallTimeout, when positive, is installed on the Executor via

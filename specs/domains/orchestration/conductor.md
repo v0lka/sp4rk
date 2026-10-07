@@ -73,16 +73,17 @@ type PendingDelegations interface {
 
 `Run` returns an error only when the context factory or system-prompt factory is missing, or when the underlying executor returns an error. A non-nil error is still accompanied by a non-nil `*ExecutionResult` carrying best-effort output.
 
-### Step-boundary signals (PauseChecker, UserMessageSource)
+### Step-boundary signals (PauseChecker, UserMessageSource, ToolCallTimeout)
 
-Two optional `ConductorConfig` callbacks are installed on the executor so the host can interact with a run at its step boundaries:
+Optional `ConductorConfig` fields installed on the executor let the host interact with a run at its step boundaries; `ToolCallTimeout` additionally installs the per-tool-call ceiling:
 
 | Config | Executor hook | Effect |
 | ------ | ------------- | ------ |
-| `PauseChecker func(ctx) bool` | `SetPauseChecker` | A true return stops the loop cooperatively with `agent.ErrPaused`; `Run` maps it to `ExecutionStatusPaused` and leaves `Output` empty (a clean, resumable checkpoint — never the raw sentinel string). |
+| `PauseChecker func(ctx) bool` | `SetPauseChecker` | A true return stops the loop cooperatively with `agent.ErrPaused`; `Run` maps it to `ExecutionStatusPaused` and leaves `Output` empty (a clean, resumable checkpoint — never the raw sentinel string). The checker is polled at every step boundary **and**, since the tool-call watchdog, on the executor's `toolWatchdogInterval` ticker while a tool call is in flight — keep it cheap and idempotent. |
 | `UserMessageSource func(ctx) string` | `SetUserMessageSource` | A non-empty return is delivered to the model as the final `{role:user}` message of the very next LLM request (see [executor.md § Live user messages](executor.md#live-user-messages-usermessagesource)). The source drains one message per boundary. |
+| `ToolCallTimeout time.Duration` | `SetToolCallTimeout` | Bounds a SINGLE tool call: a tool that does not return within the duration has its wait abandoned and the run returns an error wrapping `agent.ErrToolTimeout` (naming the tool). Zero (the default) disables it. Interactive/long-running tools can be exempted via `SetToolCallTimeoutExempt`; see [executor.md § Per-tool-call ceiling and watchdog](executor.md#per-tool-call-ceiling-and-watchdog). |
 
-Both are polled inside `Executor.Run` in that order — pause first, then the message poll — so a pausing run never consumes a queued message: the host's queue keeps it for the resumed run. The host threads one universal pause signal and one live-message queue here so any conductor run (normal or specialized) is pauseable and steerable. Nil (default) disables each; both are fully backward-compatible.
+Both callbacks are polled inside `Executor.Run` in that order — pause first, then the message poll — so a pausing run never consumes a queued message: the host's queue keeps it for the resumed run. The host threads one universal pause signal and one live-message queue here so any conductor run (normal or specialized) is pauseable and steerable. Nil (default) disables each; all are fully backward-compatible.
 
 ### Optional ContextManager capabilities
 

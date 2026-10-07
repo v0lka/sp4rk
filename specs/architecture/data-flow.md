@@ -274,7 +274,7 @@ Steps communicate through the blackboard: one step can `StoreFact` with keywords
 - Parallel steps run in separate subagent goroutines with their own `Executor` and `ContextManager`, coordinated only through the shared `Blackboard`.
 - Tool execution is fail-closed for `PolicyUserConfirm` tools when no `ConfirmFunc` is configured.
 - At every executor boundary, pause is evaluated before a live user-message source; a paused checkpoint never consumes the next queued message.
-- A pending resume interjection is retired only after successful LLM delivery, and a pending post-edit verification is flushed before terminal or paused control returns to the host.
+- A pending resume interjection is retired only after successful LLM delivery, and a pending post-edit verification is flushed before a paused or finished result returns to the host (the terminal arms that return no result do not flush).
 
 ## Anti-Patterns
 

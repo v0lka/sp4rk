@@ -58,8 +58,9 @@ Available options:
 | `WithCircuitBreaker(c CircuitBreakerConfig)` | Loop-protection thresholds. Defaults to `DefaultCircuitBreakerConfig()` when unset. |
 | `WithHITL(h HITLHandler)` | Human-in-the-loop hooks (nil → `NoopHITLHandler`). |
 | `WithResumeSteps(steps []Step)` | Seeds prior ReAct steps so `Run` resumes from a checkpoint instead of starting fresh. The step counter starts at `len(steps)+1` and the full trajectory (seeded plus new steps) syncs to the `TrajectoryStore`. The resumed steps count against `maxSteps`; the caller must seed the `ContextManager` with the same steps (e.g. via `memory.ContextWindow.SeedSteps`). Nil/empty (or omitted) is the default fresh-start behavior. |
-| `WithPauseChecker(func(context.Context) bool)` | Installs a cooperative pause signal checked once per step boundary, after cancellation and before live-message polling. A true return yields `ErrPaused`, `Finished: false`, and the resumable trajectory. |
+| `WithPauseChecker(func(context.Context) bool)` | Installs a cooperative pause signal checked once per step boundary, after cancellation and before live-message polling — and, since the tool-call watchdog, also polled on the executor's `toolWatchdogInterval` ticker while a tool call is in flight (so a long tool pauses without waiting for the boundary). A true return yields `ErrPaused`, `Finished: false`, and the resumable trajectory. |
 | `WithUserMessageSource(func(context.Context) string)` | Polls a host-owned live-message queue once per step boundary. A non-empty return becomes the final user message in the next LLM request; at most one message is drained per boundary. |
+| `WithToolCallTimeout(time.Duration)` | Per-tool-call ceiling: a single tool call whose wait exceeds the duration is abandoned and the tool's context is cancelled (a cooperative request — an uninterruptible tool may still finish) and `Run` returns an error wrapping `ErrToolTimeout`, named with the tool. Zero (default) disables it. `SetToolCallTimeout` mirrors it at runtime; `SetToolCallTimeoutExempt(names...)` exempts interactive/long-running tools (e.g. `ask_user`, `declare_plan`, `delegate`, `execute_plan`). |
 
 A minimal construction using the SDK defaults:
 
@@ -93,7 +94,7 @@ func (e *Executor) Run(
 - `taskTools` — the tools available for this run. The `finish` tool is appended automatically if not already present.
 - `cw` — the `ContextManager` that owns the prompt history and compaction logic.
 
-Returns an `*ExecutorResult` and an error. A non-nil error normally indicates a fatal failure (LLM error, context cancellation). The recoverable exception is `ErrPaused`: `errors.Is(err, agent.ErrPaused)` is true, the result is non-nil, `Finished` is false, and `Steps` is a resumable checkpoint. A `nil` error with `Finished == false` means the step budget was exhausted or a circuit breaker aborted the loop.
+Returns an `*ExecutorResult` and an error. A non-nil error normally indicates a fatal failure (LLM error, context cancellation). The recoverable exception is `ErrPaused`: `errors.Is(err, agent.ErrPaused)` is true, the result is non-nil, `Finished` is false, and `Steps` is a resumable checkpoint. A non-nil error can also wrap `agent.ErrToolTimeout` when a single tool call exceeded the per-tool-call ceiling (see [Per-tool-call ceiling](#per-tool-call-ceiling)) — the wait was abandoned and the tool's context was cancelled (a cooperative request, so an uninterruptible tool may still finish), so treat its side effects as possibly applied. A `nil` error with `Finished == false` means the step budget was exhausted or a circuit breaker aborted the loop.
 
 ```go
 result, err := exec.Run(ctx, taskTools, cm)
@@ -114,7 +115,7 @@ Each iteration of `Run` proceeds as follows:
 1. **Trajectory sync** — if a `TrajectoryStore` is in the context, the current step history is synced so tools (e.g. a reflector) can read it.
 2. **Step-limit boundary** — if the step budget is reached, `OnStepLimit` is consulted via the HITL handler to decide whether to grant more steps.
 3. **StepStart event and cancellation** — `emitter.StepStart(stepNum)` fires, then context cancellation is checked.
-4. **Cooperative pause** — a configured pause checker runs. A true result returns `ErrPaused` with the trajectory collected so far; no live message is drained on that boundary.
+4. **Cooperative pause** — a configured pause checker runs. A true result returns `ErrPaused` with the trajectory collected so far; no live message is drained on that boundary. The checker is also polled *while a tool call is in flight* (on the executor's `toolWatchdogInterval` ticker, see [Per-tool-call ceiling](#per-tool-call-ceiling)), so a long tool reaches its checkpoint without waiting for the boundary.
 5. **Live user message** — a configured source is polled. One non-empty message is recorded as a nudge-only step and becomes the final user message in this iteration's LLM request.
 6. **LLM call** — the prompt is built from the context manager and sent to the LLM. If the provider reports a context-window-exceeded error, a reactive compaction is triggered and the call is retried. A pending resume interjection is consumed only after a successful response, so it remains present on the retry.
 7. **Thought event** — `emitter.Thought(stepNum, content, reasoning)` fires with the model's reasoning and content.
@@ -130,7 +131,7 @@ The loop terminates when the `finish` tool is called (`Finished: true`) or the b
 
 These three mechanisms all deliver control at an LLM step boundary, but they have different ownership and lifetime:
 
-- **Cooperative pause** — configure `WithPauseChecker` at construction or `SetPauseChecker` before `Run`. The checker runs after cancellation and before live-message polling. When it returns true, `Run` returns `ErrPaused` and the completed trajectory without consuming a queued message. Resume by seeding both the executor (`WithResumeSteps`) and context manager (`SeedSteps`).
+- **Cooperative pause** — configure `WithPauseChecker` at construction or `SetPauseChecker` before `Run`. The checker runs after cancellation and before live-message polling, and is also polled on the executor's `toolWatchdogInterval` ticker while a tool call is in flight (keep it cheap and idempotent). When it returns true, `Run` returns `ErrPaused` and the completed trajectory without consuming a queued message. Resume by seeding both the executor (`WithResumeSteps`) and context manager (`SeedSteps`).
 - **Live user messages** — configure `WithUserMessageSource` or `SetUserMessageSource`. The host callback drains at most one message per boundary; a non-empty value is recorded as `Step{UserNudge: msg}` and rendered as the final `{role:user}` message in the immediate LLM request. Delivery emits an `ExecutorDiagnostic` named `live_user_message`.
 - **Resume interjection** — the Conductor sets a one-shot `PendingUserInterjection` on a context manager implementing `orchestration.InterjectionAware`. An executor recognizes `InterjectionConsumer` and retires the nudge only after a successful LLM response. If the first call fails with context overflow and triggers reactive compaction, the rebuilt prompt still contains the nudge.
 
@@ -151,6 +152,10 @@ if errors.Is(err, agent.ErrPaused) {
 ```
 
 The callbacks must be cheap and safe to invoke from the `Run` goroutine. Queue persistence and undelivered-message handling remain host responsibilities.
+
+## Per-tool-call ceiling
+
+`WithToolCallTimeout` / `SetToolCallTimeout` bound a single tool call. The executor runs the call on a detached, panic-recovering goroutine and abandons the **wait** — cancelling the tool's derived call context (a cooperative request, so an uninterruptible tool may still finish) — when the ceiling fires, returning an error wrapping `agent.ErrToolTimeout` named with the tool (`tool "name": tool call timed out`). Treat the abandoned tool's side effects as having possibly occurred. Zero (the default) disables the ceiling. Interactive/long-running orchestration tools that block on a human or sub-work by design (`ask_user`, `declare_plan`, `propose_goal`, `delegate`, `execute_plan`) are exempt by default; `SetToolCallTimeoutExempt(names...)` replaces that set. Resume a run that returned `ErrToolTimeout` only after reconciling the possibly-applied tool.
 
 ## Verify-on-edit
 

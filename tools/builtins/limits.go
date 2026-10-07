@@ -47,8 +47,13 @@ func DefaultRipgrepLimits() RipgrepLimits {
 // GlobLimits holds configurable limits for the glob tool. Together they make a
 // single glob walk bounded: a filesystem runaway (a symlink loop or an
 // enormous directory tree) must neither hang the tool nor exhaust memory.
+// A completely zero GlobLimits is replaced by DefaultGlobLimits() in
+// NewGlobToolWithLimits, so a zero-value GlobLimits cannot register an
+// unbounded walk (the bounds are a property of the tool, not of every caller).
+// An individual zero field on an otherwise-populated struct is honored as
+// "disabled" (see the field comments below).
 type GlobLimits struct {
-	MaxEntries int           // max filesystem entries visited (Open/ReadDir/Stat calls) before the walk is aborted (0 = no entry budget)
+	MaxEntries int           // max filesystem entries visited (directory entries read, plus Open/Stat calls) before the walk is aborted (0 = no entry budget)
 	MaxResults int           // max matching paths collected before the walk is aborted (0 = unlimited)
 	Timeout    time.Duration // wall-clock timeout for a single glob walk (0 = no timeout)
 }

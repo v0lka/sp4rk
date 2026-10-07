@@ -23,7 +23,7 @@ The Executor is **not safe for concurrent use on a single instance** — `Run` m
 func NewExecutor(llmRouter LLMCaller, toolRegistry ToolExecutor, maxSteps int, opts ...Option) *Executor
 ```
 
-The event emitter and the HITL handler are **nil-safe** — `nil` is replaced with `NoopEvents` and `NoopHITLHandler`. Options: `WithTokenCounter`, `WithEvents`, `WithSuppressAssistantEvents` (hides streaming events for sub-steps), `WithStreaming` (streams LLM text deltas live as `AssistantChunk` events; see [Streaming](#streaming)), `WithToolResultBudget` (defaults to `DefaultToolResultBudget()`), `WithCircuitBreaker` (defaults to `DefaultCircuitBreakerConfig()`), `WithHITL`, `WithResumeSteps` (seeds prior ReAct steps to resume from a checkpoint; see [Resume from a checkpoint](#resume-from-a-checkpoint)), `WithPauseChecker`, and `WithUserMessageSource`. The equivalent runtime setters are available for pause/message hooks (`SetStreaming` mirrors `WithStreaming`); `SetVerifyOnEdit` installs the independent post-edit verifier.
+The event emitter and the HITL handler are **nil-safe** — `nil` is replaced with `NoopEvents` and `NoopHITLHandler`. Options: `WithTokenCounter`, `WithEvents`, `WithSuppressAssistantEvents` (hides streaming events for sub-steps), `WithStreaming` (streams LLM text deltas live as `AssistantChunk` events; see [Streaming](#streaming)), `WithToolResultBudget` (defaults to `DefaultToolResultBudget()`), `WithCircuitBreaker` (defaults to `DefaultCircuitBreakerConfig()`), `WithHITL`, `WithResumeSteps` (seeds prior ReAct steps to resume from a checkpoint; see [Resume from a checkpoint](#resume-from-a-checkpoint)), `WithPauseChecker`, `WithUserMessageSource`, and `WithToolCallTimeout` (the per-tool-call ceiling — zero disables; installed at runtime via `SetToolCallTimeout`, with `SetToolCallTimeoutExempt` naming the interactive/long-running tools exempt from it). The equivalent runtime setters are available for pause/message hooks (`SetStreaming` mirrors `WithStreaming`); `SetVerifyOnEdit` installs the independent post-edit verifier.
 
 ### Run
 
@@ -37,7 +37,7 @@ func (e *Executor) Run(ctx context.Context, taskTools []tools.ToolDescriptor, cw
 
 1. **Trajectory sync** — if a `TrajectoryStore` is in `ctx`, the current step history is synced so tools (e.g. a reflector) can read it.
 2. **Step-limit boundary** — if the budget is reached, `HITLHandler.OnStepLimit` decides whether to grant more steps.
-3. **Cooperative pause check** — if a pause checker is installed (`WithPauseChecker`/`SetPauseChecker`), a true return stops the loop immediately with `ErrPaused` and the trajectory so far (a resumable checkpoint).
+3. **Cooperative pause check** — if a pause checker is installed (`WithPauseChecker`/`SetPauseChecker`), a true return stops the loop immediately with `ErrPaused` and the trajectory so far (a resumable checkpoint). The checker is also polled *while a tool call is in flight* (on the executor's `toolWatchdogInterval` ticker, see [Per-tool-call ceiling and watchdog](#per-tool-call-ceiling-and-watchdog)), so a long tool reaches its checkpoint without waiting for the boundary.
 4. **Live user message poll** — if a user-message source is installed (`WithUserMessageSource`/`SetUserMessageSource`), a non-empty return is appended to the trajectory and the context manager as a nudge-only step, so it renders as a `{role:user}` message in this iteration's LLM call.
 5. **LLM call** — the prompt is built from the context manager and sent. If the provider reports a context-window-exceeded error and no delta of that attempt was delivered live, reactive compaction runs and the call is retried; after a delivered delta the error is returned instead (a retry would mix two attempts' visible text).
 6. **Implicit-finish check** — if the model returns no tool calls, the executor decides whether this is a legitimate finish or a failure mode (printed tool-call syntax); a nudge may force an explicit `finish`.
@@ -137,7 +137,7 @@ A nil/omitted source disables the injection entirely (default, backward-compatib
 
 `EditVerifyResult` carries combined output, exit code, timeout state/effective limit, and a runner infrastructure error. `FormatVerifyNote` distinguishes pass, verification failure, timeout, blocked/killed execution without an exit code, and inability to start. The command outcome remains an observation rather than an executor Go error. Output is capped by Unicode code points (`DefaultVerifyOnEditCap == 4000` when the configured cap is non-positive), preserving valid UTF-8 and adding an explicit truncation marker.
 
-Pending verification is flushed on response-group edge cases and before terminal/pause paths so a successful edit cannot disappear from a resumable trajectory or final output without its verification result. A nil runner is the default and leaves edit observations unchanged.
+Pending verification is flushed on the paths that return a consumer for the note — a HITL rejection, a finish, and a pause checkpoint — so a successful edit cannot disappear from a resumable trajectory or final output without its verification result. The terminal arms that return no result (a tool-call ceiling, or an infrastructure/cancellation error) do not flush: with no consumer the note would be discarded, so running the command there would be wasted work. A nil runner is the default and leaves edit observations unchanged.
 
 ### Tool result cache & two-stage truncation
 
@@ -154,11 +154,23 @@ Cache mode selection: `read_file` is file-backed by default (streamed from disk)
 
 The `batch` tool lets the model dispatch multiple tool calls in one turn. It is intercepted by the executor before reaching the registry; its own `Execute()` returns an error. Sub-calls go through the full policy + truncation + caching pipeline, are emitted with a `(batched)` suffix, and per-sub-call errors do not abort the batch.
 
+### Per-tool-call ceiling and watchdog
+
+`WithToolCallTimeout` / `SetToolCallTimeout` bound a **single** tool call. `executeToolCall`:
+
+- runs `e.tools.Execute` on a detached, **panic-recovering** goroutine (a tool panic is contained and delivered as the call's error rather than aborting the process);
+- drains an already-completed result *before* racing the context, so a finished tool always wins over a simultaneously-ready `ctx.Done()`, pause-tick, or timeout arm;
+- abandons the WAIT — cancelling the tool's derived call context (a cooperative request, so an uninterruptible tool may still finish; treat its side effects as having possibly occurred) — when the ceiling fires, returning an error wrapping `ErrToolTimeout` (the dispatch site wraps it with the tool name: `tool "name": tool call timed out`);
+- polls the `PauseChecker` on the executor's `toolWatchdogInterval` ticker (default `defaultToolWatchdogInterval`, 250 ms) for as long as a tool is in flight, so a cooperative pause is observed *mid-call*.
+
+Zero (the default) disables the ceiling. `SetToolCallTimeoutExempt(names...)` names the interactive/long-running orchestration tools (e.g. `ask_user`, `declare_plan`, `delegate`, `execute_plan`) that block on a human or on sub-work by design and are therefore never bounded.
+
 ## Error Handling
 
 - **Fatal LLM/tool error**: `Run` returns a non-nil error.
 - **Context cancelled**: propagated immediately, no retry.
 - **Cooperative pause**: `Run` returns `ErrPaused` plus the trajectory accumulated through the previous completed boundary; pending post-edit verification is flushed before the checkpoint is returned.
+- **Tool call ceiling exceeded**: `Run` returns an error wrapping `ErrToolTimeout` (naming the tool). This arm returns no result, so a pending post-edit verification is deliberately NOT flushed here — with no consumer the note would be discarded, so running the command would be wasted work. Exempt tools (see `SetToolCallTimeoutExempt`) are never bounded.
 - **Verification command failure/timeout**: represented in a `[verify_on_edit]` observation and does not become a `Run` error.
 - **Budget exhausted without finish**: `Finished: false`, treated as incomplete (not an error).
 - **Tool not found / parse failure**: surfaced as `ToolResult{IsError: true}`, not a Go error.

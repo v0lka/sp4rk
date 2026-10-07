@@ -163,6 +163,27 @@ func (e *Executor) flushPendingVerifyOnEdit(ctx context.Context, state *runState
 	return FormatVerifyNote(e.verifyOnEdit(ctx), e.verifyOnEditCap)
 }
 
+// flushPendingVerifyOnEditAtCheckpoint flushes a pending verify-on-edit at a
+// terminal boundary that returns a resumable checkpoint — a pause — and records
+// the note in state.allSteps as a user-nudge step, so a resumed run sees the
+// verification of an edit performed earlier in the same response group. It is
+// deliberately NOT called from the arms that return no checkpoint (a tool-call
+// ceiling or an infrastructure/cancellation error): with no consumer the note
+// would be discarded, so running the command there would be wasted work. It is a
+// no-op when nothing is pending (no runner installed, or no edit since the last
+// flush).
+//
+// pendingVerifyEdit lives on the loop-local runState, not on the returned
+// Steps, so without this the pending verification would be dropped the moment
+// the run leaves the tool-dispatch path — and a resumed run, which starts with
+// a fresh runState, would never verify the edit (the same silent loss the
+// HITL-reject path already guards against).
+func (e *Executor) flushPendingVerifyOnEditAtCheckpoint(ctx context.Context, state *runState) {
+	if note := e.flushPendingVerifyOnEdit(ctx, state); note != "" {
+		state.allSteps = append(state.allSteps, Step{UserNudge: note})
+	}
+}
+
 // SetVerifyOnEdit installs a post-edit verification hook. After every
 // response group containing at least one successful write_file/edit_file
 // call, the hook runs once (debounced per group) and its output is appended

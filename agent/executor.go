@@ -534,8 +534,12 @@ type Executor struct {
 	// pauseChecker, when non-nil, is invoked at every step boundary in Run
 	// (after the context-cancellation check). A true return causes Run to stop
 	// cooperatively, returning the trajectory so far and the ErrPaused
-	// sentinel. Set via WithPauseChecker or SetPauseChecker. Nil disables
-	// pausing (default, backward-compatible behavior).
+	// sentinel. Since the tool-call watchdog, it is ALSO polled while a tool
+	// call is in flight — on this executor's toolWatchdogInterval ticker (see
+	// executeToolCall) — so a long tool reaches its pause checkpoint without
+	// waiting for the step boundary; keep it cheap and idempotent. Set via
+	// WithPauseChecker or SetPauseChecker. Nil disables pausing (default,
+	// backward-compatible behavior).
 	pauseChecker func(context.Context) bool
 
 	// toolCallTimeout bounds a single tool call. When positive, executeToolCall
@@ -543,8 +547,26 @@ type Executor struct {
 	// ErrToolTimeout (wrapped with the tool name by the dispatch site), so a
 	// stuck tool cannot block the ReAct loop indefinitely. Zero (the default)
 	// disables the bound, preserving the pre-watchdog behavior. Set via
-	// WithToolCallTimeout or SetToolCallTimeout.
+	// WithToolCallTimeout or SetToolCallTimeout. Tools named in
+	// toolCallTimeoutExempt are never bounded (see that field).
 	toolCallTimeout time.Duration
+
+	// toolCallTimeoutExempt names the tools exempt from toolCallTimeout. They
+	// are interactive/long-running orchestration tools that block inside
+	// Execute by design — on a human (a confirmation card, ask_user, a plan or
+	// goal approval) or on sub-work (a blocking delegate, a synchronously
+	// executed plan) — and must not fail the whole run when the ceiling fires.
+	// Defaulted to defaultToolCallTimeoutExemptTools in NewExecutor; hosts may
+	// extend or replace it via SetToolCallTimeoutExempt.
+	toolCallTimeoutExempt map[string]struct{}
+
+	// toolWatchdogInterval is this executor's pause-poll cadence for a tool
+	// call in flight (see executeToolCall). It is defaulted to
+	// defaultToolWatchdogInterval in NewExecutor and lives on the instance —
+	// never in package state — so shortening it for a test cannot change the
+	// real cadence for the rest of the package. Set via the unexported
+	// withToolWatchdogInterval option.
+	toolWatchdogInterval time.Duration
 
 	// userMessageSource, when non-nil, is invoked at every step boundary in
 	// Run, immediately after the pause check and before the LLM call. A
@@ -575,6 +597,7 @@ type executorOptions struct {
 	resumeSteps             []Step
 	pauseChecker            func(context.Context) bool
 	toolCallTimeout         time.Duration
+	watchdogInterval        time.Duration
 	userMessageSource       func(context.Context) string
 }
 
@@ -595,6 +618,7 @@ var (
 	_ Option = resumeStepsOption{}
 	_ Option = pauseCheckerOption{}
 	_ Option = toolCallTimeoutOption{}
+	_ Option = watchdogIntervalOption{}
 	_ Option = userMessageSourceOption{}
 )
 
@@ -707,7 +731,9 @@ func (o pauseCheckerOption) apply(opts *executorOptions) { opts.pauseChecker = o
 // the sentinel ErrPaused and Finished: false. A nil/omitted checker means the
 // loop never pauses on its own (the default, fully backward-compatible
 // behavior). The checker must be safe to call from the Run goroutine and
-// should be cheap; it is invoked once per step.
+// should be cheap and idempotent; it is invoked once per step boundary AND,
+// while a tool call is in flight, polled on the toolWatchdogInterval ticker
+// (see executeToolCall).
 func WithPauseChecker(checker func(context.Context) bool) Option {
 	return pauseCheckerOption{Checker: checker}
 }
@@ -724,6 +750,19 @@ func (o toolCallTimeoutOption) apply(opts *executorOptions) { opts.toolCallTimeo
 // DefaultToolCallTimeout for the recommended value.
 func WithToolCallTimeout(timeout time.Duration) Option {
 	return toolCallTimeoutOption{Timeout: timeout}
+}
+
+type watchdogIntervalOption struct{ Interval time.Duration }
+
+func (o watchdogIntervalOption) apply(opts *executorOptions) { opts.watchdogInterval = o.Interval }
+
+// withToolWatchdogInterval overrides the executor's pause-poll cadence (see
+// toolWatchdogInterval). It is unexported on purpose: the cadence is an
+// internal detail, and keeping the seam on the instance means a test cannot
+// leak a shortened cadence into production or into a parallel test. A
+// non-positive duration is ignored and the default applies.
+func withToolWatchdogInterval(interval time.Duration) Option {
+	return watchdogIntervalOption{Interval: interval}
 }
 
 type userMessageSourceOption struct{ Source func(context.Context) string }
@@ -764,6 +803,9 @@ func NewExecutor(llmRouter LLMCaller, toolRegistry ToolExecutor, maxSteps int, o
 	if o.hitl == nil {
 		o.hitl = &NoopHITLHandler{}
 	}
+	if o.watchdogInterval <= 0 {
+		o.watchdogInterval = defaultToolWatchdogInterval
+	}
 	return &Executor{
 		llm:                     llmRouter,
 		tools:                   toolRegistry,
@@ -780,6 +822,8 @@ func NewExecutor(llmRouter LLMCaller, toolRegistry ToolExecutor, maxSteps int, o
 		resumeSteps:             o.resumeSteps,
 		pauseChecker:            o.pauseChecker,
 		toolCallTimeout:         o.toolCallTimeout,
+		toolCallTimeoutExempt:   copyToolNameSet(defaultToolCallTimeoutExemptTools),
+		toolWatchdogInterval:    o.watchdogInterval,
 		userMessageSource:       o.userMessageSource,
 	}
 }
@@ -855,9 +899,51 @@ func (e *Executor) SetPauseChecker(fn func(context.Context) bool) { e.pauseCheck
 // Run returns an error wrapping ErrToolTimeout (wrapped with the tool name), so
 // a stuck tool cannot block the ReAct loop indefinitely — pause and cancel
 // remain observable while the tool is in flight. A zero value (the default)
-// disables the bound and restores the pre-watchdog behavior. See
+// disables the bound and restores the pre-watchdog behavior. Tools named in the
+// exemption set (see SetToolCallTimeoutExempt) are never bounded. See
 // DefaultToolCallTimeout for the recommended value. Must be called before Run.
 func (e *Executor) SetToolCallTimeout(timeout time.Duration) { e.toolCallTimeout = timeout }
+
+// SetToolCallTimeoutExempt replaces the set of tool names exempt from the
+// per-tool-call ceiling (see SetToolCallTimeout). These are the interactive /
+// long-running orchestration tools that block on a human or on sub-work by
+// design — ask_user, declare_plan, propose_goal, a blocking delegate, a
+// synchronously executed plan — and must not fail the whole run when the
+// ceiling fires. Passing no names (or only empty strings) clears the
+// exemption so every tool is bounded. Must be called before Run.
+func (e *Executor) SetToolCallTimeoutExempt(names ...string) {
+	m := make(map[string]struct{}, len(names))
+	for _, n := range names {
+		if n != "" {
+			m[n] = struct{}{}
+		}
+	}
+	if len(m) == 0 {
+		e.toolCallTimeoutExempt = nil
+		return
+	}
+	e.toolCallTimeoutExempt = m
+}
+
+// isToolCallTimeoutExempt reports whether name is exempt from the per-tool-call
+// ceiling.
+func (e *Executor) isToolCallTimeoutExempt(name string) bool {
+	_, ok := e.toolCallTimeoutExempt[name]
+	return ok
+}
+
+// copyToolNameSet returns a shallow copy of src (nil when src is empty) so a
+// per-executor set never aliases the package-level default.
+func copyToolNameSet(src map[string]struct{}) map[string]struct{} {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[string]struct{}, len(src))
+	for k := range src {
+		dst[k] = struct{}{}
+	}
+	return dst
+}
 
 // SetUserMessageSource installs a live user-message source polled at every
 // step boundary in Run, immediately after the pause check and before the LLM
@@ -1289,7 +1375,9 @@ var ErrPaused = errors.New("executor paused at step boundary")
 // WithToolCallTimeout. The dispatch sites wrap it with the tool name, so a
 // surfaced error reads `tool "name": tool call timed out`. The run returns
 // promptly with a nil result instead of blocking the ReAct loop indefinitely on
-// a stuck tool; the underlying tool keeps running in its detached goroutine.
+// a stuck tool; the tool's derived call context is cancelled (a cooperative
+// request), so an uninterruptible tool may still keep running in its detached
+// goroutine beyond that.
 // errors.Is-check for ErrToolTimeout to distinguish it from cancellation or a
 // genuine tool failure.
 var ErrToolTimeout = errors.New("tool call timed out")

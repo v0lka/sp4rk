@@ -104,6 +104,7 @@ type ConductorConfig struct {
     PendingUserInterjection string
     PauseChecker func(context.Context) bool
     UserMessageSource func(context.Context) string
+    ToolCallTimeout time.Duration
     CompactOnStart bool
 }
 ```
@@ -134,8 +135,9 @@ type ConductorConfig struct {
 | `ResumeSteps` | Prior ReAct steps to resume from a checkpoint instead of starting fresh. When non-empty, `Run` seeds the `ContextManager` (via its `StepSeedable` capability) and the `Executor` (via `agent.WithResumeSteps`) with a defensive copy, so the step counter continues from `len(steps)+1` and the full trajectory syncs to the `TrajectoryStore`. The steps count against `MaxSteps`, not in addition to it. Requires a `StepSeedable` `ContextManager`; `Run` fails fast otherwise. Nil/empty (the default) is fully backward-compatible. |
 | `ContentBlocks` | Optional text/image blocks for a multimodal task. When non-empty, requires the optional `BlockTaskAware` path; providers render blocks ahead of plain content. |
 | `PendingUserInterjection` | One-shot resume nudge appended after seeded history as the final user message. Requires `InterjectionAware`; an `InterjectionConsumer` retires it only after a successful LLM response. Empty disables it. |
-| `PauseChecker` | Cooperative step-boundary pause callback. A true return becomes `ExecutionStatusPaused` with an empty output and preserved trajectory. Nil disables pause. |
+| `PauseChecker` | Cooperative pause callback. A true return becomes `ExecutionStatusPaused` with an empty output and preserved trajectory. It is checked at every step boundary and, while a tool call is in flight, polled on the executor's `toolWatchdogInterval` ticker (keep it cheap and idempotent). Nil disables pause. |
 | `UserMessageSource` | Host-owned live-message source polled after pause at each boundary. One non-empty message is delivered in the next LLM request. Nil disables live steering. |
+| `ToolCallTimeout` | Per-tool-call ceiling installed via `SetToolCallTimeout`. A single tool call whose wait exceeds it is abandoned and the tool's context is cancelled (a cooperative request — an uninterruptible tool may still finish) and the run returns an error wrapping `agent.ErrToolTimeout`, named with the tool. Interactive/long-running tools can be exempted via `agent.Executor.SetToolCallTimeoutExempt`. Zero (default) disables it. |
 | `CompactOnStart` | Forces one compaction pass right after resume/nudge seeding — before the first LLM call — regardless of fill thresholds. Intended for manual compaction of a paused task: relaunch with `ResumeSteps` + `CompactOnStart` and the seeded trajectory is compressed up front. Emits a `ContextCompaction` event (empty step ID) only when `Compact` reports a result; a nil result (nothing to compact) emits nothing. The Executor's threshold-driven reactive compaction may still fire later. `false` (default) keeps compaction purely threshold-driven. |
 
 ### NewConductor

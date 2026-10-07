@@ -1130,20 +1130,33 @@ func (e *Executor) processSingleToolCall(
 	}
 	result, err := e.executeToolCall(execCtx, action.Name, input)
 	if err != nil {
+		// Every arm below abandons the tool: its detached goroutine may still
+		// be running, so treat the tool's side effects as having possibly
+		// occurred even though the run does not record its step.
+		//
 		// Cooperative pause observed while the tool was in flight: the tool
 		// blocked long enough for the pause checker to trip at a watchdog
 		// tick. Return the same resumable, unfinished checkpoint the
 		// step-boundary pause produces (see the boundary case in Run), so a
-		// paused task can be resumed from state.allSteps.
+		// paused task can be resumed from state.allSteps. Because this arm
+		// returns a checkpoint, flush a verification still pending from an
+		// earlier successful edit in this group first — the checkpoint carries
+		// no pendingVerifyEdit, so a resumed run would otherwise never verify
+		// the edit (flushPendingVerifyOnEditAtCheckpoint).
 		if isPauseError(err) {
+			e.flushPendingVerifyOnEditAtCheckpoint(ctx, state)
 			return &ExecutorResult{Steps: state.allSteps, Finished: false}, actionNone, ErrPaused
 		}
 		// A tool that exceeded its per-call ceiling: surface an error naming
-		// the tool (errors.Is-matchable against ErrToolTimeout).
+		// the tool (errors.Is-matchable against ErrToolTimeout). This arm
+		// returns no checkpoint, so a pending verification is deliberately NOT
+		// flushed: with no consumer the note would be discarded, so running the
+		// command would be pure wasted work.
 		if isToolTimeoutError(err) {
 			return nil, actionNone, fmt.Errorf("tool %q: %w", action.Name, ErrToolTimeout)
 		}
-		// Infrastructure error (including context cancellation/deadline).
+		// Infrastructure error (including context cancellation/deadline): also
+		// returns no checkpoint, so no verification is flushed (see above).
 		return nil, actionNone, err
 	}
 
@@ -1537,18 +1550,32 @@ func (e *Executor) processBatchTool(
 			result, execErr = e.executeToolCall(execCtx, subCall.Name, subInput)
 		}
 		if execErr != nil {
+			// Every returning arm below abandons the sub-call's tool: its
+			// detached goroutine may still be running, so treat the tool's side
+			// effects as having possibly occurred even though the run does not
+			// record its step.
+			//
 			// Cooperative pause observed while the sub-call's tool was in
 			// flight: return the resumable, unfinished checkpoint (mirroring
-			// the step-boundary pause and the single-call path above).
+			// the step-boundary pause and the single-call path above). Because
+			// this arm returns a checkpoint, flush a verification still pending
+			// from an earlier successful edit in this group first — the
+			// checkpoint carries no pendingVerifyEdit, so a resumed run would
+			// otherwise never verify the edit
+			// (flushPendingVerifyOnEditAtCheckpoint).
 			if isPauseError(execErr) {
+				e.flushPendingVerifyOnEditAtCheckpoint(ctx, state)
 				return &ExecutorResult{Steps: state.allSteps, Finished: false}, actionNone, ErrPaused
 			}
-			// Per-call ceiling exceeded: surface an error naming the tool.
+			// Per-call ceiling exceeded: surface an error naming the tool. This
+			// arm returns no checkpoint, so a pending verification is
+			// deliberately NOT flushed (no consumer would see the note).
 			if isToolTimeoutError(execErr) {
 				return nil, actionNone, fmt.Errorf("tool %q: %w", subCall.Name, ErrToolTimeout)
 			}
 			// Context cancellation/deadline: propagate rather than swallow as
-			// an error result, so a cancelled run stops promptly.
+			// an error result, so a cancelled run stops promptly. Also returns
+			// no checkpoint, so no verification is flushed.
 			if isContextError(execErr) {
 				return nil, actionNone, execErr
 			}
