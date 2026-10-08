@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/v0lka/sp4rk/sysproc"
 	"github.com/v0lka/sp4rk/tools"
@@ -23,6 +24,16 @@ Inputs: pattern (regex or literal); optional context_lines (lines around each ma
 Outputs: matched lines with file and line number, plus context when requested; empty output means no matches.
 Example: pattern "func TestOrchestrator" with file_pattern "*_test.go" locates orchestrator tests.
 Anti-example: not for file discovery by name (glob); matching is case-sensitive unless ignore_case=true; regex metacharacters in a literal string must be escaped.`
+
+// maxRipgrepResultBytes caps how much formatted match output the ripgrep tool
+// accumulates in memory. The scanner buffer bounds a single line only; the
+// executor's central truncation layer runs only after Execute returns, so
+// without this cap a search over a huge tree (e.g. pattern ".") grows the
+// result buffer until the host is OOM-killed. When the cap is reached the
+// scan stops storing and counting further results; the child's stdout is
+// still drained to EOF so rg exits promptly, and the result carries an
+// incompleteness marker naming the cap.
+const maxRipgrepResultBytes = 10 << 20 // 10 MiB
 
 // RipgrepTool searches file contents using regex patterns via the system
 // `rg` CLI (ripgrep). The rg binary is a managed runtime dependency provided
@@ -55,6 +66,12 @@ func NewRipgrepToolWithLimits(limits RipgrepLimits) *RipgrepTool {
 // absolute path is used, otherwise the bare "rg" name is stored (and
 // re-resolved lazily in Execute if still unset).
 func NewRipgrepToolWithPath(limits RipgrepLimits, rgPath string) *RipgrepTool {
+	if limits.Timeout <= 0 {
+		// A zero-value (or non-positive-timeout) config would derive a zero
+		// per-call deadline, cancelling every search before it starts; fall
+		// back to the defaults (see RipgrepLimits).
+		limits = DefaultRipgrepLimits()
+	}
 	if rgPath == "" {
 		if resolved, err := exec.LookPath("rg"); err == nil {
 			rgPath = resolved
@@ -218,7 +235,7 @@ func (t *RipgrepTool) Execute(ctx context.Context, input json.RawMessage) (tools
 	checker := tools.IgnoreCheckerFrom(ctx)
 	args = append(args, "-e", params.Pattern, "--", params.Path)
 
-	searchCtx, cancel := context.WithTimeout(ctx, t.limits.Timeout)
+	searchCtx, cancel := context.WithTimeout(ctx, t.effectiveTimeout())
 	defer cancel()
 
 	cmd := exec.CommandContext(searchCtx, rgPath, args...)
@@ -242,7 +259,11 @@ func (t *RipgrepTool) Execute(ctx context.Context, input json.RawMessage) (tools
 	var sb strings.Builder
 	fileSet := make(map[string]struct{})
 	matchCount := 0
+	// resultTruncated reports that the scan stopped early because the
+	// accumulated output reached maxRipgrepResultBytes.
+	resultTruncated := false
 
+scan:
 	for scanner.Scan() {
 		var ev rgEvent
 		if unmarshalErr := json.Unmarshal(scanner.Bytes(), &ev); unmarshalErr != nil {
@@ -261,6 +282,12 @@ func (t *RipgrepTool) Execute(ctx context.Context, input json.RawMessage) (tools
 			// only rules rg cannot see.
 			if isIgnoredPath(checker, params.Path, path) {
 				continue
+			}
+			// Bound the accumulated result: stop storing (and counting) once
+			// the cap is reached; everything after it is reported as omitted.
+			if sb.Len() >= maxRipgrepResultBytes {
+				resultTruncated = true
+				break scan
 			}
 			fileSet[path] = struct{}{}
 			content := strings.TrimRight(m.Lines.Text, "\n")
@@ -286,6 +313,10 @@ func (t *RipgrepTool) Execute(ctx context.Context, input json.RawMessage) (tools
 			if isIgnoredPath(checker, params.Path, c.Path.Text) {
 				continue
 			}
+			if sb.Len() >= maxRipgrepResultBytes {
+				resultTruncated = true
+				break scan
+			}
 			content := strings.TrimRight(c.Lines.Text, "\n")
 			fmt.Fprintf(&sb, "  %s\n", content)
 		}
@@ -296,9 +327,10 @@ func (t *RipgrepTool) Execute(ctx context.Context, input json.RawMessage) (tools
 	// silently dropping the rest of the results.
 	lineTruncated := errors.Is(scanner.Err(), bufio.ErrTooLong)
 
-	// Drain any remaining stdout. When the scanner aborts early (ErrTooLong),
-	// rg keeps producing output into a pipe nobody reads, blocks on a full
-	// pipe buffer, and never exits — causing cmd.Wait to hang until the search
+	// Drain any remaining stdout. When the scanner aborts early (ErrTooLong,
+	// or the result cap was reached and we stopped scanning), rg keeps
+	// producing output into a pipe nobody reads, blocks on a full pipe
+	// buffer, and never exits — causing cmd.Wait to hang until the search
 	// timeout. Draining to EOF lets rg finish and exit promptly. When the
 	// scanner already reached EOF this is a no-op.
 	_, _ = io.Copy(io.Discard, stdout)
@@ -324,26 +356,45 @@ func (t *RipgrepTool) Execute(ctx context.Context, input json.RawMessage) (tools
 
 	timedOut := errors.Is(searchCtx.Err(), context.DeadlineExceeded)
 
-	if matchCount == 0 {
-		content := "no matches found"
+	// Report every incompleteness condition on both return paths so the
+	// branches cannot drift. resultTruncated is reachable with zero stored
+	// matches: the context branch can fill the result cap before the first
+	// match event is ever stored, and a bare "no matches found" would then
+	// silently hide the early stop.
+	markers := func(add func(string)) {
 		if timedOut {
-			content += "\n[search timed out — results may be incomplete]"
+			add("\n[search timed out — results may be incomplete]")
 		}
 		if lineTruncated {
-			content += "\n[some results omitted — a line exceeded the scan buffer]"
+			add("\n[some results omitted — a line exceeded the scan buffer]")
 		}
+		if resultTruncated {
+			add(fmt.Sprintf("\n[some results omitted — output exceeded the %d byte result cap]", maxRipgrepResultBytes))
+		}
+	}
+
+	if matchCount == 0 {
+		content := "no matches found"
+		markers(func(s string) { content += s })
 		return tools.ToolResult{Content: content}, nil
 	}
 
 	fmt.Fprintf(&sb, "\nFound %d matches in %d files", matchCount, len(fileSet))
-	if timedOut {
-		sb.WriteString("\n[search timed out — results may be incomplete]")
-	}
-	if lineTruncated {
-		sb.WriteString("\n[some results omitted — a line exceeded the scan buffer]")
-	}
+	markers(func(s string) { sb.WriteString(s) })
 
 	return tools.ToolResult{Content: sb.String()}, nil
+}
+
+// effectiveTimeout returns the per-call deadline for one search: the
+// configured timeout, or the default when the tool carries a non-positive
+// one. A directly constructed RipgrepTool with zero-value limits would
+// otherwise derive a zero deadline, cancelling every search before it starts
+// (see RipgrepLimits).
+func (t *RipgrepTool) effectiveTimeout() time.Duration {
+	if t.limits.Timeout > 0 {
+		return t.limits.Timeout
+	}
+	return DefaultRipgrepLimits().Timeout
 }
 
 // isIgnoredPath reports whether a ripgrep-emitted path should be dropped

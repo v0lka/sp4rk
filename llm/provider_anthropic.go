@@ -92,7 +92,10 @@ func NewAnthropicProvider(cfg AnthropicProviderConfig) (*AnthropicProvider, erro
 	// the DeltaSink as they arrive off the wire) and the synchronous path pays
 	// the same transient ~1× body-size allocation as before. A body the SDK
 	// abandons early (e.g. a cancelled stream) captures partially — enough for
-	// diagnostics. The provided HTTP client is cloned (not mutated) so any
+	// diagnostics. The capture retains only the first maxCapturedBodyBytes
+	// (64 KiB) of the body — far more than any diagnostic consumes — so even a
+	// hostile, arbitrarily large or never-ending response cannot grow the heap
+	// without bound. The provided HTTP client is cloned (not mutated) so any
 	// shared proxy/TLS/timeout configuration is preserved and other consumers
 	// of the same client are unaffected.
 	httpClient := &http.Client{}
@@ -173,16 +176,37 @@ type bodyCaptureCtxKey struct{}
 // abandoned early — then what was read so far). ChatCompletion owns one
 // instance per call and shares it with the transport through the request
 // context, so the caller can inspect the body after either the synchronous or
-// the streaming path completes.
+// the streaming path completes. The capture is bounded: write retains only the
+// first maxCapturedBodyBytes bytes of the body, so even a hostile or
+// misbehaving endpoint streaming an arbitrarily large (or never-ending) body
+// cannot grow the heap without bound — the SDK itself never materializes the
+// whole body, so an uncapped tee would be a net-new, always-on allocation.
 type capturedBody struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
 }
 
-// write appends bytes read off the wire.
+// maxCapturedBodyBytes bounds the per-request response-body capture at 64 KiB.
+// The capture exists only for error diagnostics — truncateForError embeds at
+// most 2 KiB in an error message — so a bounded prefix is always sufficient,
+// while the cap makes the transport's memory footprint constant regardless of
+// response size or stream length.
+const maxCapturedBodyBytes = 64 * 1024
+
+// write appends bytes read off the wire, retaining only a bounded prefix
+// (maxCapturedBodyBytes); bytes past the cap are dropped. Every consumer reads
+// only the head of the body (truncateForError), so dropping the tail is
+// lossless for diagnostics while capping memory.
 func (c *capturedBody) write(p []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	room := maxCapturedBodyBytes - c.buf.Len()
+	if room <= 0 {
+		return
+	}
+	if len(p) > room {
+		p = p[:room]
+	}
 	c.buf.Write(p)
 }
 
@@ -378,14 +402,24 @@ func (p *AnthropicProvider) buildRequest(req ChatRequest) (*anthropic.MessagesRe
 		// Skip messages with no renderable content (Anthropic API rejects empty
 		// messages). ContentBlocks are included so an image-only user message
 		// (empty Content, non-empty ContentBlocks) is not silently dropped.
-		// ReasoningContent is also checked so an assistant message carrying only
-		// reasoning is not silently dropped.
-		if msg.Content == "" && len(msg.ContentBlocks) == 0 && len(msg.ToolCalls) == 0 && msg.ToolCallID == "" && msg.ReasoningContent == "" {
+		// ReasoningContent deliberately does NOT keep a message alive: a
+		// reasoning-only message has no renderable block (the assistant branch
+		// emits text and tool_use blocks only), so sending it would marshal a
+		// nil Content as "content": null and the API would reject the whole
+		// request with HTTP 400 — the same treatment buildGoogleRequest gives
+		// such messages.
+		if msg.Content == "" && len(msg.ContentBlocks) == 0 && len(msg.ToolCalls) == 0 && msg.ToolCallID == "" {
 			continue
 		}
 		anthropicMsg, err := p.convertMessage(msg)
 		if err != nil {
 			return nil, err
+		}
+		// Choke point: never send a message that rendered to zero content
+		// blocks — a nil Content slice marshals as "content": null, which the
+		// Messages API rejects with HTTP 400.
+		if len(anthropicMsg.Content) == 0 {
+			continue
 		}
 		messages = append(messages, anthropicMsg)
 	}
@@ -440,7 +474,20 @@ func (p *AnthropicProvider) buildRequest(req ChatRequest) (*anthropic.MessagesRe
 	// thinking.budget_tokens, and the budget itself must be >= 1024. Clamp
 	// the budget for small max_tokens values (e.g. the 8192 fallback) and
 	// skip thinking entirely when no valid budget fits.
-	if req.ReasoningEffort == "On" {
+	//
+	// Thinking is also skipped when the request re-sends an assistant turn
+	// carrying tool_use blocks (a tool-use continuation). The Messages API
+	// requires such an assistant message to START with a thinking (or
+	// redacted_thinking) block when thinking is enabled; parseResponse
+	// collapses the thinking block into ChatResponse.Reasoning and never
+	// re-emits it on the wire (llm.Message carries no thinking block), so a
+	// continuation request sent with thinking enabled is rejected with
+	// HTTP 400 ("Expected `thinking` or `redacted_thinking`, but found
+	// `tool_use`") — deterministically breaking every tool call of a
+	// reasoning-enabled run. Disabling thinking for the continuation request
+	// is the documented fail-safe: the request is accepted, at the cost of
+	// extended thinking on that turn.
+	if req.ReasoningEffort == "On" && !historyHasAssistantToolUse(filteredMsgs) {
 		budget := 32000
 		if anthropicReq.MaxTokens <= budget {
 			budget = anthropicReq.MaxTokens / 2
@@ -463,16 +510,41 @@ func (p *AnthropicProvider) buildRequest(req ChatRequest) (*anthropic.MessagesRe
 	if len(req.Tools) > 0 {
 		tools := make([]anthropic.ToolDefinition, len(req.Tools))
 		for i, tool := range req.Tools {
+			sanitized := SanitizeSchemaForAnthropic(tool.InputSchema)
+			var inputSchema any = sanitized
+			if len(sanitized) == 0 {
+				// A schema-less tool must not go out with an empty input_schema:
+				// assigned to the SDK's any-typed field, a (typed-nil)
+				// json.RawMessage defeats omitempty and marshals as
+				// "input_schema": null — the Messages API requires input_schema
+				// to be a JSON Schema object and rejects the whole request with
+				// HTTP 400. Mirror convertSchemaToMap (Chat Completions) and
+				// install the same default object schema.
+				inputSchema = defaultObjectSchema()
+			}
 			tools[i] = anthropic.ToolDefinition{
 				Name:        tool.Name,
 				Description: tool.Description,
-				InputSchema: SanitizeSchemaForAnthropic(tool.InputSchema),
+				InputSchema: inputSchema,
 			}
 		}
 		anthropicReq.Tools = tools
 	}
 
 	return anthropicReq, nil
+}
+
+// historyHasAssistantToolUse reports whether the outgoing message history
+// re-sends at least one assistant turn that carries tool_use blocks — the
+// shape the Anthropic Messages API rejects with HTTP 400 when thinking is
+// enabled and the turn does not start with a (redacted_)thinking block.
+func historyHasAssistantToolUse(msgs []Message) bool {
+	for _, msg := range msgs {
+		if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // convertMessage converts a Message to anthropic.Message.
@@ -632,7 +704,14 @@ func (p *AnthropicProvider) parseResponse(resp anthropic.MessagesResponse, rawBo
 		Reasoning:  reasoning,
 		StopReason: string(resp.StopReason),
 		Usage: TokenUsage{
-			InputTokens:  resp.Usage.InputTokens,
+			// input_tokens counts only the tokens after the last cache
+			// breakpoint; the cached prefix arrives separately as
+			// cache_creation_input_tokens / cache_read_input_tokens. Sum all
+			// three so usage tracking and the executor's near-context-limit
+			// warning see the true prompt size instead of the tiny uncached
+			// remainder (this provider arms caching on multi-part system
+			// prompts, so the cache counters are routinely populated).
+			InputTokens:  resp.Usage.InputTokens + resp.Usage.CacheCreationInputTokens + resp.Usage.CacheReadInputTokens,
 			OutputTokens: resp.Usage.OutputTokens,
 		},
 	}, nil

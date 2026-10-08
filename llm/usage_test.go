@@ -157,9 +157,11 @@ func TestTrackingCaller_CallCorrectContextTracker(t *testing.T) {
 
 	ctxTracker := NewContextTokenTracker(NewSimpleTokenCounter())
 	ctxTracker.AddDelta("some pending text that should be replaced")
-	tc = tc.WithContextTracker(ctxTracker)
+	// WithContextTracker returns the Caller interface (TrackerInjector
+	// contract), so bind the step-local caller to a new variable.
+	tracked := tc.WithContextTracker(ctxTracker)
 
-	_, err := tc.Call(context.Background(), ChatRequest{Model: "gpt-4o"})
+	_, err := tracked.Call(context.Background(), ChatRequest{Model: "gpt-4o"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

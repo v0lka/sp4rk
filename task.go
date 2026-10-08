@@ -61,6 +61,7 @@ type TaskBuilder struct {
 	customReflector *reflector.Reflector
 
 	maxRetries int
+	maxReplans int
 
 	planModel string
 	execModel string
@@ -73,14 +74,15 @@ type TaskBuilder struct {
 }
 
 // newTaskBuilder returns a TaskBuilder with the common defaults (maxRetries=2,
-// compaction="sliding_window"). Every construction path should go through here
-// to keep defaults in one place.
+// maxReplans=3, compaction="sliding_window"). Every construction path should
+// go through here to keep defaults in one place.
 func newTaskBuilder(ctx context.Context, task string, fw *Framework) *TaskBuilder {
 	return &TaskBuilder{
 		ctx:        ctx,
 		fw:         fw,
 		task:       task,
 		maxRetries: 2,
+		maxReplans: 3,
 		compaction: "sliding_window",
 	}
 }
@@ -169,6 +171,18 @@ func (b *TaskBuilder) MaxRetries(n int) *TaskBuilder {
 	return b
 }
 
+// MaxReplans sets the global replan budget — the maximum number of plan
+// regenerations adopted during a single execution (default 3). Each adopted
+// replan re-derives the remaining plan after the reflector judges the plan
+// itself flawed; without a budget a deterministically failing step loops
+// forever (fail → reflect "replan" → re-plan → fail …). When the budget is
+// exhausted, execution stops with a partial status and the proposed replan is
+// reported via OnReplanFailed. 0 disables replanning entirely.
+func (b *TaskBuilder) MaxReplans(n int) *TaskBuilder {
+	b.maxReplans = n
+	return b
+}
+
 // Models configures runtime model switching: planModel for planning/reflection,
 // execModel for step execution. The router is restored to planModel after
 // execution. Use when you want a strong-reasoning model for planning and a
@@ -233,6 +247,16 @@ func (b *TaskBuilder) Execute() (*orchestration.ExecutionResult, error) {
 	}
 	defer conductor.Cleanup()
 
+	// Plan-and-execute with a dedicated execution model: the Conductor's
+	// per-step context budget (window, output reserve, tokenizer) and system
+	// prompt must be sized against the model that actually serves the step
+	// calls, not the framework's construction-time default. NewConductor
+	// snapshots the then-active model; runPlanned switches the router to
+	// execModel before executing, so pin the Conductor's model to match.
+	if b.usePlanner && b.execModel != "" {
+		conductor.SetModel(b.execModel)
+	}
+
 	bb, shutdown := b.fw.newBlackboard("taskf")
 	defer shutdown()
 	bb.SetOriginalRequest(b.task)
@@ -293,11 +317,19 @@ func (b *TaskBuilder) runPlanned(
 	var reflections []orchestration.Reflection
 	aborted := false
 	paused := false
+	replans := 0
 
 	// Honour context cancellation between waves: without this check a
 	// cancelled context causes the loop to grind through every remaining
 	// ready step (each conductor.Run failing with a context error) and
 	// misreport them as failures rather than recognising the cancellation.
+	//
+	// The replans counter bounds the fail→reflect-"replan"→re-plan cycle: a
+	// step that fails deterministically would otherwise replan indefinitely
+	// (each cycle leaving the step un-completed so FindReadySteps re-selects
+	// it), hanging Execute and burning LLM budget for as long as the context
+	// lives. When the budget is exhausted the proposed replan is refused and
+	// the loop terminates with a partial result.
 	for ctx.Err() == nil {
 		ready := orchestration.FindReadySteps(plan, completed)
 		if len(ready) == 0 {
@@ -315,11 +347,23 @@ func (b *TaskBuilder) runPlanned(
 			break
 		}
 		if replanPlan != nil {
+			if replans >= b.maxReplans {
+				b.events.OnReplanFailed(fmt.Errorf("replan budget exhausted after %d replans; stopping execution", replans))
+				break
+			}
 			// Reflection flagged a plan-level flaw: adopt the re-derived plan,
 			// carrying forward prior successful work, and restart the DAG over
 			// the new steps.
+			replans++
 			plan = replanPlan
-			completed = orchestration.BuildCarryForward(completedInOrder(completed, bb.GetPlan()), plan)
+			// BuildCarryForward returns a nil map when no completed step
+			// survives into the new plan; keep the set non-nil so the
+			// runStep writes below cannot panic on a nil map.
+			if c := orchestration.BuildCarryForward(completedInOrder(completed, bb.GetPlan()), plan); c != nil {
+				completed = c
+			} else {
+				completed = make(map[string]orchestration.CompletedStep)
+			}
 			bb.SetPlan(plan)
 			b.events.OnPlanGenerated(len(plan.Steps), planStepsToEvents(plan))
 			continue
@@ -556,6 +600,12 @@ func (b *TaskBuilder) resolvePlanner(ctx context.Context) (*planner.Planner, err
 	}
 	cfg := planner.DefaultConfig()
 	cfg.Prompts = DefaultPromptSet()
+	// Wire the framework registry so the replan prompt's AVAILABLE-TOOLS
+	// section lists the tools the revised plan's steps will run with.
+	// Safe on this default path: PlannerToolNames stays empty, so Plan
+	// routes to direct planning and the registry is consulted only for the
+	// replan tool listing (see planner.getPlannerTools).
+	cfg.ToolRegistry = b.fw.ToolRegistry()
 	// Resolve family from the planning model if set, else the active model.
 	model := b.planModel
 	if model == "" {

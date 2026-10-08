@@ -187,6 +187,7 @@ func responsesAPICompletionStream(ctx context.Context, client *oai.Client, provi
 	var terminal *responses.Response
 	var (
 		textBuf      strings.Builder                     // response.output_text.delta payload
+		refusalBuf   strings.Builder                     // response.refusal.delta payload
 		reasoningBuf strings.Builder                     // response.reasoning_summary_text.delta payload
 		doneItems    []responses.ResponseOutputItemUnion // items from response.output_item.done
 	)
@@ -196,6 +197,20 @@ func responsesAPICompletionStream(ctx context.Context, client *oai.Client, provi
 		case "response.output_text.delta":
 			if d := ev.Delta.OfString; d != "" {
 				textBuf.WriteString(d)
+				if req.DeltaSink != nil {
+					if err := req.DeltaSink(StreamDelta{Text: d}); err != nil {
+						return nil, err
+					}
+				}
+			}
+		case "response.refusal.delta":
+			// The refusal channel streams its text through its own event
+			// type while output_text stays silent; forwarding it keeps the
+			// sink fed with the model's actual message, and the accumulated
+			// text feeds the same empty-content fallback the terminal
+			// conversion applies (see applyStreamedOutputFallback).
+			if d := ev.Delta.OfString; d != "" {
+				refusalBuf.WriteString(d)
 				if req.DeltaSink != nil {
 					if err := req.DeltaSink(StreamDelta{Text: d}); err != nil {
 						return nil, err
@@ -238,7 +253,7 @@ func responsesAPICompletionStream(ctx context.Context, client *oai.Client, provi
 	if err != nil {
 		return nil, err
 	}
-	applyStreamedOutputFallback(converted, textBuf.String(), reasoningBuf.String(), doneItems)
+	applyStreamedOutputFallback(converted, textBuf.String(), refusalBuf.String(), reasoningBuf.String(), doneItems)
 	logToolCallArguments(logger, providerName, converted.Message.ToolCalls)
 	return converted, nil
 }
@@ -480,16 +495,19 @@ func sanitizeResponsesFunctionName(name string) string {
 func convertToResponsesTools(tools []ToolDefinition) []responses.ToolUnionParam {
 	result := make([]responses.ToolUnionParam, 0, len(tools))
 	for _, tool := range tools {
-		var params map[string]any
+		// Start from the default object schema (mirroring the Chat path's
+		// convertSchemaToMap) so a tool registered with a nil/empty
+		// InputSchema still carries a "parameters" object on the wire: the
+		// FunctionToolParam.Parameters field is tagged
+		// "parameters,omitzero,required", so a nil map is omitted entirely
+		// and the endpoint rejects the tool with HTTP 400
+		// missing_required_parameter — while the same toolset works on the
+		// Chat protocol, which installs exactly this default.
+		params := defaultObjectSchema()
 		if len(tool.InputSchema) > 0 {
 			sanitized := SanitizeSchemaForOpenAI(tool.InputSchema)
 			if err := json.Unmarshal(sanitized, &params); err != nil {
-				params = map[string]any{
-					"type":                 "object",
-					"properties":           map[string]any{},
-					"required":             []any{},
-					"additionalProperties": false,
-				}
+				params = defaultObjectSchema()
 			}
 		}
 		result = append(result, responses.ToolParamOfFunction(
@@ -544,6 +562,12 @@ func convertResponsesResponse(resp *responses.Response) (*ChatResponse, error) {
 
 	// Extract reasoning items and function_call items from the response output.
 	var reasoningParts []string
+	// Refusal parts ride message items' content ({"type":"refusal",...}) which
+	// resp.OutputText() ignores — it assembles output_text parts only. A
+	// refusal (or content-filtered answer) arrives as HTTP 200 with no text
+	// parts, so without collecting them the run would finish as a deliberate
+	// but EMPTY final answer.
+	var refusalParts []string
 	for _, item := range resp.Output {
 		switch item.Type {
 		case "reasoning":
@@ -565,6 +589,12 @@ func convertResponsesResponse(resp *responses.Response) (*ChatResponse, error) {
 				Name:  item.Name,
 				Input: json.RawMessage(item.Arguments),
 			})
+		case "message":
+			for _, part := range item.Content {
+				if part.Type == "refusal" && part.Refusal != "" {
+					refusalParts = append(refusalParts, part.Refusal)
+				}
+			}
 		}
 	}
 
@@ -572,6 +602,13 @@ func convertResponsesResponse(resp *responses.Response) (*ChatResponse, error) {
 	// This makes reasoning visible to the UI and to non-Responses transports.
 	if len(reasoningParts) > 0 {
 		message.ReasoningContent = strings.Join(reasoningParts, "\n")
+	}
+
+	// Surface a refusal as the assistant content when the response carries no
+	// output_text: the refusal text is the model's actual message, and
+	// dropping it ends the run as an empty success.
+	if message.Content == "" && len(refusalParts) > 0 {
+		message.Content = strings.Join(refusalParts, "\n")
 	}
 
 	stopReason := mapResponsesStopReason(resp)
@@ -615,8 +652,10 @@ func responsesReasoningSummary(item responses.ResponseOutputItemUnion) string {
 // (empty one-shot results, ErrNoJSON on routing extraction). The merge is
 // strictly fallback: terminal content, reasoning and tool calls are never
 // overridden, and appended items are de-duplicated by ID so a backend that
-// emits both shapes does not double them.
-func applyStreamedOutputFallback(converted *ChatResponse, text, reasoning string, doneItems []responses.ResponseOutputItemUnion) {
+// emits both shapes does not double them. refusal carries the accumulated
+// response.refusal.delta payload: a refusal-only stream has no output_text
+// deltas, so without it the refusal would still assemble an empty Message.
+func applyStreamedOutputFallback(converted *ChatResponse, text, refusal, reasoning string, doneItems []responses.ResponseOutputItemUnion) {
 	if converted == nil {
 		return
 	}
@@ -624,9 +663,15 @@ func applyStreamedOutputFallback(converted *ChatResponse, text, reasoning string
 	// Message text: accumulated deltas first, else the message items that
 	// arrived via response.output_item.done (no-delta backends).
 	if converted.Message.Content == "" {
-		if text != "" {
+		switch {
+		case text != "":
 			converted.Message.Content = text
-		} else {
+		case refusal != "":
+			// A refusal streams its text via response.refusal.delta with
+			// output_text silent; surface it as the message content so the
+			// run does not end as an empty success.
+			converted.Message.Content = refusal
+		default:
 			var b strings.Builder
 			for _, item := range doneItems {
 				if item.Type != "message" {

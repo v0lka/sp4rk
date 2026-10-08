@@ -15,6 +15,13 @@ import (
 // (ResolveExistingPrefix) to handle OS-level symlinks like macOS
 // /var → /private/var even when paths don't exist on disk.
 //
+// The child is resolved in OS component order from its raw spelling: it is
+// NOT lexically cleaned first, so a "symlink/.." sequence is evaluated the
+// way the OS evaluates it — the symlink is resolved, and ".." then climbs
+// from the link TARGET's directory. A path like <parent>/<link-to-outside>/../x
+// therefore resolves outside the parent and is correctly rejected; cleaning
+// it first would erase the link and wrongly approve the escape.
+//
 // Both parent and child must be absolute paths. Passing a relative path
 // produces undefined results; callers must resolve paths to absolute form
 // before calling this function.
@@ -81,7 +88,17 @@ func isWithinPath(parent, child string, fold bool) (bool, error) {
 		return false, errors.New("pathutil: empty parent path — containment cannot be determined")
 	}
 	parentResolved := ResolveExistingPrefix(filepath.Clean(parent))
-	childResolved := ResolveExistingPrefix(filepath.Clean(child))
+	// The child is deliberately NOT lexically cleaned before resolution.
+	// filepath.Clean collapses "symlink/.." into a single directory jump
+	// that erases the link before any symlink is resolved, so a link
+	// pointing outside the parent would silently disappear and a path like
+	// <parent>/<link-outside-root>/../x would be (wrongly) judged within.
+	// The OS resolves the symlink first and applies ".." against the
+	// target's directory, so containment must be decided on the raw
+	// component order: EvalSymlinks inside ResolveExistingPrefix resolves
+	// each symlink as it is encountered and evaluates ".." segments in that
+	// same OS order. Only the trusted parent root keeps its Clean.
+	childResolved := ResolveExistingPrefix(child)
 	if fold {
 		parentResolved = strings.ToLower(parentResolved)
 		childResolved = strings.ToLower(childResolved)
@@ -244,6 +261,16 @@ func probeCaseInsensitive(dir string) bool {
 //
 // Example: if "/ws/link" is a symlink but "/ws/link/newfile.txt" doesn't exist,
 // returns the symlink-resolved prefix + "/newfile.txt".
+//
+// The path is evaluated in OS component order: symlinks are resolved as they
+// are encountered and ".." segments climb from the resolved location, so
+// "<link>/.." refers to the link target's parent directory, not to the
+// link's lexical parent. Callers deciding containment MUST pass the path
+// un-cleaned for this reason — cleaning "symlink/.." first would erase the
+// link and defeat the check (see [IsWithinPath]). The climb to the longest
+// existing prefix shares that rule: it cuts off raw components without
+// calling filepath.Dir (which Clean()s and would erase the link before the
+// next resolution attempt).
 func ResolveExistingPrefix(path string) string {
 	candidate := path
 	for {
@@ -252,17 +279,17 @@ func ResolveExistingPrefix(path string) string {
 			if candidate == path {
 				return resolved
 			}
-			rel, relErr := filepath.Rel(candidate, path)
-			if relErr != nil {
-				// Paths on different volumes — fall back to unresolved.
-				return path
-			}
-			return filepath.Join(resolved, rel)
+			// Join the RAW remainder: it may still contain "symlink/.."
+			// sequences that must not be lexically collapsed against the
+			// resolved prefix. Everything in `resolved` is a real directory
+			// by construction, so the single Clean inside Join matches what
+			// the OS would do with the remaining components.
+			return filepath.Join(resolved, path[len(candidate):])
 		}
 		if errors.Is(err, os.ErrNotExist) {
-			parent := filepath.Dir(candidate)
-			if parent == candidate {
-				// Reached root — nothing exists, return as-is.
+			parent, ok := rawParent(candidate)
+			if !ok {
+				// No separator left (relative path at its top) — return as-is.
 				return path
 			}
 			candidate = parent
@@ -271,4 +298,31 @@ func ResolveExistingPrefix(path string) string {
 		// Permission or other error — return as-is.
 		return path
 	}
+}
+
+// rawParent returns candidate minus its last path component, cutting at the
+// raw byte level WITHOUT cleaning: intermediate "symlink/.." spellings must
+// survive to the next resolution attempt, because the OS resolves the link
+// before applying the ".." (filepath.Dir would Clean first and erase the
+// link). It returns ok=false when candidate has no separator (a relative
+// path at its top — there is nothing left to climb to).
+func rawParent(candidate string) (string, bool) {
+	i := -1
+	for j := len(candidate) - 1; j >= 0; j-- {
+		if os.IsPathSeparator(candidate[j]) {
+			i = j
+			break
+		}
+	}
+	if i < 0 {
+		return "", false
+	}
+	// Collapse any run of separators, but never cross the root separator.
+	for i > 0 && os.IsPathSeparator(candidate[i-1]) {
+		i--
+	}
+	if i == 0 {
+		i = 1 // preserve the root separator itself
+	}
+	return candidate[:i], true
 }

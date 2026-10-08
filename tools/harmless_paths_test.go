@@ -13,7 +13,11 @@ func TestIsHarmlessDevicePath(t *testing.T) {
 	}{
 		{"empty", "", false},
 		{"null", "/dev/null", runtime.GOOS != "windows"},
-		{"full", "/dev/full", runtime.GOOS != "windows"},
+		// Deliberately NOT harmless — must not match. /dev/full's writes fail
+		// with ENOSPC, but its reads are an infinite zero stream (like
+		// /dev/zero on Linux), so an unbounded read never returns EOF and the
+		// read-safety half of the harmless invariant does not hold.
+		{"full", "/dev/full", false},
 		// Process streams are deliberately NOT harmless: their targets are
 		// host-defined file descriptors, so writing can exfiltrate and reading
 		// consumes the agent's input. On macOS these are symlinks into /dev/fd/*.

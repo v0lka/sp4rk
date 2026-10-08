@@ -15,8 +15,11 @@ import (
 // resolvePath resolves a file path against the session roots (workspace and
 // temp directory, treated as equal peers).
 //
-// Relative paths are joined with the workspace root and MUST stay within it —
-// escaping via ".." components is rejected (returns ""). Relative paths cannot
+// Relative paths are resolved in OS component order against the workspace
+// root (symlinks expanded as encountered, ".." climbing from the resolved
+// location) and MUST stay within it — a spelling that POSIX-resolves outside
+// the workspace (a plain ".." escape or a "symlink/.." climbing from an
+// out-of-root link target) is rejected (returns ""). Relative paths cannot
 // target the temp directory; callers must use absolute paths for temp access.
 //
 // Absolute paths are symlink-resolved via pathutil.ResolveExistingPrefix and
@@ -49,19 +52,134 @@ func resolvePath(ctx context.Context, path string) string {
 		return pathutil.ResolveExistingPrefix(path)
 	}
 
-	// Relative path: join with workspace then resolve to absolute for
-	// containment validation. filepath.Join resolves ".." components,
-	// so the result may escape the workspace — reject if it does.
-	joined := filepath.Join(ws, path)
-	absJoined, absErr := filepath.Abs(joined)
-	if absErr != nil {
-		return ""
-	}
-	resolved := pathutil.ResolveExistingPrefix(absJoined)
+	// Relative path: resolve in OS component order from the (already
+	// symlink-resolved) workspace root. The raw concatenation — no Clean, no
+	// filepath.Join — is load-bearing: a "symlink/.." spelling must expand
+	// the link first and climb ".." from the link TARGET's directory, exactly
+	// as the kernel does. A lexical Join would erase the link before any
+	// symlink resolution and silently re-point the path inside the
+	// workspace; the containment check below then refuses what POSIX
+	// resolution places outside it.
+	resolved := pathutil.ResolveExistingPrefix(rawJoin(realWS, path))
 	if !tools.IsWithinRoot(ctx, realWS, resolved) {
 		return ""
 	}
 	return resolved
+}
+
+// resolvePathUnresolved resolves a file path against the session roots like
+// resolvePath, but WITHOUT following a symlink in the final path component.
+// It exists for the DESTRUCTIVE tools (delete_file, delete_directory): POSIX
+// rm semantics remove the link itself, never the target, so the path that is
+// unlinked must stay as spelled in its last component while everything above
+// it is canonicalized (longest-existing-prefix resolution of the parent —
+// never a full EvalSymlinks of the target).
+//
+// The parent prefix is resolved in OS component order — symlinks are expanded
+// as encountered and ".." climbs from the resolved location — so
+// "symlink/../name" addresses the link TARGET's parent, exactly as the kernel
+// resolves the spelling. filepath.Clean and filepath.Join must never run on
+// the input first: they collapse "symlink/.." lexically, erasing the link
+// before any symlink resolution and silently re-pointing the spelling at the
+// link's lexical parent.
+//
+// The contract otherwise mirrors resolvePath: relative paths MUST stay within
+// the workspace after OS-order resolution ("" is returned otherwise — a
+// relative symlink pointing outside, or a "symlink/.." spelling that climbs
+// out of the link target, is therefore refused, the fail-closed direction);
+// absolute paths are returned regardless of containment, leaving access
+// control to the Judge layer and the registry confirmation flow. When no
+// workspace is available the path is returned as-is.
+func resolvePathUnresolved(ctx context.Context, path string) string {
+	ws := tools.WorkspacePathFrom(ctx)
+	if ws == "" {
+		return path
+	}
+
+	realWS, err := resolveWorkspaceRoot(ws)
+	if err != nil {
+		return "" // unresolvable workspace — reject
+	}
+
+	if filepath.IsAbs(path) {
+		// Resolve the parent prefix in OS component order; the final
+		// component stays exactly as spelled so a symlink there is never
+		// followed. No Clean: it would erase "symlink/.." before any
+		// symlink resolution (see resolveKeepFinal).
+		return resolveKeepFinal(path)
+	}
+
+	// Relative path: resolve in OS component order from the resolved
+	// workspace root, keeping the final component as spelled. Containment is
+	// checked on the RESULT: a spelling that POSIX-resolves outside the
+	// workspace (a "symlink/.." climbing from an out-of-root target, or a
+	// plain ".." escape) is refused, and [tools.IsWithinRoot] internally
+	// resolves symlinks, so a final-component symlink pointing outside is
+	// refused as before — the fail-closed direction.
+	resolved := resolveKeepFinal(rawJoin(realWS, path))
+	if !tools.IsWithinRoot(ctx, realWS, resolved) {
+		return ""
+	}
+	return resolved
+}
+
+// rawJoin concatenates base and rel at the raw byte level WITHOUT cleaning:
+// "symlink/.." sequences in rel must survive to
+// [pathutil.ResolveExistingPrefix], which evaluates them in OS component
+// order. filepath.Join would Clean the concatenation first and lexically
+// erase the link before any symlink resolution runs.
+func rawJoin(base, rel string) string {
+	trimmed := strings.TrimRight(base, string(filepath.Separator))
+	if trimmed == "" {
+		// base is the filesystem root itself ("/" or a Windows volume root).
+		trimmed = string(filepath.Separator)
+	}
+	if rel == "" {
+		return trimmed
+	}
+	return trimmed + string(filepath.Separator) + rel
+}
+
+// resolveKeepFinal resolves the directory prefix of rawAbs in OS component
+// order — symlinks are expanded as encountered and ".." climbs from the
+// resolved location ([pathutil.ResolveExistingPrefix] on the un-cleaned
+// parent) — while the FINAL component is kept exactly as spelled: a symlink
+// in the last position is never followed (POSIX rm semantics for the
+// destructive tools). The input must be absolute; callers building it from a
+// relative path must go through [rawJoin] so no Clean collapses
+// "symlink/.." beforehand.
+//
+// "." and ".." as the final component are folded back into the directory and
+// fully resolved: neither can be a symlink, so resolving them is safe and
+// matches what the kernel does with such spellings.
+func resolveKeepFinal(rawAbs string) string {
+	trimmed := strings.TrimRight(rawAbs, string(filepath.Separator))
+	if trimmed == "" {
+		// The path is the filesystem root itself ("/" or a volume root):
+		// there is no final component to keep unresolved.
+		return pathutil.ResolveExistingPrefix(rawAbs)
+	}
+	dir, base := filepath.Split(trimmed)
+	dir = strings.TrimRight(dir, string(filepath.Separator))
+	switch {
+	case dir == "" && strings.HasPrefix(trimmed, string(filepath.Separator)):
+		// Only the leading root separator preceded the final component and
+		// TrimRight removed it — restore the root.
+		dir = string(filepath.Separator)
+	case dir != "" && dir == filepath.VolumeName(trimmed):
+		// A volume root ("C:\", "\\server\share"): the separator after the
+		// volume is structural, so restore it — a bare volume ("C:") is a
+		// cwd-relative spelling on Windows, not the volume root.
+		dir += string(filepath.Separator)
+	case dir == "":
+		// A single component with no root at all — nothing to keep
+		// unresolved, resolve fully.
+		return pathutil.ResolveExistingPrefix(trimmed)
+	}
+	if base == "." || base == ".." {
+		return pathutil.ResolveExistingPrefix(rawJoin(dir, base))
+	}
+	return filepath.Join(pathutil.ResolveExistingPrefix(dir), base)
 }
 
 // ResolvePath is the exported form of resolvePath. It resolves a file path
@@ -115,7 +233,7 @@ func validateResolvedPath(resolved string) error {
 // that OS-level symlinks (e.g., macOS /tmp → /private/tmp) do not cause false
 // negatives.
 //
-// Harmless special-device paths (/dev/null, /dev/full; NUL on Windows) are
+// Harmless special-device paths (/dev/null; NUL on Windows) are
 // treated as local via [tools.IsHarmlessDevicePath] so file operations
 // targeting them do not force a user-confirmation prompt.
 func isPathInSessionRoots(ctx context.Context, absPath string) bool {

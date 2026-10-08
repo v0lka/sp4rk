@@ -1,9 +1,11 @@
 package builtins
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -369,5 +371,184 @@ func TestReadSingleLine(t *testing.T) {
 	// Invalid line number.
 	if _, _, err := ReadSingleLine(path, 0); err == nil {
 		t.Error("expected error for lineNum <= 0")
+	}
+}
+
+// TestReadFileRange_SingleHugeLineBounded is the regression repro for review
+// finding #19: a file whose entire content is ONE line far above the per-line
+// cap must still read successfully with the truncation marker, and the
+// emitted output must be bounded by the cap — the whole line must never be
+// materialized just to be truncated afterwards.
+func TestReadFileRange_SingleHugeLineBounded(t *testing.T) {
+	const lineCap = 64 << 10           // 64 KiB
+	huge := strings.Repeat("x", 8<<20) // single 8 MiB line, no newline
+	path := writeTempFile(t, "hugeline.bin", huge)
+
+	result, err := ReadFileRange(FileReadParams{
+		Path:         path,
+		DefaultLines: 2000,
+		MaxLineBytes: lineCap,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.TotalLines != 1 {
+		t.Errorf("TotalLines = %d, want 1", result.TotalLines)
+	}
+	if !strings.Contains(result.Content, "[...line 1 truncated at 65536 bytes. Use tool_result_read(hash, line=1) to read the full line...]") {
+		t.Errorf("expected truncation marker, got suffix: %q", tail(result.Content, 200))
+	}
+	if result.BytesRead > lineCap+200 {
+		t.Errorf("emitted content is %d bytes, want bounded by cap %d (+marker)", result.BytesRead, lineCap)
+	}
+}
+
+// TestReadFileRange_HugeLineBeforeWindow proves the bounded scan keeps line
+// accounting correct when an over-cap line sits BEFORE the requested window:
+// the huge line is drained (not accumulated) and line 2 is returned intact.
+func TestReadFileRange_HugeLineBeforeWindow(t *testing.T) {
+	const lineCap = 16 << 10
+	content := strings.Repeat("y", 4<<20) + "\n" + "second line\n"
+	path := writeTempFile(t, "hugelinefirst.txt", content)
+
+	result, err := ReadFileRange(FileReadParams{
+		Path:         path,
+		StartLine:    2,
+		EndLine:      2,
+		DefaultLines: 1,
+		MaxLineBytes: lineCap,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.TotalLines != 2 {
+		t.Errorf("TotalLines = %d, want 2", result.TotalLines)
+	}
+	if result.Content != "second line\n" {
+		t.Errorf("window content = %q, want %q", result.Content, "second line\n")
+	}
+}
+
+// TestReadSingleLine_LargeLineRecoverable proves the tool_result_read escape
+// hatch still recovers a multi-megabyte line IN FULL through the bounded
+// scanner (the line exceeds the 1 MiB default read cap but stays far below
+// the 64 MiB absolute ceiling).
+func TestReadSingleLine_LargeLineRecoverable(t *testing.T) {
+	payload := strings.Repeat("z", 4<<20)
+	path := writeTempFile(t, "recoverable.txt", payload+"\nlast\n")
+
+	line, total, err := ReadSingleLine(path, 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if line != payload {
+		t.Errorf("recovered line length = %d, want %d (content mismatch)", len(line), len(payload))
+	}
+	if total != 2 {
+		t.Errorf("total = %d, want 2", total)
+	}
+}
+
+// tail returns at most n trailing bytes of s — helper for bounded-output
+// assertions that check the marker at the end of the window.
+func tail(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[len(s)-n:]
+}
+
+// TestReadLineBounded_BoundedRetention pins the scan-level contract of
+// readLineBounded directly: with a reader buffer far smaller than the line,
+// a line far above the cap is retained only up to the cap, flagged truncated,
+// and the delimiter is consumed so the next line stays in sync — a revert to
+// a buffer-the-whole-line ReadString would fail the retention and sync
+// assertions.
+func TestReadLineBounded_BoundedRetention(t *testing.T) {
+	const capBytes = 8 << 10
+	// Reader buffer (512 B) ≪ cap ≪ line: the scan must fragment, retain at
+	// most the cap, and drain the rest fragment-by-fragment.
+	input := strings.Repeat("a", 1<<20) + "\nsecond\n"
+	r := bufio.NewReaderSize(strings.NewReader(input), 512)
+
+	ln, err := readLineBounded(r, capBytes)
+	if err != nil {
+		t.Fatalf("readLineBounded: %v", err)
+	}
+	if !ln.truncated {
+		t.Error("expected truncated=true for a line above the cap")
+	}
+	if !ln.complete {
+		t.Error("expected complete=true: the delimiter was consumed")
+	}
+	if len(ln.text) != capBytes {
+		t.Errorf("retained %d bytes, want exactly the cap %d", len(ln.text), capBytes)
+	}
+	if got := strings.TrimSuffix(ln.text, "\n"); got != strings.Repeat("a", capBytes) {
+		t.Error("retained text is not the line's first cap bytes")
+	}
+
+	// Delimiter sync: the next read must return the SECOND line, not the
+	// undrained remainder of the first.
+	ln2, err := readLineBounded(r, capBytes)
+	if err != nil {
+		t.Fatalf("readLineBounded (second line): %v", err)
+	}
+	if ln2.truncated || ln2.text != "second\n" {
+		t.Errorf("second line = %q (truncated=%v), want %q", ln2.text, ln2.truncated, "second\n")
+	}
+}
+
+// TestReadLineBounded_NoCapAccumulatesFully pins the maxBytes<=0 contract:
+// the line is accumulated in full and never flagged truncated.
+func TestReadLineBounded_NoCapAccumulatesFully(t *testing.T) {
+	line := strings.Repeat("b", 256<<10) + "\n"
+	r := bufio.NewReaderSize(strings.NewReader(line), 512)
+	ln, err := readLineBounded(r, 0)
+	if err != nil {
+		t.Fatalf("readLineBounded: %v", err)
+	}
+	if ln.truncated || !ln.complete || ln.text != line {
+		t.Errorf("no-cap read: truncated=%v complete=%v len=%d, want false/true/full", ln.truncated, ln.complete, len(ln.text))
+	}
+}
+
+// TestReadFileRange_SingleHugeLineBoundedMemory is the allocation-side guard
+// for review finding #19: reading a single 16 MiB line with a 64 KiB cap must
+// allocate on the order of the cap, not the line. The pre-fix
+// buffer-the-whole-line ReadString materialized the full line (with append
+// growth) before truncating — an order of magnitude above this budget — so a
+// silent revert fails here even though the emitted-output assertions alone
+// would still pass.
+func TestReadFileRange_SingleHugeLineBoundedMemory(t *testing.T) {
+	const lineCap = 64 << 10
+	huge := strings.Repeat("x", 16<<20)
+	path := writeTempFile(t, "hugeline16m.bin", huge)
+
+	runtime.GC()
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+
+	result, err := ReadFileRange(FileReadParams{
+		Path:         path,
+		DefaultLines: 2000,
+		MaxLineBytes: lineCap,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(result.Content, "truncated at 65536 bytes") {
+		t.Fatalf("expected truncation marker, got suffix %q", tail(result.Content, 200))
+	}
+
+	runtime.GC()
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+	// Budget: cap-sized retention, fixed reader buffers, the result string,
+	// and OS read buffers — 64× the cap, yet ~8× below what materializing
+	// the 16 MiB line alone would allocate.
+	const budget = 4 << 20
+	if delta := after.TotalAlloc - before.TotalAlloc; delta > budget {
+		t.Errorf("cumulative allocations during bounded read = %d bytes, want <= %d (a buffer-the-whole-line implementation allocates the full 16 MiB line)", delta, budget)
 	}
 }

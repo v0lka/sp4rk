@@ -15,6 +15,16 @@ import (
 // checkpoint write operation.
 const defaultPersistenceTimeout = 5 * time.Second
 
+// maxPersistenceQueue caps the number of queued persistence operations. When
+// the single worker is stuck, further operations are dropped (logged) instead
+// of accumulating without bound.
+const maxPersistenceQueue = 128
+
+// defaultShutdownGrace bounds Shutdown's wait for the persistence worker: a
+// worker stuck on a persistence backend that ignores its context deadline
+// must not hang process shutdown.
+const defaultShutdownGrace = 30 * time.Second
+
 // compile-time check
 var _ Blackboard = (*CheckpointedBlackboard)(nil)
 
@@ -24,20 +34,30 @@ var _ Blackboard = (*CheckpointedBlackboard)(nil)
 //
 // All persistence calls are best-effort: errors are logged but do not propagate
 // to callers. Persistence operations are executed by a single background worker
-// goroutine with a timeout and panic recovery to prevent hangs.
+// goroutine, and every operation is bounded twice: the caller's wait carries
+// the timeout (waitPersistenceResult), and the operation itself runs under a
+// context with the same deadline, so a Checkpointer that honours its context
+// cannot stall the worker past it. Panic recovery guards the worker itself.
+// The pending-operation queue is capped (maxPersistenceQueue); overflow is
+// logged and the operation is dropped rather than buffered without bound.
 //
-// Call Shutdown() to release the background worker. The caller (typically the
-// Orchestrator) is responsible for calling Shutdown when the blackboard is no
-// longer needed to prevent goroutine leaks.
+// Call Shutdown() to release the background worker. Shutdown's drain wait is
+// bounded by a grace period (defaultShutdownGrace), so even a worker stuck on
+// a backend that ignores its context deadline cannot hang shutdown — the
+// worker is abandoned (leaked) instead, and this is logged. The caller
+// (typically the Orchestrator) is responsible for calling Shutdown when the
+// blackboard is no longer needed to prevent goroutine leaks.
 type CheckpointedBlackboard struct {
 	*MapBlackboard
 	id                 string
 	checkpointer       Checkpointer
 	logger             *slog.Logger
 	persistenceTimeout time.Duration
+	shutdownGrace      time.Duration // bounds Shutdown's drain wait; <= 0 → defaultShutdownGrace
 	queue              []persistOp
 	queueMu            sync.Mutex
 	queueCh            chan struct{}
+	workerDone         chan struct{} // closed by the persistence worker on exit
 	closed             atomic.Bool
 	persistCtx         context.Context         // context for persistence operations; nil-safe (falls back to Background)
 	onChanged          func(changeType string) // optional callback, nil-safe
@@ -62,7 +82,9 @@ func NewCheckpointedBlackboard(id string, cp Checkpointer, logger *slog.Logger, 
 		checkpointer:       cp,
 		logger:             logger,
 		persistenceTimeout: timeout,
+		shutdownGrace:      defaultShutdownGrace,
 		queueCh:            make(chan struct{}, 1),
+		workerDone:         make(chan struct{}),
 	}
 	pb.wg.Add(1)
 	go pb.persistenceWorker()
@@ -192,8 +214,11 @@ func (pb *CheckpointedBlackboard) ID() string {
 	return pb.id
 }
 
-// Shutdown signals the persistence worker to stop, waits for it to drain any
-// queued operations, then returns. Safe to call multiple times.
+// Shutdown signals the persistence worker to stop and waits, bounded by the
+// shutdown grace period, for it to drain any queued operations. A worker
+// still busy past the grace (a persistence backend that ignores its context
+// deadline) is abandoned — Shutdown returns instead of hanging — and the
+// abandonment is logged. Safe to call multiple times.
 func (pb *CheckpointedBlackboard) Shutdown() {
 	pb.shutdownOnce.Do(func() {
 		// Set closed under queueMu. persistSafe checks closed and sends the
@@ -205,7 +230,21 @@ func (pb *CheckpointedBlackboard) Shutdown() {
 		pb.closed.Store(true)
 		pb.queueMu.Unlock()
 		close(pb.queueCh)
-		pb.wg.Wait()
+
+		grace := pb.shutdownGrace
+		if grace <= 0 {
+			grace = defaultShutdownGrace
+		}
+		timer := time.NewTimer(grace)
+		defer timer.Stop()
+		select {
+		case <-pb.workerDone:
+		case <-timer.C:
+			if pb.logger != nil {
+				pb.logger.Warn("persistence worker did not stop before the shutdown grace expired; abandoning it",
+					"grace", grace)
+			}
+		}
 	})
 }
 
@@ -217,11 +256,13 @@ func (pb *CheckpointedBlackboard) Shutdown() {
 // The caller blocks until the operation completes or the timeout expires.
 // Errors are logged.
 //
-// The enqueue never blocks: the operation is appended to an unbounded queue
-// under queueMu, then a non-blocking signal is sent to the worker goroutine.
-// This prevents deadlock under I/O contention — unlike a fixed-size buffered
-// channel, the queue grows as needed. If the blackboard has been shut down,
-// the operation is skipped (logged as a warning).
+// The enqueue never blocks: the operation is appended to a queue capped at
+// maxPersistenceQueue under queueMu, then a non-blocking signal is sent to
+// the worker goroutine. This prevents deadlock under I/O contention — unlike
+// a fixed-size buffered channel — while the cap stops unbounded growth when
+// the worker is stuck: an operation arriving at a full queue is dropped (and
+// logged) without waiting. If the blackboard has been shut down, the
+// operation is skipped (logged as a warning).
 //
 // The closed-check, queue-append, and signal-send are all performed under
 // queueMu. Shutdown sets the closed flag under the same lock, which gives a
@@ -240,6 +281,14 @@ func (pb *CheckpointedBlackboard) persistSafe(operation string, fn func(context.
 		}
 		return
 	}
+	if len(pb.queue) >= maxPersistenceQueue {
+		pb.queueMu.Unlock()
+		if pb.logger != nil {
+			pb.logger.Warn("persistence queue full; dropping operation",
+				"operation", operation, "queue_cap", maxPersistenceQueue)
+		}
+		return
+	}
 	pb.queue = append(pb.queue, op)
 	select {
 	case pb.queueCh <- struct{}{}:
@@ -250,12 +299,19 @@ func (pb *CheckpointedBlackboard) persistSafe(operation string, fn func(context.
 	pb.waitPersistenceResult(operation, done)
 }
 
+// operationTimeout returns the per-operation persistence timeout: the bound
+// applied both to the caller's wait (waitPersistenceResult) and, as a context
+// deadline, to the operation itself (persistenceWorker).
+func (pb *CheckpointedBlackboard) operationTimeout() time.Duration {
+	if pb.persistenceTimeout == 0 {
+		return defaultPersistenceTimeout
+	}
+	return pb.persistenceTimeout
+}
+
 // waitPersistenceResult waits for a persistence operation to complete or timeout.
 func (pb *CheckpointedBlackboard) waitPersistenceResult(operation string, done <-chan error) {
-	timeout := pb.persistenceTimeout
-	if timeout == 0 {
-		timeout = defaultPersistenceTimeout
-	}
+	timeout := pb.operationTimeout()
 	var err error
 	timer := time.NewTimer(timeout)
 	select {
@@ -275,9 +331,14 @@ func (pb *CheckpointedBlackboard) waitPersistenceResult(operation string, done <
 // persistenceWorker is the single goroutine that executes persist operations
 // serially, with panic recovery for each operation. It drains the entire queue
 // on each signal from queueCh, ensuring all queued operations are processed.
-// The worker exits when queueCh is closed by Shutdown.
+// Every operation runs under a context carrying the per-operation deadline, so
+// a Checkpointer that honours its context cannot stall the worker past the
+// timeout even though the caller's own wait has already expired. The worker
+// exits when queueCh is closed by Shutdown, closing workerDone so Shutdown's
+// bounded wait observes the exit.
 func (pb *CheckpointedBlackboard) persistenceWorker() {
 	defer pb.wg.Done()
+	defer close(pb.workerDone)
 	for range pb.queueCh {
 		for {
 			pb.queueMu.Lock()
@@ -295,7 +356,13 @@ func (pb *CheckpointedBlackboard) persistenceWorker() {
 						op.done <- fmt.Errorf("panic in persistence: %v", r)
 					}
 				}()
-				op.done <- op.fn(pb.persistCtxOrDefault())
+				// Bound the operation itself, not just the caller's wait:
+				// without a deadline a SaveCheckpoint that blocks while
+				// ignoring its context would stall the single worker forever,
+				// growing the queue without bound and hanging Shutdown.
+				ctx, cancel := context.WithTimeout(pb.persistCtxOrDefault(), pb.operationTimeout())
+				defer cancel()
+				op.done <- op.fn(ctx)
 			}()
 		}
 	}
@@ -344,7 +411,9 @@ func RestoreBlackboard(ctx context.Context, id string, cp Checkpointer, logger *
 		checkpointer:       cp,
 		logger:             logger,
 		persistenceTimeout: timeout,
+		shutdownGrace:      defaultShutdownGrace,
 		queueCh:            make(chan struct{}, 1),
+		workerDone:         make(chan struct{}),
 	}
 	pb.wg.Add(1)
 	go pb.persistenceWorker()

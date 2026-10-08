@@ -8,7 +8,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -16,6 +18,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	mcpclient "github.com/mark3labs/mcp-go/client"
@@ -50,14 +53,23 @@ const unhealthyTimeoutThreshold = 3
 // ServerConfig defines how to launch an MCP server.
 // This is a local copy to avoid importing backend/config.
 type ServerConfig struct {
-	Transport  string            // "stdio" | "http"; default "stdio"
-	Command    string            // stdio: command to execute
-	Args       []string          // stdio: command arguments
-	Env        map[string]string // stdio: environment variables
-	URL        string            // http: server URL
-	Headers    map[string]string // http: custom headers
-	WorkDir    string            // stdio: working directory for the server process
-	HTTPClient *http.Client      // http: optional proxy-configured HTTP client
+	Transport string            // "stdio" | "http"; default "stdio"
+	Command   string            // stdio: command to execute
+	Args      []string          // stdio: command arguments
+	Env       map[string]string // stdio: environment variables
+	URL       string            // http: server URL
+	Headers   map[string]string // http: custom headers
+	WorkDir   string            // stdio: working directory for the server process
+	// HTTPClient optionally supplies a pre-configured HTTP client for HTTP
+	// transport servers (typically a proxy setup). It REPLACES the SDK's
+	// bounded default wholesale: the SDK bounds the SSE leg's connection-level
+	// waits (dial, TLS, response headers) only when HTTPClient is nil (see
+	// boundedStreamHTTPClient), so a supplied client must carry its own
+	// timeout and transport bounds — a zero-bound client lets an unresponsive
+	// endpoint stall Connect and tool calls indefinitely. Prefer
+	// transport-level bounds over Client.Timeout: the latter also caps the
+	// long-lived SSE event stream itself and would cut live sessions short.
+	HTTPClient *http.Client
 	// ToolGroupOverride optionally tags every tool served by this server with
 	// an explicit capability group instead of the transport-derived default
 	// (stdio → local_mcp, http → remote_mcp). Use it when the transport
@@ -128,8 +140,18 @@ type Server struct {
 	// defaultServerCloseGrace. Test hook — production code leaves it zero.
 	// Guarded by mu.
 	closeGrace time.Duration
-	logger     *slog.Logger
-	mu         sync.RWMutex
+	// inflight counts CallTool invocations that have captured a non-nil client
+	// and have not returned yet. Close drains it before closing the transport:
+	// the SSE transport's reader goroutine fetches a call's response channel
+	// and only then sends on it, while Close closes those same channels — a
+	// send on a closed channel panics an unrecoverable goroutine and kills the
+	// host. Draining guarantees no response channel is still registered when
+	// the transport closes. Add runs under mu.RLock and Wait after mu has been
+	// released, so they never overlap (WaitGroup contract); Close resets
+	// s.client to nil under mu.Lock before waiting, so no new call can join.
+	inflight sync.WaitGroup
+	logger   *slog.Logger
+	mu       sync.RWMutex
 }
 
 // ToolInfo holds metadata about a tool discovered from an MCP server.
@@ -188,6 +210,17 @@ func (s *Server) Connect(ctx context.Context, cfg ServerConfig) error {
 	transportType := cfg.Transport
 	if transportType == "" {
 		transportType = "stdio"
+	}
+
+	// A stdio server without a command cannot be spawned — and mcp-go's stdio
+	// transport does not reject the empty command itself: its spawnCommand
+	// treats it as "nothing to spawn", skips creating the stdout pipe, and its
+	// reader goroutine then panics on the nil reader, killing the whole host.
+	// Fail closed here instead (the gateway records the failure and keeps
+	// serving the remaining servers).
+	if transportType == "stdio" && cfg.Command == "" {
+		s.lastError = "stdio transport requires a non-empty command"
+		return fmt.Errorf("MCP server %s: stdio transport requires a non-empty command", s.name)
 	}
 
 	var client *mcpclient.Client
@@ -341,6 +374,14 @@ func timeoutErrorFor(base, child context.Context, fallback *TimeoutError) (bool,
 
 // connectStdio creates a stdio MCP client.
 func (s *Server) connectStdio(ctx context.Context, cfg ServerConfig) (*mcpclient.Client, error) {
+	// Defense in depth for callers that reach the stdio transport without
+	// passing through Connect's transport switch: an empty command must never
+	// reach mcp-go, whose spawnCommand skips the stdout pipe for it and whose
+	// reader goroutine then panics on the nil reader (finding 44).
+	if cfg.Command == "" {
+		return nil, fmt.Errorf("MCP server %s: stdio transport requires a non-empty command", s.name)
+	}
+
 	// Build environment variables slice using an allowlist rather than
 	// os.Environ(). MCP servers run arbitrary, potentially third-party
 	// commands from config (ASI04 — agentic supply chain); forwarding the
@@ -395,6 +436,16 @@ func (s *Server) connectStdio(ctx context.Context, cfg ServerConfig) (*mcpclient
 		return nil, fmt.Errorf("failed to create stdio MCP client for %s: %w", s.name, err)
 	}
 
+	// Drain the child's stderr for the lifetime of the connection. mcp-go
+	// creates the stderr pipe but never reads it (its reader goroutine reads
+	// stdout only, and Close merely closes the pipe); a server that logs more
+	// than the OS pipe buffer (~64 KiB on Linux) to the MCP-sanctioned logging
+	// channel then blocks in write(2) and stops servicing the JSON-RPC
+	// protocol — wedging the handshake or every subsequent tools/call. The
+	// drain must start before the handshake: a server that floods stderr
+	// during startup would otherwise stall Connect itself (finding 58).
+	s.drainStdioStderr(client)
+
 	if err := s.initializeClient(ctx, client); err != nil {
 		// The child was already spawned by Start, so the handshake-failure
 		// cleanup needs the same bounded close as a live connection: a server
@@ -407,6 +458,58 @@ func (s *Server) connectStdio(ctx context.Context, cfg ServerConfig) (*mcpclient
 	}
 
 	return client, nil
+}
+
+// stderrRingBytes bounds how much of a stdio server's drained stderr is kept
+// for diagnostics. The drain itself is unbounded (to io.Discard semantics) —
+// only the retained tail is capped, so a chatty server cannot grow memory.
+const stderrRingBytes = 8 * 1024
+
+// stderrRing is a write-only bounded buffer that keeps the LAST stderrRingBytes
+// bytes written to it: older output is dropped, so the retained tail always
+// reflects a server's most recent log lines. It satisfies io.Writer.
+type stderrRing struct {
+	buf []byte
+}
+
+// Write appends p to the ring, discarding the oldest bytes when the cap is
+// exceeded. It never fails and always reports the full write, so io.Copy's
+// drain is never cut short.
+func (r *stderrRing) Write(p []byte) (int, error) {
+	if len(p) >= stderrRingBytes {
+		r.buf = append(r.buf[:0], p[len(p)-stderrRingBytes:]...)
+		return len(p), nil
+	}
+	if len(r.buf)+len(p) > stderrRingBytes {
+		keep := len(r.buf) + len(p) - stderrRingBytes
+		r.buf = append(r.buf[:0], r.buf[keep:]...)
+	}
+	r.buf = append(r.buf, p...)
+	return len(p), nil
+}
+
+// drainStdioStderr starts a goroutine that drains the stdio child's stderr
+// pipe for the lifetime of the connection, teeing it into a bounded tail
+// buffer that is logged at Debug level when the drain ends (child exit or
+// connection close). It must be called as soon as the client exists and
+// BEFORE the handshake: a server that floods stderr during startup wedges
+// Connect itself when nobody reads the pipe. The goroutine always terminates:
+// the child's exit (or Close closing the pipe read end) ends the Copy with
+// EOF or a closed-pipe error. This cannot be done inside the command factory
+// — setting cmd.Stderr there makes mcp-go's own StderrPipe() call fail.
+func (s *Server) drainStdioStderr(client *mcpclient.Client) {
+	stderr, ok := mcpclient.GetStderr(client)
+	if !ok || stderr == nil {
+		return
+	}
+	go func() {
+		ring := &stderrRing{buf: make([]byte, 0, stderrRingBytes)}
+		_, _ = io.Copy(ring, stderr)
+		if len(ring.buf) > 0 {
+			s.log().Debug("MCP stdio server stderr (last bytes)",
+				"server", s.name, "stderr", string(ring.buf))
+		}
+	}()
 }
 
 // stdioEnvAllowlist is the set of environment variables that are inherited
@@ -602,11 +705,19 @@ func (s *Server) connectHTTP(ctx context.Context, cfg ServerConfig) (*mcpclient.
 	}
 
 	// The handshake bound (s.timeout) applies to EACH transport attempt below:
-	// the Streamable HTTP attempt and, if it fails, the SSE fallback. An HTTP
-	// server that accepts the connection but never answers initialize can
-	// therefore spend up to twice the bound before Connect fails. client.Start
-	// is deliberately not bounded (see initializeClient), so transport setup is
-	// not counted against the bound either.
+	// the Streamable HTTP attempt and, if it fails, the SSE fallback. On the
+	// Streamable HTTP leg the transport's requests carry the bounded contexts
+	// handed to Initialize/CallTool, so a stalled server is cut off by the
+	// handshake bound itself. The SSE leg blocks in TWO waits, each bounded on
+	// its own: the wait for the response headers is bounded by the transport
+	// HTTP client installed below (when the host supplies none — a
+	// host-supplied HTTPClient replaces it and must carry its own bounds), and
+	// the wait for the SSE endpoint event is bounded by the Start race in
+	// initializeClientWithStartCtx. A stalled endpoint therefore costs a small
+	// multiple of the bound, never an unbounded transport-internal wait. Only
+	// the Initialize exchange is bounded by the handshake context — the SSE
+	// transport's Start deliberately runs on a detached context (see the
+	// fallback leg below).
 
 	// Prepare headers option
 	var opts []transport.StreamableHTTPCOption
@@ -634,16 +745,39 @@ func (s *Server) connectHTTP(ctx context.Context, cfg ServerConfig) (*mcpclient.
 	if len(cfg.Headers) > 0 {
 		sseOpts = append(sseOpts, transport.WithHeaders(cfg.Headers))
 	}
-	if cfg.HTTPClient != nil {
-		sseOpts = append(sseOpts, transport.WithHTTPClient(cfg.HTTPClient))
+	httpClient := cfg.HTTPClient
+	if httpClient == nil {
+		// The SSE transport's built-in client has NO timeouts at all, and its
+		// Start performs the blocking event-stream GET itself with whatever
+		// context it is handed — with the default client and a context without
+		// a deadline (the framework path), a server that accepts the TCP
+		// connection but never sends response headers would hold Connect
+		// indefinitely (finding 40). Install a client whose dial, TLS, and
+		// response-header waits are bounded by the handshake bound instead;
+		// Client.Timeout stays zero because the connected event stream is
+		// long-lived and must not be cut mid-session.
+		httpClient = boundedStreamHTTPClient(s.timeout)
 	}
+	sseOpts = append(sseOpts, transport.WithHTTPClient(httpClient))
 
 	client, err = mcpclient.NewSSEMCPClient(cfg.URL, sseOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create HTTP MCP client for %s (tried Streamable HTTP and SSE): %w", s.name, err)
 	}
 
-	if err := s.initializeClient(ctx, client); err != nil {
+	// The SSE transport retains the Start context as the LIFETIME of its event
+	// stream: the blocking GET runs on a context derived from it, and only
+	// Close cancels it. Handing the caller's context to Start therefore ties a
+	// long-lived connection to whatever scope happened to call
+	// StartGateway/Reconfigure — a host's `ctx, cancel := context.WithTimeout(...);
+	// defer cancel()` would silently kill the live server the moment that
+	// scope exits (finding 41). Start on a detached context instead (values
+	// are preserved; cancellation and deadlines are dropped), and keep the
+	// Initialize exchange below bounded by the caller's context and the
+	// handshake timeout as before. The detached stream is still torn down by
+	// Server.Close → client.Close, which cancels it explicitly.
+	startCtx := context.WithoutCancel(ctx)
+	if err := s.initializeClientWithStartCtx(ctx, startCtx, client); err != nil {
 		if closeErr := client.Close(); closeErr != nil {
 			s.log().Debug("failed to close MCP client after connection failure", "error", closeErr)
 		}
@@ -653,23 +787,131 @@ func (s *Server) connectHTTP(ctx context.Context, cfg ServerConfig) (*mcpclient.
 	return client, nil
 }
 
+// boundedStreamHTTPClient builds the HTTP client used for the SSE fallback
+// transport when the host supplies none: connection-level waits are bounded so
+// a stalled endpoint cannot hold Connect open indefinitely, while
+// Client.Timeout remains zero — the SSE event stream is a long-lived response
+// body that must stay open for the lifetime of the connection
+// (ResponseHeaderTimeout bounds only the wait for headers, not the body).
+func boundedStreamHTTPClient(bound time.Duration) *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			Proxy:                 http.ProxyFromEnvironment,
+			DialContext:           (&net.Dialer{Timeout: bound}).DialContext,
+			ForceAttemptHTTP2:     true,
+			TLSHandshakeTimeout:   bound,
+			ResponseHeaderTimeout: bound,
+		},
+	}
+}
+
 // initializeClient initializes the MCP connection for the given client.
 //
 // Caller must hold s.mu (Connect holds it), so reading the resolved s.timeout
 // without an additional lock is safe.
 func (s *Server) initializeClient(ctx context.Context, client *mcpclient.Client) error {
-	// Start the client transport. This call is DELIBERATELY NOT wrapped with
-	// the handshake timeout: for the stdio transport the process is already
-	// started with context.Background() by the transport constructor, and Start
-	// only attaches to it — deriving Start's context from a timeout would
-	// couple the child process's lifetime to the handshake deadline, so a
-	// server that is merely slow to finish the MCP handshake would have its
+	return s.initializeClientWithStartCtx(ctx, ctx, client)
+}
+
+// initializeClientWithStartCtx starts the client transport on startCtx and
+// runs the MCP initialize exchange on ctx. The split exists because transports
+// disagree about what a Start context means: stdio pre-starts its child with
+// context.Background() in the constructor (Start is a no-op), Streamable HTTP
+// does not retain it (Start is a no-op without continuous listening), but the
+// SSE transport keeps it as the lifetime of its event stream — so the SSE leg
+// passes a detached context as startCtx while ctx continues to bound the
+// handshake. The Start call itself is raced against the resolved handshake
+// bound (see below): the SSE transport's Start blocks until the server's
+// endpoint event arrives, under a fixed 30s internal timeout that neither the
+// detached start context nor the bounded transport HTTP client can tighten.
+//
+// Caller must hold s.mu (Connect holds it), so reading the resolved s.timeout
+// without an additional lock is safe.
+func (s *Server) initializeClientWithStartCtx(ctx, startCtx context.Context, client *mcpclient.Client) error {
+	// Start the client transport. Start's CONTEXT is DELIBERATELY NOT derived
+	// from the handshake timeout: for the stdio transport the process is
+	// already started with context.Background() by the transport constructor,
+	// and Start only attaches to it — deriving Start's context from a timeout
+	// would couple the child process's lifetime to the handshake deadline, so
+	// a server that is merely slow to finish the MCP handshake would have its
 	// process killed (and the connection torn down) instead of the handshake
-	// being aborted and retried. Start also returns as soon as the transport is
-	// up, so it is not the blocking step a timeout needs to bound. Only the
-	// Initialize exchange below is time-bounded.
-	if err := client.Start(ctx); err != nil {
-		return fmt.Errorf("failed to start MCP client for %s: %w", s.name, err)
+	// being aborted and retried.
+	//
+	// The Start CALL is instead raced against the resolved handshake bound.
+	// For stdio and Streamable HTTP the race is inert — Start returns as soon
+	// as the transport is up. The SSE transport's Start, however, BLOCKS until
+	// the server's endpoint event arrives, under a fixed 30s internal timeout
+	// (mcp-go transport/sse.go): the detached start context carries no
+	// deadline to tighten it, and the bounded transport HTTP client installed
+	// by connectHTTP covers only the wait for response headers, so an endpoint
+	// that sends headers and then stalls would otherwise hold Connect — under
+	// the gateway's write lock — for ~30s regardless of the configured
+	// Timeout. When the bound fires, the race context is cancelled — which
+	// makes the SSE endpoint wait return through its own ctx.Done() arm — and
+	// the Start goroutine is reaped BEFORE returning, so the error path's
+	// client.Close (Connect's callers close on every failure) can never
+	// overlap a still-running Start: mcp-go's transports do not synchronize a
+	// concurrent Start against Close (the SSE transport assigns
+	// cancelSSEStream racily), and Connect then fails with a TimeoutError
+	// inside the configured bound.
+	raceCtx, raceCancel := context.WithCancel(startCtx)
+	// startCompleted records that Start returned successfully, so the
+	// deferred cancel below becomes a no-op on the success path: the SSE
+	// transport retains raceCtx as the parent of its event stream, and
+	// cancelling it would kill the live connection — the exact lifetime
+	// coupling finding 41 removed. On every failure path the cancel still
+	// fires, so no context is ever leaked.
+	startCompleted := false
+	defer func() {
+		if !startCompleted {
+			raceCancel()
+		}
+	}()
+	startDone := make(chan error, 1) // buffered: the timer branch reaps the goroutine without deadlocking on its send
+	go func() {
+		startDone <- client.Start(raceCtx)
+	}()
+
+	startTimer := time.NewTimer(s.timeout)
+	defer startTimer.Stop()
+
+	select {
+	case err := <-startDone:
+		if err != nil {
+			return fmt.Errorf("failed to start MCP client for %s: %w", s.name, err)
+		}
+		startCompleted = true
+	case <-ctx.Done():
+		// The host cancelled (or deadline-expired) the Connect context while
+		// the endpoint wait was stalled: abort promptly and attribute the
+		// failure to the caller instead of misreporting it as a server
+		// timeout — the same attribution rule timeoutErrorFor follows.
+		// Cancel and reap exactly like the timer branch below, so the error
+		// path's client.Close can never overlap a still-running Start. If
+		// Start completes concurrently with the cancellation, the race
+		// context is cancelled first, so the just-started stream is dead on
+		// arrival and Connect's caller closes it on this failure path.
+		raceCancel()
+		<-startDone
+		return ctx.Err()
+	case <-startTimer.C:
+		// Cancel first (unblocks a stalled Start in milliseconds through the
+		// transport's own context handling), then reap the goroutine so the
+		// error path's client.Close — Connect's callers close on every
+		// failure — can never overlap a still-running Start: mcp-go's
+		// transports do not synchronize a concurrent Start against Close (the
+		// SSE transport assigns cancelSSEStream racily). Start is guaranteed
+		// to observe the cancellation — its endpoint wait selects on
+		// ctx.Done() and its HTTP request carries the context — so the reap
+		// is prompt; the receive is intentionally unbounded, because a bound
+		// would re-open the Start/Close overlap this branch exists to avoid.
+		// Tie-break: if Start completes right at the tick, the just-started
+		// stream is cancelled by raceCancel and the TimeoutError is still
+		// reported — the microscopic window favors honoring the advertised
+		// bound; the caller's error path closes the transport and may retry.
+		raceCancel()
+		<-startDone
+		return &TimeoutError{Server: s.name, Op: "initialize", Timeout: s.timeout}
 	}
 
 	// Initialize the MCP connection
@@ -727,8 +969,15 @@ func (s *Server) DiscoverTools(ctx context.Context) error {
 		defer cancel()
 	}
 
-	// List all tools from the MCP server
-	result, err := s.client.ListTools(listCtx, mcp.ListToolsRequest{})
+	// Page through tools/list at the transport level and keep every tool's
+	// inputSchema as the server sent it. Decoding into mcp.Tool instead would
+	// silently drop every top-level schema keyword its ToolInputSchema struct
+	// does not model (enum, oneOf, $ref, ... — the struct's marshaller emits
+	// only type/$defs/properties/required/additionalProperties, and the
+	// RawInputSchema escape hatch is json:"-" with no UnmarshalJSON, so it is
+	// always nil on the client decode path): a tool advertised with a top-level
+	// enum or $ref would reach the LLM parameterless and unusable (finding 51).
+	tools, err := s.listToolsRaw(listCtx)
 	if err != nil {
 		if _, timeoutErr := timeoutErrorFor(ctx, listCtx,
 			&TimeoutError{Server: s.name, Op: "list_tools", Timeout: s.timeout}); timeoutErr != nil {
@@ -737,26 +986,7 @@ func (s *Server) DiscoverTools(ctx context.Context) error {
 		return fmt.Errorf("failed to list tools from MCP server %s: %w", s.name, err)
 	}
 
-	// Convert MCP tools to our internal format
-	s.tools = make([]ToolInfo, 0, len(result.Tools))
-	for _, tool := range result.Tools {
-		// Marshal the input schema to json.RawMessage
-		schema, err := json.Marshal(tool.InputSchema)
-		if err != nil {
-			// Fall back to raw schema if structured marshaling fails
-			if tool.RawInputSchema != nil {
-				schema = tool.RawInputSchema
-			} else {
-				schema = []byte(`{"type":"object"}`)
-			}
-		}
-
-		s.tools = append(s.tools, ToolInfo{
-			Name:        tool.Name,
-			Description: tool.Description,
-			InputSchema: schema,
-		})
-	}
+	s.tools = tools
 
 	toolNames := make([]string, len(s.tools))
 	for i, t := range s.tools {
@@ -765,6 +995,92 @@ func (s *Server) DiscoverTools(ctx context.Context) error {
 	s.log().Debug("MCP tools discovered", "server", s.name, "count", len(s.tools), "tools", toolNames)
 
 	return nil
+}
+
+// mcpRawRequestID generates request IDs for DiscoverTools' transport-level
+// tools/list paging. The mcp-go client numbers its requests sequentially from
+// 1 and routes responses by echoed ID through a shared map, so reusing small
+// IDs could hijack the response of a concurrent in-flight call on the same
+// connection (Server.CallTool drops the server lock before its wire call).
+// Seeding the counter far above any sequential run keeps the two ID spaces
+// disjoint. The base must stay under 2^53: mcp-go's RequestId re-parses
+// response IDs through float64, so larger IDs lose precision on the way back
+// and the response would no longer match the map key. DiscoverTools runs once
+// per (re)connect under the server write lock, so its own calls never collide
+// with each other.
+const mcpRawRequestIDBase = int64(1) << 52
+
+var mcpRawRequestID atomic.Int64
+
+// rawTool is the decode target for one entry of a tools/list page. InputSchema
+// is captured as raw bytes and stored verbatim — see listToolsRaw.
+type rawTool struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	InputSchema json.RawMessage `json:"inputSchema"`
+}
+
+// rawListToolsPage is the decode target for one page of a tools/list response.
+type rawListToolsPage struct {
+	Tools      []rawTool  `json:"tools"`
+	NextCursor mcp.Cursor `json:"nextCursor,omitempty"`
+}
+
+// listToolsRaw pages through tools/list on the server connection and returns
+// the discovered tools with their input schemas preserved byte-for-byte. It
+// mirrors what mcp-go's own paginated helper does on the wire (JSON-RPC
+// request with a params.cursor, JSON-RPC error surfaced as a Go error) while
+// decoding each page into rawTool so no schema keyword is lost.
+//
+// Caller must hold s.mu (DiscoverTools holds it): the client and the transport
+// are read without an additional lock, same as the CallTool path reads the
+// captured client.
+func (s *Server) listToolsRaw(ctx context.Context) ([]ToolInfo, error) {
+	tr := s.client.GetTransport()
+	if tr == nil {
+		return nil, fmt.Errorf("mcp server %s: client has no transport", s.name)
+	}
+
+	var tools []ToolInfo
+	cursor := mcp.Cursor("")
+	for {
+		response, err := tr.SendRequest(ctx, transport.JSONRPCRequest{
+			JSONRPC: mcp.JSONRPC_VERSION,
+			ID:      mcp.NewRequestId(mcpRawRequestIDBase + mcpRawRequestID.Add(1)),
+			Method:  "tools/list",
+			Params:  mcp.PaginatedParams{Cursor: cursor},
+		})
+		if err != nil {
+			return nil, err
+		}
+		if response.Error != nil {
+			return nil, response.Error.AsError()
+		}
+
+		var page rawListToolsPage
+		if err := json.Unmarshal(response.Result, &page); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal tools/list response: %w", err)
+		}
+
+		for _, tool := range page.Tools {
+			schema := tool.InputSchema
+			if len(schema) == 0 {
+				// A server may omit inputSchema entirely (an MCP tool with no
+				// arguments); advertise an empty object schema rather than nil.
+				schema = json.RawMessage(`{"type":"object"}`)
+			}
+			tools = append(tools, ToolInfo{
+				Name:        tool.Name,
+				Description: tool.Description,
+				InputSchema: schema,
+			})
+		}
+
+		if page.NextCursor == "" {
+			return tools, nil
+		}
+		cursor = page.NextCursor
+	}
 }
 
 // Tools returns the list of discovered tools.
@@ -783,11 +1099,23 @@ func (s *Server) CallTool(ctx context.Context, name string, arguments map[string
 	s.mu.RLock()
 	client := s.client
 	callTimeout := s.callTimeout
+	if client != nil {
+		// Register the in-flight call while still holding the lock, so a
+		// concurrent Close cannot reach client.Close() while this call's
+		// response channel is registered in the transport: the SSE transport
+		// closes those channels in Close and its reader goroutine sends on
+		// them after dropping its lock, so closing under an in-flight call can
+		// panic that goroutine with "send on closed channel" and kill the host
+		// (finding 64). Close releases s.mu before waiting, and resets
+		// s.client under the lock, so no call can join after the drain starts.
+		s.inflight.Add(1)
+	}
 	s.mu.RUnlock()
 
 	if client == nil {
 		return nil, fmt.Errorf("mcp server %s is not connected", s.name)
 	}
+	defer s.inflight.Done()
 
 	req := mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
@@ -866,16 +1194,28 @@ func (s *Server) effectiveCloseGrace() time.Duration {
 // as long as it pleases. Close therefore waits at most closeGrace for a
 // voluntary exit and then kills the child: stdin EOF already delivered the
 // polite shutdown request, the kill only reaps what refused it.
+//
+// In-flight tool calls are drained first (bounded by their own per-call
+// bound, or closeGrace for a hand-built server that never connected): closing
+// the transport while a call is still registered can panic the SSE reader
+// goroutine with "send on closed channel" (finding 64), and a drained call
+// simply completes instead of being killed mid-flight.
 func (s *Server) Close() error {
+	// Phase 1 (under the lock): detach the client and reset state. New calls
+	// observe client == nil from here on; calls that already captured the
+	// client are tracked by the inflight counter.
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if s.client == nil {
+		s.mu.Unlock()
 		return nil
 	}
 
 	client := s.client
+	cmd := s.stdioCmd
+	grace := s.effectiveCloseGrace()
+	drainBound := s.callTimeout
 	s.client = nil
+	s.stdioCmd = nil
 	s.tools = nil
 	// A closed connection can no longer be slow: drop the advisory unhealthy
 	// mark together with the timeout streak and its recorded description
@@ -884,12 +1224,48 @@ func (s *Server) Close() error {
 	s.consecutiveTimeouts = 0
 	s.unhealthy = false
 	s.lastError = ""
+	s.mu.Unlock()
 
-	err := s.closeClientLocked(client)
+	// Phase 2 (without the lock): drain in-flight calls so the transport is
+	// closed with no response channel still registered. The wait is bounded by
+	// the calls' own per-call bound — each is wrapped in a call-context
+	// deadline — falling back to the close grace for a server whose bounds
+	// were never resolved. The lock must not be held while waiting: a drained
+	// call takes it to record its outcome.
+	if drainBound <= 0 {
+		drainBound = grace
+	}
+	s.drainInflight(drainBound)
+
+	err := closeClientBounded(client, cmd, grace)
+	s.mu.Lock()
 	if err != nil {
 		s.lastError = err.Error()
 	}
+	s.mu.Unlock()
 	return err
+}
+
+// drainInflight waits for in-flight CallTool invocations to return, bounded by
+// bound. Calls whose bound elapses are allowed to keep running: closing under
+// them re-opens the finding 64 race, but an unbounded wait would let a single
+// wedged call stall shutdown forever — the residual risk is limited to a call
+// that ignores its own context deadline, which no connected server can
+// produce (CallTool always derives one from the per-call bound).
+func (s *Server) drainInflight(bound time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		s.inflight.Wait()
+		close(done)
+	}()
+	timer := time.NewTimer(bound)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+		s.log().Debug("MCP server close proceeding with tool calls still in flight",
+			"server", s.name, "waited", bound)
+	}
 }
 
 // closeClientLocked closes the transport client with the bounded-close

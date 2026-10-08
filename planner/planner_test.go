@@ -1129,8 +1129,8 @@ func TestContinuationMultiMode_Fields(t *testing.T) {
 	if mode.preamble != "cont_pre" {
 		t.Errorf("expected cont_pre, got %q", mode.preamble)
 	}
-	if mode.tail != "" {
-		t.Errorf("expected empty tail, got %q", mode.tail)
+	if mode.tail != continuationModeTail {
+		t.Errorf("expected continuationModeTail, got %q", mode.tail)
 	}
 	if mode.jsonExample != continuationModeJSONExample {
 		t.Error("expected continuationModeJSONExample")
@@ -1152,8 +1152,8 @@ func TestContinuationSingleMode_Fields(t *testing.T) {
 	if mode.preamble != "cont_single_pre" {
 		t.Errorf("expected cont_single_pre, got %q", mode.preamble)
 	}
-	if mode.tail != "" {
-		t.Errorf("expected empty tail, got %q", mode.tail)
+	if mode.tail != continuationModeTail {
+		t.Errorf("expected continuationModeTail, got %q", mode.tail)
 	}
 	if mode.jsonExample != continuationSingleStepJSONExample {
 		t.Error("expected continuationSingleStepJSONExample")

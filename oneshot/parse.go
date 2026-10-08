@@ -314,18 +314,27 @@ func SplitInline(value string, keys ...string) (head, key, inlineValue string, o
 // (the caller decides whether empty content is acceptable), and ("", false)
 // when either marker is missing or they appear in the wrong order. The
 // extracted text is whitespace-trimmed.
+//
+// "After it" means after the END of the start marker: the end-marker search
+// begins past the start marker, so overlapping or equal markers work as the
+// same-delimiter case demands (e.g. start == end for a ``` fence pair). The
+// end marker may not overlap the start marker's own text.
 func BetweenMarkers(s, start, end string) (string, bool) {
 	startIdx := strings.Index(s, start)
 	if startIdx < 0 {
 		return "", false
 	}
-	endIdx := strings.Index(s[startIdx:], end)
+	// Search from the end of the start marker, not from its own offset:
+	// an end marker equal to (or contained in) the start marker would
+	// otherwise match at offset 0 and place the content end before the
+	// content start — a slice-bounds panic. This also makes start == end
+	// extract the text between two successive occurrences, as documented.
+	after := startIdx + len(start)
+	endIdx := strings.Index(s[after:], end)
 	if endIdx < 0 {
 		return "", false
 	}
-	contentStart := startIdx + len(start)
-	contentEnd := startIdx + endIdx
-	return strings.TrimSpace(s[contentStart:contentEnd]), true
+	return strings.TrimSpace(s[after : after+endIdx]), true
 }
 
 // Marked scans the response's candidate fields (Content → ReasoningContent →

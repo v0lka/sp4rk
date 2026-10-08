@@ -496,3 +496,126 @@ func TestResolveExistingPrefix_WithSymlink(t *testing.T) {
 		t.Errorf("symlink prefix should be resolved: got %q, want %q", result, expected)
 	}
 }
+
+// rawJoin concatenates segments with the OS separator WITHOUT cleaning, so a
+// raw "symlink/.." spelling survives to the function under test.
+// filepath.Join would lexically collapse the ".." and erase the link —
+// hiding exactly the case the containment check must defend against.
+func rawJoin(segments ...string) string {
+	return strings.Join(segments, string(filepath.Separator))
+}
+
+func TestIsWithinPath_SymlinkDotDotEscape(t *testing.T) {
+	// Regression: the child path was lexically cleaned before symlink
+	// resolution, so "symlink/.." collapsed to a plain directory jump, the
+	// link was erased before any symlink was resolved, and a link pointing
+	// outside the root was wrongly judged within. The OS resolves the link
+	// first and applies ".." against the link TARGET's directory, so the
+	// containment check must see the raw spelling.
+	dir := t.TempDir()
+	root := filepath.Join(dir, "root")
+	outside := filepath.Join(dir, "outside")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("mkdir root: %v", err)
+	}
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatalf("mkdir outside: %v", err)
+	}
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlinks unavailable on this platform: %v", err)
+	}
+	// The OS resolves root/link/../f as <parent-of-link-target>/f — i.e.
+	// dir/, NOT outside/. Put the file there so the escape is real: the
+	// kernel must be able to open the raw spelling.
+	existing := filepath.Join(dir, "secret.txt")
+	if err := os.WriteFile(existing, []byte("x"), 0o644); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		child string
+	}{
+		// The target already exists: the OS opens it through the link and
+		// the "..", and the resolved location lands outside root.
+		{"existing target", rawJoin(root, "link", "..", "secret.txt")},
+		// The target does not exist (the write_file case): the longest
+		// existing prefix — link/.. — still resolves through the link.
+		{"non-existent target", rawJoin(root, "link", "..", "pwned.txt")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Kernel ground truth for the existing case: the raw spelling
+			// really does escape the root, so the containment check has a
+			// genuine escape to reject (and EvalSymlinks agrees).
+			if _, err := os.Stat(tc.child); err == nil {
+				if resolved, err := filepath.EvalSymlinks(tc.child); err == nil && strings.HasPrefix(resolved, root+string(filepath.Separator)) {
+					t.Fatalf("test setup: %q unexpectedly resolves inside root (%q)", tc.child, resolved)
+				}
+			}
+
+			ok, err := IsWithinPath(root, tc.child)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if ok {
+				t.Errorf("symlink/.. escape %q judged within root %q: the OS resolves the link first, so '..' climbs outside", tc.child, root)
+			}
+			// The fold variant shares the resolution path and must reject too.
+			okFold, err := IsWithinPathFold(root, tc.child)
+			if err != nil {
+				t.Fatalf("unexpected fold error: %v", err)
+			}
+			if okFold {
+				t.Errorf("symlink/.. escape %q judged within root by the fold variant", tc.child)
+			}
+		})
+	}
+}
+
+func TestIsWithinPath_SymlinkDotDotInsideRoot(t *testing.T) {
+	// Positive control: a link resolving INSIDE the root followed by ".."
+	// must stay within (the OS turns link/../file.txt into root/file.txt).
+	// The fix must reject symlink escapes without condemning every ".."
+	// that trails a symlink.
+	dir := t.TempDir()
+	root := filepath.Join(dir, "root")
+	if err := os.MkdirAll(filepath.Join(root, "sub"), 0o755); err != nil {
+		t.Fatalf("mkdir sub: %v", err)
+	}
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(filepath.Join(root, "sub"), link); err != nil {
+		t.Skipf("symlinks unavailable on this platform: %v", err)
+	}
+	child := rawJoin(root, "link", "..", "file.txt")
+
+	ok, err := IsWithinPath(root, child)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !ok {
+		t.Errorf("symlink inside root followed by '..' must stay within root (resolves to %q)", filepath.Join(root, "file.txt"))
+	}
+}
+
+func TestResolveExistingPrefix_SymlinkDotDot(t *testing.T) {
+	// Pins the primitive IsWithinPath relies on: "link/.." resolves to the
+	// link TARGET's parent directory, never the link's lexical parent.
+	dir := t.TempDir()
+	root := filepath.Join(dir, "root")
+	outside := filepath.Join(dir, "outside")
+	_ = os.MkdirAll(root, 0o755)
+	_ = os.MkdirAll(outside, 0o755)
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlinks unavailable on this platform: %v", err)
+	}
+
+	got := ResolveExistingPrefix(rawJoin(root, "link", "..", "new.txt"))
+	// The parent may itself be symlink-resolved (macOS /var → /private/var).
+	resolvedParent, _ := filepath.EvalSymlinks(filepath.Dir(outside))
+	expected := filepath.Join(resolvedParent, "new.txt")
+	if got != expected {
+		t.Errorf("link/.. must resolve through the link target: got %q, want %q", got, expected)
+	}
+}

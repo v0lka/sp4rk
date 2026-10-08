@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -145,11 +146,13 @@ func TestEditFileTool_Execute_RejectsFifo(t *testing.T) {
 	}
 }
 
-// TestWriteFileTool_Execute_ReplacesFifoWithoutBlocking validates the documented
-// FIFO-safety of atomicWriteFile: the target is never open()ed — a regular temp
-// file is created next to it and renamed over it — so writing through a FIFO
-// path neither blocks nor fails; it replaces the FIFO with a regular file.
-func TestWriteFileTool_Execute_ReplacesFifoWithoutBlocking(t *testing.T) {
+// TestWriteFileTool_Execute_RefusesFifoWithoutBlocking validates the fix for
+// review finding #56: a FIFO is not a regular file, so write_file must refuse
+// to replace it — the atomic rename would otherwise silently overwrite the
+// device/FIFO node with a regular file. The refusal must also not block: the
+// target is probed with os.Stat (which never opens the FIFO), so the call
+// returns promptly instead of hanging inside open(2).
+func TestWriteFileTool_Execute_RefusesFifoWithoutBlocking(t *testing.T) {
 	fifo := mkFifoForTest(t)
 	tool := NewWriteFileTool()
 	input, _ := json.Marshal(WriteFileInput{Path: fifo, Content: "replaced"})
@@ -162,22 +165,118 @@ func TestWriteFileTool_Execute_ReplacesFifoWithoutBlocking(t *testing.T) {
 	if out.err != nil {
 		t.Fatalf("write_file Execute returned a transport error: %v", out.err)
 	}
-	if out.isError {
-		t.Fatalf("write_file over a FIFO failed: %q", out.content)
+	if !out.isError {
+		t.Fatalf("write_file over a FIFO was not refused: %q", out.content)
+	}
+	if !strings.Contains(out.content, "not a regular file") {
+		t.Errorf("expected a not-a-regular-file refusal, got: %q", out.content)
 	}
 
+	// The FIFO must survive untouched.
 	info, err := os.Stat(fifo)
 	if err != nil {
-		t.Fatalf("stat after write: %v", err)
+		t.Fatalf("stat after refused write: %v", err)
 	}
-	if !info.Mode().IsRegular() {
-		t.Fatalf("write over a FIFO left a non-regular file: mode %v", info.Mode())
+	if info.Mode()&os.ModeNamedPipe == 0 {
+		t.Fatalf("refused write clobbered the FIFO: mode %v", info.Mode())
 	}
-	got, err := os.ReadFile(fifo)
+}
+
+// TestDeleteFileTool_Execute_RefusesFifo validates the delete_file half of the
+// non-regular-target refusal (#56): a FIFO must not be unlinked — the tool
+// reports an error and the FIFO survives.
+func TestDeleteFileTool_Execute_RefusesFifo(t *testing.T) {
+	fifo := mkFifoForTest(t)
+	tool := NewDeleteFileTool()
+	input, _ := json.Marshal(DeleteFileInput{Path: fifo})
+
+	out := withFifoWatchdog(t, "delete_file", func() toolOutcome {
+		res, err := tool.Execute(context.Background(), input)
+		return toolOutcome{content: res.Content, isError: res.IsError, err: err}
+	})
+
+	if out.err != nil {
+		t.Fatalf("delete_file Execute returned a transport error: %v", out.err)
+	}
+	if !out.isError {
+		t.Fatalf("delete_file of a FIFO was not refused: %q", out.content)
+	}
+	if !strings.Contains(out.content, "not a regular file") {
+		t.Errorf("expected a not-a-regular-file refusal, got: %q", out.content)
+	}
+	if _, err := os.Stat(fifo); err != nil {
+		t.Fatalf("FIFO did not survive the refused delete: %v", err)
+	}
+}
+
+// TestWriteFileTool_Execute_RefusesDevNull validates the harmless-device half
+// of the non-regular-target refusal (review finding #56): /dev/null (os.DevNull)
+// is judge-exempted as a harmless device, but it is a character device, not a
+// regular file — write_file must refuse to rename a regular file over it even
+// though the judge would auto-approve. POSIX-only: on Windows NUL is a
+// reserved name with different semantics, so the case is skipped there.
+func TestWriteFileTool_Execute_RefusesDevNull(t *testing.T) {
+	tool := NewWriteFileTool()
+	input, _ := json.Marshal(WriteFileInput{Path: os.DevNull, Content: "clobber"})
+
+	out := withFifoWatchdog(t, "write_file "+os.DevNull, func() toolOutcome {
+		res, err := tool.Execute(context.Background(), input)
+		return toolOutcome{content: res.Content, isError: res.IsError, err: err}
+	})
+
+	if out.err != nil {
+		t.Fatalf("write_file Execute returned a transport error: %v", out.err)
+	}
+	if !out.isError {
+		t.Fatalf("write_file over %s was not refused: %q", os.DevNull, out.content)
+	}
+	if !strings.Contains(out.content, "not a regular file") {
+		t.Errorf("expected a not-a-regular-file refusal, got: %q", out.content)
+	}
+}
+
+// TestDeleteFileTool_Execute_RefusesDevNull is the delete_file half of the
+// same refusal: unlinking the null device would break every process on the
+// host that redirects to it, so the tool must refuse.
+func TestDeleteFileTool_Execute_RefusesDevNull(t *testing.T) {
+	tool := NewDeleteFileTool()
+	input, _ := json.Marshal(DeleteFileInput{Path: os.DevNull})
+
+	out := withFifoWatchdog(t, "delete_file "+os.DevNull, func() toolOutcome {
+		res, err := tool.Execute(context.Background(), input)
+		return toolOutcome{content: res.Content, isError: res.IsError, err: err}
+	})
+
+	if out.err != nil {
+		t.Fatalf("delete_file Execute returned a transport error: %v", out.err)
+	}
+	if !out.isError {
+		t.Fatalf("delete_file of %s was not refused: %q", os.DevNull, out.content)
+	}
+	if !strings.Contains(out.content, "not a regular file") {
+		t.Errorf("expected a not-a-regular-file refusal, got: %q", out.content)
+	}
+	if _, err := os.Stat(os.DevNull); err != nil {
+		t.Fatalf("%s must survive the refused delete: %v", os.DevNull, err)
+	}
+}
+
+// TestWriteFileTool_CreateNewAtExemptedPathAllowed proves the refusal is
+// scoped to REPLACING an existing non-regular target: a regular file whose
+// NAME collides with a Windows reserved-device spelling (a plain file named
+// "NUL" on POSIX, where it is an ordinary name) is created/overwritten
+// normally. This pins the "creating a new file at an exempted path stays
+// allowed" half of finding #56.
+func TestWriteFileTool_CreateNewAtExemptedPathAllowed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "NUL") // ordinary file name on POSIX
+	tool := NewWriteFileTool()
+	input, _ := json.Marshal(WriteFileInput{Path: path, Content: "plain file"})
+
+	res, err := tool.Execute(context.Background(), input)
 	if err != nil {
-		t.Fatalf("read after write: %v", err)
+		t.Fatalf("unexpected transport error: %v", err)
 	}
-	if string(got) != "replaced" {
-		t.Fatalf("content = %q, want %q", got, "replaced")
+	if res.IsError {
+		t.Fatalf("creating a new regular file at %q failed: %s", path, res.Content)
 	}
 }

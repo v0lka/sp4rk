@@ -388,11 +388,12 @@ func TestGlobTool_SymlinkLoopTerminates(t *testing.T) {
 	}
 }
 
-// TestGlobTool_LiteralSymlinkPrefixIsFollowed pins the documented caveat of
-// doublestar.WithNoFollow: a symlink named before the pattern's first meta
-// character (here `alias/**`) is still followed, so non-traversal applies to
-// symlinked directories *encountered during* the walk, not to a literal
-// symlink prefix. Both halves are asserted against the concrete result set.
+// TestGlobTool_LiteralSymlinkPrefixIsFollowed pins the glob containment
+// contract around doublestar.WithNoFollow's literal-prefix caveat: a symlink
+// named before the pattern's first meta character (here `alias/**`) is still
+// FOLLOWED by the walk, but the per-entry containment check keeps every
+// resolved-outside entry out of the results — an in-root alias still lists,
+// and an alias pointing outside the session roots yields nothing.
 func TestGlobTool_LiteralSymlinkPrefixIsFollowed(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "real"), 0o755); err != nil {
@@ -408,11 +409,15 @@ func TestGlobTool_LiteralSymlinkPrefixIsFollowed(t *testing.T) {
 		t.Skipf("symlinks unsupported on this filesystem: %v", err)
 	}
 
+	// Workspace context so per-entry containment is enforced (glob keeps its
+	// fail-open behavior when no session roots are attached).
+	ctx := tools.WithWorkspacePath(context.Background(), root)
+
 	tool := NewGlobTool()
 	run := func(pattern string) string {
 		t.Helper()
 		input, _ := json.Marshal(GlobInput{Pattern: pattern, Path: root, Type: "all"})
-		res, err := tool.Execute(context.Background(), input)
+		res, err := tool.Execute(ctx, input)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -426,9 +431,83 @@ func TestGlobTool_LiteralSymlinkPrefixIsFollowed(t *testing.T) {
 	if diff := diffGlobResultSet(run("**/*"), []string{"alias", "top.go", "real", "real/keep.go"}); diff != "" {
 		t.Errorf("`**/*` must not traverse the symlinked dir: %s", diff)
 	}
-	// A literal symlink prefix is followed (the documented doublestar caveat).
+	// The literal symlink prefix is followed by the walker, but every entry
+	// under it resolves inside the workspace, so the alias listing survives
+	// containment intact.
 	if diff := diffGlobResultSet(run("alias/**"), []string{"alias", "alias/keep.go"}); diff != "" {
-		t.Errorf("`alias/**` must follow the literal symlink prefix: %s", diff)
+		t.Errorf("`alias/**` must still list the in-root alias: %s", diff)
+	}
+}
+
+// TestGlobTool_OutOfRootSymlinkPrefixYieldsNothing is the regression repro for
+// review finding #61: with a workspace attached, `glob({"pattern":"link/*"})`
+// where link points OUTSIDE the workspace must return zero out-of-root
+// entries (and must not fail the whole walk) — the literal-prefix symlink the
+// walker still follows must not leak outside-root names into the results.
+func TestGlobTool_OutOfRootSymlinkPrefixYieldsNothing(t *testing.T) {
+	ws := t.TempDir()
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "a.conf"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "b.conf"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "note.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, "real.go"), []byte("package x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(ws, "link")); err != nil {
+		t.Skipf("symlinks unsupported on this filesystem: %v", err)
+	}
+
+	ctx := tools.WithWorkspacePath(context.Background(), ws)
+	tool := NewGlobTool()
+	run := func(pattern, typeFilter string) []string {
+		t.Helper()
+		input, _ := json.Marshal(GlobInput{Pattern: pattern, Path: ws, Type: typeFilter})
+		res, err := tool.Execute(ctx, input)
+		if err != nil {
+			t.Fatalf("unexpected error for pattern %q: %v", pattern, err)
+		}
+		if res.IsError {
+			t.Fatalf("out-of-root link must not error the walk, got: %s", res.Content)
+		}
+		return globResultLines(res.Content)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		pattern string
+	}{
+		{"star under link", "link/*"},
+		{"recursive conf under link", "link/**/*.conf"},
+		{"doublestar all under link", "link/**/*"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := run(tc.pattern, "all")
+			if len(got) != 0 {
+				t.Errorf("glob(%q) leaked out-of-root entries, got: %v", tc.pattern, got)
+			}
+		})
+	}
+
+	// The in-root sibling is unaffected under the same workspace context.
+	// The `link` entry itself is dropped too: its resolved path leaves the
+	// workspace, and the containment contract is resolve-then-drop for every
+	// entry, symlink or not.
+	allInput, _ := json.Marshal(GlobInput{Pattern: "**/*", Path: ws, Type: "all"})
+	allRes, err := tool.Execute(ctx, allInput)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if allRes.IsError {
+		t.Fatalf("unexpected error result: %s", allRes.Content)
+	}
+	if diff := diffGlobResultSet(allRes.Content, []string{"real.go"}); diff != "" {
+		t.Errorf("in-root entries must survive containment: %s", diff)
 	}
 }
 

@@ -24,8 +24,11 @@ const (
 )
 
 // batchIndexBase is the base multiplier for batch sub-call indices.
-// Multiplied by callIdx in processBatchTool to create unique emitter indices
-// that cannot collide with standalone tool call indices (which are sequential, 0..N-1).
+// Each batch call's sub-calls start at (callIdx+1)*batchIndexBase in
+// processBatchTool, so they cannot collide with standalone tool call
+// indices (which are sequential, 0..N-1 within a response) — including
+// when the batch is the response's first call, whose sub-calls would
+// otherwise land exactly on the standalone range.
 const batchIndexBase = 10000
 
 // runState holds all loop-local state for a single Run invocation.
@@ -869,193 +872,15 @@ func (e *Executor) processSingleToolCall(
 	}
 	// --- End batch handling ---
 
-	// Check for finish tool (also before ToolCall emission).
+	// Check for finish tool (also before ToolCall emission). The terminal
+	// handling is shared with the batch meta-tool's sub-call loop
+	// (handleFinishCall below) so a finish wrapped inside a batch terminates
+	// the run exactly as a direct one does — guards included. Dispatching a
+	// batched finish to the registry instead would record its answer as an
+	// ordinary tool observation, silently swallow the completion signal, and
+	// keep the loop running past the model's answer.
 	if action.Name == "finish" {
-		// Finish guard: allow the caller (e.g. sp4rk Conductor) to reject
-		// finish when preconditions are not met (e.g. pending async
-		// delegations). If the guard returns an error, inject a nudge and
-		// retry instead of accepting finish.
-		if e.finishGuard != nil {
-			if guardErr := e.finishGuard(ctx); guardErr != nil {
-				// The nudge renders standalone (ResponseGroup 0). Carry the
-				// response's reasoning items exactly when finish is the
-				// group's FIRST call — then this nudge is the response's only
-				// materialized step, and buildStandaloneMessages reads its
-				// items directly, so the encrypted chain survives. With
-				// earlier siblings, groupSteps[0] already carries the items,
-				// and a copy here would re-emit the same reasoning-item IDs
-				// to the backend.
-				var nudgeItems []llm.ReasoningItem
-				if callIdx == 0 {
-					nudgeItems = resp.Message.ReasoningItems
-				}
-				nudgeStep := Step{
-					Thought:        thought,
-					UserNudge:      guardErr.Error(),
-					ReasoningItems: nudgeItems,
-					TokensUsed:     resp.Usage.InputTokens + resp.Usage.OutputTokens,
-				}
-				state.allSteps = append(state.allSteps, nudgeStep)
-				cw.AddStep(nudgeStep)
-				e.emitter.ExecutorDiagnostic(state.stepNum, "finish_guard_rejected", map[string]any{"reason": guardErr.Error()})
-				return nil, actionBreak, nil //nolint:nilerr // guard rejection is a nudge, not a propagated error
-			}
-		}
-
-		// Parse answer from input
-		var params struct {
-			Answer string `json:"answer"`
-		}
-		if err := json.Unmarshal(action.Input, &params); err != nil {
-			params.Answer = string(action.Input) // fallback
-		}
-
-		// Emit finishing event so the frontend can show "Finishing..." status
-		// instead of "Running tool: finish".
-		e.emitter.Finishing(state.stepNum, params.Answer)
-
-		// Mutation gate: if this step requires mutations, check whether any
-		// mutating tool was successfully executed. If not, inject a nudge on
-		// the first attempt and reject finish. On the second attempt, accept
-		// finish but mark the step as not finished (Finished: false) so the
-		// orchestrator triggers reflection/replan instead of recording success.
-		if e.mutationRequired && !e.hasMutatingToolExecuted(state) && !e.mutationNudgeAttempted {
-			e.mutationNudgeAttempted = true
-			// Same standalone-carry rule as the finish-guard nudge above:
-			// items ride the nudge only when finish is the group's first
-			// call (the nudge is then the response's only step); with
-			// earlier siblings groupSteps[0] already carries them, and a
-			// copy would re-emit the same reasoning-item IDs.
-			var nudgeItems []llm.ReasoningItem
-			if callIdx == 0 {
-				nudgeItems = resp.Message.ReasoningItems
-			}
-			nudgeStep := Step{
-				Thought:        thought,
-				UserNudge:      executorMutationNudge,
-				ReasoningItems: nudgeItems,
-				TokensUsed:     resp.Usage.InputTokens + resp.Usage.OutputTokens,
-			}
-			state.allSteps = append(state.allSteps, nudgeStep)
-			cw.AddStep(nudgeStep)
-			e.emitter.ExecutorDiagnostic(state.stepNum, "mutation_gate_nudge", map[string]any{
-				"reason": "finish_without_mutation",
-			})
-			return nil, actionBreak, nil // retry — LLM should now make changes or justify
-		}
-
-		// Checklist gate (Enf-1): a non-trivial step must have at least one
-		// update_checklist call. Trivial steps (≤ checklistTrivialThreshold
-		// productive tool calls) are exempt. The gate is a soft nudge: after
-		// one attempt, finish is accepted regardless.
-		if e.checklistGateEnabled && state.checklistAvailable &&
-			!e.hasChecklistUpdate(state) &&
-			e.countProductiveToolCalls(state) > checklistTrivialThreshold &&
-			!e.checklistMissingNudgeAttempted {
-			e.checklistMissingNudgeAttempted = true
-			// Same standalone-carry rule as the finish-guard nudge above:
-			// items ride the nudge only when finish is the group's first
-			// call (the nudge is then the response's only step); with
-			// earlier siblings groupSteps[0] already carries them, and a
-			// copy would re-emit the same reasoning-item IDs.
-			var nudgeItems []llm.ReasoningItem
-			if callIdx == 0 {
-				nudgeItems = resp.Message.ReasoningItems
-			}
-			nudgeStep := Step{
-				Thought:        thought,
-				UserNudge:      executorChecklistMissingNudge,
-				ReasoningItems: nudgeItems,
-				TokensUsed:     resp.Usage.InputTokens + resp.Usage.OutputTokens,
-			}
-			state.allSteps = append(state.allSteps, nudgeStep)
-			cw.AddStep(nudgeStep)
-			e.emitter.ExecutorDiagnostic(state.stepNum, "checklist_gate_nudge", map[string]any{
-				"reason": "finish_without_checklist",
-			})
-			return nil, actionBreak, nil // retry — LLM should call update_checklist or justify
-		}
-
-		// Checklist gate (Enf-2): if the last checklist has unchecked items,
-		// nudge the agent to complete them or explicitly justify skipping.
-		if e.checklistGateEnabled && state.checklistAvailable &&
-			!e.checklistUncheckedNudgeAttempted {
-			if unchecked := e.lastChecklistUnchecked(state); unchecked > 0 {
-				e.checklistUncheckedNudgeAttempted = true
-				// Same standalone-carry rule as the finish-guard nudge above:
-				// items ride the nudge only when finish is the group's first
-				// call (the nudge is then the response's only step); with
-				// earlier siblings groupSteps[0] already carries them, and a
-				// copy would re-emit the same reasoning-item IDs.
-				var nudgeItems []llm.ReasoningItem
-				if callIdx == 0 {
-					nudgeItems = resp.Message.ReasoningItems
-				}
-				nudgeStep := Step{
-					Thought:        thought,
-					UserNudge:      fmt.Sprintf(executorChecklistUncheckedNudge, unchecked),
-					ReasoningItems: nudgeItems,
-					TokensUsed:     resp.Usage.InputTokens + resp.Usage.OutputTokens,
-				}
-				state.allSteps = append(state.allSteps, nudgeStep)
-				cw.AddStep(nudgeStep)
-				e.emitter.ExecutorDiagnostic(state.stepNum, "checklist_unchecked_nudge", map[string]any{
-					"reason":    "finish_with_unchecked_checklist",
-					"unchecked": unchecked,
-				})
-				return nil, actionBreak, nil // retry — LLM should complete or justify
-			}
-		}
-
-		stepThought := ""
-		stepReasoning := ""
-		var stepReasoningItems []llm.ReasoningItem
-		if callIdx == 0 {
-			stepThought = thought
-			stepReasoning = resp.Message.ReasoningContent
-			stepReasoningItems = resp.Message.ReasoningItems
-		}
-		step := Step{
-			Thought:          stepThought,
-			ReasoningContent: stepReasoning,
-			ReasoningItems:   stepReasoningItems,
-			Action:           action,
-			TokensUsed:       resp.Usage.InputTokens + resp.Usage.OutputTokens,
-			ResponseGroup:    responseGroup,
-		}
-		state.allSteps = append(state.allSteps, step)
-
-		// Verify-on-edit hook: when the model finishes in the same response
-		// group as an edit, the pending verification still runs and its note
-		// is attached to the finish observation (and the final output) so the
-		// verification result is recorded rather than silently dropped.
-		params.Answer = e.runVerifyOnEditHook(ctx, action.Name, false, true, state, params.Answer)
-
-		e.emitter.ToolResult(state.stepNum, callIdx, len(params.Answer), params.Answer, false)
-
-		// If mutation gate was triggered (nudge attempted) but still no mutation,
-		// mark as not finished so the orchestrator treats this as a failure.
-		// Output keeps the model's answer (it is a genuine answer, just without a
-		// mutation); AbortReason carries a short, structured cause so consumers
-		// that surface a failure reason (RunSubAgent) don't mistake the answer
-		// prose for the abort cause.
-		finished := true
-		abortReason := ""
-		if e.mutationRequired && !e.hasMutatingToolExecuted(state) {
-			finished = false
-			abortReason = "finish rejected: required mutation was not performed"
-			e.emitter.ExecutorDiagnostic(state.stepNum, "mutation_gate_rejected", map[string]any{
-				"reason": "finish_without_mutation_after_nudge",
-			})
-		}
-
-		state.finishResult = &ExecutorResult{
-			Output:      params.Answer,
-			Steps:       state.allSteps,
-			Finished:    finished,
-			AbortReason: abortReason,
-		}
-		return nil, actionBreak, nil // stop processing further tool calls
+		return nil, e.handleFinishCall(ctx, action, callIdx, callIdx, callIdx == 0, resp, thought, responseGroup, state, cw), nil
 	}
 
 	// Emit tool call (AFTER batch/finish checks — meta-tools handle their own events).
@@ -1200,8 +1025,13 @@ func (e *Executor) processSingleToolCall(
 	// --- End parse error tracker ---
 
 	// Stage 1 + 2: truncation, caching, token budget (shared helper).
+	// Pass the EFFECTIVE input (post-HITL modification): the cache entry's
+	// file-backed metadata (FilePath/FileBacked) and display args must
+	// describe the call that actually executed — a HITL-rewritten path read
+	// by the tool — not the model's original request, or tool_result_read
+	// would stream from a file the tool never read.
 	var cacheHash string
-	observation, cacheHash = e.processToolResult(execCtx, observation, result.Content, action.Name, action.Input, cw)
+	observation, cacheHash = e.processToolResult(execCtx, observation, result.Content, action.Name, input, cw)
 
 	// Verify-on-edit hook: after the last call of a group containing at
 	// least one successful write_file/edit_file, run the configured
@@ -1282,6 +1112,228 @@ func (e *Executor) processSingleToolCall(
 	return nil, actionNone, nil
 }
 
+// handleFinishCall processes the inline finish tool call — the terminal path
+// shared by the standalone dispatch (processSingleToolCall) and the batch
+// meta-tool's sub-call loop (processBatchTool). Sharing it guarantees a
+// finish wrapped inside a batch terminates the run with the same guards,
+// gates, and bookkeeping as a direct finish — setting state.finishResult and
+// stopping the loop — instead of being dispatched to the registry as an
+// ordinary tool, which would record the answer as a plain observation,
+// silently swallow the completion signal, and bypass the guard/mutation/
+// checklist gates (the same reason stopToolTermination is shared: batching a
+// terminator must not defeat it).
+//
+// callIdx is the finish call's position in the response's tool-call array;
+// emitIdx is the emitter index for the ToolResult event (the standalone
+// index, or the batch sub-call's offset space); firstMaterialized reports
+// whether no earlier step of this response has been materialized yet. The
+// response's thought and reasoning ride the steps this helper appends only
+// when firstMaterialized is true — then the step is the response's only
+// materialized step and buildStandaloneMessages reads its thought/items
+// directly; with earlier materialized steps the first step already carries
+// them, and a copy would duplicate the assistant turn and re-emit the same
+// reasoning-item IDs to the backend.
+//
+// It always returns actionBreak: after setting state.finishResult on
+// acceptance, and after installing a gate nudge (guard/mutation/checklist)
+// that asks the model to retry.
+func (e *Executor) handleFinishCall(
+	ctx context.Context,
+	action llm.ToolCall,
+	callIdx int,
+	emitIdx int,
+	firstMaterialized bool,
+	resp *llm.ChatResponse,
+	thought string,
+	responseGroup int64,
+	state *runState,
+	cw ContextManager,
+) loopAction {
+	// Finish guard: allow the caller (e.g. sp4rk Conductor) to reject
+	// finish when preconditions are not met (e.g. pending async
+	// delegations). If the guard returns an error, inject a nudge and
+	// retry instead of accepting finish.
+	if e.finishGuard != nil {
+		if guardErr := e.finishGuard(ctx); guardErr != nil {
+			// The nudge renders standalone (ResponseGroup 0). Carry the
+			// response's thought and reasoning items exactly when finish is
+			// the response's FIRST materialized call — then this nudge is
+			// the response's only materialized step, and
+			// buildStandaloneMessages reads its thought and items directly,
+			// so the assistant turn and the encrypted chain survive. With
+			// earlier materialized steps, the first step already carries
+			// them, and a copy here would duplicate the assistant turn and
+			// re-emit the same reasoning-item IDs to the backend.
+			var nudgeItems []llm.ReasoningItem
+			nudgeThought := ""
+			if firstMaterialized {
+				nudgeItems = resp.Message.ReasoningItems
+				nudgeThought = thought
+			}
+			nudgeStep := Step{
+				Thought:        nudgeThought,
+				UserNudge:      guardErr.Error(),
+				ReasoningItems: nudgeItems,
+				TokensUsed:     resp.Usage.InputTokens + resp.Usage.OutputTokens,
+			}
+			state.allSteps = append(state.allSteps, nudgeStep)
+			cw.AddStep(nudgeStep)
+			e.emitter.ExecutorDiagnostic(state.stepNum, "finish_guard_rejected", map[string]any{"reason": guardErr.Error()})
+			return actionBreak // retry — the guard rejection is a nudge, not an error
+		}
+	}
+
+	// Parse answer from input
+	var params struct {
+		Answer string `json:"answer"`
+	}
+	if err := json.Unmarshal(action.Input, &params); err != nil {
+		params.Answer = string(action.Input) // fallback
+	}
+
+	// Emit finishing event so the frontend can show "Finishing..." status
+	// instead of "Running tool: finish".
+	e.emitter.Finishing(state.stepNum, params.Answer)
+
+	// Mutation gate: if this step requires mutations, check whether any
+	// mutating tool was successfully executed. If not, inject a nudge on
+	// the first attempt and reject finish. On the second attempt, accept
+	// finish but mark the step as not finished (Finished: false) so the
+	// orchestrator triggers reflection/replan instead of recording success.
+	if e.mutationRequired && !e.hasMutatingToolExecuted(state) && !e.mutationNudgeAttempted {
+		e.mutationNudgeAttempted = true
+		// Same first-materialized-carry rule as the finish-guard nudge above.
+		var nudgeItems []llm.ReasoningItem
+		nudgeThought := ""
+		if firstMaterialized {
+			nudgeItems = resp.Message.ReasoningItems
+			nudgeThought = thought
+		}
+		nudgeStep := Step{
+			Thought:        nudgeThought,
+			UserNudge:      executorMutationNudge,
+			ReasoningItems: nudgeItems,
+			TokensUsed:     resp.Usage.InputTokens + resp.Usage.OutputTokens,
+		}
+		state.allSteps = append(state.allSteps, nudgeStep)
+		cw.AddStep(nudgeStep)
+		e.emitter.ExecutorDiagnostic(state.stepNum, "mutation_gate_nudge", map[string]any{
+			"reason": "finish_without_mutation",
+		})
+		return actionBreak // retry — LLM should now make changes or justify
+	}
+
+	// Checklist gate (Enf-1): a non-trivial step must have at least one
+	// update_checklist call. Trivial steps (≤ checklistTrivialThreshold
+	// productive tool calls) are exempt. The gate is a soft nudge: after
+	// one attempt, finish is accepted regardless.
+	if e.checklistGateEnabled && state.checklistAvailable &&
+		!e.hasChecklistUpdate(state) &&
+		e.countProductiveToolCalls(state) > checklistTrivialThreshold &&
+		!e.checklistMissingNudgeAttempted {
+		e.checklistMissingNudgeAttempted = true
+		// Same first-materialized-carry rule as the finish-guard nudge above.
+		var nudgeItems []llm.ReasoningItem
+		nudgeThought := ""
+		if firstMaterialized {
+			nudgeItems = resp.Message.ReasoningItems
+			nudgeThought = thought
+		}
+		nudgeStep := Step{
+			Thought:        nudgeThought,
+			UserNudge:      executorChecklistMissingNudge,
+			ReasoningItems: nudgeItems,
+			TokensUsed:     resp.Usage.InputTokens + resp.Usage.OutputTokens,
+		}
+		state.allSteps = append(state.allSteps, nudgeStep)
+		cw.AddStep(nudgeStep)
+		e.emitter.ExecutorDiagnostic(state.stepNum, "checklist_gate_nudge", map[string]any{
+			"reason": "finish_without_checklist",
+		})
+		return actionBreak // retry — LLM should call update_checklist or justify
+	}
+
+	// Checklist gate (Enf-2): if the last checklist has unchecked items,
+	// nudge the agent to complete them or explicitly justify skipping.
+	if e.checklistGateEnabled && state.checklistAvailable &&
+		!e.checklistUncheckedNudgeAttempted {
+		if unchecked := e.lastChecklistUnchecked(state); unchecked > 0 {
+			e.checklistUncheckedNudgeAttempted = true
+			// Same first-materialized-carry rule as the finish-guard nudge above.
+			var nudgeItems []llm.ReasoningItem
+			nudgeThought := ""
+			if firstMaterialized {
+				nudgeItems = resp.Message.ReasoningItems
+				nudgeThought = thought
+			}
+			nudgeStep := Step{
+				Thought:        nudgeThought,
+				UserNudge:      fmt.Sprintf(executorChecklistUncheckedNudge, unchecked),
+				ReasoningItems: nudgeItems,
+				TokensUsed:     resp.Usage.InputTokens + resp.Usage.OutputTokens,
+			}
+			state.allSteps = append(state.allSteps, nudgeStep)
+			cw.AddStep(nudgeStep)
+			e.emitter.ExecutorDiagnostic(state.stepNum, "checklist_unchecked_nudge", map[string]any{
+				"reason":    "finish_with_unchecked_checklist",
+				"unchecked": unchecked,
+			})
+			return actionBreak // retry — LLM should complete or justify
+		}
+	}
+
+	stepThought := ""
+	stepReasoning := ""
+	var stepReasoningItems []llm.ReasoningItem
+	if firstMaterialized {
+		stepThought = thought
+		stepReasoning = resp.Message.ReasoningContent
+		stepReasoningItems = resp.Message.ReasoningItems
+	}
+	step := Step{
+		Thought:          stepThought,
+		ReasoningContent: stepReasoning,
+		ReasoningItems:   stepReasoningItems,
+		Action:           action,
+		TokensUsed:       resp.Usage.InputTokens + resp.Usage.OutputTokens,
+		ResponseGroup:    responseGroup,
+	}
+	state.allSteps = append(state.allSteps, step)
+
+	// Verify-on-edit hook: when the model finishes in the same response
+	// group as an edit, the pending verification still runs and its note
+	// is attached to the finish observation (and the final output) so the
+	// verification result is recorded rather than silently dropped. Finish
+	// terminates the run, so it is always the last call of its response.
+	params.Answer = e.runVerifyOnEditHook(ctx, action.Name, false, true, state, params.Answer)
+
+	e.emitter.ToolResult(state.stepNum, emitIdx, len(params.Answer), params.Answer, false)
+
+	// If mutation gate was triggered (nudge attempted) but still no mutation,
+	// mark as not finished so the orchestrator treats this as a failure.
+	// Output keeps the model's answer (it is a genuine answer, just without a
+	// mutation); AbortReason carries a short, structured cause so consumers
+	// that surface a failure reason (RunSubAgent) don't mistake the answer
+	// prose for the abort cause.
+	finished := true
+	abortReason := ""
+	if e.mutationRequired && !e.hasMutatingToolExecuted(state) {
+		finished = false
+		abortReason = "finish rejected: required mutation was not performed"
+		e.emitter.ExecutorDiagnostic(state.stepNum, "mutation_gate_rejected", map[string]any{
+			"reason": "finish_without_mutation_after_nudge",
+		})
+	}
+
+	state.finishResult = &ExecutorResult{
+		Output:      params.Answer,
+		Steps:       state.allSteps,
+		Finished:    finished,
+		AbortReason: abortReason,
+	}
+	return actionBreak // stop processing further tool calls
+}
+
 // stopToolTermination decides whether a just-executed tool call is a
 // host-designated stop tool that must end the run — the "turn terminator"
 // distinct from the inline finish tool (see Executor.stopTools / SetStopTools).
@@ -1323,15 +1375,21 @@ func (e *Executor) stopToolTermination(
 	if e.finishGuard != nil {
 		if guardErr := e.finishGuard(ctx); guardErr != nil {
 			nudgeStep := Step{
-				Thought:   thought,
-				UserNudge: guardErr.Error(),
-				// ReasoningItems deliberately NOT carried: the step for the
-				// stop tool itself was already appended (carrying the
-				// response's items whenever it is the group's first step), or
-				// an earlier sibling already carries them as groupSteps[0] —
-				// this nudge renders standalone (ResponseGroup 0), so a copy
-				// here would re-emit the same reasoning-item IDs to the
-				// backend.
+				// Thought deliberately NOT carried: the stop-tool step itself
+				// was already appended by the caller (carrying the response's
+				// thought whenever it is the response's first materialized
+				// step), so this nudge is never the response's first
+				// materialized step — a copy here would render a duplicate
+				// standalone assistant turn ahead of the guard nudge.
+				//
+				// ReasoningItems deliberately NOT carried for the same
+				// reason: the step for the stop tool itself was already
+				// appended (carrying the response's items whenever it is the
+				// group's first step), or an earlier sibling already carries
+				// them as groupSteps[0] — this nudge renders standalone
+				// (ResponseGroup 0), so a copy here would re-emit the same
+				// reasoning-item IDs to the backend.
+				UserNudge:  guardErr.Error(),
 				TokensUsed: resp.Usage.InputTokens + resp.Usage.OutputTokens,
 			}
 			state.allSteps = append(state.allSteps, nudgeStep)
@@ -1427,7 +1485,12 @@ func (e *Executor) processBatchTool(
 
 	// Use unique index space for batch sub-calls to avoid collisions
 	// with standalone tool call indices in the emitter's localToolIDs map.
-	baseIdx := callIdx * batchIndexBase
+	// The +1 keeps the batch space entirely above the standalone range
+	// (0..N-1) even when the batch is the response's FIRST call
+	// (callIdx == 0): a base of callIdx*batchIndexBase would put that
+	// batch's sub-calls at 0, 1, 2, … — colliding with any sibling call
+	// emitted at its own standalone position.
+	baseIdx := (callIdx + 1) * batchIndexBase
 
 	for subIdx, sub := range batchInput.Calls {
 		effectiveIdx := baseIdx + subIdx
@@ -1450,17 +1513,23 @@ func (e *Executor) processBatchTool(
 			e.emitter.ToolCall(state.stepNum, effectiveIdx, batchedName, string(sub.Input), e.tools.GetToolSource(sub.Tool))
 			e.emitter.ToolResult(state.stepNum, effectiveIdx, len(obs), obs, true)
 			// The first step of the batch group carries the response's
-			// reasoning items (see the success path below) — a rejected
-			// FIRST sub-call still materializes as groupSteps[0], so the
-			// encrypted reasoning chain must ride it.
+			// thought and reasoning items (see the success path below) — a
+			// rejected FIRST sub-call still materializes as groupSteps[0],
+			// so the assistant turn and the encrypted reasoning chain must
+			// ride it. Later sub-calls gate the thought exactly like the
+			// success path: with a lone batch (ResponseGroup 0) every
+			// sub-call step renders standalone, so an ungated copy here
+			// would emit the response's thought twice.
 			var guardReasoningItems []llm.ReasoningItem
 			guardReasoning := ""
+			guardThought := ""
 			if subIdx == 0 && callIdx == 0 {
 				guardReasoning = resp.Message.ReasoningContent
 				guardReasoningItems = resp.Message.ReasoningItems
+				guardThought = thought
 			}
 			step := Step{
-				Thought:          thought,
+				Thought:          guardThought,
 				ReasoningContent: guardReasoning,
 				ReasoningItems:   guardReasoningItems,
 				Action:           subCall,
@@ -1473,6 +1542,21 @@ func (e *Executor) processBatchTool(
 			state.allSteps = append(state.allSteps, step)
 			cw.AddStep(step)
 			continue
+		}
+
+		// A finish sub-call is a terminator exactly like the standalone
+		// path's: intercept it BEFORE any dispatch or emission so the
+		// completion signal is honored — via the shared handleFinishCall,
+		// with the same finish guard / mutation / checklist gates — instead
+		// of being executed as an ordinary tool. Dispatching it to the
+		// registry would record the answer as a plain observation, set
+		// neither Finished nor Output, and keep the run going past the
+		// model's final answer. firstMaterialized is true only when no
+		// earlier sub-call (or earlier sibling call) has materialized a
+		// step for this response yet — only then may the response's
+		// thought/reasoning ride the steps the helper appends.
+		if subCall.Name == "finish" {
+			return nil, e.handleFinishCall(ctx, subCall, callIdx, effectiveIdx, callIdx == 0 && subIdx == 0, resp, thought, responseGroup, state, cw), nil
 		}
 
 		// Emit tool call with "(batched)" suffix. A tool_result_read sub-call is
@@ -1517,17 +1601,24 @@ func (e *Executor) processBatchTool(
 				obs = e.runVerifyOnEditHook(ctx, subCall.Name, true, lastCallInGroup, state, obs)
 				e.emitter.ToolResult(state.stepNum, effectiveIdx, len(obs), obs, true)
 				// The first step of the batch group carries the response's
-				// reasoning (see the success path below): a rejected FIRST
-				// sub-call still materializes as groupSteps[0], so the
-				// encrypted reasoning chain must ride it.
+				// thought and reasoning (see the success path below): a
+				// rejected FIRST sub-call still materializes as
+				// groupSteps[0], so the assistant turn and the encrypted
+				// reasoning chain must ride it. Later sub-calls gate the
+				// thought exactly like the success path: with a lone batch
+				// (ResponseGroup 0) every sub-call step renders standalone,
+				// so an ungated copy here would emit the response's thought
+				// twice.
 				var rejectReasoningItems []llm.ReasoningItem
 				rejectReasoning := ""
+				rejectThought := ""
 				if subIdx == 0 && callIdx == 0 {
 					rejectReasoning = resp.Message.ReasoningContent
 					rejectReasoningItems = resp.Message.ReasoningItems
+					rejectThought = thought
 				}
 				step := Step{
-					Thought:          thought,
+					Thought:          rejectThought,
 					ReasoningContent: rejectReasoning,
 					ReasoningItems:   rejectReasoningItems,
 					Action:           subCall,
@@ -1604,8 +1695,11 @@ func (e *Executor) processBatchTool(
 		isUntrusted := e.tools.IsToolUntrusted(subCall.Name)
 
 		// Stage 1 + 2: truncation, caching, token budget (shared helper).
+		// Pass the EFFECTIVE input (post-HITL modification), mirroring the
+		// standalone path: the cache metadata must describe the call that
+		// actually executed.
 		var batchCacheHash string
-		observation, batchCacheHash = e.processToolResult(execCtx, observation, result.Content, subCall.Name, subCall.Input, cw)
+		observation, batchCacheHash = e.processToolResult(execCtx, observation, result.Content, subCall.Name, subInput, cw)
 
 		// Verify-on-edit hook (debounced per response group): runs once at
 		// the last sub-call of the last batch call when any edit succeeded.
@@ -1698,6 +1792,17 @@ func (e *Executor) processToolResult(
 		observation = truncated
 	}
 
+	// Stage-1 recovery nudge, if one was built below. It is kept in this
+	// variable and re-appended AFTER the Stage-2 budget truncation instead
+	// of being appended now and re-discovered by string search: a tool
+	// result whose own body embeds the nudge sentinel (e.g. a read_file of
+	// a file that captured a truncated output) would make a whole-string
+	// search split the observation at the embedded copy — re-applying the
+	// body verbatim around a no-op budget and dropping the hash from the
+	// recovery hint. Tracking the nudge we ourselves just built removes the
+	// fragility entirely.
+	var stage1Nudge string
+
 	if e.toolCache != nil {
 		if _, isNonCacheable := e.nonCacheableTools[toolName]; !isNonCacheable {
 			// Cacheable tool: eagerly store the full result so the LLM can
@@ -1712,14 +1817,13 @@ func (e *Executor) processToolResult(
 						maxSliceHint = cfg.MaxLines
 					}
 				}
-				nudge := FormatFragmentationNudge(cacheHash, toolName, maxSliceHint)
-				observation += nudge
+				stage1Nudge = FormatFragmentationNudge(cacheHash, toolName, maxSliceHint)
 			} else if meta.FileBacked {
 				// File-backed entries (read_file) get a nudge even without
 				// Stage 1 truncation — tool_result_read serves the token-economy
 				// use case (LLM reads fragments on demand), not just truncation
 				// recovery.
-				observation += formatFileBackedNudge(cacheHash)
+				stage1Nudge = formatFileBackedNudge(cacheHash)
 			}
 		} else {
 			// Non-cacheable tool: skip EAGER caching, but if the result will be
@@ -1740,30 +1844,22 @@ func (e *Executor) processToolResult(
 							maxSliceHint = cfg.MaxLines
 						}
 					}
-					observation += FormatFragmentationNudge(cacheHash, toolName, maxSliceHint)
+					stage1Nudge = FormatFragmentationNudge(cacheHash, toolName, maxSliceHint)
 				}
 			}
 		}
 	}
 
-	// --- Stage 2: Token-budget truncation (preserve nudge) ---
-	const stage1NudgePrefix = "\n\n[This output was truncated to"
-	var nudge string
-	if idx := strings.Index(observation, stage1NudgePrefix); idx >= 0 {
-		nudge = observation[idx:]
-		observation = observation[:idx]
-	} else if idx := strings.Index(observation, fileBackedNudgePrefix); idx >= 0 {
-		nudge = observation[idx:]
-		observation = observation[:idx]
-	}
-	// Suppress the Stage‑2 hash hint when a nudge containing the cache hash
-	// was already appended — avoids redundant "Use tool_result_read…" instructions.
+	// --- Stage 2: Token-budget truncation (Stage 1 nudge preserved) ---
+	// Suppress the Stage‑2 hash hint when a Stage-1 nudge carrying the cache
+	// hash will be re-appended — avoids redundant "Use tool_result_read…"
+	// instructions.
 	budgetHash := cacheHash
-	if nudge != "" {
+	if stage1Nudge != "" {
 		budgetHash = ""
 	}
 	observation = e.applyToolResultBudget(observation, cw, toolName, budgetHash)
-	observation += nudge
+	observation += stage1Nudge
 
 	processedObservation = observation
 	return

@@ -767,7 +767,7 @@ func shellOutsideRoots(ctx context.Context, report *api.Report, workDir string, 
 // check used to close.
 // Raw-device reads (/dev/urandom, /dev/zero, …) ARE excluded — they are
 // routine inputs, not a scope concern, and a raw device is "system" only as
-// a write target. Harmless devices (/dev/null, /dev/full) are exempt via
+// a write target. Harmless devices (/dev/null) are exempt via
 // [shellIsHarmlessDevicePath] inside the containment walk.
 func shellOutsideRootDirectNonSystemTargets(ctx context.Context, report *api.Report, workDir string, lang api.Lang) []string {
 	var out []string
@@ -890,7 +890,7 @@ var windowsSystemPathPrefixes = []string{
 }
 
 // shellIsHarmlessDevicePath reports whether an absolute shell-analysis target
-// is a harmless bit-bucket device (/dev/null, /dev/full; Windows NUL), evaluated
+// is a harmless bit-bucket device (/dev/null; Windows NUL), evaluated
 // independently of the host OS.
 //
 // Unlike the host-gated [IsHarmlessDevicePath] — correct for filesystem tools,
@@ -917,7 +917,7 @@ func shellIsHarmlessDevicePath(absPath string) bool {
 // shellIsSystemOrRawDevicePath reports whether an absolute target is a
 // system path (POSIX prefixes, Windows System32 / Program Files) or a
 // non-harmless raw device under /dev. Harmless bit-bucket devices
-// (/dev/null, /dev/full, and Windows NUL via [shellIsHarmlessDevicePath])
+// (/dev/null, and Windows NUL via [shellIsHarmlessDevicePath])
 // are exempt so routine redirections never fire.
 //
 // lang is the dialect the command was analyzed in. It makes the Windows
@@ -1274,13 +1274,18 @@ var shellVerificationSafeEnv = map[string]map[string]bool{
 // shellDependencyManifests lists dependency/module-manifest basenames whose
 // write (effect target or redirection) breaks the marker: rewriting the
 // module graph is a supply-chain control, not verification plumbing.
+//
+// Keys MUST be lower-case: [shellIsDependencyManifest] lower-cases the
+// operand's basename before this lookup (basename match, case-insensitive),
+// so a mixed-case key is unreachable and silently disarms the screen for its
+// ecosystem.
 var shellDependencyManifests = map[string]struct{}{
 	"go.mod": {}, "go.sum": {}, "go.work": {}, "go.work.sum": {},
 	"package.json": {}, "package-lock.json": {}, "npm-shrinkwrap.json": {},
 	"yarn.lock": {}, "pnpm-lock.yaml": {}, "bun.lockb": {},
-	"Cargo.toml": {}, "Cargo.lock": {},
-	"requirements.txt": {}, "pyproject.toml": {}, "Pipfile": {}, "Pipfile.lock": {}, "poetry.lock": {},
-	"composer.json": {}, "composer.lock": {}, "Gemfile": {}, "Gemfile.lock": {},
+	"cargo.toml": {}, "cargo.lock": {},
+	"requirements.txt": {}, "pyproject.toml": {}, "pipfile": {}, "pipfile.lock": {}, "poetry.lock": {},
+	"composer.json": {}, "composer.lock": {}, "gemfile": {}, "gemfile.lock": {},
 }
 
 // shellEnvAssignRe matches a NAME=VALUE assignment word in the raw command
@@ -1359,7 +1364,7 @@ func shellMarkerEffectsSafe(ctx context.Context, workDir string, report *api.Rep
 
 // shellMarkerTargetInRoots resolves one path-shaped marker operand against
 // the resolution base and reports whether it lands inside a session root.
-// Harmless bit-bucket devices (/dev/null, /dev/full) are always in scope.
+// Harmless bit-bucket devices (/dev/null) are always in scope.
 func shellMarkerTargetInRoots(ctx context.Context, base, target string) bool {
 	abs, ok := shellResolveTarget(target, base)
 	if !ok {

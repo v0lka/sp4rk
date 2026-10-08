@@ -391,6 +391,7 @@ func (p *OpenAIProvider) chatCompletionStream(ctx context.Context, req ChatReque
 
 	var (
 		content   strings.Builder
+		refusal   strings.Builder // assistant refusal channel (see delta.Refusal below)
 		reasoning strings.Builder
 		toolAcc   = map[int]*streamToolCall{}
 		finish    string
@@ -420,6 +421,17 @@ func (p *OpenAIProvider) chatCompletionStream(ctx context.Context, req ChatReque
 			if delta.Content != "" {
 				content.WriteString(delta.Content)
 				if err := req.DeltaSink(StreamDelta{Text: delta.Content}); err != nil {
+					return nil, err
+				}
+			}
+			// The refusal channel (typed field on the delta): a refusal or
+			// content-filtered answer streams its text here while "content"
+			// stays empty. Forward it to the sink as text — it IS the model's
+			// textual output — and accumulate it so the assembled response
+			// carries the refusal instead of finishing as an empty success.
+			if delta.Refusal != "" {
+				refusal.WriteString(delta.Refusal)
+				if err := req.DeltaSink(StreamDelta{Text: delta.Refusal}); err != nil {
 					return nil, err
 				}
 			}
@@ -491,6 +503,13 @@ func (p *OpenAIProvider) chatCompletionStream(ctx context.Context, req ChatReque
 		Content:          content.String(),
 		ReasoningContent: reasoning.String(),
 		ToolCalls:        toolCalls,
+	}
+	// A refusal-only stream (no content deltas) would otherwise assemble an
+	// empty assistant message — the streaming counterpart of the synchronous
+	// path's refusal handling: the refusal text becomes the content.
+	if message.Content == "" && refusal.Len() > 0 {
+		message.Content = refusal.String()
+		p.log().Warn("openai: assistant reply is a refusal", "provider", p.name)
 	}
 	logToolCallArguments(p.log(), p.name, message.ToolCalls)
 
@@ -903,24 +922,30 @@ func applyKimiReasoning(params *oai.ChatCompletionNewParams, model, effort strin
 	}
 }
 
+// defaultObjectSchema returns the empty object schema installed when a tool
+// declares no usable InputSchema: both OpenAI wire builders
+// (convertSchemaToMap for Chat Completions, convertToResponsesTools for the
+// Responses API) send this default instead of omitting "parameters" entirely,
+// which the endpoints reject with HTTP 400 missing_required_parameter. A fresh
+// map is returned per call so a caller mutating its copy cannot leak state
+// into another tool definition.
+func defaultObjectSchema() map[string]any {
+	return map[string]any{
+		"type":                 "object",
+		"properties":           map[string]any{},
+		"required":             []any{},
+		"additionalProperties": false,
+	}
+}
+
 // convertSchemaToMap converts JSON schema bytes to a map[string]any.
 func (p *OpenAIProvider) convertSchemaToMap(schema []byte) map[string]any {
 	if len(schema) == 0 {
-		return map[string]any{
-			"type":                 "object",
-			"properties":           map[string]any{},
-			"required":             []any{},
-			"additionalProperties": false,
-		}
+		return defaultObjectSchema()
 	}
 	var params map[string]any
 	if err := json.Unmarshal(schema, &params); err != nil {
-		return map[string]any{
-			"type":                 "object",
-			"properties":           map[string]any{},
-			"required":             []any{},
-			"additionalProperties": false,
-		}
+		return defaultObjectSchema()
 	}
 	return params
 }
@@ -1022,6 +1047,16 @@ func (p *OpenAIProvider) convertChatResponseMessage(msg oai.ChatCompletionMessag
 		Content: msg.Content,
 	}
 
+	// Surface the assistant refusal channel: a refusal (or content-filtered
+	// answer) arrives as HTTP 200 with an empty "content" and the model's
+	// actual message in "refusal". Dropping it would let the run finish as a
+	// deliberate but EMPTY final answer with no error or diagnostic, so the
+	// refusal text becomes the assistant content when content is empty.
+	if result.Content == "" && msg.Refusal != "" {
+		result.Content = msg.Refusal
+		p.log().Warn("openai: assistant reply is a refusal", "provider", p.name)
+	}
+
 	// Extract reasoning_content from raw JSON (DeepSeek extension).
 	result.ReasoningContent = extractReasoningContent(msg.RawJSON())
 
@@ -1085,12 +1120,20 @@ func readOpenAIErrorBody(apiErr *oai.Error) string {
 	if apiErr == nil || apiErr.Response == nil || apiErr.Response.Body == nil {
 		return ""
 	}
-	body, err := io.ReadAll(apiErr.Response.Body)
+	// The cap must bound the READ, not just the returned string: the body is
+	// remote-controlled input, and an endpoint (or hostile proxy) answering a
+	// failed request with an arbitrarily large or endless body must not turn
+	// the error path into an unbounded heap allocation. Same reader-level
+	// bounding idiom as the other body reads in this package
+	// (modelregistry.go, tiktoken_loader.go): read at most one byte beyond
+	// the cap — the extra byte distinguishes "exactly at the cap" from
+	// "truncated" — then trim and cut to the cap.
+	const maxErrorBodySize = 4096 // 4 KiB cap to keep error messages bounded
+	raw, err := io.ReadAll(io.LimitReader(apiErr.Response.Body, maxErrorBodySize+1))
 	if err != nil {
 		return ""
 	}
-	body = bytes.TrimSpace(body)
-	const maxErrorBodySize = 4096 // 4 KiB cap to keep error messages bounded
+	body := bytes.TrimSpace(raw)
 	if len(body) > maxErrorBodySize {
 		return string(body[:maxErrorBodySize]) + "..."
 	}

@@ -93,6 +93,21 @@ func (t *UsageTracker) Totals() (inputTokens, outputTokens int) {
 	return t.totalIn, t.totalOut
 }
 
+// TrackerInjector is implemented by callers that can bind a per-context
+// [ContextTokenTracker]: calling WithContextTracker yields a derived caller
+// whose Call corrects the given tracker with each response's authoritative
+// input-token usage. The orchestration layer type-asserts its LLM caller
+// against this interface to wire API-reported usage into a step's context
+// window. (llm cannot import agent, so the interface is expressed in terms of
+// [Caller]; llm.Caller and agent.LLMCaller have identical method sets, which
+// keeps values of the two interface types interchangeable.)
+type TrackerInjector interface {
+	WithContextTracker(t *ContextTokenTracker) Caller
+}
+
+// TrackingCaller satisfies TrackerInjector.
+var _ TrackerInjector = (*TrackingCaller)(nil)
+
 // TrackingCaller wraps a Caller and automatically:
 //   - Records usage from Call() responses into UsageTracker
 //   - Corrects the active ContextTokenTracker (if set) after each call
@@ -136,7 +151,12 @@ func (tc *TrackingCaller) Call(ctx context.Context, req ChatRequest) (*ChatRespo
 // WithContextTracker returns a new TrackingCaller that shares the same inner
 // caller and session-level UsageTracker, but corrects the given per-step
 // ContextTokenTracker. Use this to create step-local callers for parallel execution.
-func (tc *TrackingCaller) WithContextTracker(t *ContextTokenTracker) *TrackingCaller {
+//
+// The return type is the package's Caller interface (not *TrackingCaller) so
+// TrackingCaller satisfies TrackerInjector: Go requires exact return-type
+// matches for interface satisfaction, and orchestration's conductor wires the
+// tracker through that interface.
+func (tc *TrackingCaller) WithContextTracker(t *ContextTokenTracker) Caller {
 	return &TrackingCaller{
 		inner:      tc.inner,
 		session:    tc.session,

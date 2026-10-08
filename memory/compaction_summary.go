@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 
 	sdkagent "github.com/v0lka/sp4rk/agent"
 	"github.com/v0lka/sp4rk/llm"
@@ -22,6 +23,7 @@ type SummarizationStrategy struct {
 	tokenCounter        llm.TokenCounter
 	maxSummarizeTokens  int
 	logger              *slog.Logger
+	noSummarizerWarn    sync.Once
 }
 
 // SetLogger sets the logger for the strategy. If nil, slog.Default() is used.
@@ -38,7 +40,9 @@ func (s *SummarizationStrategy) log() *slog.Logger {
 // blockSize is the number of steps per summary block.
 // keepLast is the number of recent steps to preserve verbatim.
 // observationTruncate is the max chars for observations in summary blocks (default: 500 if <= 0).
-// summarizer is the function to call for LLM summarization.
+// summarizer is the function to call for LLM summarization; a nil summarizer
+// makes Compact keep the step history verbatim (fail-closed) rather than
+// discard it — see Compact.
 // tokenCounter is optional; if provided, blocks are truncated to maxSummarizeTokens.
 // maxSummarizeTokens defaults to 16000 if zero.
 func NewSummarizationStrategy(blockSize, keepLast, observationTruncate int, summarizer func(ctx context.Context, text string) (string, error), tokenCounter llm.TokenCounter, maxSummarizeTokens int) *SummarizationStrategy {
@@ -68,9 +72,25 @@ func NewSummarizationStrategy(blockSize, keepLast, observationTruncate int, summ
 // summarizes each block via the LLM summarizer, returns compacted steps.
 // Recent steps (within keepLast) are preserved verbatim.
 // Summary blocks become single messages with Role="system" and Content=summarized text.
+// With a nil summarizer the strategy fails closed: it keeps the whole history
+// verbatim instead of replacing the summarized steps with a bare placeholder
+// (the output is frozen as the prompt prefix, so a placeholder would
+// permanently discard those steps' thought/action/observation from LLM
+// context). The window simply stops shrinking until a summarizer is wired —
+// the same contract CompactConversationHistory enforces by returning an error.
 func (s *SummarizationStrategy) Compact(ctx context.Context, steps []sdkagent.Step, budgetTokens int) []llm.Message {
 	// If no compaction needed, convert all steps to messages
 	if len(steps) <= s.keepLast {
+		return stepsToMessages(steps)
+	}
+
+	// Fail closed when no summarizer is wired (see doc comment). A short
+	// history returns verbatim above without needing the LLM, mirroring
+	// CompactConversationHistory's short-circuit before its Summarize check.
+	if s.summarizer == nil {
+		s.noSummarizerWarn.Do(func() {
+			s.log().Warn("summary compaction: no summarizer configured; keeping step history verbatim (window will not shrink)")
+		})
 		return stepsToMessages(steps)
 	}
 
@@ -101,18 +121,11 @@ func (s *SummarizationStrategy) Compact(ctx context.Context, steps []sdkagent.St
 		}
 
 		// Summarize the block
-		var summary string
-		if s.summarizer != nil {
-			var err error
-			summary, err = s.summarizer(ctx, blockText)
-			if err != nil {
-				s.log().Error("summary compaction: summarization failed", "error", err)
-				// Fallback to a simple indicator if summarization fails
-				summary = fmt.Sprintf("[Summary of steps %d-%d failed: %v]", i+1, end, err)
-			}
-		} else {
-			// No summarizer provided, use a simple placeholder
-			summary = fmt.Sprintf("[... %d steps summarized ...]", end-i)
+		summary, err := s.summarizer(ctx, blockText)
+		if err != nil {
+			s.log().Error("summary compaction: summarization failed", "error", err)
+			// Fallback to a simple indicator if summarization fails
+			summary = fmt.Sprintf("[Summary of steps %d-%d failed: %v]", i+1, end, err)
 		}
 
 		// Add summary as a system message

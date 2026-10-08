@@ -3,12 +3,18 @@ package sp4rk
 import "github.com/v0lka/sp4rk/planner"
 
 // defaultBasePrompt is a general-purpose planner base prompt. It uses bare
-// placeholders resolved by the planner's substitution engine:
-//   - Trusted (template-on-template): MODE-PREAMBLE, MAX-STEPS
-//   - Untrusted (single-pass, injection-safe): AVAILABLE-TOOLS, AVAILABLE-SKILLS
+// placeholders resolved by the planner's substitution engine (see
+// docs/planner.md, "Placeholder system"):
+//   - Trusted (template-on-template, resolved iteratively): MODE-PREAMBLE,
+//     MODE-TOT, MODE-GUIDANCE, MODE-EXTRA-SECTIONS, MODE-TAIL, MODE-JSON-EXAMPLE,
+//     MAX-STEPS, DOMAIN-ASSIGNMENT, AGENT-PROFILES
+//   - Untrusted (single-pass, injection-safe): AVAILABLE-TOOLS, AVAILABLE-SKILLS,
+//     WORKSPACE-PATH, RECENT-CONVERSATION, and — on continuation plans only —
+//     ORIGINAL-REQUEST, COMPLETED-PLAN-SUMMARY, TERMINAL-STEPS (on direct plans
+//     the planner substitutes descriptive "(n/a …)" defaults for those).
 //
-// MODE-JSON-EXAMPLE and MODE-TAIL are injected by the planner from package
-// constants, so they need no PromptSet field.
+// Every placeholder the planner registers must have a slot here; a missing slot
+// silently drops the data from the prompt.
 const defaultBasePrompt = `You are a task planning agent. Break the task into concrete, verifiable steps.
 
 Available tools:
@@ -17,9 +23,32 @@ AVAILABLE-TOOLS
 Available skills:
 AVAILABLE-SKILLS
 
+WORKSPACE-PATH
+
 MODE-PREAMBLE
 
+MODE-TOT
+
+MODE-GUIDANCE
+
+DOMAIN-ASSIGNMENT
+
+AGENT-PROFILES
+
+MODE-EXTRA-SECTIONS
+
+Prior-plan context (empty on an initial plan):
+- Original request: ORIGINAL-REQUEST
+- Prior plan status:
+COMPLETED-PLAN-SUMMARY
+- Prior plan terminal steps (chain new steps onto them via depends_on): TERMINAL-STEPS
+
+Recent conversation:
+RECENT-CONVERSATION
+
 Create at most MAX-STEPS steps. Each step needs a clear summary, description, and verifiable acceptance criteria. Use depends_on to express ordering between steps; mark parallelizable steps when they have no dependencies on each other.
+
+MODE-TAIL
 
 MODE-JSON-EXAMPLE`
 
@@ -43,7 +72,10 @@ func DefaultPromptSet() planner.PromptSet {
 		SingleStepPreamble: "This task is simple enough to complete in a single step. Produce one step that fully addresses the request.",
 		SingleStepGuidance: "The single step should be self-contained and produce a complete, verifiable result.",
 
-		// Replan mode (after a failure + reflection).
+		// Replan mode (after a failure + reflection). Carries a slot for every
+		// data key the replan builder substitutes, plus the trusted
+		// MODE-PREAMBLE / MODE-JSON-EXAMPLE / MAX-STEPS template tokens that
+		// the unified prompt pipeline's trusted pass resolves.
 		ReplanPrompt: `You are a task planning agent revising a plan after a step failed.
 
 Available tools:
@@ -51,7 +83,27 @@ AVAILABLE-TOOLS
 
 MODE-PREAMBLE
 
-The previous plan and the reflection analysis are provided. Produce a revised plan that avoids the failure. Keep completed steps as-is; only change steps that have not yet succeeded or that depended on the failed step.
+Original plan:
+ORIGINAL-PLAN
+
+Completed steps:
+COMPLETED-STEPS
+
+Failed step:
+FAILED-STEP
+
+CURRENT-REFLECTION
+
+PREVIOUS-SESSION-REFLECTIONS
+
+Available skills:
+AVAILABLE-SKILLS
+
+WORKSPACE-PATH
+
+Produce a revised plan that avoids the failure. Keep completed steps as-is; only change steps that have not yet succeeded or that depended on the failed step.
+
+Create at most MAX-STEPS steps. Each step needs a clear summary, description, and verifiable acceptance criteria. Use depends_on to express ordering between steps.
 
 MODE-JSON-EXAMPLE`,
 

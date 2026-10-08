@@ -146,7 +146,9 @@ func (r *Router) Route(ctx context.Context, userMessage string, availableTools [
 	// Build system prompt.
 	// If the template uses PROJECT-CONTEXT, insert the context there
 	// (before the JSON-output directive to avoid recency bias).
-	// Otherwise fall back to appending at the end for backward compatibility.
+	// Otherwise insert it at the projectContextMarker right after the
+	// JSON-output directive, falling back to prepending for templates
+	// lacking both.
 	// Tool/skill lists and project context (AGENTS.md etc.) are dynamic,
 	// externally-influenced values — substituted via ReplaceData so
 	// placeholder names inside them are never expanded.
@@ -162,22 +164,40 @@ func (r *Router) Route(ctx context.Context, userMessage string, availableTools [
 		toolMatchingSection = toolMatchingInstruction
 		jsonSchema = routingJSONSchemaWithTools
 	}
+	// The context is inserted exactly once: via the PROJECT-CONTEXT
+	// placeholder when the template declares it, otherwise at the
+	// projectContextMarker (right after JSON-OUTPUT-SCHEMA), falling back to
+	// prepending when the template has neither. The marker is appended to the
+	// JSON-OUTPUT-SCHEMA replacement only in the marker path — with the
+	// placeholder present, the same context must not be inserted a second
+	// time at the marker (that would duplicate a potentially multi-KB
+	// AGENTS.md on every routing call).
+	templateHasProjectCtx := strings.Contains(r.systemPrompt, "PROJECT-CONTEXT")
+	schemaReplacement := jsonSchema
+	if !templateHasProjectCtx {
+		schemaReplacement += projectContextMarker
+	}
 	builder := prompt.NewBuilder().
 		Core(r.systemPrompt).
 		Replace("TOOL-MATCHING", toolMatchingSection).
-		Replace("JSON-OUTPUT-SCHEMA", jsonSchema+projectContextMarker).
+		Replace("JSON-OUTPUT-SCHEMA", schemaReplacement).
 		ReplaceData("AVAILABLE-TOOLS", toolListStr).
 		ReplaceData("AVAILABLE-SKILLS", skillListStr)
-	if strings.Contains(r.systemPrompt, "PROJECT-CONTEXT") {
+	if templateHasProjectCtx {
 		builder = builder.ReplaceData("PROJECT-CONTEXT", projectContext)
 	}
 	systemPrompt := builder.Build()
-	// When the template lacks PROJECT-CONTEXT, insert the context at the
-	// projectContextMarker (right after JSON-OUTPUT-SCHEMA) rather than
-	// appending at the very end. This avoids recency bias where the project's
-	// conventions are the last thing the LLM sees before producing its routing
-	// decision.
-	if projectContext != "" {
+	switch {
+	case templateHasProjectCtx:
+		// Context was already substituted into the PROJECT-CONTEXT
+		// placeholder above; the marker was never injected, so nothing
+		// else to do.
+	case projectContext != "":
+		// The template lacks PROJECT-CONTEXT: insert the context at the
+		// projectContextMarker (right after JSON-OUTPUT-SCHEMA) rather
+		// than appending at the very end. This avoids recency bias where
+		// the project's conventions are the last thing the LLM sees
+		// before producing its routing decision.
 		if idx := strings.Index(systemPrompt, projectContextMarker); idx >= 0 {
 			systemPrompt = systemPrompt[:idx] + projectContext + "\n\n" + systemPrompt[idx+len(projectContextMarker):]
 		} else {
@@ -185,7 +205,7 @@ func (r *Router) Route(ctx context.Context, userMessage string, availableTools [
 			// fall back to prepending.
 			systemPrompt = projectContext + "\n\n" + systemPrompt
 		}
-	} else {
+	default:
 		// Remove the marker when there's no project context.
 		systemPrompt = strings.ReplaceAll(systemPrompt, projectContextMarker, "")
 	}

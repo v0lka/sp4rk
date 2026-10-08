@@ -90,3 +90,86 @@ func TestOpenFile_WritesRegularFile(t *testing.T) {
 		t.Fatalf("OpenFile wrote %q, want %q", got, "hello\n")
 	}
 }
+
+// TestReadFileLimited_AtLimitReadsWholeFile pins the boundary: a file of
+// exactly limit bytes is read in full, not refused.
+func TestReadFileLimited_AtLimitReadsWholeFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "edge.bin")
+	content := strings.Repeat("a", 4096)
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ReadFileLimited(path, int64(len(content)))
+	if err != nil {
+		t.Fatalf("ReadFileLimited(at limit): %v", err)
+	}
+	if string(got) != content {
+		t.Fatalf("ReadFileLimited returned %d bytes, want the full %d", len(got), len(content))
+	}
+}
+
+// TestReadFileLimited_OverLimitRefused pins the explicit too-large error: an
+// oversized file is refused instead of being read into memory.
+func TestReadFileLimited_OverLimitRefused(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "big.bin")
+	if err := os.WriteFile(path, []byte(strings.Repeat("a", 4097)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := ReadFileLimited(path, 4096)
+	if err == nil {
+		t.Fatal("ReadFileLimited(over limit) succeeded, want a too-large refusal")
+	}
+	if !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("ReadFileLimited(over limit) err = %v, want errors.Is(err, ErrTooLarge)", err)
+	}
+	var tooLarge *TooLargeError
+	if !errors.As(err, &tooLarge) {
+		t.Fatalf("ReadFileLimited(over limit) err = %v, want a *TooLargeError", err)
+	}
+	if tooLarge.Path != path {
+		t.Errorf("TooLargeError.Path = %q, want %q", tooLarge.Path, path)
+	}
+	if tooLarge.Limit != 4096 {
+		t.Errorf("TooLargeError.Limit = %d, want 4096", tooLarge.Limit)
+	}
+	if !strings.Contains(err.Error(), "too large") {
+		t.Errorf("err = %v, want it to mention the file being too large", err)
+	}
+}
+
+// TestReadFile_DefaultCapRefusesOversizedFile is the OOM regression: a file
+// just over DefaultMaxFileSize bytes is refused with the explicit error
+// instead of io.ReadAll slurping it into memory.
+func TestReadFile_DefaultCapRefusesOversizedFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "huge.bin")
+	if err := os.WriteFile(path, make([]byte, DefaultMaxFileSize+1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := ReadFile(path)
+	if err == nil {
+		t.Fatal("ReadFile(just over default cap) succeeded, want a too-large refusal")
+	}
+	if !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("ReadFile(just over default cap) err = %v, want errors.Is(err, ErrTooLarge)", err)
+	}
+}
+
+// TestReadFile_DefaultCapAllowsFileAtCap pins the other side of the default
+// cap: a file of exactly DefaultMaxFileSize bytes still reads in full.
+func TestReadFile_DefaultCapAllowsFileAtCap(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "at-cap.bin")
+	if err := os.WriteFile(path, make([]byte, DefaultMaxFileSize), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(at default cap): %v", err)
+	}
+	if int64(len(got)) != DefaultMaxFileSize {
+		t.Fatalf("ReadFile returned %d bytes, want %d", len(got), DefaultMaxFileSize)
+	}
+}

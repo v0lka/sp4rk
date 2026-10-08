@@ -27,6 +27,7 @@ func init() {
 		"127.0.0.0/8",
 		"169.254.0.0/16",
 		"::1/128",
+		"::/128", // IPv6 unspecified — dials loopback, like 0.0.0.0/8
 		"fc00::/7",
 		"fe80::/10",
 		"0.0.0.0/8",
@@ -51,12 +52,18 @@ func init() {
 }
 
 // isPrivateIP reports whether ip falls within a private or reserved range.
+// Reserved IP classes are short-circuited via net.IP predicates before the
+// CIDR list is consulted, so a future list gap cannot reintroduce them.
 // When the CIDR list failed to initialize (privateNetworksInitErr != nil),
 // returns false — callers MUST check resolveHostIsPrivate's returned error
 // rather than relying on the boolean alone.
 func isPrivateIP(ip net.IP) bool {
 	if privateNetworksInitErr != nil {
 		return false
+	}
+	if ip.IsUnspecified() || ip.IsLoopback() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsPrivate() {
+		return true
 	}
 	for _, network := range privateNetworks {
 		if network.Contains(ip) {

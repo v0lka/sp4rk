@@ -427,6 +427,62 @@ func TestMarked_NoMarkers(t *testing.T) {
 	}
 }
 
+// --- BetweenMarkers with overlapping markers (regression: slice-bounds panic) ---
+
+func TestBetweenMarkers_SameStartAndEnd(t *testing.T) {
+	// Regression: the end marker was searched from the start marker's own
+	// offset, so start == end always matched at offset 0 and placed the
+	// content end before the content start — a slice-bounds panic. Equal
+	// delimiters (a ``` fence, a --- rule) must extract the text between
+	// two successive occurrences instead, per the documented contract.
+	for _, tc := range []struct {
+		name  string
+		in    string
+		start string
+		end   string
+		want  string
+		ok    bool
+	}{
+		{"fence pair", "```json\n{\"a\":1}\n```", "```", "```", "json\n{\"a\":1}", true},
+		{"rule pair", "---\ntext\n---", "---", "---", "text", true},
+		{"empty between adjacent", "XX", "X", "X", "", true},
+		{"second marker missing", "---\nonly one", "---", "---", "", false},
+		{"first pair wins", "---A---B---", "---", "---", "A", true},
+	} {
+		got, ok := BetweenMarkers(tc.in, tc.start, tc.end)
+		if ok != tc.ok || got != tc.want {
+			t.Errorf("%s: BetweenMarkers(%q, %q, %q) = (%q, %v), want (%q, %v)",
+				tc.name, tc.in, tc.start, tc.end, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
+func TestBetweenMarkers_EndInsideStart(t *testing.T) {
+	// "AB" occurs inside the start marker "AAB" (offset 1). The old search
+	// from startIdx matched it there, making contentEnd (startIdx+1)
+	// precede contentStart (startIdx+3) and panicking on the slice. The
+	// search now begins after the start marker and extracts "xx".
+	got, ok := BetweenMarkers("AABxxABzz", "AAB", "AB")
+	if !ok || got != "xx" {
+		t.Errorf("BetweenMarkers() = (%q, %v), want (%q, true)", got, ok, "xx")
+	}
+	// An end marker occurring ONLY inside the start marker has no
+	// occurrence after it: ("", false), not a panic.
+	if got, ok := BetweenMarkers("AAB", "AAB", "AB"); ok || got != "" {
+		t.Errorf("BetweenMarkers() = (%q, %v), want (\"\", false)", got, ok)
+	}
+}
+
+func TestMarked_FencePair(t *testing.T) {
+	// Marked delegates to BetweenMarkers, so the same-delimiter fence pair
+	// must work through it too (e.g. extracting fenced output).
+	resp := respWith("```json\n{\"verdict\": \"ALLOW\"}\n```", "", "")
+	want := "json\n{\"verdict\": \"ALLOW\"}"
+	if got, ok := Marked(resp, "```", "```"); !ok || got != want {
+		t.Errorf("Marked() = (%q, %v), want (%q, true)", got, ok, want)
+	}
+}
+
 // --- ParseJSON ---
 
 type extractResult struct {

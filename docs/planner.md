@@ -195,7 +195,7 @@ type PromptSet struct {
 
 Prompt templates use uppercase placeholders that the planner substitutes at call time. This keeps prompts data-driven and avoids hand-building strings.
 
-**Plan-mode placeholders** (used by `BasePrompt` / `InformedPrompt`):
+**Plan-mode placeholders** (used by `BasePrompt` / `InformedPrompt` / `ReplanPrompt`):
 
 | Placeholder | Replaced with |
 | --- | --- |
@@ -222,6 +222,8 @@ Prompt templates use uppercase placeholders that the planner substitutes at call
 | `FAILED-STEP` | The failed step ID, error, and output. |
 | `CURRENT-REFLECTION` | The reflection on the failure. |
 | `PREVIOUS-SESSION-REFLECTIONS` | Earlier reflections from the session. |
+| `AVAILABLE-SKILLS` | Formatted skill list (via `FormatSkillList`). |
+| `WORKSPACE-PATH` | Workspace instruction block. |
 
 **Continuation placeholders** (used by `BasePrompt` in continuation mode):
 

@@ -86,6 +86,16 @@ func NewWebFetchTool(limits WebFetchLimits) *WebFetchTool {
 // dialing; otherwise the client is left as-is (e.g. custom RoundTripper or
 // nil transport using http.DefaultTransport).
 func NewWebFetchToolWithClient(limits WebFetchLimits, client *http.Client) *WebFetchTool {
+	// web_fetch always runs with a bounded request timeout: a non-positive
+	// Timeout (including the zero value) is replaced by the default. Without
+	// this, a zero-value limits yields &http.Client{Timeout: 0} and no fetch
+	// budget, so an origin that accepts the connection and stalls would hang
+	// the tool run indefinitely — the SSRF dialer's Timeout covers only the
+	// TCP/TLS connect, not the wait for a response.
+	if limits.Timeout <= 0 {
+		limits.Timeout = DefaultWebFetchLimits().Timeout
+	}
+
 	schema := `{
 		"type": "object",
 		"properties": {
@@ -112,9 +122,17 @@ func NewWebFetchToolWithClient(limits WebFetchLimits, client *http.Client) *WebF
 		}
 	} else {
 		// Never mutate the caller's client: make a shallow copy and configure
-		// the copy (Transport, CheckRedirect) for exclusive use by this tool.
+		// the copy (Transport, CheckRedirect, Timeout) for exclusive use by
+		// this tool.
 		c := *client
 		client = &c
+		// A caller-supplied client without a timeout would still hang on a
+		// stalled origin even with normalized limits; floor it at the
+		// (non-zero) configured timeout. An explicit positive caller timeout
+		// is left untouched.
+		if client.Timeout <= 0 {
+			client.Timeout = limits.Timeout
+		}
 		if transport, ok := client.Transport.(*http.Transport); ok {
 			// Wrap the caller's transport with SSRF-safe dialing. Clone preserves
 			// existing settings (proxy, TLS config, etc.) while adding the

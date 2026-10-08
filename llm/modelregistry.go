@@ -454,12 +454,35 @@ func fallbackMetadata() ModelMetadata {
 // negativeCacheTTL window. The observed runtime entry (tier 1.5) is cleared
 // too, along with its fuzzy-index mirror: it describes the PREVIOUS serving
 // arrangement, which a model switch has just invalidated.
+//
+// The sweep also covers cache keys that are different SPELLINGS of the same
+// model: the fuzzy tier (2b) writes a resolved twin under the query spelling
+// (see cacheResolved), so Invalidate("my-llama-3") must also drop
+// cache["myllama3"] — normalizeModelID collapses both — or a post-switch
+// resolve under the drifted spelling would miss every tier above the cache
+// and serve the stale pre-switch entry. ApplyOverrides performs the same
+// normalized-ID sweep over r.cache for the same reason; r.negativeCache is
+// swept too so a stale probe suppression cannot outlive the switch either.
+// The scan is bounded by the cache sizes, and Invalidate runs once per model
+// switch, so indexing the twin spellings is not worth it.
 func (r *ModelRegistry) Invalidate(model string) {
 	r.mu.Lock()
 	key := strings.ToLower(model)
 	delete(r.cache, key)
 	delete(r.negativeCache, key)
 	delete(r.runtime, key)
+	if norm := normalizeModelID(key); norm != "" {
+		for k := range r.cache {
+			if normalizeModelID(k) == norm {
+				delete(r.cache, k)
+			}
+		}
+		for k := range r.negativeCache {
+			if normalizeModelID(k) == norm {
+				delete(r.negativeCache, k)
+			}
+		}
+	}
 	r.rebuildRuntimeIndex()
 	r.mu.Unlock()
 }
@@ -517,6 +540,20 @@ func (r *ModelRegistry) SetCachedMetadata(model string, meta ModelMetadata) {
 // probe a server should set the fields they actually observed and leave the
 // rest zero.
 //
+// Partial entries are NOT enriched here and the record is stored RAW — the
+// same contract as ApplyOverrides: Family and Protocol are deliberately not
+// resolved at write time. resolveFamily would fill an empty Family with
+// DetectFamily's name-only guess, and because the runtime tier (1.5) sits
+// ABOVE the built-in catalog, that non-empty guess would block
+// enrichPartialWith's inheritance and shadow the catalog's authoritative
+// Family for checkpoints whose ID carries no family token ("k3" → "kimi",
+// "Bonsai 2 27B" → "qwen" would both degrade to "default", silently losing
+// the family-gated sampling and reasoning adaptations). Left empty, the field
+// inherits from the tiers below runtime at Resolve time; finalizeMeta still
+// derives Family/Protocol from the model ID when every tier leaves them
+// empty. Callers that probe a server should set the fields they actually
+// observed and leave the rest zero.
+//
 // Unlike the network tiers, this method performs no I/O. The entry is keyed
 // by the exact (lowercased) model id the caller resolved, so it is consulted
 // by both Resolve and the network-free ResolveLocal; it is also mirrored into
@@ -528,8 +565,6 @@ func (r *ModelRegistry) SetCachedMetadata(model string, meta ModelMetadata) {
 // probe that reuses its own ModelMetadata value afterwards cannot race the
 // registry's concurrent readers.
 func (r *ModelRegistry) SetRuntimeMetadata(model string, meta ModelMetadata) {
-	meta.Family = resolveFamily(model, meta)
-	meta.Protocol = resolveProtocol(model, meta)
 	meta.Capabilities = cloneCapabilities(meta.Capabilities)
 	r.mu.Lock()
 	r.runtime[strings.ToLower(model)] = meta

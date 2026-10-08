@@ -2,6 +2,7 @@ package builtins
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -81,14 +82,14 @@ func ReadFileRange(params FileReadParams) (*FileReadResult, error) {
 	pastWindow := false
 
 	for {
-		line, rerr := reader.ReadString('\n')
+		ln, rerr := readLineBounded(reader, params.MaxLineBytes)
 
-		if line != "" {
+		if ln.text != "" {
 			lineNum++
 			totalLines = lineNum
 
 			if !pastWindow && lineNum >= startLine && lineNum <= endLine {
-				writeLine(&builder, line, lineNum, params.MaxLineBytes)
+				writeLine(&builder, ln, lineNum, params.MaxLineBytes)
 			}
 
 			if lineNum > endLine {
@@ -96,7 +97,7 @@ func ReadFileRange(params FileReadParams) (*FileReadResult, error) {
 			}
 		}
 
-		if rerr == io.EOF {
+		if errors.Is(rerr, io.EOF) {
 			break
 		}
 		if rerr != nil {
@@ -123,25 +124,78 @@ func ReadFileRange(params FileReadParams) (*FileReadResult, error) {
 	}, nil
 }
 
+// boundedLine is one physical line as produced by readLineBounded: the
+// retained text (trailing '\n' included only when that byte fit within the
+// cap), whether content past the cap was drained but dropped, and whether the
+// trailing '\n' was actually consumed (false for a final line without one —
+// the distinction the truncation marker needs to reproduce the old line
+// structure).
+type boundedLine struct {
+	text      string
+	truncated bool
+	complete  bool
+}
+
+// readLineBounded reads one '\n'-terminated line from r while accumulating at
+// most maxBytes bytes of it. Peak memory for the line is therefore bounded by
+// maxBytes (plus the reader's fixed buffer) no matter how long the physical
+// line is: once the cap is hit the remaining fragments of the line are still
+// drained — the delimiter is always consumed so the caller stays in sync —
+// but no longer retained, and truncated reports that content was dropped.
+// maxBytes <= 0 means no cap (the line is accumulated in full, the caller's
+// documented contract).
+//
+// The returned error is the terminal read error: nil when the delimiter was
+// found, io.EOF at end of input (with any final partial line still returned),
+// or any other reader error.
+func readLineBounded(r *bufio.Reader, maxBytes int) (boundedLine, error) {
+	var ln boundedLine
+	var buf []byte
+	for {
+		frag, err := r.ReadSlice('\n')
+		if !ln.truncated {
+			if maxBytes <= 0 || len(buf)+len(frag) <= maxBytes {
+				buf = append(buf, frag...)
+			} else {
+				buf = append(buf, frag[:maxBytes-len(buf)]...)
+				ln.truncated = true
+			}
+		}
+		switch {
+		case err == nil:
+			// Delimiter found: the line is complete.
+			ln.text, ln.complete = string(buf), true
+			return ln, nil
+		case errors.Is(err, bufio.ErrBufferFull):
+			// The reader's buffer filled before the delimiter; keep
+			// scanning (and draining) the next fragment.
+			continue
+		case errors.Is(err, io.EOF):
+			ln.text = string(buf)
+			return ln, io.EOF
+		default:
+			ln.text = string(buf)
+			return ln, err
+		}
+	}
+}
+
 // writeLine appends a line to the builder, applying an optional per-line byte
-// cap. When the line exceeds MaxLineBytes, it is truncated and a marker is
-// appended. The marker names the line number and points at the recovery path:
-// tool_result_read(hash, line=lineNum) reads the full raw line via
-// ReadSingleLine, bypassing the cap. The trailing newline (if present) is
-// preserved after the marker.
-func writeLine(builder *strings.Builder, line string, lineNum, maxLineBytes int) {
-	if maxLineBytes <= 0 || len(line) <= maxLineBytes {
-		builder.WriteString(line)
+// cap. When the line exceeded MaxLineBytes (truncated from readLineBounded),
+// a marker is appended. The marker names the line number and points at the
+// recovery path: tool_result_read(hash, line=lineNum) reads the full raw line
+// via ReadSingleLine, bypassing the cap. The trailing newline (when the line
+// was complete) is preserved after the marker.
+func writeLine(builder *strings.Builder, ln boundedLine, lineNum, maxLineBytes int) {
+	if maxLineBytes <= 0 || !ln.truncated {
+		builder.WriteString(ln.text)
 		return
 	}
 
-	hasNewline := strings.HasSuffix(line, "\n")
-	truncated := line[:maxLineBytes]
-	truncated = strings.TrimSuffix(truncated, "\n")
-	builder.WriteString(truncated)
+	builder.WriteString(strings.TrimSuffix(ln.text, "\n"))
 	fmt.Fprintf(builder, "[...line %d truncated at %d bytes. Use tool_result_read(hash, line=%d) to read the full line...]",
 		lineNum, maxLineBytes, lineNum)
-	if hasNewline {
+	if ln.complete {
 		builder.WriteString("\n")
 	}
 }
@@ -184,14 +238,13 @@ func ReadSingleLine(path string, lineNum int) (line string, totalLines int, err 
 	current := 0
 
 	for {
-		raw, rerr := reader.ReadString('\n')
-		if raw != "" {
+		ln, rerr := readLineBounded(reader, maxRawLineBytes)
+		if ln.text != "" {
 			current++
 			if current == lineNum {
-				full := strings.TrimSuffix(raw, "\n")
-				if len(full) > maxRawLineBytes {
-					full = full[:maxRawLineBytes] +
-						fmt.Sprintf("[...raw line capped at %d bytes (absolute memory bound)...]", maxRawLineBytes)
+				full := strings.TrimSuffix(ln.text, "\n")
+				if ln.truncated {
+					full += fmt.Sprintf("[...raw line capped at %d bytes (absolute memory bound)...]", maxRawLineBytes)
 				}
 				// Continue scanning only to compute totalLines.
 				remaining, countErr := countRemainingNewlines(reader)
@@ -201,7 +254,7 @@ func ReadSingleLine(path string, lineNum int) (line string, totalLines int, err 
 				return full, current + remaining, nil
 			}
 		}
-		if rerr == io.EOF {
+		if errors.Is(rerr, io.EOF) {
 			break
 		}
 		if rerr != nil {

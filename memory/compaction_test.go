@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 
@@ -133,23 +134,36 @@ func TestSummarizationStrategy_NoCompactionNeeded(t *testing.T) {
 	}
 }
 
+// TestSummarizationStrategy_NilSummarizer verifies the fail-closed contract:
+// with no summarizer wired the strategy keeps the step history verbatim. A
+// bare "[... N steps summarized ...]" placeholder would permanently discard
+// those steps from LLM context, because ContextWindow.Compact freezes the
+// strategy's output as the prompt prefix and never renders the summarized
+// steps again.
 func TestSummarizationStrategy_NilSummarizer(t *testing.T) {
-	// When summarizer is nil, should use placeholder
 	steps := createTestSteps(15)
 	strategy := NewSummarizationStrategy(5, 5, 0, nil, nil, 0)
 
 	messages := strategy.Compact(context.Background(), steps, 10000)
 
-	// Should have placeholder summaries
-	foundPlaceholder := false
+	// No placeholder summaries: the history must not be replaced by one-liners.
 	for _, msg := range messages {
 		if msg.Role == "system" && strings.Contains(msg.Content, "steps summarized") {
-			foundPlaceholder = true
-			break
+			t.Errorf("nil summarizer produced a placeholder, discarding history: %q", msg.Content)
 		}
 	}
-	if !foundPlaceholder {
-		t.Error("Expected placeholder summary when summarizer is nil")
+	// Every step's thought must still be present.
+	preserved := make(map[string]bool, len(steps))
+	for _, msg := range messages {
+		if msg.Role == "assistant" {
+			preserved[msg.Content] = true
+		}
+	}
+	for i := 1; i <= len(steps); i++ {
+		thought := fmt.Sprintf("Thought %d", i)
+		if !preserved[thought] {
+			t.Errorf("nil summarizer dropped step %d (%q) — step history was discarded", i, thought)
+		}
 	}
 }
 
@@ -273,23 +287,36 @@ func TestHierarchicalStrategy_DifferentCompressionLevels(t *testing.T) {
 	}
 }
 
+// TestHierarchicalStrategy_NilSummarizer verifies the fail-closed contract:
+// with no summarizer wired the strategy keeps the step history verbatim. A
+// bare "[zone: N steps summarized]" placeholder would permanently discard
+// those steps from LLM context, because ContextWindow.Compact freezes the
+// strategy's output as the prompt prefix and never renders the summarized
+// steps again.
 func TestHierarchicalStrategy_NilSummarizer(t *testing.T) {
-	// When summarizer is nil, should use placeholder
 	steps := createTestSteps(15)
 	strategy := NewHierarchicalStrategy(0.4, 0.3, 0.3, 0, nil, nil, 0)
 
 	messages := strategy.Compact(context.Background(), steps, 10000)
 
-	// Should have placeholder summaries
-	foundPlaceholder := false
+	// No placeholder summaries: the history must not be replaced by one-liners.
 	for _, msg := range messages {
 		if msg.Role == "system" && strings.Contains(msg.Content, "zone:") {
-			foundPlaceholder = true
-			break
+			t.Errorf("nil summarizer produced a placeholder, discarding history: %q", msg.Content)
 		}
 	}
-	if !foundPlaceholder {
-		t.Error("Expected placeholder summary when summarizer is nil")
+	// Every step's thought must still be present.
+	preserved := make(map[string]bool, len(steps))
+	for _, msg := range messages {
+		if msg.Role == "assistant" {
+			preserved[msg.Content] = true
+		}
+	}
+	for i := 1; i <= len(steps); i++ {
+		thought := fmt.Sprintf("Thought %d", i)
+		if !preserved[thought] {
+			t.Errorf("nil summarizer dropped step %d (%q) — step history was discarded", i, thought)
+		}
 	}
 }
 
@@ -348,6 +375,132 @@ func TestNewCompactionStrategy_DefaultValues(t *testing.T) {
 	strategy = NewCompactionStrategy("hierarchical", cfg, deps)
 	if strategy == nil {
 		t.Fatal("Expected non-nil strategy")
+	}
+}
+
+// TestNewCompactionStrategy_NilSummarizerFallsBackToSlidingWindow verifies
+// that requesting an LLM-backed strategy without wiring a summarizer falls
+// back to the sliding window. Handing back a summarization/hierarchical
+// strategy with a nil summarizer would silently and permanently discard the
+// summarized step history behind bare placeholder one-liners.
+func TestNewCompactionStrategy_NilSummarizerFallsBackToSlidingWindow(t *testing.T) {
+	cfg := CompactionConfig{}
+	cfg.Summarization.BlockSize = 7
+	cfg.Hierarchical.DistantRatio = 0.4
+	cfg.Hierarchical.MiddleRatio = 0.3
+	cfg.Hierarchical.RecentRatio = 0.3
+
+	for _, name := range []string{"summarization", "hierarchical"} {
+		strategy := NewCompactionStrategy(name, cfg, CompactionDeps{})
+		if _, ok := strategy.(*SlidingWindowStrategy); !ok {
+			t.Errorf("NewCompactionStrategy(%q) with nil Summarize = %T, want *SlidingWindowStrategy", name, strategy)
+		}
+	}
+
+	// The fallback must behave like the sliding window: first and last steps
+	// survive, middle steps are omitted with a labeled placeholder.
+	messages := NewCompactionStrategy("summarization", cfg, CompactionDeps{}).Compact(context.Background(), createTestSteps(20), 100000)
+	if !containsContent(messages, "Thought 3") || !containsContent(messages, "Thought 20") {
+		t.Error("nil-summarizer fallback lost the kept first/last steps")
+	}
+	if containsContent(messages, "Thought 7") {
+		t.Error("nil-summarizer fallback kept a middle step; expected sliding-window omission")
+	}
+}
+
+// TestNewHierarchicalStrategy_NonPositiveRatiosFallBackToDefaults verifies
+// that ratio sets containing a non-positive or non-finite member are rejected
+// wholesale — even when they sum to exactly 1.0 — and replaced with the
+// defaults. A negative member previously survived normalization (the sum
+// check only repaired total <= 0 or total != 1.0) and drove negative zone
+// boundaries, panicking Compact with a slice-bounds error.
+func TestNewHierarchicalStrategy_NonPositiveRatiosFallBackToDefaults(t *testing.T) {
+	tests := []struct {
+		name                    string
+		distant, middle, recent float64
+	}{
+		{"negative member sums to 1.0", 0.95, -1.2, 1.25},
+		{"zero member sums to 1.0", 0, 0.5, 0.5},
+		{"all negative", -0.4, -0.3, -0.3},
+		{"NaN member", math.NaN(), 0.5, 0.5},
+		{"Inf member", math.Inf(1), 0.5, 0.5},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			strategy := NewHierarchicalStrategy(tt.distant, tt.middle, tt.recent, 0, mockSummarizer, nil, 0)
+			if strategy.distantRatio != 0.4 || strategy.middleRatio != 0.3 || strategy.recentRatio != 0.3 {
+				t.Errorf("unusable ratio set (%v, %v, %v) = (%v, %v, %v), want defaults (0.4, 0.3, 0.3)",
+					tt.distant, tt.middle, tt.recent, strategy.distantRatio, strategy.middleRatio, strategy.recentRatio)
+			}
+		})
+	}
+}
+
+// TestHierarchicalStrategy_NegativeRatioNoPanic reproduces the review's
+// exact panic trigger — NewHierarchicalStrategy(0.95, -1.2, 1.25, …) over 6
+// steps, which used to panic with "slice bounds out of range [:-1]" — and
+// verifies Compact now applies the defaults instead.
+func TestHierarchicalStrategy_NegativeRatioNoPanic(t *testing.T) {
+	strategy := NewHierarchicalStrategy(0.95, -1.2, 1.25, 0, mockSummarizer, nil, 0)
+
+	// 6 steps: distant=int(6*0.4)=2, middleEnd=int(6*0.7)=4 → both zones
+	// non-empty, recent zone keeps steps 5-6 verbatim.
+	messages := strategy.Compact(context.Background(), createTestSteps(6), 10000)
+
+	hasDistant, hasMiddle := false, false
+	preserved := make(map[string]bool)
+	for _, msg := range messages {
+		switch {
+		case msg.Role == "system" && strings.Contains(msg.Content, "distant"):
+			hasDistant = true
+		case msg.Role == "system" && strings.Contains(msg.Content, "middle"):
+			hasMiddle = true
+		case msg.Role == "assistant":
+			preserved[msg.Content] = true
+		}
+	}
+	if !hasDistant || !hasMiddle {
+		t.Errorf("expected both zone summaries after fallback to defaults, got distant=%v middle=%v", hasDistant, hasMiddle)
+	}
+	for _, want := range []string{"Thought 5", "Thought 6"} {
+		if !preserved[want] {
+			t.Errorf("recent-zone thought %q not preserved", want)
+		}
+	}
+	for _, omitted := range []string{"Thought 1", "Thought 2"} {
+		if preserved[omitted] {
+			t.Errorf("distant-zone thought %q should be summarized, but survived verbatim", omitted)
+		}
+	}
+}
+
+// TestHierarchicalStrategy_ZeroValueStructNoPanic verifies the Compact-side
+// lower-bound guards: a strategy assembled without the constructor (zero-value
+// struct or hand-populated fields) must not panic on negative boundaries.
+func TestHierarchicalStrategy_ZeroValueStructNoPanic(t *testing.T) {
+	strategy := &HierarchicalStrategy{
+		distantRatio: -0.5,
+		middleRatio:  0.75,
+		recentRatio:  0.75,
+		summarizer:   mockSummarizer,
+	}
+
+	messages := strategy.Compact(context.Background(), createTestSteps(6), 10000)
+
+	// distantEnd = int(6*-0.5) = -3 clamps to 0 (then bumps to 1); the zones
+	// stay ordered and every step is accounted for: distant + middle summaries
+	// plus the verbatim recent steps 3-6.
+	preserved := make(map[string]bool)
+	for _, msg := range messages {
+		if msg.Role == "assistant" {
+			preserved[msg.Content] = true
+		}
+	}
+	for _, want := range []string{"Thought 3", "Thought 4", "Thought 5", "Thought 6"} {
+		if !preserved[want] {
+			t.Errorf("recent-zone thought %q not preserved", want)
+		}
 	}
 }
 

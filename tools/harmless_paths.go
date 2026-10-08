@@ -8,12 +8,9 @@ import (
 )
 
 // harmlessPOSIXDevices lists POSIX special-device paths whose access cannot
-// leak data outside the workspace nor persist unwanted changes. Both entries
-// are real character devices (never symlinks) wherever they exist:
+// leak data outside the workspace nor persist unwanted changes. The single
+// entry is a real character device (never a symlink) wherever it exists:
 //   - /dev/null — reads return EOF; writes are discarded (the bit bucket).
-//   - /dev/full — reads return EOF; writes fail with ENOSPC (nothing stored).
-//     /dev/full is Linux-only; on macOS it does not exist, so an operation
-//     targeting it simply fails at open(2) — still harmless.
 //
 // Deliberately EXCLUDED:
 //   - /dev/stdin, /dev/stdout, /dev/stderr — the process's standard streams.
@@ -24,6 +21,12 @@ import (
 //     symlinks into /dev/fd/*, which the symlink gate must therefore walk and
 //     resolve (see [checkPathsForSymlinks]); on Linux they are character
 //     devices and produce no symlink traversal. On Windows there is no /dev.
+//   - /dev/full — although writes fail with ENOSPC (nothing stored), its reads
+//     are an INFINITE zero stream (identical to /dev/zero on Linux: character
+//     device 1:7), so an unbounded read never returns EOF and can exhaust the
+//     reader's memory. The "provably safe to read from" half of the invariant
+//     below is false for it, so it must not be exempted from the
+//     out-of-workspace determination.
 //   - /dev/zero and /dev/urandom (infinite/unbounded read), /dev/random,
 //     /dev/tty (interactive), real block/character devices, and named pipes.
 //
@@ -37,7 +40,6 @@ import (
 // consult it — it resolves every path via Lstat (see [checkPathsForSymlinks]).
 var harmlessPOSIXDevices = map[string]bool{
 	"/dev/null": true,
-	"/dev/full": true,
 }
 
 // IsHarmlessDevicePath reports whether absPath is a harmless special device —
@@ -52,7 +54,7 @@ var harmlessPOSIXDevices = map[string]bool{
 // out-of-workspace operations.
 //
 // Recognized harmless devices:
-//   - POSIX: /dev/null and /dev/full (matched as cleaned absolute paths), only
+//   - POSIX: /dev/null (matched as a cleaned absolute path), only
 //     on non-Windows hosts — on Windows /dev/null is an ordinary out-of-root
 //     path, not a device.
 //   - Windows: NUL — the /dev/null equivalent — matched case-insensitively as
