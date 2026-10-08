@@ -523,6 +523,22 @@ func TestProcessToolResult_Stage1NudgePreserved(t *testing.T) {
 	}
 }
 
+// decodePathArg unmarshals a tool-call input and returns its "path" field,
+// failing the test if the input is not valid JSON. Comparing the decoded path
+// (rather than substring-matching the raw JSON) is required for portability:
+// JSON-encoded Windows paths escape their backslashes ("C:\\dir\\f.txt"), so a
+// raw-path substring match fails on Windows even when the tool got the right path.
+func decodePathArg(t *testing.T, input json.RawMessage) string {
+	t.Helper()
+	var args struct {
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal(input, &args); err != nil {
+		t.Fatalf("tool input %s is not valid JSON: %v", input, err)
+	}
+	return args.Path
+}
+
 // TestProcessToolResult_HITLModifiedInputDrivesCacheMeta verifies a
 // HITL-rewritten read_file path drives the cache entry's file-backed
 // metadata: the entry must reference the file the tool ACTUALLY read, not
@@ -578,9 +594,12 @@ func TestProcessToolResult_HITLModifiedInputDrivesCacheMeta(t *testing.T) {
 	if len(mockTools.calls) == 0 || mockTools.calls[0].Name != "read_file" {
 		t.Fatalf("read_file was never executed (calls = %+v)", mockTools.calls)
 	}
-	// The tool must have executed with the MODIFIED input.
-	if !strings.Contains(string(mockTools.calls[0].Input), realPath) {
-		t.Fatalf("tool executed with input %s, want the HITL-modified path %s", mockTools.calls[0].Input, realPath)
+	// The tool must have executed with the MODIFIED input. Compare the decoded
+	// path, not a substring of the raw JSON: the JSON-encoded input escapes the
+	// Windows backslashes ("C:\\...\\real.txt"), so a raw-path substring match
+	// would fail on Windows even though the tool received the right path.
+	if got := decodePathArg(t, mockTools.calls[0].Input); got != realPath {
+		t.Fatalf("tool executed with path %q, want the HITL-modified path %q", got, realPath)
 	}
 
 	var readStep *Step
@@ -606,8 +625,8 @@ func TestProcessToolResult_HITLModifiedInputDrivesCacheMeta(t *testing.T) {
 	if entry.FilePath != realPath {
 		t.Errorf("entry FilePath = %q, want the HITL-modified path %q — the cache must reference the file the tool actually read", entry.FilePath, realPath)
 	}
-	if !strings.Contains(entry.Input, realPath) {
-		t.Errorf("entry Input = %q, want the effective (post-HITL) arguments", entry.Input)
+	if got := decodePathArg(t, json.RawMessage(entry.Input)); got != realPath {
+		t.Errorf("entry Input path = %q, want the effective (post-HITL) path %q", got, realPath)
 	}
 }
 
