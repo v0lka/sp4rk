@@ -2766,8 +2766,15 @@ func TestAllPathsInSessionRoots_FullDeviceNotExempt(t *testing.T) {
 		dev = `C:\NUL`
 	}
 	inRoot := filepath.ToSlash(filepath.Join(ws, "out"))
-	mixed := json.RawMessage(`{"path":"` + dev + `","dest":"` + inRoot + `"}`)
-	if !AllPathsInSessionRoots(ctx, mixed) {
+	// Build the input via json.Marshal so the Windows drive path's backslash is
+	// escaped correctly: a raw `C:\NUL` concatenated into a JSON string literal
+	// is invalid JSON ("\N" is an illegal escape), which makes the parser fail
+	// closed and the test spuriously report the device as not exempt.
+	mixedBytes, err := json.Marshal(map[string]string{"path": dev, "dest": inRoot})
+	if err != nil {
+		t.Fatalf("marshal mixed input: %v", err)
+	}
+	if !AllPathsInSessionRoots(ctx, json.RawMessage(mixedBytes)) {
 		t.Fatalf("expected %s + in-root path to stay exempt", dev)
 	}
 }

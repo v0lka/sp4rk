@@ -539,9 +539,22 @@ func TestProcessToolResult_HITLModifiedInputDrivesCacheMeta(t *testing.T) {
 		t.Fatalf("write real: %v", err)
 	}
 
+	// Build the tool-argument JSON with json.Marshal so a Windows path's
+	// backslashes are escaped correctly: hand-concatenating a raw path into a
+	// JSON string literal yields illegal escapes ("\U", "\d", ...) that make
+	// json.Unmarshal fail closed, so buildCacheMeta would never observe the path.
+	decoyArgs, err := json.Marshal(map[string]string{"path": decoy})
+	if err != nil {
+		t.Fatalf("marshal decoy args: %v", err)
+	}
+	realArgs, err := json.Marshal(map[string]string{"path": realPath})
+	if err != nil {
+		t.Fatalf("marshal real args: %v", err)
+	}
+
 	mockLLM := &mockLLMCaller{
 		responses: []*llm.ChatResponse{
-			llmResponseWithToolCall("reading", "read_file", json.RawMessage(`{"path":"`+decoy+`"}`)),
+			llmResponseWithToolCall("reading", "read_file", json.RawMessage(decoyArgs)),
 			llmResponseFinish("done", "ok"),
 		},
 	}
@@ -552,7 +565,7 @@ func TestProcessToolResult_HITLModifiedInputDrivesCacheMeta(t *testing.T) {
 
 	exec := newExecutorDefaultHITL(mockLLM, mockTools, &mockTokenCounter{}, 10, &recordingEvents{}, false, ToolResultBudget{}, defaultCircuitBreakerConfig,
 		WithHITL(&scenarioHITL{modify: map[string]json.RawMessage{
-			"read_file": json.RawMessage(`{"path":"` + realPath + `"}`),
+			"read_file": json.RawMessage(realArgs),
 		}}))
 	exec.toolCache = NewToolResultCache(0)
 
