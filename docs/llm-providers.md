@@ -400,10 +400,10 @@ type TrackingCaller struct { /* ... */ }
 
 func NewTrackingCaller(inner Caller, tracker *UsageTracker) *TrackingCaller
 func (tc *TrackingCaller) Call(ctx context.Context, req ChatRequest) (*ChatResponse, error)
-func (tc *TrackingCaller) WithContextTracker(t *ContextTokenTracker) *TrackingCaller
+func (tc *TrackingCaller) WithContextTracker(t *ContextTokenTracker) Caller
 ```
 
-`WithContextTracker` returns a new `TrackingCaller` that shares the same inner caller and session-level `UsageTracker` but corrects a per-step `ContextTokenTracker`. Use this to create step-local callers for parallel execution.
+`WithContextTracker` returns the caller behind the `llm.TrackerInjector` interface (`WithContextTracker(*ContextTokenTracker) Caller`), so hosts can wire step-local correction without importing the concrete type. The returned value shares the same inner caller and session-level `UsageTracker` but corrects a per-step `ContextTokenTracker`. Use this to create step-local callers for parallel execution.
 
 ```go
 sessionTracker := llm.NewUsageTracker()

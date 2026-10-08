@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // This file implements the Google Generative Language ("Gemini") generateContent
@@ -49,6 +50,20 @@ type googlePart struct {
 	InlineData   *googleInlineData       `json:"inlineData,omitempty"`
 	FunctionCall *googleFunctionCall     `json:"functionCall,omitempty"`
 	FunctionResp *googleFunctionResponse `json:"functionResponse,omitempty"`
+	// Thought marks a chain-of-thought part (returned by gateways that enable
+	// includeThoughts). Thought text is internal reasoning: parseGoogleResponse
+	// routes it to the response's reasoning channel — never to the visible
+	// Content — and it is deliberately NOT re-emitted on subsequent requests
+	// (Google's own SDKs drop thought parts when replaying history).
+	Thought bool `json:"thought,omitempty"`
+	// ThoughtSignature carries the opaque thinking signature Gemini 3 attaches
+	// to a part (alongside a functionCall). The API requires the signature to
+	// be returned verbatim on the next request's matching part, even at minimal
+	// thinking budget, or the request fails with 400 INVALID_ARGUMENT ("Function
+	// call is missing a thought_signature"). parseGoogleResponse captures it on
+	// the produced ToolCall (see googleThoughtSigSep) and convertGoogleMessage
+	// re-emits it on the functionCall part of the following request.
+	ThoughtSignature string `json:"thoughtSignature,omitempty"`
 }
 
 type googleInlineData struct {
@@ -120,6 +135,20 @@ var googleFinishReasonMap = map[string]string{
 	"OTHER":      "end_turn",
 }
 
+// maxGoogleResponseBytes caps how much of a generateContent response body is
+// buffered into memory. The delegate decodes the whole body with encoding/json,
+// so an unbounded read against a hostile or misbehaving endpoint (routed via a
+// custom base URL) could exhaust host memory. 32 MiB comfortably covers the
+// largest legitimate responses (long candidates plus inline base64 media).
+const maxGoogleResponseBytes = 32 << 20
+
+// googleDefaultHTTPClient bounds Google delegate calls when the host supplies
+// no HTTP client. It replaces http.DefaultClient, whose zero timeout lets a
+// stalled response hang googleCompletion (and its caller) forever. The generous
+// wall clock accommodates long non-streaming generations; hosts that need
+// different limits pass their own client via googleCompletionConfig.HTTPClient.
+var googleDefaultHTTPClient = &http.Client{Timeout: 10 * time.Minute}
+
 // googleCompletion performs a non-streaming Google Generative Language
 // generateContent call. It is the delegate for ProtocolGoogle models (Gemini /
 // Gemma) served by an OpenAI-compatible gateway (e.g. Zen) that reuses the same
@@ -149,11 +178,11 @@ type googleCompletionConfig struct {
 // googleCompletion calls the Google Generative Language API (Gemini) and
 // returns a unified ChatResponse.
 // cfg.ProviderName is used to attribute errors. cfg.HTTPClient may be nil
-// (→ http.DefaultClient).
+// (→ googleDefaultHTTPClient, a timeout-bounded client).
 func googleCompletion(ctx context.Context, cfg googleCompletionConfig, req ChatRequest) (*ChatResponse, error) {
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
-		httpClient = http.DefaultClient
+		httpClient = googleDefaultHTTPClient
 	}
 	providerName := cfg.ProviderName
 	baseURL := cfg.BaseURL
@@ -220,9 +249,17 @@ func googleCompletion(ctx context.Context, cfg googleCompletionConfig, req ChatR
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBody, err := io.ReadAll(resp.Body)
+	// Cap the buffered body (mirroring tiktoken_loader.go): read one extra
+	// byte beyond the limit to distinguish "exactly maxGoogleResponseBytes"
+	// (accepted) from "more" (rejected). Without the cap a hostile or broken
+	// endpoint streaming an unbounded body would exhaust host memory.
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxGoogleResponseBytes+1))
 	if err != nil {
 		return nil, WrapProviderError(providerName, resp.StatusCode, fmt.Errorf("google: read response body: %w", err))
+	}
+	if len(respBody) > maxGoogleResponseBytes {
+		return nil, WrapProviderError(providerName, resp.StatusCode,
+			fmt.Errorf("google: response body exceeds %d byte limit", maxGoogleResponseBytes))
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -269,23 +306,54 @@ func buildGoogleRequest(req ChatRequest) *googleGenerateRequest {
 		}
 	}
 
-	for _, msg := range filtered {
+	for i := 0; i < len(filtered); {
+		msg := filtered[i]
+		if msg.Role == "tool" {
+			// Bundle the maximal run of consecutive tool messages into ONE
+			// "user" Content whose parts carry one functionResponse per call.
+			// The generateContent API requires the function responses for a
+			// function-call turn to be returned as a single Content turn whose
+			// part count equals that turn's functionCall part count; emitting
+			// one "user" turn per tool message yields a part-count mismatch
+			// and a 400 INVALID_ARGUMENT on the first response part.
+			var parts []googlePart
+			for i < len(filtered) && filtered[i].Role == "tool" {
+				toolMsg := filtered[i]
+				i++
+				// Skip messages with no renderable content (matches the
+				// empty-turn filter below; Google rejects empty turns).
+				if toolMsg.Content == "" && len(toolMsg.ContentBlocks) == 0 && toolMsg.ToolCallID == "" {
+					continue
+				}
+				parts = append(parts, googleFunctionResponsePart(toolMsg, callIDToName))
+			}
+			if len(parts) > 0 {
+				out.Contents = append(out.Contents, googleContent{Role: "user", Parts: parts})
+			}
+			continue
+		}
 		// Skip messages with no renderable content (Google rejects empty turns).
 		if msg.Content == "" && len(msg.ContentBlocks) == 0 && len(msg.ToolCalls) == 0 && msg.ToolCallID == "" {
+			i++
 			continue
 		}
 		out.Contents = append(out.Contents, convertGoogleMessage(msg, callIDToName))
+		i++
 	}
 
 	// Tools → a single tools[] entry whose functionDeclarations list each tool.
-	// Schema is passed through best-effort (InputSchema is already JSON Schema).
+	// Schemas pass through SanitizeSchemaForGoogle: Google's Schema.type is a
+	// single-valued proto enum, so a JSON-Schema type union ("type": ["array",
+	// "string"], as declared by the in-tree fact tools) would be rejected with
+	// 400 INVALID_ARGUMENT — the sanitizer collapses unions, inlines $ref and
+	// strips keywords the Schema proto does not model.
 	if len(req.Tools) > 0 {
 		decls := make([]googleFunctionDeclaration, len(req.Tools))
 		for i, tool := range req.Tools {
 			decls[i] = googleFunctionDeclaration{
 				Name:        tool.Name,
 				Description: tool.Description,
-				Parameters:  tool.InputSchema,
+				Parameters:  SanitizeSchemaForGoogle(tool.InputSchema),
 			}
 		}
 		out.Tools = []googleToolDecls{{FunctionDeclarations: decls}}
@@ -312,6 +380,12 @@ func buildGoogleRequest(req ChatRequest) *googleGenerateRequest {
 // callIDToName maps a ToolCall.ID to the function NAME; it is used to resolve
 // the name a tool result must report in functionResponse.name, since Google
 // correlates function responses by name rather than by call ID.
+//
+// Note on grouping: a multi-tool-call turn's function responses must reach the
+// API bundled in a single "user" Content; buildGoogleRequest merges each run
+// of consecutive tool messages into one turn via googleFunctionResponsePart.
+// This function (one tool message → one turn) remains for single-tool-result
+// calls and direct per-message conversion.
 func convertGoogleMessage(msg Message, callIDToName map[string]string) googleContent {
 	switch msg.Role {
 	case "user":
@@ -340,38 +414,50 @@ func convertGoogleMessage(msg Message, callIDToName map[string]string) googleCon
 			parts = append(parts, googlePart{Text: msg.Content})
 		}
 		for _, tc := range msg.ToolCalls {
-			parts = append(parts, googlePart{FunctionCall: &googleFunctionCall{
-				Name: tc.Name,
-				Args: tc.Input,
-			}})
+			// Re-emit the Gemini 3 thought signature captured on the ToolCall
+			// (empty for calls without one — omitempty keeps the part clean).
+			// ReasoningContent is deliberately NOT re-emitted: thought parts
+			// are internal reasoning and Google's SDKs drop them when
+			// replaying history.
+			parts = append(parts, googlePart{
+				FunctionCall:     &googleFunctionCall{Name: tc.Name, Args: tc.Input},
+				ThoughtSignature: googleThoughtSignatureFromID(tc.ID),
+			})
 		}
 		return googleContent{Role: "model", Parts: parts}
 
 	case "tool":
 		// Google identifies a function response by the function NAME, not by
-		// call ID. Resolve the name from the preceding assistant turn's tool
-		// call (indexed in callIDToName); fall back to the ToolCallID itself
-		// when no match is found (best-effort for the single-call case, where
-		// Google-sourced IDs already equal the function name). The response
-		// payload must be a JSON object: use the content verbatim when it is
-		// already a JSON object, otherwise wrap it as {"result": ...}.
-		name := msg.ToolCallID
-		if n, ok := callIDToName[msg.ToolCallID]; ok {
-			name = n
-		}
+		// call ID (resolved in googleFunctionResponsePart).
 		return googleContent{
-			Role: "user",
-			Parts: []googlePart{{
-				FunctionResp: &googleFunctionResponse{
-					Name:     name,
-					Response: googleFunctionResponsePayload(msg.Content),
-				},
-			}},
+			Role:  "user",
+			Parts: []googlePart{googleFunctionResponsePart(msg, callIDToName)},
 		}
 
 	default:
 		// Unknown role — render as user text so the turn is not dropped.
 		return googleContent{Role: "user", Parts: []googlePart{{Text: msg.Content}}}
+	}
+}
+
+// googleFunctionResponsePart builds the functionResponse part for one tool
+// result message. Google identifies a function response by the function NAME,
+// not by call ID: the name is resolved from the preceding assistant turn's
+// tool call (indexed in callIDToName), falling back to the ToolCallID itself
+// when no match is found (best-effort for the single-call case, where
+// Google-sourced IDs already equal the function name). The response payload
+// must be a JSON object: the content is used verbatim when it is already a
+// JSON object, otherwise wrapped as {"result": ...}.
+func googleFunctionResponsePart(msg Message, callIDToName map[string]string) googlePart {
+	name := msg.ToolCallID
+	if n, ok := callIDToName[msg.ToolCallID]; ok {
+		name = n
+	}
+	return googlePart{
+		FunctionResp: &googleFunctionResponse{
+			Name:     name,
+			Response: googleFunctionResponsePayload(msg.Content),
+		},
 	}
 }
 
@@ -389,6 +475,35 @@ func buildToolCallIDIndex(msgs []Message) map[string]string {
 		}
 	}
 	return idx
+}
+
+// googleThoughtSigSep separates a function name from its round-tripped Gemini
+// thought signature inside a ToolCall.ID. The neutral llm.ToolCall struct has
+// no signature field, and the signature must survive the executor's message
+// history to be re-emitted on the next request's functionCall part, so it rides
+// in the ID. The unit separator cannot occur in function names (restricted to
+// [a-zA-Z0-9-_.]) nor in Google's base64 signatures ([A-Za-z0-9+/=]), so the
+// split is unambiguous; IDs of calls without a signature stay the bare function
+// name (bit-identical to the historical format).
+const googleThoughtSigSep = "\x1f"
+
+// googleThoughtSignatureID returns the ToolCall.ID encoding name plus an
+// optional thought signature (bare name when sig is empty).
+func googleThoughtSignatureID(name, sig string) string {
+	if sig == "" {
+		return name
+	}
+	return name + googleThoughtSigSep + sig
+}
+
+// googleThoughtSignatureFromID extracts the thought signature encoded in a
+// ToolCall.ID by googleThoughtSignatureID, or "" when the ID carries none.
+func googleThoughtSignatureFromID(id string) string {
+	_, sig, found := strings.Cut(id, googleThoughtSigSep)
+	if !found {
+		return ""
+	}
+	return sig
 }
 
 // googleFunctionResponsePayload coerces a tool result string into the JSON
@@ -418,18 +533,30 @@ func parseGoogleResponse(model string, resp *googleGenerateResponse, rawBody []b
 
 	for _, part := range candidate.Content.Parts {
 		if part.Text != "" {
-			if msg.Content != "" {
-				msg.Content += "\n"
+			if part.Thought {
+				// A thought part is internal chain-of-thought: route it to
+				// the reasoning channel, never to the visible answer (which
+				// the executor would re-send and the user would see).
+				if msg.ReasoningContent != "" {
+					msg.ReasoningContent += "\n"
+				}
+				msg.ReasoningContent += part.Text
+			} else {
+				if msg.Content != "" {
+					msg.Content += "\n"
+				}
+				msg.Content += part.Text
 			}
-			msg.Content += part.Text
 		}
 		if part.FunctionCall != nil {
 			hasToolCalls = true
 			// Google has no per-call ID; use the function name as the ID so the
 			// executor's tool-result correlation has a stable identifier (it is
-			// echoed back as the functionResponse name on the next turn).
+			// echoed back as the functionResponse name on the next turn). A
+			// Gemini 3 thought signature rides behind the name (see
+			// googleThoughtSigSep) so it survives to the next request.
 			msg.ToolCalls = append(msg.ToolCalls, ToolCall{
-				ID:    part.FunctionCall.Name,
+				ID:    googleThoughtSignatureID(part.FunctionCall.Name, part.ThoughtSignature),
 				Name:  part.FunctionCall.Name,
 				Input: part.FunctionCall.Args,
 			})
@@ -454,6 +581,7 @@ func parseGoogleResponse(model string, resp *googleGenerateResponse, rawBody []b
 	return &ChatResponse{
 		Model:      model,
 		Message:    msg,
+		Reasoning:  msg.ReasoningContent,
 		StopReason: mapGoogleFinishReason(candidate.FinishReason, hasToolCalls),
 		Usage:      usage,
 	}, nil

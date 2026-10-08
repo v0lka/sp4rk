@@ -3,6 +3,7 @@ package skills
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 
 	"github.com/v0lka/sp4rk/safeio"
@@ -91,11 +92,16 @@ func (t *ReadSkillResourceTool) Execute(ctx context.Context, input json.RawMessa
 	}
 
 	// Read the file. safeio.ReadFile refuses a non-regular path (a FIFO or
-	// device planted inside a skill directory) without blocking the open.
+	// device planted inside a skill directory) without blocking the open, and
+	// refuses a file larger than its read cap instead of slurping it into
+	// memory.
 	data, err := safeio.ReadFile(absPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return sdktools.ErrorResult("resource %q not found in skill %q", parsed.Path, parsed.Skill), nil
+		}
+		if errors.Is(err, safeio.ErrTooLarge) {
+			return sdktools.ErrorResult("resource %q in skill %q exceeds the %d byte read limit", parsed.Path, parsed.Skill, safeio.DefaultMaxFileSize), nil
 		}
 		return sdktools.ErrorResult("failed to read resource: %v", err), nil
 	}

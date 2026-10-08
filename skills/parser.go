@@ -29,7 +29,8 @@ func (e *ParseError) Error() string {
 // dirPath is the absolute path to the skill directory (used for DirPath and name validation).
 func ParseSkill(skillMDPath, dirPath string) (*Skill, error) {
 	// safeio.ReadFile refuses a non-regular SKILL.md (a FIFO planted under
-	// <workspace>/.agents/skills/<name>/) without blocking the open.
+	// <workspace>/.agents/skills/<name>/) without blocking the open, and
+	// refuses an oversized SKILL.md instead of reading it into memory.
 	data, err := safeio.ReadFile(skillMDPath)
 	if err != nil {
 		return nil, fmt.Errorf("read SKILL.md: %w", err)

@@ -2,7 +2,6 @@ package llm
 
 import (
 	"encoding/json"
-	"reflect"
 	"sort"
 )
 
@@ -126,159 +125,282 @@ func resolveRef(schema, defs map[string]any) map[string]any {
 	return cp
 }
 
-// resolveRefRecursive replaces $ref with the referenced definition and recurses
-// to resolve any nested $ref chains within the resolved definition itself.
-func resolveRefRecursive(schema, defs map[string]any) map[string]any {
-	return resolveRefRecursiveWithVisited(schema, defs, nil)
+// maxSchemaExpansionNodes caps the expansion weight a single sanitization may
+// spend while inlining $ref definitions (see refExpander.charge). A malicious
+// or compromised MCP server can hand a tool schema whose $defs graph is a
+// deep "diamond" chain — every definition referenced by two sibling
+// properties, each sibling inlining it independently. Naive per-site
+// expansion turns ~2 KB of input into millions of materialized nodes and
+// gigabytes of allocations (OOM or effective hang) on every request build and
+// token estimate. Two defenses combine here:
+//
+//   - Memoization: every definition is fully expanded at most once per
+//     document (refExpander.memo) and spliced by reference at reuse sites, so
+//     an acyclic diamond DAG costs linear work instead of exponential.
+//   - The weight budget: a reuse site is charged the FULL weight of the
+//     spliced subtree — shared subtrees still serialize once per occurrence —
+//     so the output size of any schema, diamond or not, is bounded.
+//     Exceeding the budget fail-closes the offending $ref to
+//     safeFallbackSchema.
+//
+// 50,000 weight units (1 per object node and array element, 1 per 64 bytes
+// of string content) sits orders of magnitude above any legitimate tool
+// schema while capping the worst case at a couple of megabytes and
+// milliseconds.
+const maxSchemaExpansionNodes = 50_000
+
+// refExpansion is a fully inlined definition: schema contains no unresolved
+// $ref anywhere; names is every definition name transitively inlined inside
+// it (including the definition itself); breaks is the subset of those names
+// that sat on the ancestor path the expansion was computed with — exactly the
+// references that were cycle-broken into the safe fallback; and nodes is the
+// expansion's charged weight, splice multiplicity included.
+//
+// (names, breaks) make a memo entry safe to REUSE across contexts: an
+// expansion computed under ancestor path A is reproduced verbatim at a site
+// whose path is B precisely when A and B intersect the expansion's reachable
+// names in the same set — see refExpander.canSplice.
+type refExpansion struct {
+	schema map[string]any
+	names  map[string]struct{}
+	breaks map[string]struct{}
+	nodes  int
 }
 
-// resolveRefRecursiveWithVisited is the internal implementation that tracks
-// visited definition names to detect and break cycles.
-//
-// Cycle detection: when a schema is a $ref, the target definition name is
-// recorded on a private copy of the visited set before descending into the
-// resolved content. This serves two purposes:
-//   - A self-referential schema (e.g. a tree node whose "children" items
-//     reference the same definition) terminates with a safe fallback instead
-//     of recursing forever. Without this, the visited set is never populated
-//     because the resolved definition is a full object (not a bare $ref), so
-//     the chain-detection loop below never runs.
-//   - Sibling properties do not pollute each other's visited sets: each $ref
-//     resolution copies the ancestor set, so one sibling's resolution cannot
-//     cause a false cycle in another sibling.
-func resolveRefRecursiveWithVisited(schema, defs map[string]any, visited map[string]struct{}) map[string]any {
-	// Record the current $ref target on a copy of the visited set so that
-	// nested back-references to the same definition are detected as cycles.
-	if ref, ok := schema["$ref"].(string); ok && defs != nil {
-		if parts := splitRefPath(ref); len(parts) > 0 {
-			name := parts[len(parts)-1]
-			if visited == nil {
-				visited = make(map[string]struct{})
+// refExpander inlines $ref references against one document's $defs /
+// definitions table. One expander is created per resolveRefRecursive call,
+// which the sanitizers invoke once at the document root, so the memo and the
+// weight budget cover the whole document.
+type refExpander struct {
+	defs  map[string]any
+	memo  map[string]refExpansion
+	names map[string]struct{} // reachable names of the expansion being built
+	nodes int                 // weight charged so far, capped by maxSchemaExpansionNodes
+}
+
+// resolveRefRecursive replaces $ref with the referenced definition and
+// recursively inlines every nested $ref inside the resolved content, breaking
+// reference cycles with safeFallbackSchema and bounding the total expansion
+// with maxSchemaExpansionNodes (fail-closed). A definition referenced several
+// times is expanded once and spliced at every reuse site, so a diamond-shaped
+// $defs graph inlines in linear time — producing exactly the fully inlined
+// schema the naive per-site expansion would — until the weight budget
+// fail-closes the offending references.
+func resolveRefRecursive(schema, defs map[string]any) map[string]any {
+	e := &refExpander{defs: defs}
+	return e.resolveDocument(schema)
+}
+
+// resolveDocument inlines a whole document: the definition table is consumed
+// through e.defs and must never be inlined into the walk — cloning it would
+// re-expand every definition in place (doubling the work and draining the
+// budget on unreferenced entries) for keys the sanitizers filter from the
+// result anyway. A root that is itself a $ref keeps the table: the reference
+// branch replaces the whole map, table included, exactly as the shallow
+// resolver always did.
+func (e *refExpander) resolveDocument(schema map[string]any) map[string]any {
+	if _, ok := schema["$ref"]; !ok {
+		for _, key := range []string{"$defs", "definitions"} {
+			if _, has := schema[key]; has {
+				cp := make(map[string]any, len(schema)-1)
+				for k, v := range schema {
+					if k == "$defs" || k == "definitions" {
+						continue
+					}
+					cp[k] = v
+				}
+				schema = cp
+				break
 			}
-			if _, seen := visited[name]; seen {
-				return safeFallbackSchema()
-			}
-			visited = copyVisitedSet(visited)
-			visited[name] = struct{}{}
 		}
 	}
+	return e.cloneSchema(schema, nil)
+}
 
-	resolved := resolveRef(schema, defs)
-
-	// Re-resolve if the resolved schema is itself just another $ref chain.
-	// Track visited definition names to break cycles (e.g. A→B→C→A).
-	if visited == nil {
-		visited = make(map[string]struct{})
+// cloneSchema inlines schema into the expansion output. A map carrying a
+// resolvable "$ref" is not copied but REPLACED with the referenced
+// definition's inlined expansion (sibling keys of the $ref site are dropped,
+// exactly as the shallow resolveRef always did); anything else is rebuilt key
+// by key through cloneValue, so an expansion owns its whole tree and its
+// charged weight reflects its true output size.
+func (e *refExpander) cloneSchema(schema map[string]any, visited map[string]struct{}) map[string]any {
+	if schema == nil {
+		return nil
 	}
-	for {
-		ref, ok := resolved["$ref"].(string)
-		if !ok {
-			break
-		}
+	if ref, ok := schema["$ref"].(string); ok && e.defs != nil {
 		parts := splitRefPath(ref)
 		if len(parts) == 0 {
-			break
+			// Unparseable reference path ("#", an external URL): the naive
+			// resolver fail-closed to the safe fallback schema.
+			return e.fallbackCharged()
 		}
-		name := parts[len(parts)-1]
-		if _, seen := visited[name]; seen {
-			// Cycle detected: the resolved definition points back to
-			// an already-visited name. Return a safe fallback schema
-			// instead of the bare $ref (which would be filtered to
-			// an empty map by callers).
-			return safeFallbackSchema()
+		return e.resolveRefName(parts[len(parts)-1], visited)
+	}
+	cp := make(map[string]any, len(schema))
+	e.charge(1)
+	for key, val := range schema {
+		cp[key] = e.cloneValue(val, visited)
+	}
+	return cp
+}
+
+// cloneValue rebuilds a schema value, charging the budget per node: objects
+// count 1, arrays 1 per element plus 1, string content 1 per 64 bytes.
+func (e *refExpander) cloneValue(v any, visited map[string]struct{}) any {
+	switch t := v.(type) {
+	case map[string]any:
+		return e.cloneSchema(t, visited)
+	case []any:
+		e.charge(1 + len(t))
+		cp := make([]any, len(t))
+		for i, item := range t {
+			cp[i] = e.cloneValue(item, visited)
 		}
-		visited[name] = struct{}{}
-		next := resolveRef(resolved, defs)
-		if reflect.DeepEqual(next, resolved) {
-			// No progress; self-reference or already fully resolved.
-			// If the result is still just a bare $ref with no useful
-			// content, return a safe fallback.
-			if _, stillRef := resolved["$ref"]; stillRef && len(resolved) == 1 {
-				return safeFallbackSchema()
-			}
-			break
+		return cp
+	case string:
+		e.charge((len(t) + 63) / 64)
+		return t
+	default:
+		e.charge(1)
+		return v
+	}
+}
+
+// resolveRefName inlines the definition addressed by a "$ref" path's final
+// segment. A back-reference to a definition on the current ancestor path
+// (visited) is a cycle and fails closed; a memoized, path-independent
+// expansion is spliced; anything else starts a fresh expansion. The three
+// outcomes mirror the naive resolver's — full definition, cycle-broken
+// fallback — with the memo in front.
+func (e *refExpander) resolveRefName(name string, visited map[string]struct{}) map[string]any {
+	if _, seen := visited[name]; seen {
+		return e.fallbackCharged()
+	}
+	if exp, ok := e.memo[name]; ok && e.canSplice(exp, visited) {
+		// Memoized splice, provably exact: the expansion cycle-broke its
+		// internal references to exactly exp.breaks, and the ancestor path
+		// reaching this site would break the same set and nothing else —
+		// so the expansion is independent of the path that reached here.
+		e.recordNames(exp.names)
+		if !e.charge(exp.nodes) {
+			return e.fallbackCharged()
 		}
-		resolved = next
+		return exp.schema
+	}
+	if e.nodes >= maxSchemaExpansionNodes {
+		// Budget exhausted: fail closed instead of starting another expansion.
+		return e.fallbackCharged()
+	}
+	visited = copyVisitedSet(visited)
+	visited[name] = struct{}{}
+	return e.expandDefinition(name, visited)
+}
+
+// expandDefinition fully inlines the definition `name`, whose target has
+// already been added to visited on the caller's private copy. The body is
+// rebuilt through cloneSchema/cloneValue, so nested refs recurse via
+// resolveRefName and memoized subtrees splice rather than recompute. The
+// finished expansion is memoized (first computation wins) together with its
+// reachable-name set and the cycle breaks its ancestor path forced: those two
+// sets are what let canSplice decide, at any later reuse site, whether the
+// cached tree is exactly what a fresh expansion under that site's own path
+// would produce. When it is not, the site re-expands under its own context —
+// bounded, like everything else, by the weight budget.
+func (e *refExpander) expandDefinition(name string, visited map[string]struct{}) map[string]any {
+	savedNames := e.names
+	savedNodes := e.nodes
+	e.names = make(map[string]struct{})
+	e.names[name] = struct{}{}
+
+	var resolved map[string]any
+	if defMap, ok := e.defs[name].(map[string]any); ok {
+		resolved = e.cloneSchema(defMap, visited)
+	} else {
+		// Missing target or a non-object definition (JSON Schema allows
+		// boolean schemas): the naive resolver's safe fallback.
+		resolved = e.fallbackCharged()
 	}
 
-	// Recursively process individual property values (not the container itself).
-	if props, ok := resolved["properties"].(map[string]any); ok {
-		newProps := make(map[string]any, len(props))
-		changed := false
-		for propName, propVal := range props {
-			if propMap, ok := propVal.(map[string]any); ok {
-				newProps[propName] = resolveRefRecursiveWithVisited(propMap, defs, visited)
-				changed = true
-			} else {
-				newProps[propName] = propVal
-			}
-		}
-		if changed {
-			resolved = copyMap(resolved)
-			resolved["properties"] = newProps
+	names := e.names
+	e.names = savedNames
+	if savedNames != nil {
+		// Merge this expansion's reachable names into the parent's recorder,
+		// so a memoized parent lists every name its tree transitively inlines.
+		for n := range names {
+			savedNames[n] = struct{}{}
 		}
 	}
-
-	// Recursively process items (both object and tuple form).
-	if items, ok := resolved["items"]; ok {
-		switch v := items.(type) {
-		case map[string]any:
-			resolved = copyMap(resolved)
-			resolved["items"] = resolveRefRecursiveWithVisited(v, defs, visited)
-		case []any:
-			newItems := make([]any, len(v))
-			changed := false
-			for i, item := range v {
-				if itemMap, ok := item.(map[string]any); ok {
-					newItems[i] = resolveRefRecursiveWithVisited(itemMap, defs, visited)
-					changed = true
-				} else {
-					newItems[i] = item
-				}
-			}
-			if changed {
-				resolved = copyMap(resolved)
-				resolved["items"] = newItems
+	if _, ok := e.memo[name]; !ok {
+		// First expansion of this definition: record it as the canonical
+		// entry, annotated with the breaks its ancestor path forced.
+		breaks := make(map[string]struct{})
+		for n := range visited {
+			if _, inTree := names[n]; inTree {
+				breaks[n] = struct{}{}
 			}
 		}
-	}
-
-	// Recursively process additionalProperties if it's a schema object.
-	if addProps, ok := resolved["additionalProperties"].(map[string]any); ok {
-		resolved = copyMap(resolved)
-		resolved["additionalProperties"] = resolveRefRecursiveWithVisited(addProps, defs, visited)
-	}
-
-	// Recursively process composition keywords.
-	for _, key := range []string{"anyOf", "oneOf", "allOf"} {
-		if arr, ok := resolved[key].([]any); ok {
-			newArr := make([]any, len(arr))
-			changed := false
-			for i, item := range arr {
-				if itemMap, ok := item.(map[string]any); ok {
-					newArr[i] = resolveRefRecursiveWithVisited(itemMap, defs, visited)
-					changed = true
-				} else {
-					newArr[i] = item
-				}
-			}
-			if changed {
-				resolved = copyMap(resolved)
-				resolved[key] = newArr
-			}
+		if e.memo == nil {
+			e.memo = make(map[string]refExpansion)
+		}
+		e.memo[name] = refExpansion{
+			schema: resolved,
+			names:  names,
+			breaks: breaks,
+			nodes:  e.nodes - savedNodes,
 		}
 	}
-
 	return resolved
 }
 
-// copyMap creates a shallow copy of a map.
-func copyMap(m map[string]any) map[string]any {
-	cp := make(map[string]any, len(m))
-	for k, v := range m {
-		cp[k] = v
+// charge adds n to the expansion weight and reports whether the document is
+// still within maxSchemaExpansionNodes. The counter keeps growing past the
+// budget so later decisions see the overrun; ref-resolution sites consult the
+// return value (or the counter directly) to fail closed.
+func (e *refExpander) charge(n int) bool {
+	e.nodes += n
+	return e.nodes <= maxSchemaExpansionNodes
+}
+
+// fallbackCharged returns a fresh safeFallbackSchema — the fail-closed
+// replacement for a reference that cannot be inlined (cycle, missing target,
+// non-object definition, budget exhaustion) — and charges its weight. Fresh
+// per call: sharing one instance would alias a single map into every
+// fallback site of the output.
+func (e *refExpander) fallbackCharged() map[string]any {
+	e.charge(4)
+	return safeFallbackSchema()
+}
+
+// recordNames unions names into the recorder of the expansion currently being
+// built, so its memo entry lists every name its tree transitively inlines.
+func (e *refExpander) recordNames(names map[string]struct{}) {
+	if e.names == nil {
+		e.names = make(map[string]struct{}, len(names))
 	}
-	return cp
+	for n := range names {
+		e.names[n] = struct{}{}
+	}
+}
+
+// canSplice reports whether the memoized expansion exp may be spliced
+// verbatim at a site whose ancestor path is visited. The expansion broke its
+// internal references to exactly exp.breaks; the splice is exact when the
+// site's own path intersects the expansion's reachable names in that same
+// set — no name the expansion inlined would now have to break, and no break
+// the expansion made would now be skipped. Structural induction over the
+// expansion tree: with equal break sets, every subtree recursion sees the
+// same context, so the two expansions coincide.
+func (e *refExpander) canSplice(exp refExpansion, visited map[string]struct{}) bool {
+	matched := 0
+	for n := range visited {
+		if _, inTree := exp.names[n]; inTree {
+			if _, broken := exp.breaks[n]; !broken {
+				return false
+			}
+			matched++
+		}
+	}
+	return matched == len(exp.breaks)
 }
 
 // copyVisitedSet returns a shallow copy of a cycle-detection visited set.

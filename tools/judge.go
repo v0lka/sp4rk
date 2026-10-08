@@ -544,10 +544,19 @@ func (j *ToolJudge) Judge(ctx context.Context, toolName string, input json.RawMe
 		return VerdictConfirm, "Judge provider unavailable; requiring manual confirmation for safety", nil
 	}
 
-	// Build LLM request
-	inputStr := string(input)
+	// Build LLM request. The task context and the tool input are untrusted
+	// data — the task may quote fetched content and the input may carry
+	// attacker-influenced argument values — so both are wrapped in a security
+	// untrusted-content boundary (see [security.WrapUntrustedContent],
+	// mirroring [ToolJudge.JudgeStrict]'s tool_input envelope): a hostile
+	// value cannot close the boundary early (tag breakouts are neutralized)
+	// and instruction-like text inside it is data, never policy. The "Tool:"
+	// line and the block labels stay outside the boundaries: they are
+	// SDK-authored prompt structure.
+	inputStr := security.WrapUntrustedContent(string(input), "tool_input", nil)
+	taskStr := security.WrapUntrustedContent(taskContext, "task", nil)
 
-	userPrompt := "Task: " + taskContext + "\n\nTool: " + toolName + "\n\nInput: " + inputStr
+	userPrompt := "Task: " + taskStr + "\n\nTool: " + toolName + "\n\nInput: " + inputStr
 
 	// Append compact environment context for safety reasoning.
 	if envBlock := FormatCompactEnvBlock(EnvInfoFrom(ctx)); envBlock != "" {
@@ -882,6 +891,66 @@ func HasRelativeEscape(s string) bool {
 	return parentRefRe.MatchString(s)
 }
 
+// windowsBackslashPathRe matches the Windows path spellings that pathRegex
+// deliberately does not cover: backslash-only forms with no drive letter and
+// no forward slash. Three alternatives, mirroring the recognizers
+// [shellIsWindowsAbsPath] and [looksLikePath] use:
+//
+//   - UNC: `\\server\share\…` — the server component must not begin with "."
+//     or "?", so the `\\.\device` and `\\?\verbatim` namespaces are not
+//     matched (the latter keeps its literal-path meaning and its
+//     drive-absolute interior is still extracted by pathRegex).
+//   - Root-relative: `\Windows\System32` — at least two backslash-separated
+//     components, the first at least two characters long. The length floors
+//     keep the escape sequences that survive JSON decoding (`\n`, `\t`,
+//     `\.`) from reading as path components: their components are a single
+//     character. Single-component forms (`\Windows`) stay unmatched for the
+//     same reason — a residual, fail-open gap only for spellings that also
+//     carry no second component.
+//   - Drive-relative: `C:Windows\System32` — a component character directly
+//     after the colon, so drive-absolute `C:\…` (already covered by
+//     pathRegex) is never re-matched by this alternative.
+var windowsBackslashPathRe = regexp.MustCompile(
+	`\\\\[A-Za-z0-9_\-][A-Za-z0-9_.\-]*[\\/][A-Za-z0-9\\/_.\-~]*` +
+		`|\\[A-Za-z0-9_.\-~][A-Za-z0-9_.\-~]+(?:\\[A-Za-z0-9_.\-~]+)+` +
+		`|[A-Za-z]:[A-Za-z0-9_.\-~][A-Za-z0-9_.\-~]*(?:\\[A-Za-z0-9_.\-~]+)+`)
+
+// hasUnextractedWindowsPath reports whether s carries a backslash-only
+// Windows path spelling that [ExtractPaths] cannot extract (see
+// [windowsBackslashPathRe]). It is the fail-closed counterpart to
+// ExtractPaths for that spelling class, in the same role [HasRelativeEscape]
+// plays for relative ".." escapes: without it, a mixed tool input could hide
+// an out-of-root backslash target behind an in-root path, and
+// [AllPathsInSessionRoots] would auto-approve the call without ever seeing
+// the hidden target.
+//
+// A match is skipped when its first byte is preceded by a path-component
+// character — the same relative-path heuristic ExtractPaths applies to the
+// POSIX alternative, so prose and code that merely mention backslash paths
+// inside a larger word (`src\lib\util`, `a\n`) do not trigger the check — or
+// by a drive colon, because a backslash directly after "X:" is the
+// drive-absolute form pathRegex already extracts. Non-Windows hosts fail
+// closed for these spellings too: on them a backslash-only token is an
+// ordinary relative name whose resolution stays inside the workspace, so the
+// extra escalation is safe, and the recognizer must not depend on the host
+// OS to stay correct on every host.
+func hasUnextractedWindowsPath(s string) bool {
+	for _, m := range windowsBackslashPathRe.FindAllStringIndex(s, -1) {
+		if m[0] > 0 {
+			switch prev := s[m[0]-1]; {
+			case prev == ':':
+				// The drive-absolute separator ("C:\…") — already extracted.
+				continue
+			case isPathComponentChar(prev):
+				// Relative-path heuristic: the separator is inside a word.
+				continue
+			}
+		}
+		return true
+	}
+	return false
+}
+
 // AllPathsInDir returns true if the JSON input contains at least one absolute
 // path and every such path is within the specified directory. Containment
 // respects the session case-sensitivity flag (see [CaseInsensitivePathsFrom]):
@@ -901,6 +970,9 @@ func AllPathsInDir(ctx context.Context, input json.RawMessage, dir string) bool 
 	for _, s := range strValues {
 		if HasRelativeEscape(s) {
 			return false // relative ".." escape cannot be assessed — fail closed.
+		}
+		if hasUnextractedWindowsPath(s) {
+			return false // backslash-only Windows spelling cannot be assessed — fail closed.
 		}
 		allPaths = append(allPaths, ExtractPaths(s)...)
 	}
@@ -948,7 +1020,7 @@ func pathInAnyRoot(ctx context.Context, absPath string, roots []string) bool {
 // roots (workspace, temp directory, and any additional allowed roots). This
 // is the canonical path-containment check consulted by the judge fast-path.
 //
-// Harmless special-device paths (/dev/null, /dev/full; NUL on Windows) are
+// Harmless special-device paths (/dev/null; NUL on Windows) are
 // excluded from the check via [IsHarmlessDevicePath] so they do not force a
 // confirmation when they appear alongside in-root paths.
 func AllPathsInSessionRoots(ctx context.Context, input json.RawMessage) bool {
@@ -967,6 +1039,9 @@ func AllPathsInSessionRoots(ctx context.Context, input json.RawMessage) bool {
 	for _, s := range strValues {
 		if HasRelativeEscape(s) {
 			return false // relative ".." escape cannot be assessed — fail closed.
+		}
+		if hasUnextractedWindowsPath(s) {
+			return false // backslash-only Windows spelling cannot be assessed — fail closed.
 		}
 		allPaths = append(allPaths, ExtractPaths(s)...)
 	}

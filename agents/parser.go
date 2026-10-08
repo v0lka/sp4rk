@@ -30,7 +30,8 @@ func (e *ParseError) Error() string {
 // agent directory (used for DirPath and to validate that name == dir name).
 func ParseAgent(agentMDPath, dirPath string) (*Agent, error) {
 	// safeio.ReadFile refuses a non-regular AGENT.md (a FIFO planted under
-	// <workspace>/.agents/agents/<name>/) without blocking the open.
+	// <workspace>/.agents/agents/<name>/) without blocking the open, and
+	// refuses an oversized AGENT.md instead of reading it into memory.
 	data, err := safeio.ReadFile(agentMDPath)
 	if err != nil {
 		return nil, fmt.Errorf("read AGENT.md: %w", err)

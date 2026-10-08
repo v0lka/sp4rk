@@ -192,6 +192,20 @@ func (c *Conductor) SetReasoningEffort(effort string) {
 	c.cfg.ReasoningEffort = effort
 }
 
+// SetModel overrides the model whose metadata the Conductor resolves for the
+// system prompt and the context window (ConductorConfig.Model). Use it when
+// the model serving the calls is chosen (or switched) after construction —
+// e.g. a TaskBuilder that switches the router to a dedicated execution model
+// before running plan steps: the per-step context budget (window, output
+// reserve, tokenizer) must be sized against that execution model, not the
+// framework's construction-time default. Safe to call concurrently with Run;
+// Run snapshots the value under the same lock.
+func (c *Conductor) SetModel(model string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cfg.Model = model
+}
+
 // Run launches the Conductor: a single Executor.Run that owns the task.
 // The caller is responsible for injecting Conductor-specific context values
 // (DelegationRegistry, DelegationLauncher, PlanPublisher, ReflectionRunner,
@@ -231,9 +245,15 @@ func (c *Conductor) Run(
 	// OutputLimit=4096) is always usable. Using the fallback when ok=false is
 	// critical: a zero ContextWindow disables compaction entirely, causing the
 	// conversation to grow unbounded until the API rejects it.
+	//
+	// cfg.Model is snapshotted under the lock because SetModel may update it
+	// concurrently with Run.
+	c.mu.RLock()
+	model := c.cfg.Model
+	c.mu.RUnlock()
 	var modelMeta llm.ModelMetadata
 	if c.cfg.ModelRegistry != nil {
-		modelMeta, _ = c.cfg.ModelRegistry.Resolve(ctx, c.cfg.Model)
+		modelMeta, _ = c.cfg.ModelRegistry.Resolve(ctx, model)
 	}
 	if modelMeta.ContextWindow == 0 {
 		modelMeta.ContextWindow = 128000
@@ -311,13 +331,11 @@ func (c *Conductor) Run(
 
 	// Build the executor caller: wire context tracker correction if the
 	// context manager exposes one (TrackerProvider) and the caller supports
-	// tracker injection.
+	// tracker injection (llm.TrackerInjector — e.g. *llm.TrackingCaller).
 	caller := c.cfg.LLM
 	if ctm, ok := cm.(TrackerProvider); ok {
-		if tc, ok2 := caller.(interface {
-			WithContextTracker(*llm.ContextTokenTracker) agent.LLMCaller
-		}); ok2 {
-			caller = tc.WithContextTracker(ctm.ContextTracker())
+		if ti, ok2 := caller.(llm.TrackerInjector); ok2 {
+			caller = ti.WithContextTracker(ctm.ContextTracker())
 		}
 	}
 

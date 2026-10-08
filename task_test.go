@@ -5,9 +5,15 @@ import (
 	"errors"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/v0lka/sp4rk/agent"
+	"github.com/v0lka/sp4rk/agent/reflector"
+	"github.com/v0lka/sp4rk/llm"
 	"github.com/v0lka/sp4rk/orchestration"
+	"github.com/v0lka/sp4rk/planner"
 )
 
 func TestTaskExecuteWithoutSystem(t *testing.T) {
@@ -331,5 +337,238 @@ func TestFramework_NewBlackboard_NoCheckpointer(t *testing.T) {
 	shutdown() // must be a safe no-op
 	if _, ok := bb.(*orchestration.MapBlackboard); !ok {
 		t.Fatalf("newBlackboard without Checkpointer = %T, want *MapBlackboard", bb)
+	}
+}
+
+// --- Fakes for the runPlanned replan tests ---
+
+// scriptedCaller is an agent.LLMCaller returning canned responses in
+// sequence, repeating the last one; with err set every call fails.
+type scriptedCaller struct {
+	mu    sync.Mutex
+	resp  []*llm.ChatResponse
+	calls int
+	err   error
+}
+
+func (s *scriptedCaller) Call(_ context.Context, _ llm.ChatRequest) (*llm.ChatResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	if s.err != nil {
+		return nil, s.err
+	}
+	if len(s.resp) == 0 {
+		return nil, errors.New("scriptedCaller: no canned responses")
+	}
+	i := s.calls - 1
+	if i >= len(s.resp) {
+		i = len(s.resp) - 1
+	}
+	return s.resp[i], nil
+}
+
+func (s *scriptedCaller) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+// replanEventsRecorder counts OnReplanFailed fires, delegating everything
+// else to NoopEvents.
+type replanEventsRecorder struct {
+	*orchestration.NoopEvents
+	replanFailed atomic.Int32
+}
+
+func (e *replanEventsRecorder) OnReplanFailed(_ error) { e.replanFailed.Add(1) }
+
+// noopContextManager is a minimal agent.ContextManager for conductor-based
+// tests that never reach real prompt building.
+type noopContextManager struct{}
+
+func (noopContextManager) BuildPrompt() []llm.Message {
+	return []llm.Message{{Role: "system", Content: "sys"}}
+}
+func (noopContextManager) AddStep(agent.Step)                              {}
+func (noopContextManager) Compact(context.Context) *agent.CompactionResult { return nil }
+func (noopContextManager) SetStrategy(agent.CompactionStrategy)            {}
+func (noopContextManager) CheckFill() agent.FillCheck {
+	return agent.FillCheck{Percent: 1, Status: "ok", Used: 1, Max: 100000}
+}
+func (noopContextManager) CorrectTokenCount(int)                       {}
+func (noopContextManager) FillPercent() float64                        { return 1 }
+func (noopContextManager) AvailableTokens() int                        { return 100000 }
+func (noopContextManager) OutputLimit() int                            { return 4096 }
+func (noopContextManager) VulnerableOutputs() []agent.VulnerableOutput { return nil }
+
+// newReplanTestBuilder assembles a TaskBuilder wired to scripted planner and
+// reflector callers plus a conductor whose step-execution caller always
+// fails — the deterministic stand-in for a step the LLM cannot complete. It
+// returns the planner and reflector callers so tests can assert call counts.
+func newReplanTestBuilder(t *testing.T, b *TaskBuilder, planResp, reflectResps []string) (planCaller, reflectCaller *scriptedCaller) {
+	t.Helper()
+
+	toResponses := func(bodies []string) []*llm.ChatResponse {
+		out := make([]*llm.ChatResponse, len(bodies))
+		for i, body := range bodies {
+			out[i] = &llm.ChatResponse{
+				Message:    llm.Message{Role: "assistant", Content: body},
+				StopReason: "end_turn",
+			}
+		}
+		return out
+	}
+
+	planCaller = &scriptedCaller{resp: toResponses(planResp)}
+	plCfg := planner.DefaultConfig()
+	plCfg.Model = "test-model"
+	pl, err := planner.NewPlanner(planCaller, plCfg)
+	if err != nil {
+		t.Fatalf("planner.NewPlanner: %v", err)
+	}
+	reflectCaller = &scriptedCaller{resp: toResponses(reflectResps)}
+	rf := reflector.New(reflectCaller, reflector.Config{SystemPrompt: "analyze failures"})
+
+	b.Planner(pl).Reflector(rf).Events(&replanEventsRecorder{NoopEvents: &orchestration.NoopEvents{}})
+	return planCaller, reflectCaller
+}
+
+const replanTestPlanS1 = `{"steps":[{"id":"s1","summary":"s","description":"do s1","depends_on":[]}]}`
+const replanTestPlanS1R = `{"steps":[{"id":"s1r","summary":"s","description":"do s1 again","depends_on":[]}]}`
+const replanTestReflectionReplan = `{"summary":"broken","root_cause":"plan flawed","suggested_action":"replan","action_plan":"re-derive"}`
+const replanTestReflectionRetry = `{"summary":"broken","root_cause":"transient","suggested_action":"retry"}`
+
+// TestTaskReplanBudgetExhaustionStopsLoop is the regression test for the
+// unbounded replan loop: a deterministically failing step whose reflector
+// always answers "replan" used to cycle fail→re-plan→fail forever (each pass
+// leaving the step un-completed so FindReadySteps re-selected it), hanging
+// Execute and burning LLM budget. The replan budget must cap the adopted
+// replans and terminate with a partial result.
+func TestTaskReplanBudgetExhaustionStopsLoop(t *testing.T) {
+	fw := testFramework(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	b := fw.TaskF(ctx, "impossible task").System("sys")
+	// Plan on call 1; every Replan on calls 2+ re-derives the (renamed)
+	// single-step plan. The reflector always recommends "replan".
+	planCaller, reflectCaller := newReplanTestBuilder(t, b,
+		[]string{replanTestPlanS1, replanTestPlanS1R},
+		[]string{replanTestReflectionReplan},
+	)
+
+	// The step-execution caller always fails: every conductor.Run errors on
+	// its first attempt, driving the reflect→replan cycle.
+	conductor := orchestration.NewConductor(orchestration.ConductorConfig{
+		LLM: &scriptedCaller{err: errors.New("exec backend down")},
+		ContextFactory: func(_ string, _ llm.ModelMetadata, _ string, _ ...orchestration.PruningOverride) agent.ContextManager {
+			return noopContextManager{}
+		},
+		SystemPrompt: func(_ context.Context, _ string, _ llm.ModelMetadata) string { return "sys" },
+		MaxSteps:     5,
+	})
+
+	// Default budget: 3 adopted replans. Each adopted pass proposes one more
+	// replan, so the planner is called 5 times (1 Plan + 4 Replans: 3 adopted
+	// + 1 proposed after the budget was exhausted and refused), and the
+	// refusal is reported via OnReplanFailed.
+	res, execErr := b.runPlanned(ctx, conductor, orchestration.NewMapBlackboard(), nil)
+
+	if !errors.Is(execErr, orchestration.ErrExecutionIncomplete) {
+		t.Errorf("execErr = %v, want ErrExecutionIncomplete (replan budget must end in a partial result)", execErr)
+	}
+	if res == nil || res.Status != orchestration.ExecutionStatusPartial {
+		t.Errorf("Status = %v, want %v", res, orchestration.ExecutionStatusPartial)
+	}
+	// The old unbounded loop would keep replanning until the context deadline
+	// and blow far past this count.
+	if got := planCaller.callCount(); got != 5 {
+		t.Errorf("planner calls = %d, want 5 (1 Plan + 3 adopted Replans + 1 refused Replan)", got)
+	}
+	if got := reflectCaller.callCount(); got != 4 {
+		t.Errorf("reflector calls = %d, want 4 (one per DAG pass)", got)
+	}
+	if rec, ok := b.events.(*replanEventsRecorder); !ok || rec.replanFailed.Load() != 1 {
+		t.Errorf("OnReplanFailed fired %v times, want exactly 1 (budget refusal)", b.events)
+	}
+}
+
+// TestTaskReplanKeepsCompletedMapNonNil is the regression test for the nil
+// completed map: a replan whose new plan preserves no completed step made
+// BuildCarryForward return nil, and the next runStep write to completed
+// panicked ("assignment to entry in nil map"). Here the first pass fails and
+// replans to a renamed step; the second pass then exhausts its retries and
+// records the failure — which must be a clean failed status, not a panic.
+func TestTaskReplanKeepsCompletedMapNonNil(t *testing.T) {
+	fw := testFramework(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	b := fw.TaskF(ctx, "flaky plan").System("sys")
+	// Reflect #1 recommends replan (adopting a renamed plan that preserves no
+	// completed step); later reflections recommend retry so pass 2 exhausts
+	// its retry budget and records the step failure.
+	_, _ = newReplanTestBuilder(t, b,
+		[]string{replanTestPlanS1, replanTestPlanS1R},
+		[]string{replanTestReflectionReplan, replanTestReflectionRetry, replanTestReflectionRetry},
+	)
+
+	conductor := orchestration.NewConductor(orchestration.ConductorConfig{
+		LLM: &scriptedCaller{err: errors.New("exec backend down")},
+		ContextFactory: func(_ string, _ llm.ModelMetadata, _ string, _ ...orchestration.PruningOverride) agent.ContextManager {
+			return noopContextManager{}
+		},
+		SystemPrompt: func(_ context.Context, _ string, _ llm.ModelMetadata) string { return "sys" },
+		MaxSteps:     5,
+	})
+
+	res, execErr := b.runPlanned(ctx, conductor, orchestration.NewMapBlackboard(), nil)
+
+	// Without the non-nil guard this write path panicked before returning.
+	if res == nil || res.Status != orchestration.ExecutionStatusFailed {
+		t.Errorf("Status = %v, want %v", res, orchestration.ExecutionStatusFailed)
+	}
+	if execErr != nil {
+		t.Errorf("execErr = %v, want nil (a failed step is a status, not an error)", execErr)
+	}
+	if res.FailedSteps != 1 {
+		t.Errorf("FailedSteps = %d, want 1", res.FailedSteps)
+	}
+}
+
+// TestResolvePlannerWiresFrameworkRegistry proves the default planner built
+// by TaskBuilder.resolvePlanner carries the framework tool registry, so the
+// replan prompt's AVAILABLE-TOOLS section lists real tools on the default
+// fluent path (TaskF(...).Plan().Reflect().Execute()) instead of shipping an
+// empty listing.
+func TestResolvePlannerWiresFrameworkRegistry(t *testing.T) {
+	fw := testFramework(t)
+	b := fw.TaskF(context.Background(), "task").System("sys")
+
+	pl, err := b.resolvePlanner(context.Background())
+	if err != nil {
+		t.Fatalf("resolvePlanner: %v", err)
+	}
+	if pl.Cfg.ToolRegistry == nil {
+		t.Fatal("expected the framework tool registry wired into the default planner")
+	}
+	listing := pl.Cfg.ToolRegistry.List()
+	if len(listing) == 0 {
+		t.Fatal("expected a non-empty tool inventory on the default planner")
+	}
+	found := false
+	for _, d := range listing {
+		if d.Name == "finish" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected the auto-registered finish tool in the planner's registry listing")
+	}
+	// The replan prompt embeds exactly this rendering; it must not be empty.
+	if got := agent.BuildGroupedToolList(listing); got == "" {
+		t.Error("expected non-empty grouped tool list for the replan AVAILABLE-TOOLS section")
 	}
 }

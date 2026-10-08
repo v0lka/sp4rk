@@ -70,6 +70,17 @@ func NewCompactionStrategy(name string, cfg CompactionConfig, deps CompactionDep
 	case "sliding_window":
 		return NewSlidingWindowStrategy(keepFirst, keepLast)
 	case "summarization":
+		// The LLM-backed strategies need a summarizer: without one they would
+		// replace every summarized step with a bare placeholder that carries
+		// none of its thought/action/observation, and ContextWindow.Compact
+		// would then freeze that loss over the whole step history. Fall back
+		// to the sliding window instead — matching the framework's own
+		// "summarization requires LLM caller; nil = sliding only" intent and
+		// CompactConversationHistory's fail-closed contract for the same
+		// configuration.
+		if deps.Summarize == nil {
+			return NewSlidingWindowStrategy(keepFirst, keepLast)
+		}
 		blockSize := cfg.Summarization.BlockSize
 		if blockSize <= 0 {
 			blockSize = 10
@@ -84,6 +95,10 @@ func NewCompactionStrategy(name string, cfg CompactionConfig, deps CompactionDep
 		}
 		return NewSummarizationStrategy(blockSize, keepLast, obsTruncate, deps.Summarize, deps.TokenCounter, maxTokens)
 	case "hierarchical":
+		// Same nil-summarizer fail-closed fallback as "summarization".
+		if deps.Summarize == nil {
+			return NewSlidingWindowStrategy(keepFirst, keepLast)
+		}
 		distant := cfg.Hierarchical.DistantRatio
 		if distant <= 0 {
 			distant = 0.4

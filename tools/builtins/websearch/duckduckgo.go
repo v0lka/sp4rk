@@ -24,8 +24,21 @@ type DuckDuckGoProvider struct {
 // NewDuckDuckGoProviderWithClient creates a new DuckDuckGoProvider with the given timeout
 // and optional HTTP client. If client is nil, a default client with the specified timeout is used.
 func NewDuckDuckGoProviderWithClient(timeout time.Duration, client *http.Client) *DuckDuckGoProvider {
+	// Refuse to follow redirects, matching the other search providers. The
+	// stock net/http policy silently re-issues the request to any Location —
+	// up to 10 hops — so a compromised or MITM'd endpoint (or a custom
+	// SetBaseURL) could make the host perform a server-side request to an
+	// arbitrary, e.g. internal, URL. This protection must apply to a
+	// caller-supplied client too: we make a shallow copy (never mutating the
+	// caller's) and set CheckRedirect unconditionally, so the 3xx response is
+	// surfaced to Search instead of being followed.
+	noRedirect := func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	if client == nil {
-		client = &http.Client{Timeout: timeout}
+		client = &http.Client{Timeout: timeout, CheckRedirect: noRedirect}
+	} else {
+		c := *client
+		c.CheckRedirect = noRedirect
+		client = &c
 	}
 	return &DuckDuckGoProvider{
 		baseURL: "https://html.duckduckgo.com/html/",

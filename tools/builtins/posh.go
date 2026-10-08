@@ -3,7 +3,6 @@
 package builtins
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -95,6 +94,7 @@ func NewPoshExecToolWithInvocation(blacklist []string, timeouts BashTimeouts, in
 	if err := invocation.Validate(); err != nil {
 		return nil, err
 	}
+	timeouts = normalizeBashTimeouts(timeouts)
 	compiled := make([]*regexp.Regexp, 0, len(blacklist))
 	for _, pattern := range blacklist {
 		re, err := regexp.Compile(pattern)
@@ -200,6 +200,13 @@ func (t *PoshExecTool) Execute(ctx context.Context, input json.RawMessage) (tool
 	if timeout > t.timeouts.MaxTimeout {
 		timeout = t.timeouts.MaxTimeout
 	}
+	// A non-positive resolved timeout — a directly constructed tool carrying
+	// zero-value timeouts, or a negative request — would create an
+	// already-expired context that cancels the command before it starts.
+	// Fall back to the default maximum instead.
+	if timeout <= 0 {
+		timeout = DefaultBashTimeouts().MaxTimeout
+	}
 
 	// Create context with timeout
 	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -263,10 +270,15 @@ func (t *PoshExecTool) Execute(ctx context.Context, input json.RawMessage) (tool
 	// Capture combined stdout+stderr ourselves rather than using
 	// CombinedOutput: CombinedOutput runs Start+Wait as one atomic step,
 	// leaving no window to attach the process tree to its Job Object between
-	// them. Both streams share one buffer so ordering is preserved.
-	var buf bytes.Buffer
-	cmd.Stdout = &buf
-	cmd.Stderr = &buf
+	// them. Both streams share one bounded buffer so ordering is preserved
+	// and peak memory is capped at maxShellOutputBytes — the timeout bounds
+	// duration, not bytes written, and os/exec serializes writes to equal
+	// writer values through a single goroutine. Bytes past the cap are
+	// drained (so PowerShell never blocks on a full pipe) and the result
+	// carries a truncation marker naming the cap.
+	buf := newBoundedOutputBuffer(maxShellOutputBytes)
+	cmd.Stdout = buf
+	cmd.Stderr = buf
 
 	if err := cmd.Start(); err != nil {
 		return tools.ToolResult{
@@ -291,7 +303,7 @@ func (t *PoshExecTool) Execute(ctx context.Context, input json.RawMessage) (tool
 	defer jobCleanup()
 
 	err = cmd.Wait()
-	output := decodePowerShellOutput(buf.Bytes())
+	output := decodePowerShellOutput(buf.Bytes()) + buf.marker()
 
 	if err != nil {
 		result := output + "\n" + err.Error()

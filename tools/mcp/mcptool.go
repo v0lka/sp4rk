@@ -139,14 +139,18 @@ func convertMCPResult(result *mcp.CallToolResult) sdktools.ToolResult {
 }
 
 // extractTextFromContent extracts text from an MCP Content interface.
+//
+// Text content is returned verbatim. Every other content type (image, audio,
+// resource link, embedded resource) is JSON-marshalled so the model receives
+// the structured, parseable form of the content. mcp.GetTextFromContent is
+// deliberately NOT used as the dispatch here: its default arm stringifies
+// unrecognized content with fmt.Sprintf("%v", ...), so relying on it returning
+// "" to reach a JSON fallback made that fallback unreachable — every non-text
+// result was delivered as a Go value dump (finding 63).
 func extractTextFromContent(content mcp.Content) string {
-	// Try to extract text using the mcp helper
-	text := mcp.GetTextFromContent(content)
-	if text != "" {
-		return text
-	}
-
-	// Fall back to type assertion for TextContent
+	// Typed text content (the only shape the wire decoding produces: an
+	// unrecognized content map fails ParseContent and surfaces as a call
+	// error, so untyped maps never reach this function).
 	if tc, ok := mcp.AsTextContent(content); ok {
 		return tc.Text
 	}

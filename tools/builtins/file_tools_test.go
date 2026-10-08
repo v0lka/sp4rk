@@ -2565,13 +2565,16 @@ func TestIsPathInSessionRoots_NoRoots(t *testing.T) {
 // TestIsPathInSessionRoots_HarmlessDevice verifies harmless special-device
 // paths are treated as local by the file-tool judges, so read_file/write_file
 // targeting them do not force a confirmation. The harmless set is host-
-// dependent: POSIX exempts /dev/null and /dev/full, Windows exempts the
-// reserved NUL device (its /dev/null equivalent) — on Windows /dev/null and
-// /dev/full are ordinary out-of-root paths, not devices.
+// dependent: POSIX exempts only /dev/null, Windows exempts the reserved NUL
+// device (its /dev/null equivalent) — on Windows /dev/null is an ordinary
+// out-of-root path, not a device. /dev/full and /dev/zero are deliberately
+// NOT harmless: their reads are infinite zero/random streams that never
+// return EOF, so an unbounded read can exhaust the reader's memory — they
+// must stay gated like any out-of-root path.
 func TestIsPathInSessionRoots_HarmlessDevice(t *testing.T) {
 	ws := t.TempDir()
 	ctx := tools.WithWorkspacePath(context.Background(), ws)
-	harmless := []string{"/dev/null", "/dev/full"}
+	harmless := []string{"/dev/null"}
 	if runtime.GOOS == "windows" {
 		harmless = []string{"NUL"}
 	}
@@ -2581,10 +2584,17 @@ func TestIsPathInSessionRoots_HarmlessDevice(t *testing.T) {
 		}
 	}
 	// Process streams are NOT harmless — their targets are host-defined file
-	// descriptors — so they must be treated as out-of-root and gated.
-	for _, p := range []string{"/dev/stdin", "/dev/stdout", "/dev/stderr"} {
+	// descriptors — so they must be treated as out-of-root and gated. The
+	// same applies to the infinite-stream devices /dev/full and /dev/zero.
+	notHarmless := []string{"/dev/stdin", "/dev/stdout", "/dev/stderr", "/dev/full", "/dev/zero"}
+	if runtime.GOOS == "windows" {
+		// /dev/* paths are ordinary out-of-root paths on Windows; keep the
+		// check POSIX-only so the test does not depend on host device layout.
+		notHarmless = []string{"/dev/stdin", "/dev/stdout", "/dev/stderr"}
+	}
+	for _, p := range notHarmless {
 		if isPathInSessionRoots(ctx, p) {
-			t.Errorf("expected process stream %q to NOT be treated as local", p)
+			t.Errorf("expected non-harmless device %q to NOT be treated as local", p)
 		}
 	}
 	// A genuinely out-of-root path must still be rejected.
@@ -2807,5 +2817,115 @@ func TestListDirectoryTool_Judge_RequiredPathFailsClosed(t *testing.T) {
 	}
 	if reasoning != "cannot determine target path" {
 		t.Errorf("expected 'cannot determine target path', got: %s", reasoning)
+	}
+}
+
+// TestListDirectoryTool_TruncatesAtEntryCap is the regression repro for the
+// list_directory half of review finding #25: a directory with more entries
+// than the cap must render a bounded, still-sorted prefix plus a truncation
+// marker instead of the unbounded full listing.
+func TestListDirectoryTool_TruncatesAtEntryCap(t *testing.T) {
+	dir := t.TempDir()
+	const total = 20
+	for i := 0; i < total; i++ {
+		name := filepath.Join(dir, fmt.Sprintf("f%02d.txt", i))
+		if err := os.WriteFile(name, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tool := NewListDirectoryTool()
+	tool.maxEntries = 5
+	tool.maxBytes = 1 << 20
+
+	input, _ := json.Marshal(ListDirectoryInput{Path: dir})
+	result, err := tool.Execute(context.Background(), input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("unexpected error result: %s", result.Content)
+	}
+
+	lines := strings.Split(strings.TrimRight(result.Content, "\n"), "\n")
+	// 5 rendered entries + 1 truncation marker.
+	if len(lines) != 6 {
+		t.Fatalf("got %d lines, want 5 entries + 1 marker: %q", len(lines), result.Content)
+	}
+	if !strings.Contains(lines[5], "truncated") {
+		t.Errorf("expected a truncation marker line, got: %q", lines[5])
+	}
+	// The kept subset renders sorted (read-order prefix, name-sorted), and
+	// every kept name is one of the created entries.
+	created := map[string]bool{}
+	for i := 0; i < total; i++ {
+		created[fmt.Sprintf("f%02d.txt", i)] = true
+	}
+	for i, line := range lines[:5] {
+		name, _, ok := strings.Cut(line, "\t")
+		if !ok || !created[name] {
+			t.Errorf("line %d = %q, want a created entry in name-tab-kind-tab-size form", i, line)
+		}
+		if i > 0 && lines[i-1] >= line {
+			t.Errorf("lines %d and %d are out of order: %q >= %q", i-1, i, lines[i-1], line)
+		}
+	}
+}
+
+// TestListDirectoryTool_TruncatesAtByteCap proves the rendered-bytes cap also
+// stops the listing and appends the marker.
+func TestListDirectoryTool_TruncatesAtByteCap(t *testing.T) {
+	dir := t.TempDir()
+	for i := 0; i < 10; i++ {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("file%d.txt", i)), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tool := NewListDirectoryTool()
+	tool.maxEntries = 100
+	tool.maxBytes = 40 // room for a couple of lines, not all ten
+
+	input, _ := json.Marshal(ListDirectoryInput{Path: dir})
+	result, err := tool.Execute(context.Background(), input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("unexpected error result: %s", result.Content)
+	}
+	if !strings.Contains(result.Content, "truncated") {
+		t.Errorf("expected a truncation marker, got: %q", result.Content)
+	}
+	if len(result.Content) > 40+120 {
+		t.Errorf("output = %d bytes, want bounded near the %d-byte cap", len(result.Content), 40)
+	}
+}
+
+// TestListDirectoryTool_NoMarkerBelowCaps proves a small directory renders
+// exactly as before (no truncation marker) when the caps never fire.
+func TestListDirectoryTool_NoMarkerBelowCaps(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"a.txt", "b.txt"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("xy"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tool := NewListDirectoryTool()
+	input, _ := json.Marshal(ListDirectoryInput{Path: dir})
+	result, err := tool.Execute(context.Background(), input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("unexpected error result: %s", result.Content)
+	}
+	if strings.Contains(result.Content, "truncated") {
+		t.Errorf("unexpected truncation marker below the caps: %q", result.Content)
+	}
+	want := "a.txt\tfile\t2\nb.txt\tfile\t2\n"
+	if result.Content != want {
+		t.Errorf("content = %q, want %q", result.Content, want)
 	}
 }

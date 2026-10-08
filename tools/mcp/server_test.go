@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -575,7 +576,23 @@ const (
 	// cmd.Wait surfaces as *exec.ExitError. Server.Close must treat that as a
 	// clean disconnect, not a close failure (finding D2).
 	stdioHelperExitNonZero = "exitnonzero"
+	// stdioHelperStderrFlood floods stderr far past the OS pipe buffer BEFORE
+	// answering anything, then behaves like the well-behaved default: with no
+	// active reader on the pipe the flood blocks in write(2) and the handshake
+	// wedges (finding 58); with the drain running it completes in milliseconds.
+	stdioHelperStderrFlood = "stderrflood"
+	// stdioHelperRawSchema answers the handshake like the well-behaved default
+	// but serves a tools/list whose tool inputSchema uses top-level keywords
+	// the mcp-go ToolInputSchema struct does not model — discovery must
+	// preserve the schema verbatim (finding 51).
+	stdioHelperRawSchema = "rawschema"
 )
+
+// rawSchemaToolListJSON is the tools/list result served by the rawschema
+// helper mode. The inputSchema object is compared byte-for-byte against the
+// discovered ToolInfo, so the helper serves it as pre-built JSON rather than a
+// marshalled map.
+const rawSchemaToolListJSON = `{"tools":[{"name":"raw_tool","description":"uses unmodelled top-level keywords","inputSchema":{"type":"object","title":"Raw","properties":{"q":{"type":"string"}},"required":["q"],"enum":["a","b"],"oneOf":[{"type":"object"},{"type":"string"}],"$ref":"#/definitions/Args"}}]}`
 
 // stdioHelperPidFileEnv names the file the tree helper writes its grandchild's
 // pid to, so the test can assert the grandchild dies with the process group.
@@ -621,6 +638,21 @@ func runStdioHelper(mode string) {
 		// only be ended by the client's timeout.
 		_, _ = io.Copy(io.Discard, os.Stdin)
 		return
+	}
+
+	if mode == stdioHelperStderrFlood {
+		// Write 256 KiB to stderr BEFORE answering anything — four times the
+		// ~64 KiB Linux pipe buffer — then fall through to the well-behaved
+		// default loop. The write blocks once the pipe is full, so this mode
+		// only completes its flood (and reaches the handshake) when the client
+		// drains the pipe (finding 58).
+		chunk := bytes.Repeat([]byte("x"), 4096)
+		for i := 0; i < 64; i++ {
+			if _, err := os.Stderr.Write(chunk); err != nil {
+				return
+			}
+		}
+		mode = ""
 	}
 
 	if mode == stdioHelperIgnoreEOF {
@@ -705,6 +737,11 @@ func runStdioHelper(mode string) {
 				},
 			})
 		case "tools/list":
+			if mode == stdioHelperRawSchema {
+				// Serve the unmodelled-keyword schema verbatim (finding 51).
+				writeHelperResult(enc, req.ID, json.RawMessage(rawSchemaToolListJSON))
+				break
+			}
 			writeHelperResult(enc, req.ID, map[string]any{"tools": []any{}})
 		case "tools/call":
 			var p struct {

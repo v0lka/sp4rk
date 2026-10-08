@@ -76,6 +76,39 @@ func judgeWriteInSessionRoots(ctx context.Context, path string) tools.JudgeOutco
 	return softOutcome(false, formatOutsideRootsError(absPath).Error(), tools.ReasonCodeOutsideSessionRoots)
 }
 
+// judgeWriteInSessionRootsUnresolved is the destructive-tools variant of
+// judgeWriteInSessionRoots: it judges the path exactly as spelled in its
+// final component (only the parent directory is symlink-resolved), mirroring
+// the POSIX rm semantics of delete_file/delete_directory — those tools unlink
+// the path itself, never a symlink's target, so containment and the
+// git-internal guard must be evaluated against the LINK path, not the
+// fully-resolved target. A symlink whose target leaves the session roots
+// still escalates (soft outside_session_roots): isPathInSessionRoots resolves
+// through the link, so only confirming users reach the unlink — which then
+// removes just the link. A dangling link is judged by its longest existing
+// prefix (its parent), so it is auto-approved like any other in-root path.
+func judgeWriteInSessionRootsUnresolved(ctx context.Context, path string) tools.JudgeOutcome {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return hardOutcome(false, "cannot determine target path", tools.ReasonCodeUnassessablePath)
+	}
+	absPath = filepath.Clean(absPath)
+	if resolvedParent, parentErr := filepath.EvalSymlinks(filepath.Clean(filepath.Dir(absPath))); parentErr == nil {
+		absPath = filepath.Join(resolvedParent, filepath.Base(absPath))
+	}
+
+	if isPathInGitDir(ctx, absPath) {
+		return hardOutcome(false,
+			"target path is inside git internals (.git): "+absPath,
+			tools.ReasonCodeGitInternal)
+	}
+
+	if isPathInSessionRoots(ctx, absPath) {
+		return softOutcome(true, "target is within session workspace or temp directory", "")
+	}
+	return softOutcome(false, formatOutsideRootsError(absPath).Error(), tools.ReasonCodeOutsideSessionRoots)
+}
+
 // judgeReadInSessionRootsForPath is the shared containment core for read-side
 // judges: it makes the path absolute, resolves symlinks (falling back to the
 // resolved parent for not-yet-existing paths), and checks session-root

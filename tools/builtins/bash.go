@@ -62,6 +62,7 @@ func NewBashExecToolWithInvocation(blacklist []string, timeouts BashTimeouts, in
 	if err := invocation.Validate(); err != nil {
 		return nil, err
 	}
+	timeouts = normalizeBashTimeouts(timeouts)
 	compiled := make([]*regexp.Regexp, 0, len(blacklist))
 	for _, pattern := range blacklist {
 		re, err := regexp.Compile(pattern)
@@ -168,6 +169,13 @@ func (t *BashExecTool) Execute(ctx context.Context, input json.RawMessage) (tool
 	if timeout > t.timeouts.MaxTimeout {
 		timeout = t.timeouts.MaxTimeout
 	}
+	// A non-positive resolved timeout — a directly constructed tool carrying
+	// zero-value timeouts, or a negative request — would create an
+	// already-expired context that cancels the command before it starts.
+	// Fall back to the default maximum instead.
+	if timeout <= 0 {
+		timeout = DefaultBashTimeouts().MaxTimeout
+	}
 
 	// Create context with timeout
 	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -210,11 +218,19 @@ func (t *BashExecTool) Execute(ctx context.Context, input json.RawMessage) (tool
 		cmd.Dir = workDir
 	}
 
-	// Execute and capture combined output
-	output, err := cmd.CombinedOutput()
+	// Execute and capture combined output, bounded by maxShellOutputBytes:
+	// the timeout bounds duration, not peak memory, so bytes past the cap
+	// are drained (keeping the child's pipes flowing) and the result carries
+	// a truncation marker naming the cap. Stdout and Stderr share one
+	// boundedOutputBuffer value; os/exec serializes writes to equal writer
+	// values through a single goroutine.
+	out := newBoundedOutputBuffer(maxShellOutputBytes)
+	cmd.Stdout = out
+	cmd.Stderr = out
+	err = cmd.Run()
 
 	if err != nil {
-		result := string(output) + "\n" + err.Error()
+		result := out.String() + "\n" + err.Error()
 		if errors.Is(timeoutCtx.Err(), context.DeadlineExceeded) {
 			result += "\n[Process killed: timeout exceeded]"
 		}
@@ -225,7 +241,7 @@ func (t *BashExecTool) Execute(ctx context.Context, input json.RawMessage) (tool
 	}
 
 	return tools.ToolResult{
-		Content: string(output),
+		Content: out.String(),
 		IsError: false,
 	}, nil
 }

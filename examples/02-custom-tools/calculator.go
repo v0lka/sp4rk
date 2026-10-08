@@ -5,13 +5,28 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // evaluate parses and evaluates a simple arithmetic expression.
 // Supports +, -, *, /, parentheses, and integer/float literals.
 // This is a minimal recursive-descent evaluator — not a production calculator.
-func evaluate(expr string) (float64, error) {
-	p := &parser{tokens: tokenize(expr)}
+// It never panics on malformed input: tokenizer errors are returned as errors,
+// and the recover below converts any parser panic (e.g. "division by zero",
+// "expected ')'") into a returned error before it can escape to the caller.
+func evaluate(expr string) (val float64, err error) {
+	// The recover must be installed here, before tokenize runs, so that a
+	// panic anywhere in evaluation becomes a tool error, not a crashed process.
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("%v", r)
+		}
+	}()
+	tokens, err := tokenize(expr)
+	if err != nil {
+		return 0, err
+	}
+	p := &parser{tokens: tokens}
 	return p.parseExpr()
 }
 
@@ -35,32 +50,31 @@ type token struct {
 	value float64
 }
 
-func tokenize(s string) []token {
+func tokenize(s string) ([]token, error) {
 	var tokens []token
-	i := 0
-	for i < len(s) {
-		ch := s[i]
+	for i := 0; i < len(s); {
+		ch, size := utf8.DecodeRuneInString(s[i:])
 		switch {
-		case unicode.IsSpace(rune(ch)):
-			i++
+		case unicode.IsSpace(ch):
+			i += size
 		case ch == '+':
 			tokens = append(tokens, token{kind: tokPlus})
-			i++
+			i += size
 		case ch == '-':
 			tokens = append(tokens, token{kind: tokMinus})
-			i++
+			i += size
 		case ch == '*':
 			tokens = append(tokens, token{kind: tokStar})
-			i++
+			i += size
 		case ch == '/':
 			tokens = append(tokens, token{kind: tokSlash})
-			i++
+			i += size
 		case ch == '(':
 			tokens = append(tokens, token{kind: tokLParen})
-			i++
+			i += size
 		case ch == ')':
 			tokens = append(tokens, token{kind: tokRParen})
-			i++
+			i += size
 		case ch >= '0' && ch <= '9' || ch == '.':
 			j := i
 			for j < len(s) && (s[j] >= '0' && s[j] <= '9' || s[j] == '.') {
@@ -68,16 +82,16 @@ func tokenize(s string) []token {
 			}
 			num, err := strconv.ParseFloat(s[i:j], 64)
 			if err != nil {
-				panic(err) // tokenize errors are caught by recover in parseExpr
+				return nil, fmt.Errorf("invalid number %q: %w", s[i:j], err)
 			}
 			tokens = append(tokens, token{kind: tokNumber, value: num})
 			i = j
 		default:
-			panic(fmt.Sprintf("unexpected character: %q", ch))
+			return nil, fmt.Errorf("unexpected character %q at position %d", ch, i)
 		}
 	}
 	tokens = append(tokens, token{kind: tokEOF})
-	return tokens
+	return tokens, nil
 }
 
 // --- recursive-descent parser ---
@@ -90,12 +104,10 @@ type parser struct {
 func (p *parser) peek() token { return p.tokens[p.pos] }
 func (p *parser) next() token { t := p.tokens[p.pos]; p.pos++; return t }
 
-func (p *parser) parseExpr() (val float64, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("%v", r)
-		}
-	}()
+// parseExpr parses an addition/subtraction chain. The parser signals
+// malformed input ("division by zero", "expected ')'", "unexpected token")
+// via panic; evaluate's recover converts those into returned errors.
+func (p *parser) parseExpr() (float64, error) {
 	return p.parseAddSub(), nil
 }
 

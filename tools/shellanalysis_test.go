@@ -431,7 +431,7 @@ func TestShellIsSystemOrRawDevicePath(t *testing.T) {
 		{"/dev/sda", api.LangBash, true},
 		{"/dev/disk0", api.LangBash, true},
 		{"/dev/null", api.LangBash, false}, // harmless bit bucket
-		{"/dev/full", api.LangBash, false}, // harmless error sink
+		{"/dev/full", api.LangBash, true},  // raw device under /dev: writes fail with ENOSPC, but reads are an infinite zero stream — NOT exempt as harmless
 		{"/var/log/system.log", api.LangBash, false},
 		{"/ws/src/main.go", api.LangBash, false},
 		{`C:\Windows\System32\cmd.exe`, api.LangPowerShell, true},

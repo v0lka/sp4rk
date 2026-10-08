@@ -50,10 +50,23 @@ const (
 
 	singleStepJSONExample = `{"steps": [{"id": "step_1", "summary": "5-7 word task label", "description": "## Task Title\n### What:\nFull description of what needs to be done.\n### How:\nConcrete approach, techniques, tool usage order.\n### Where:\nSpecific files, functions, modules.\n### Acceptance Criteria:\n- Verifiable condition 1\n- Verifiable condition 2", "depends_on": [], "parallelizable": true, "estimated_tools": ["tool1", "tool2"], "profile": {"role": "executor", "domain": "code"}}]}`
 
-	continuationModeTail        = ""
-	continuationModeJSONExample = `{"steps": [{"id": "continuation_1", "summary": "Short 5-7 word label", "description": "What: ...\nHow: ...\nWhere: ...\nAcceptance Criteria:\n- ...", "depends_on": ["TERMINAL-STEP-IDS"], "parallelizable": true, "estimated_tools": ["tool1"], "profile": {"role": "coder", "allowed_tools": ["read_file", "write_file", "edit_file", "list_directory", "ripgrep", "glob", "bash_exec", "semantic_search", "search_graph"], "skills": ["go-testing"], "domain": "code"}}]}`
+	// continuationModeTail instructs continuation models how to chain onto
+	// the prior plan: depends_on entries may reference either steps of the
+	// new plan or completed steps of the previous plan. The executor
+	// resolves such cross-plan dependencies against its completed-step set,
+	// and validatePlanDAG accepts them via the prior plan's known step IDs.
+	// (Worded without the literal TERMINAL-STEPS token on purpose: data
+	// substitutions run last over the whole assembled text, so that exact
+	// substring inside this trusted value would itself be expanded.)
+	continuationModeTail = "This is a continuation plan: a step's depends_on entries may reference either steps declared in this plan or completed steps of the previous plan. Chain new work onto the previous plan's terminal steps (listed under the prior-plan context above)."
 
-	continuationSingleStepJSONExample = `{"steps": [{"id": "continuation_1", "summary": "5-7 word continuation label", "description": "## Continuation Title\n### What:\nFull description of what needs to be done.\n### How:\nConcrete approach building on completed work.\n### Where:\nSpecific files, functions, modules.\n### Acceptance Criteria:\n- Verifiable condition 1\n- Verifiable condition 2", "depends_on": ["TERMINAL-STEP-IDS"], "parallelizable": true, "estimated_tools": ["tool1"], "profile": {"role": "executor", "domain": "code"}}]}`
+	continuationModeJSONExample = `{"steps": [{"id": "continuation_1", "summary": "Short 5-7 word label", "description": "What: ...\nHow: ...\nWhere: ...\nAcceptance Criteria:\n- ...", "depends_on": ["<terminal-step-id>"], "parallelizable": true, "estimated_tools": ["tool1"], "profile": {"role": "coder", "allowed_tools": ["read_file", "write_file", "edit_file", "list_directory", "ripgrep", "glob", "bash_exec", "semantic_search", "search_graph"], "skills": ["go-testing"], "domain": "code"}}]}`
+
+	continuationSingleStepJSONExample = `{"steps": [{"id": "continuation_1", "summary": "5-7 word continuation label", "description": "## Continuation Title\n### What:\nFull description of what needs to be done.\n### How:\nConcrete approach building on completed work.\n### Where:\nSpecific files, functions, modules.\n### Acceptance Criteria:\n- Verifiable condition 1\n- Verifiable condition 2", "depends_on": ["<terminal-step-id>"], "parallelizable": true, "estimated_tools": ["tool1"], "profile": {"role": "executor", "domain": "code"}}]}`
+
+	// replanModePreamble fills the MODE-PREAMBLE slot of ReplanPrompt via the
+	// trusted substitution pass (see buildReplanSystemPrompt).
+	replanModePreamble = "You are revising a plan whose execution failed. The original plan, the completed steps, the failed step, and the reflection analysis are provided below."
 )
 
 // Circuit breaker defaults for the planner's exploration executor.
@@ -76,15 +89,28 @@ var errPlanZeroSteps = errors.New("plan has zero steps — at least one step is 
 // failures without altering either error's message.
 var errPlanUnparseable = errors.New("planner: plan response unparseable")
 
+// errPlanInvalidDAG marks plan responses whose JSON parsed but whose step DAG
+// failed structural validation (duplicate ID, unknown dependency, cycle). It
+// lets planRetryHint render a validation-specific corrective nudge instead of
+// mislabeling already-valid JSON as invalid.
+var errPlanInvalidDAG = errors.New("planner: plan response failed DAG validation")
+
 // planParseError wraps one parse-loop error. Its Error() text is exactly the
 // underlying error's text — the text rides back to the model in the retry
 // hint and surfaces in the final refusal — while errors.Is matches
-// errPlanUnparseable for caller-side classification.
-type planParseError struct{ err error }
+// errPlanUnparseable for caller-side classification (and errPlanInvalidDAG
+// when the wrap was produced by DAG validation, via invalidDAG).
+type planParseError struct {
+	err        error
+	invalidDAG bool // JSON parsed but validatePlanDAG rejected the plan
+}
 
 func (e *planParseError) Error() string { return e.err.Error() }
 func (e *planParseError) Unwrap() error { return e.err }
 func (e *planParseError) Is(target error) bool {
+	if target == errPlanInvalidDAG {
+		return e.invalidDAG
+	}
 	return target == errPlanUnparseable
 }
 
@@ -101,17 +127,18 @@ type Planner struct {
 var _ orchestration.Planner = (*Planner)(nil)
 
 // NewPlanner creates a new Planner with the given LLM caller and configuration.
-// Returns an error if caller is nil (required dependency).
+// Returns an error if caller is nil (required dependency). Unset injected
+// context functions and a non-positive MaxExploreSteps are filled with the
+// same values DefaultConfig installs, so a hand-assembled Config is safe —
+// every plan path dereferences the context functions unconditionally, and a
+// nil one would otherwise panic the host on the first call.
 func NewPlanner(caller agent.LLMCaller, cfg Config) (*Planner, error) {
 	if caller == nil {
 		return nil, errors.New("planner: caller is required")
 	}
-	if cfg.MaxExploreSteps <= 0 {
-		cfg.MaxExploreSteps = defaultMaxExploreSteps
-	}
 	return &Planner{
 		llm: caller,
-		Cfg: cfg,
+		Cfg: cfg.withDefaults(),
 	}, nil
 }
 
@@ -186,6 +213,18 @@ func (p *Planner) continuationSingleMode() planPromptMode {
 		tail:          continuationModeTail,
 		jsonExample:   continuationSingleStepJSONExample,
 		maxSteps:      "1",
+	}
+}
+
+// replanMode builds the replan mode configuration. Replanning always produces
+// a full multi-step plan in the standard plan shape, so it reuses the
+// multi-step JSON example and step cap; the failure/reflection context rides
+// in the ReplanPrompt's own data slots, not in the mode tail.
+func (p *Planner) replanMode() planPromptMode {
+	return planPromptMode{
+		preamble:    replanModePreamble,
+		jsonExample: planModeJSONExample,
+		maxSteps:    "10",
 	}
 }
 
@@ -296,7 +335,19 @@ func (p *Planner) PlanContinuation(
 	messages := systemMessagesFromPrompt(systemPrompt)
 	messages = append(messages, llm.Message{Role: "user", Content: newMessage})
 
-	plan, err := p.callAndParsePlan(ctx, messages, availableSkills)
+	// The documented continuation contract chains new steps onto the prior
+	// plan: the injected TERMINAL-STEPS slot and the continuation JSON
+	// examples direct the model to emit depends_on entries naming the prior
+	// plan's terminal step IDs. The executor resolves such cross-plan
+	// dependencies against its completed-step set (FindReadySteps), so the
+	// plan must be validated against the union of the new plan's IDs and the
+	// prior plan's IDs — not in isolation.
+	knownPriorIDs := make(map[string]bool, len(existingPlan.Steps))
+	for _, step := range existingPlan.Steps {
+		knownPriorIDs[step.ID] = true
+	}
+
+	plan, err := p.callAndParsePlanWithPriorIDs(ctx, messages, availableSkills, knownPriorIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -526,11 +577,20 @@ func (p *Planner) buildSystemPromptFromMode(
 	// LLM-generated reflections, tool/skill lists, workspace paths, and
 	// caller-provided extras (conversation history, user requests, plan
 	// summaries, etc.).
+	//
+	// The continuation-only keys are registered with descriptive defaults so
+	// base templates carrying their slots never ship the literal tokens on
+	// non-continuation paths; continuation callers override them via
+	// extraSubstitutions below.
 	dataSubstitutions := map[string]string{
-		"REFLECTIONS":      formatPlanReflections(reflections),
-		"AVAILABLE-TOOLS":  availableToolsStr,
-		"AVAILABLE-SKILLS": p.Cfg.FormatSkillList(ctx, availableSkills),
-		"WORKSPACE-PATH":   p.Cfg.FormatWorkspacePath(ctx),
+		"REFLECTIONS":            formatPlanReflections(reflections),
+		"AVAILABLE-TOOLS":        availableToolsStr,
+		"AVAILABLE-SKILLS":       p.Cfg.FormatSkillList(ctx, availableSkills),
+		"WORKSPACE-PATH":         p.Cfg.FormatWorkspacePath(ctx),
+		"RECENT-CONVERSATION":    "(no previous conversation)",
+		"ORIGINAL-REQUEST":       "(n/a — this is the initial plan for the task)",
+		"COMPLETED-PLAN-SUMMARY": "(n/a — no prior plan)",
+		"TERMINAL-STEPS":         "(n/a — no prior plan)",
 	}
 	for k, v := range extraSubstitutions {
 		dataSubstitutions[k] = v
@@ -618,25 +678,31 @@ func (p *Planner) buildReplanSystemPrompt(ctx context.Context, rc replanContext)
 	// All of these values are derived from dynamic/external content
 	// (LLM-generated plans, step outputs, reflections) — substituted via
 	// ReplaceData so placeholder names inside them are never expanded.
-	substitutions := map[string]string{
+	replanSubs := map[string]string{
 		"ORIGINAL-PLAN":                originalPlanStr,
 		"COMPLETED-STEPS":              completedStepsStr,
 		"FAILED-STEP":                  failedStepStr,
 		"PREVIOUS-SESSION-REFLECTIONS": formatSessionReflections(rc.sessionReflections),
 		"CURRENT-REFLECTION":           reflectionStr,
-		"AVAILABLE-SKILLS":             p.Cfg.FormatSkillList(ctx, rc.availableSkills),
-		"WORKSPACE-PATH":               p.Cfg.FormatWorkspacePath(ctx),
 	}
 
-	result := prompt.NewBuilder().
-		Core(p.Cfg.Prompts.ReplanPrompt).
-		Core(p.familyPrompt(ctx)).
-		Core(p.Cfg.Prompts.VerificationMandate).
-		CacheBreak().
-		ReplaceDataAll(substitutions).
-		Build()
+	// The Replan method receives no per-call tool descriptors, so the tool
+	// inventory is sourced from the registry — the set the revised plan's
+	// steps will run with. Hosts that wire a registry get the full listing;
+	// the default fluent path wires the framework registry in
+	// TaskBuilder.resolvePlanner, so only hand-built planners without a
+	// registry degrade to an empty listing.
+	var availableTools []tools.ToolDescriptor
+	if p.Cfg.ToolRegistry != nil {
+		availableTools = p.Cfg.ToolRegistry.List()
+	}
 
-	return p.Cfg.AppendContextSections(ctx, result)
+	// Route through the unified prompt pipeline: buildSystemPromptFromMode
+	// runs the trusted pass (MODE-PREAMBLE / MODE-JSON-EXAMPLE / MAX-STEPS —
+	// tokens the shipped ReplanPrompt carries) before the untrusted data
+	// pass, applies the shared AVAILABLE-TOOLS/AVAILABLE-SKILLS/
+	// WORKSPACE-PATH substitutions, and closes with AppendContextSections.
+	return p.buildSystemPromptFromMode(ctx, p.replanMode(), p.Cfg.Prompts.ReplanPrompt, availableTools, nil, rc.availableSkills, replanSubs)
 }
 
 // ---------------------------------------------------------------------------
@@ -724,15 +790,30 @@ func formatConversationHistory(history []llm.Message) string {
 
 // callAndParsePlan calls the LLM with the given messages, parses the response
 // as a plan, and retries with corrective feedback if parsing fails or the plan
-// has zero steps. The retry policy is the one-shot client's built-in
-// two-nudge loop — exactly two nudges (assistant echo of the failed output +
-// a "[System]" user message restating the exact problem), three attempts
-// total — aligned with the agent loop's parse-retry budget. The
-// initialMessages slice is not mutated.
+// has zero steps.
 func (p *Planner) callAndParsePlan(
 	ctx context.Context,
 	initialMessages []llm.Message,
 	availableSkills []skills.SkillDescriptor,
+) (*orchestration.Plan, error) {
+	return p.callAndParsePlanWithPriorIDs(ctx, initialMessages, availableSkills, nil)
+}
+
+// callAndParsePlanWithPriorIDs is callAndParsePlan with an explicit set of
+// known prior-plan step IDs: a depends_on entry may resolve to either a step
+// of the returned plan or a knownPriorIDs entry (continuation mode, where the
+// executor resolves cross-plan dependencies against its completed-step set).
+// nil knownPriorIDs keeps validation strictly in-plan.
+//
+// The retry policy is the one-shot client's built-in two-nudge loop — exactly
+// two nudges (assistant echo of the failed output + a "[System]" user message
+// restating the exact problem), three attempts total — aligned with the agent
+// loop's parse-retry budget. The initialMessages slice is not mutated.
+func (p *Planner) callAndParsePlanWithPriorIDs(
+	ctx context.Context,
+	initialMessages []llm.Message,
+	availableSkills []skills.SkillDescriptor,
+	knownPriorIDs map[string]bool,
 ) (*orchestration.Plan, error) {
 	messages := make([]llm.Message, len(initialMessages))
 	copy(messages, initialMessages)
@@ -745,9 +826,9 @@ func (p *Planner) callAndParsePlan(
 	}
 
 	parse := func(resp *llm.ChatResponse) (*orchestration.Plan, error) {
-		plan, err := p.parsePlanResponse(resp.Message.Content, availableSkills)
+		plan, err := p.parsePlanResponseWithPriorIDs(resp.Message.Content, availableSkills, knownPriorIDs)
 		if err != nil {
-			return nil, &planParseError{err: err}
+			return nil, wrapParseError(err)
 		}
 		// Defense-in-depth: reject plans with zero steps — the LLM may return
 		// valid JSON with an empty steps array ({"steps": []}), which causes
@@ -775,12 +856,14 @@ func (p *Planner) callAndParsePlan(
 }
 
 // planRetryHint renders the corrective feedback for one plan-retry nudge from
-// the parse error that triggered it, preserving the two established feedback
-// texts: one for responses that were not valid JSON (or failed DAG
-// validation) and one for valid JSON that carried zero steps. Both carry the
-// underlying error verbatim so the model can fix the exact problem.
+// the parse error that triggered it, preserving the established feedback
+// texts — one for responses that were not valid JSON, one for valid JSON with
+// zero steps, and one for valid JSON whose step DAG failed validation — each
+// carrying the underlying error verbatim so the model can fix the exact
+// problem.
 func (p *Planner) planRetryHint(parseErr error) string {
-	if errors.Is(parseErr, errPlanZeroSteps) {
+	switch {
+	case errors.Is(parseErr, errPlanZeroSteps):
 		return fmt.Sprintf(
 			"Your response was valid JSON but contained zero steps. Error: %s\n\n"+
 				"The plan MUST contain at least one step with a summary, description, "+
@@ -789,16 +872,27 @@ func (p *Planner) planRetryHint(parseErr error) string {
 				"non-empty \"steps\" array.",
 			parseErr,
 		)
+	case errors.Is(parseErr, errPlanInvalidDAG):
+		return fmt.Sprintf(
+			"Your response was valid JSON but the plan failed validation. Error: %s\n\n"+
+				"Fix the \"steps\" array so that: every step has a unique id; every "+
+				"depends_on entry references either the id of a step declared in this "+
+				"plan or (in continuation plans) the id of a completed step of the "+
+				"previous plan; and the depends_on graph contains no cycles. "+
+				"Respond ONLY with the corrected JSON object.",
+			parseErr,
+		)
+	default:
+		return fmt.Sprintf(
+			"Your response was invalid JSON. Error: %s\n\n"+
+				"Respond ONLY with a valid JSON object. "+
+				"Do NOT use markdown code fences (```json ... ```). "+
+				"Do NOT include any text, HTML, or commentary before or after the JSON. "+
+				"Your entire response must start with { and end with } "+
+				"and be parseable by a standard JSON parser.",
+			parseErr,
+		)
 	}
-	return fmt.Sprintf(
-		"Your response was invalid JSON. Error: %s\n\n"+
-			"Respond ONLY with a valid JSON object. "+
-			"Do NOT use markdown code fences (```json ... ```). "+
-			"Do NOT include any text, HTML, or commentary before or after the JSON. "+
-			"Your entire response must start with { and end with } "+
-			"and be parseable by a standard JSON parser.",
-		parseErr,
-	)
 }
 
 // reasoningEffortForCall resolves the reasoning effort for one plan call. An
@@ -818,6 +912,27 @@ func (p *Planner) reasoningEffortForCall(ctx context.Context) string {
 // markdown fences, validates the DAG (unique IDs, valid dependencies, no cycles),
 // and converts skill names found in step profiles into strongly-typed AgentProfile structs.
 func (p *Planner) parsePlanResponse(content string, availableSkills []skills.SkillDescriptor) (*orchestration.Plan, error) {
+	return p.parsePlanResponseWithPriorIDs(content, availableSkills, nil)
+}
+
+// wrapParseError tags err for the plan-retry classification machinery
+// (errPlanUnparseable / errPlanInvalidDAG sentinels) without altering its
+// message. parsePlanResponseWithPriorIDs may already return a tagged
+// *planParseError (DAG validation); those pass through unchanged.
+func wrapParseError(err error) error {
+	var perr *planParseError
+	if errors.As(err, &perr) {
+		return perr
+	}
+	return &planParseError{err: err}
+}
+
+// parsePlanResponseWithPriorIDs is parsePlanResponse with an explicit set of
+// known prior-plan step IDs accepted in depends_on (continuation mode; see
+// callAndParsePlanWithPriorIDs). DAG-validation failures are returned as
+// *planParseError values marked invalidDAG so the retry hint can address
+// them as validation — not JSON-syntax — problems.
+func (p *Planner) parsePlanResponseWithPriorIDs(content string, availableSkills []skills.SkillDescriptor, knownPriorIDs map[string]bool) (*orchestration.Plan, error) {
 	// Robust JSON extraction: handles markdown code fences and surrounding
 	// prose, and finds the last valid JSON object in the response.
 	jsonContent := llm.ExtractJSON(content)
@@ -830,8 +945,8 @@ func (p *Planner) parsePlanResponse(content string, availableSkills []skills.Ski
 		return nil, fmt.Errorf("planner: failed to unmarshal plan JSON: %w", err)
 	}
 
-	if err := validatePlanDAG(&plan); err != nil {
-		return nil, err
+	if err := validatePlanDAG(&plan, knownPriorIDs); err != nil {
+		return nil, &planParseError{err: err, invalidDAG: true}
 	}
 
 	var skillAllowed map[string]bool
@@ -886,12 +1001,17 @@ func (p *Planner) parsePlanResponse(content string, availableSkills []skills.Ski
 
 // validatePlanDAG performs structural validation of a parsed plan:
 //  1. Step IDs are unique.
-//  2. Every depends_on entry references an existing step ID.
-//  3. The dependency graph contains no cycles.
+//  2. Every depends_on entry references a known step ID — either a step of
+//     this plan or a knownPriorIDs entry (the prior plan's step IDs in
+//     continuation mode, mirroring the executor's FindReadySteps, which
+//     resolves cross-plan dependencies against its completed-step set).
+//  3. The in-plan dependency graph contains no cycles (prior-plan IDs are
+//     external anchors, not nodes, so they can neither cycle nor be
+//     duplicated).
 //
 // The returned error is descriptive so it can be fed back to the model in
 // the callAndParsePlan retry loop.
-func validatePlanDAG(plan *orchestration.Plan) error {
+func validatePlanDAG(plan *orchestration.Plan, knownPriorIDs map[string]bool) error {
 	ids := make(map[string]bool, len(plan.Steps))
 	for _, step := range plan.Steps {
 		if ids[step.ID] {
@@ -902,13 +1022,15 @@ func validatePlanDAG(plan *orchestration.Plan) error {
 
 	for _, step := range plan.Steps {
 		for _, dep := range step.DependsOn {
-			if !ids[dep] {
-				return fmt.Errorf("invalid plan: step %q depends on unknown step ID %q — depends_on may only reference IDs of steps in this plan", step.ID, dep)
+			if !ids[dep] && !knownPriorIDs[dep] {
+				return fmt.Errorf("invalid plan: step %q depends on unknown step ID %q — depends_on may only reference IDs of steps in this plan or completed steps of the previous plan", step.ID, dep)
 			}
 		}
 	}
 
-	// Cycle detection via iterative DFS with three-color marking.
+	// Cycle detection via iterative DFS with three-color marking. Only
+	// in-plan edges participate: a dependency on a prior-plan step is an
+	// external anchor resolved by the executor, not a node of this graph.
 	const (
 		white = 0 // unvisited
 		gray  = 1 // in progress
@@ -917,7 +1039,13 @@ func validatePlanDAG(plan *orchestration.Plan) error {
 	color := make(map[string]int, len(plan.Steps))
 	deps := make(map[string][]string, len(plan.Steps))
 	for _, step := range plan.Steps {
-		deps[step.ID] = step.DependsOn
+		inPlan := make([]string, 0, len(step.DependsOn))
+		for _, dep := range step.DependsOn {
+			if ids[dep] {
+				inPlan = append(inPlan, dep)
+			}
+		}
+		deps[step.ID] = inPlan
 	}
 
 	var visit func(id string) error

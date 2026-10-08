@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync"
 
 	sdkagent "github.com/v0lka/sp4rk/agent"
 	"github.com/v0lka/sp4rk/llm"
@@ -26,6 +27,7 @@ type HierarchicalStrategy struct {
 	tokenCounter        llm.TokenCounter
 	maxSummarizeTokens  int
 	logger              *slog.Logger
+	noSummarizerWarn    sync.Once
 }
 
 // SetLogger sets the logger for the strategy. If nil, slog.Default() is used.
@@ -40,19 +42,27 @@ func (h *HierarchicalStrategy) log() *slog.Logger {
 
 // NewHierarchicalStrategy creates a new HierarchicalStrategy.
 // distant, middle, recent are the fractions of steps in each zone.
-// They will be normalized to sum to 1.0 if they don't already.
+// They will be normalized to sum to 1.0 if they don't already. Any
+// non-positive or non-finite ratio makes the whole set unusable — a negative
+// ratio can still sum to exactly 1.0 and survive normalization, yet drive
+// negative zone boundaries (slice-bounds panics in Compact) — so the set
+// falls back to the defaults (0.4/0.3/0.3), mirroring usableRatio.
 // observationTruncate is the max chars for observations in summary blocks (default: 500 if <= 0).
+// summarizer is the function to call for LLM summarization; a nil summarizer
+// makes Compact keep the step history verbatim (fail-closed) rather than
+// discard it — see Compact.
 // tokenCounter is optional; if provided, blocks are truncated to maxSummarizeTokens.
 // maxSummarizeTokens defaults to 16000 if zero.
 func NewHierarchicalStrategy(distant, middle, recent float64, observationTruncate int, summarizer func(ctx context.Context, text string) (string, error), tokenCounter llm.TokenCounter, maxSummarizeTokens int) *HierarchicalStrategy {
-	// Normalize ratios
-	total := distant + middle + recent
-	if total <= 0 {
+	// Normalize ratios, rejecting any set that contains a non-positive or
+	// non-finite member (usableRatio): normalization alone cannot repair it,
+	// because ratios that already sum to 1.0 are used verbatim.
+	if !usableRatio(distant) || !usableRatio(middle) || !usableRatio(recent) {
 		// Use defaults
 		distant = 0.4
 		middle = 0.3
 		recent = 0.3
-	} else if total != 1.0 {
+	} else if total := distant + middle + recent; total != 1.0 {
 		distant /= total
 		middle /= total
 		recent /= total
@@ -80,6 +90,12 @@ func NewHierarchicalStrategy(distant, middle, recent float64, observationTruncat
 // - Distant (oldest): aggressive summarization (large blocks, ~15 steps per summary)
 // - Middle: moderate summarization (smaller blocks, ~5 steps per summary)
 // - Recent: kept verbatim
+// With a nil summarizer the strategy fails closed: it keeps the whole history
+// verbatim instead of replacing the distant/middle zones with bare
+// placeholders (the output is frozen as the prompt prefix, so a placeholder
+// would permanently discard those steps' thought/action/observation from LLM
+// context). The window simply stops shrinking until a summarizer is wired —
+// the same contract CompactConversationHistory enforces by returning an error.
 func (h *HierarchicalStrategy) Compact(ctx context.Context, steps []sdkagent.Step, budgetTokens int) []llm.Message {
 	n := len(steps)
 
@@ -88,9 +104,25 @@ func (h *HierarchicalStrategy) Compact(ctx context.Context, steps []sdkagent.Ste
 		return stepsToMessages(steps)
 	}
 
+	// Fail closed when no summarizer is wired (see doc comment). The small
+	// history above returns verbatim without needing the LLM.
+	if h.summarizer == nil {
+		h.noSummarizerWarn.Do(func() {
+			h.log().Warn("hierarchical compaction: no summarizer configured; keeping step history verbatim (window will not shrink)")
+		})
+		return stepsToMessages(steps)
+	}
+
 	// Calculate zone boundaries
 	distantEnd := int(float64(n) * h.distantRatio)
 	middleEnd := int(float64(n) * (h.distantRatio + h.middleRatio))
+
+	// Clamp into [0, n] before the ordering fixes below. The constructor
+	// rejects unusable ratios, but a strategy assembled without it (zero-value
+	// struct, hand-populated fields) must not produce negative boundaries —
+	// the slice expressions below panic on them.
+	distantEnd = min(max(distantEnd, 0), n)
+	middleEnd = min(max(middleEnd, 0), n)
 
 	// Ensure we have at least something in each zone if there are enough steps
 	if distantEnd < 1 && n > 3 {
@@ -157,19 +189,13 @@ func (h *HierarchicalStrategy) summarizeZone(ctx context.Context, steps []sdkage
 			}
 		}
 
-		// Summarize the block
-		var summary string
-		if h.summarizer != nil {
-			var err error
-			summary, err = h.summarizer(ctx, blockText)
-			if err != nil {
-				h.log().Error("hierarchy compaction: summarization failed", "error", err)
-				// Fallback to a simple indicator if summarization fails
-				summary = fmt.Sprintf("[%s zone: %d steps summarized (error: %v)]", zoneName, len(block), err)
-			}
-		} else {
-			// No summarizer provided, use a simple placeholder
-			summary = fmt.Sprintf("[%s zone: %d steps summarized]", zoneName, len(block))
+		// Summarize the block (the nil-summarizer case is fail-closed in
+		// Compact, so the summarizer is always wired here)
+		summary, err := h.summarizer(ctx, blockText)
+		if err != nil {
+			h.log().Error("hierarchy compaction: summarization failed", "error", err)
+			// Fallback to a simple indicator if summarization fails
+			summary = fmt.Sprintf("[%s zone: %d steps summarized (error: %v)]", zoneName, len(block), err)
 		}
 
 		// Add summary as a system message

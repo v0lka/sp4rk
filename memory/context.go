@@ -364,6 +364,16 @@ func (cw *ContextWindow) Tracker() *llm.ContextTokenTracker {
 	return cw.tracker
 }
 
+// ContextTracker returns the underlying ContextTokenTracker. It is the same
+// accessor as [ContextWindow.Tracker] under the name required by the
+// orchestration package's TrackerProvider capability interface, so
+// *ContextWindow satisfies it and the Conductor can wire API-reported token
+// usage from the LLM caller back into this window's fill accounting. (The
+// method set is matched structurally — memory does not import orchestration.)
+func (cw *ContextWindow) ContextTracker() *llm.ContextTokenTracker {
+	return cw.tracker
+}
+
 // SetTask sets the task content (user message in prompt).
 // The caller is responsible for formatting the task, including any criteria or context.
 // SetTask reverts to the text-only prompt path: any content blocks set by a

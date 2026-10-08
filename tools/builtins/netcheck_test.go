@@ -1,6 +1,7 @@
 package builtins
 
 import (
+	"context"
 	"net"
 	"testing"
 )
@@ -31,6 +32,10 @@ func TestIsPrivateIP_Smoke(t *testing.T) {
 		{"::1", true},
 		{"fe80::1", true},
 		{"fc00::1", true},
+		{"::", true},              // IPv6 unspecified — review finding 20
+		{"0:0:0:0:0:0:0:0", true}, // long form of ::
+		{"ff02::1", true},         // link-local multicast
+		{"224.0.0.1", true},       // IPv4 multicast
 		{"8.8.8.8", false},
 		{"1.1.1.1", false},
 		{"203.0.114.0", false}, // outside 203.0.113.0/24
@@ -45,5 +50,22 @@ func TestIsPrivateIP_Smoke(t *testing.T) {
 				t.Errorf("isPrivateIP(%s) = %v, want %v", tt.ip, got, tt.private)
 			}
 		})
+	}
+}
+
+// TestResolveHostIsPrivate_IPv6Unspecified is the regression test for review
+// finding 20: the unspecified address :: is not in any listed network unless
+// "::/128" (or the IP-class predicates) covers it, so both SSRF gates used to
+// classify http://[::]:PORT/ as public and auto-allow a loopback request.
+func TestResolveHostIsPrivate_IPv6Unspecified(t *testing.T) {
+	addr, private, err := resolveHostIsPrivate(context.Background(), "http://[::]:8080/")
+	if err != nil {
+		t.Fatalf("resolveHostIsPrivate returned error: %v", err)
+	}
+	if !private {
+		t.Errorf("resolveHostIsPrivate(http://[::]:8080/) private = false, want true (addr = %q)", addr)
+	}
+	if addr != "::" {
+		t.Errorf("resolved addr = %q, want %q", addr, "::")
 	}
 }

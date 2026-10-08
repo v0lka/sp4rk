@@ -1190,8 +1190,10 @@ func FormatFragmentationNudge(hash, toolName string, maxSliceHint int) string {
 }
 
 // fileBackedNudgePrefix is the prefix of nudge messages appended for file-backed
-// cache entries (read_file). Used by processToolResult to extract the nudge
-// before Stage 2 token-budget truncation and re-append it afterwards.
+// cache entries (read_file) — see formatFileBackedNudge. processToolResult
+// tracks the nudge it appends in a local variable (no string re-discovery), so
+// this constant is retained as the canonical prefix for tests and host-side
+// diagnostics that recognize the nudge in an observation.
 const fileBackedNudgePrefix = "\n\n[File content cached with hash:"
 
 // formatFileBackedNudge returns a message informing the LLM that the file
@@ -1447,6 +1449,19 @@ func (e *Executor) Run(ctx context.Context, taskTools []tools.ToolDescriptor, cw
 	if len(e.resumeSteps) > 0 {
 		state.allSteps = e.resumeSteps
 		startStep = len(e.resumeSteps) + 1
+		// Seed the ResponseGroup counter past the resumed trajectory. The
+		// counter is per-Executor, and a resume may run on a fresh Executor
+		// (e.g. the Conductor builds one per Run): without seeding, the new
+		// Executor's first multi-call response would reuse a group id already
+		// present in the seeded steps. Adjacent steps with equal ids are
+		// merged into ONE assistant message by the grouped renderers, which
+		// would silently drop the resumed turn's thought/reasoning and
+		// misattribute its tool calls to the previous turn.
+		for i := range e.resumeSteps {
+			if g := e.resumeSteps[i].ResponseGroup; g > e.responseGroupCounter {
+				e.responseGroupCounter = g
+			}
+		}
 	}
 
 	// Close any still-open live assistant stream when this Run exits —

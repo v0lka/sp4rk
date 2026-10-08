@@ -83,6 +83,21 @@ func (t *WriteFileTool) Execute(ctx context.Context, input json.RawMessage) (too
 		return tools.ToolResult{Content: err.Error(), IsError: true}, nil
 	}
 
+	// Refuse to REPLACE a non-regular target. The atomic rename below
+	// replaces any existing non-directory destination — including device
+	// nodes (/dev/null, NUL — which the harmless-device exemption keeps
+	// judge-local), FIFOs and sockets. Creating a NEW file at such a path is
+	// unaffected: a missing target falls through to the write. os.Stat
+	// (follow) is deliberate so write-through-symlink semantics are kept: a
+	// link to a regular file is written through, a link to a device is
+	// refused just like the device itself.
+	if info, statErr := os.Stat(params.Path); statErr == nil && !info.Mode().IsRegular() {
+		return tools.ToolResult{
+			Content: "refusing to write: target exists and is not a regular file (directory, device node, FIFO, or socket): " + params.Path,
+			IsError: true,
+		}, nil
+	}
+
 	// Coherence check: block write if file was modified since this session's last read.
 	checker := tools.CoherenceFrom(ctx)
 	if checker != nil {

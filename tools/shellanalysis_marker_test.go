@@ -241,3 +241,72 @@ func TestShellWorkspaceScopedVerification_DigestField(t *testing.T) {
 		t.Errorf("digest missing workspaceScopedVerification:true: %s", string(raw))
 	}
 }
+
+// TestShellWorkspaceScopedVerification_ManifestWriteRows pins the
+// dependency-manifest screen per ecosystem with a marker-eligible command (a
+// catalogued verification driver, every operand inside a session root), so
+// each row is refused BY the manifest screen and not by an unrelated rule.
+// Regression: the Cargo.toml, Cargo.lock, Pipfile, Pipfile.lock, Gemfile and
+// Gemfile.lock keys were stored mixed-case against a lower-cased lookup, so
+// the screen was dead for exactly those ecosystems and a manifest-rewriting
+// redirect could still reach the judge as a clean verified run.
+func TestShellWorkspaceScopedVerification_ManifestWriteRows(t *testing.T) {
+	cases := []markerCase{
+		{name: "go.mod redirect", command: "go test ./... > go.mod"},
+		{name: "Cargo.toml redirect", command: "go test ./... > Cargo.toml"},
+		{name: "Cargo.lock redirect", command: "go test ./... > Cargo.lock"},
+		{name: "Pipfile redirect", command: "go test ./... > Pipfile"},
+		{name: "Pipfile.lock redirect", command: "go test ./... > Pipfile.lock"},
+		{name: "Gemfile redirect", command: "gofmt -l . > Gemfile"},
+		{name: "Gemfile.lock redirect", command: "gofmt -l . > Gemfile.lock"},
+		{name: "lower-case spelling still screened", command: "go test ./... > cargo.toml"},
+	}
+	runMarkerCases(t, cases, false)
+}
+
+// TestShellWorkspaceScopedVerification_ManifestControlRow is the differential
+// control for the manifest screen: the same marker-eligible driver redirected
+// to a NON-manifest file keeps the clean verified-run marker, so the refusals
+// in TestShellWorkspaceScopedVerification_ManifestWriteRows are attributable
+// to the dependency-manifest screen and not to redirection per se.
+func TestShellWorkspaceScopedVerification_ManifestControlRow(t *testing.T) {
+	cases := []markerCase{
+		{name: "non-manifest redirect stays clean", command: "go test ./... > verify.out"},
+		{name: "non-manifest gofmt redirect stays clean", command: "gofmt -l . > fmt-report.txt"},
+	}
+	runMarkerCases(t, cases, true)
+}
+
+// TestShellIsDependencyManifest pins the case-insensitive basename screen
+// directly, including the mixed-case spellings whose table keys were
+// unreachable before the lower-casing fix.
+func TestShellIsDependencyManifest(t *testing.T) {
+	cases := []struct {
+		target string
+		want   bool
+	}{
+		{"Cargo.toml", true},
+		{"cargo.toml", true},
+		{"/ws/Cargo.toml", true},
+		{"Cargo.lock", true},
+		{"Pipfile", true},
+		{"pipfile", true},
+		{"Pipfile.lock", true},
+		{"Gemfile", true},
+		{"gemfile", true},
+		{"/ws/Gemfile.lock", true},
+		{"go.mod", true},
+		{"/ws/sub/dir/go.sum", true},
+		// Non-manifest shapes.
+		{"main.go", false},
+		{"cargo.txt", false},
+		{"gemfile.md", false},
+		{"/ws/Cargo.toml.bak", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := shellIsDependencyManifest(tc.target); got != tc.want {
+			t.Errorf("shellIsDependencyManifest(%q) = %v, want %v", tc.target, got, tc.want)
+		}
+	}
+}

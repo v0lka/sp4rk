@@ -14,7 +14,7 @@ import (
 	"github.com/v0lka/sp4rk/tools"
 )
 
-const toolGlobDescription = `Purpose: find files and directories by name pattern — supports * within a level and ** across levels (e.g. **/*.go, src/**/*.ts, **/*.test.ts). Symlinked directories are not traversed, and a single walk is bounded by a result cap, an entry budget and a wall-clock timeout.
+const toolGlobDescription = `Purpose: find files and directories by name pattern — supports * within a level and ** across levels (e.g. **/*.go, src/**/*.ts, **/*.test.ts). Symlinked directories are not traversed, results outside the session roots are filtered out (a symlink escaping them is never listed), and a single walk is bounded by a result cap, an entry budget and a wall-clock timeout.
 Use when: you know the name/extension shape but not the exact path. For a single directory's contents use list_directory; to search file contents use ripgrep; to open a found path use read_file.
 Inputs: pattern (glob expression); optional path (base directory, defaults to the workspace); optional type filter (files | dirs | all; default files).
 Outputs: the list of matching paths.
@@ -144,10 +144,37 @@ func (t *GlobTool) Execute(ctx context.Context, input json.RawMessage) (tools.To
 
 	var results []string
 
+	// Per-entry containment is enforced only when session roots are attached:
+	// with no workspace/temp/allowed roots in the context there is nothing to
+	// contain within, and the walk keeps today's fail-open behavior (the same
+	// convention as the ignore checker below).
+	enforceContainment := len(tools.SessionRoots(ctx)) > 0
+
 	walkErr := doublestar.GlobWalk(
 		newBoundedFS(walkCtx, os.DirFS(params.Path), t.limits),
 		params.Pattern,
 		func(p string, d fs.DirEntry) error {
+			// Containment comes first: doublestar.WithNoFollow does not
+			// suppress a symlink named in the pattern's literal prefix, so
+			// entries under such a prefix (and any other symlink escaping
+			// the roots) can resolve outside the walk's boundary. Resolve
+			// each entry against the session roots AND the search root
+			// itself — the search-root arm keeps glob usable on a
+			// work-directory root that is not a session root, while the
+			// resolution inside IsWithinRoot still catches an in-tree
+			// symlink whose target leaves both. A directory leaves via
+			// fs.SkipDir, which the walker handles as a benign subtree skip
+			// rather than a walk failure.
+			if enforceContainment {
+				absEntry := filepath.Join(params.Path, p)
+				if !isPathInSessionRoots(walkCtx, absEntry) && !tools.IsWithinRoot(walkCtx, params.Path, absEntry) {
+					if d.IsDir() {
+						return fs.SkipDir
+					}
+					return nil
+				}
+			}
+
 			// Filter by type
 			switch params.Type {
 			case "files":

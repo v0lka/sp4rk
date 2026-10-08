@@ -705,6 +705,47 @@ func TestRoute_AppendContextSections(t *testing.T) {
 	}
 }
 
+// TestRoute_AppendContextSections_WithProjectContextPlaceholder verifies the
+// context is inserted exactly once when the template declares the documented
+// PROJECT-CONTEXT placeholder: substitution into the placeholder and the
+// marker-based insertion are mutually exclusive, so a multi-KB AGENTS.md is
+// never emitted twice on every routing call, and the internal insertion
+// marker never leaks into the prompt.
+func TestRoute_AppendContextSections_WithProjectContextPlaceholder(t *testing.T) {
+	mock := &mockLLMCaller{
+		callFn: func(ctx context.Context, req llm.ChatRequest) (*llm.ChatResponse, error) {
+			return &llm.ChatResponse{
+				Message: llm.Message{Role: "assistant", Content: `{"domain":"code","complexity":3}`},
+			}, nil
+		},
+	}
+
+	const projectCtx = "PROJCTX-unique-project-context-marker"
+	r := New(mock, Config{
+		SystemPrompt:  "Tools: {{AVAILABLE-TOOLS}}\nProject: {{PROJECT-CONTEXT}}\nSkills: {{AVAILABLE-SKILLS}}\n{{JSON-OUTPUT-SCHEMA}}",
+		HistoryWindow: 5,
+		AppendContextSections: func(ctx context.Context) string {
+			return projectCtx
+		},
+	})
+
+	_, err := r.Route(context.Background(), "fix the bug", nil, nil, nil)
+	if err != nil {
+		t.Fatalf("Route returned error: %v", err)
+	}
+
+	sys := mock.lastCall().Messages[0].Content
+	if got, want := strings.Count(sys, projectCtx), 1; got != want {
+		t.Errorf("project context appears %d times in the system prompt, want %d (must not be duplicated via the placeholder AND the marker):\n%s", got, want, sys)
+	}
+	if strings.Contains(sys, "PROJECTCTXINS") {
+		t.Error("internal projectContextMarker leaked into the system prompt")
+	}
+	if strings.Contains(sys, "{{PROJECT-CONTEXT}}") {
+		t.Error("PROJECT-CONTEXT placeholder was not substituted")
+	}
+}
+
 func TestRoute_AppendContextSections_Nil(t *testing.T) {
 	// Verify that nil AppendContextSections is a no-op.
 	mock := &mockLLMCaller{
