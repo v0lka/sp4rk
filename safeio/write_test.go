@@ -51,6 +51,9 @@ func TestWriteFile_TruncatesExisting(t *testing.T) {
 // created file's perm bits must be a subset of the requested ones (the umask
 // may remove bits but never add them).
 func TestWriteFile_PermBitsWithinRequested(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("perm-bit subset semantics are unix-specific; Windows maps modes onto the read-only attribute")
+	}
 	path := filepath.Join(t.TempDir(), "out.txt")
 	if err := WriteFile(path, []byte("x"), 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
@@ -153,6 +156,9 @@ func TestWriteFileAtomic_ReplacesExisting(t *testing.T) {
 // behavior: the published file's perm bits must be a subset of the requested
 // ones.
 func TestWriteFileAtomic_PermBitsWithinRequested(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("perm-bit subset semantics are unix-specific; Windows maps modes onto the read-only attribute")
+	}
 	path := filepath.Join(t.TempDir(), "out.txt")
 	if err := WriteFileAtomic(path, []byte("x"), 0o600); err != nil {
 		t.Fatalf("WriteFileAtomic: %v", err)
