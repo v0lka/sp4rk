@@ -36,7 +36,7 @@ jobs:
         run: make vulncheck
 
       - name: Install golangci-lint
-        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
 
       - name: Lint (Go)
         run: golangci-lint run
@@ -63,7 +63,7 @@ jobs:
         run: brew install ripgrep
 
       - name: Install golangci-lint
-        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
 
       - name: Lint (Go)
         run: golangci-lint run
@@ -91,7 +91,7 @@ jobs:
         run: choco install ripgrep -y --no-progress
 
       - name: Install golangci-lint
-        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
 
       - name: Lint (Go)
         run: golangci-lint run
