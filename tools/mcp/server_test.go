@@ -586,6 +586,14 @@ const (
 	// the mcp-go ToolInputSchema struct does not model — discovery must
 	// preserve the schema verbatim (finding 51).
 	stdioHelperRawSchema = "rawschema"
+	// stdioHelperI32ID answers the handshake like the well-behaved default but
+	// echoes every tools/list request id truncated through int32 — modeling
+	// the field-observed codebase-memory-mcp, which parses JSON-RPC ids as
+	// 32-bit signed integers: a 2^52+1 request came back echoed as id=1, so
+	// the response could never match and discovery hung until the handshake
+	// timeout fired. Discovery must keep its raw paging ids inside the i32
+	// range, where truncation is the identity.
+	stdioHelperI32ID = "i32id"
 )
 
 // rawSchemaToolListJSON is the tools/list result served by the rawschema
@@ -740,6 +748,23 @@ func runStdioHelper(mode string) {
 			if mode == stdioHelperRawSchema {
 				// Serve the unmodelled-keyword schema verbatim (finding 51).
 				writeHelperResult(enc, req.ID, json.RawMessage(rawSchemaToolListJSON))
+				break
+			}
+			if mode == stdioHelperI32ID {
+				// Echo the request id truncated through int32, the way
+				// i32-parsing field servers (codebase-memory-mcp) do: ids
+				// outside the signed 32-bit range come back as different
+				// numbers and can never match the outstanding request.
+				var id int64
+				_ = json.Unmarshal(req.ID, &id)
+				writeHelperResult(enc,
+					json.RawMessage(strconv.FormatInt(int64(int32(id)), 10)),
+					map[string]any{
+						"tools": []any{map[string]any{
+							"name":        "i32_tool",
+							"description": "served despite i32 id truncation",
+						}},
+					})
 				break
 			}
 			writeHelperResult(enc, req.ID, map[string]any{"tools": []any{}})
@@ -1106,6 +1131,51 @@ func TestServer_DiscoverTools_StdioTimeout(t *testing.T) {
 	}
 	if elapsed > timeout+5*time.Second {
 		t.Errorf("tools/list timeout fired too late (took %v)", elapsed)
+	}
+}
+
+// TestServer_DiscoverTools_I32TruncatingIDServer verifies that discovery
+// survives a server that parses JSON-RPC request ids as 32-bit signed
+// integers. The field-observed codebase-memory-mcp echoes a 2^52+1 tools/list
+// request back as id=1 (low bits): the response never matched the outstanding
+// request, so discovery hung until the handshake timeout fired and the server
+// surfaced as "discover tools: list_tools timed out". mcpRawRequestIDBase must
+// keep the raw paging ids inside the i32 range, where the truncation is the
+// identity and the echo matches (finding 70).
+func TestServer_DiscoverTools_I32TruncatingIDServer(t *testing.T) {
+	s := newServer("i32id")
+	cfg := stdioHelperServerConfig(t, stdioHelperI32ID, 10*time.Second, 10*time.Second)
+	if err := s.Connect(context.Background(), cfg); err != nil {
+		t.Fatalf("Connect to scripted stdio helper: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	if err := s.DiscoverTools(context.Background()); err != nil {
+		t.Fatalf("DiscoverTools against an i32-truncating server: %v", err)
+	}
+
+	tools := s.Tools()
+	if len(tools) != 1 || tools[0].Name != "i32_tool" {
+		t.Errorf("unexpected discovered tools: %+v", tools)
+	}
+}
+
+// TestMCPRawRequestIDBase_I32Compat pins the mcpRawRequestIDBase window: the
+// raw tools/list paging ids must stay inside the signed 32-bit range so
+// i32-parsing servers (codebase-memory-mcp) echo them back exactly, while
+// remaining far above mcp-go's sequential-from-1 numbering to keep the two ID
+// spaces disjoint. Re-bumping the base past 2^31 reintroduces the field
+// failure where every tools/list response echoes a truncated id that can
+// never match and discovery hangs until the handshake timeout.
+func TestMCPRawRequestIDBase_I32Compat(t *testing.T) {
+	if mcpRawRequestIDBase <= 1<<28 {
+		t.Errorf("mcpRawRequestIDBase = %d: too close to mcp-go's sequential id space (starts at 1); want above 2^28", mcpRawRequestIDBase)
+	}
+	if mcpRawRequestIDBase >= 1<<31-1 {
+		t.Errorf("mcpRawRequestIDBase = %d: must stay below 2^31-1 — servers that parse request ids as i32 truncate larger ids, so tools/list responses can never match and discovery hangs", mcpRawRequestIDBase)
+	}
+	if mcpRawRequestIDBase >= 1<<53 {
+		t.Errorf("mcpRawRequestIDBase = %d: must stay below 2^53 — mcp-go re-parses response ids through float64", mcpRawRequestIDBase)
 	}
 }
 

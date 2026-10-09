@@ -1002,13 +1002,22 @@ func (s *Server) DiscoverTools(ctx context.Context) error {
 // 1 and routes responses by echoed ID through a shared map, so reusing small
 // IDs could hijack the response of a concurrent in-flight call on the same
 // connection (Server.CallTool drops the server lock before its wire call).
-// Seeding the counter far above any sequential run keeps the two ID spaces
-// disjoint. The base must stay under 2^53: mcp-go's RequestId re-parses
-// response IDs through float64, so larger IDs lose precision on the way back
-// and the response would no longer match the map key. DiscoverTools runs once
-// per (re)connect under the server write lock, so its own calls never collide
-// with each other.
-const mcpRawRequestIDBase = int64(1) << 52
+// Seeding the counter above any sequential run keeps the two ID spaces
+// disjoint.
+//
+// The base must also stay BELOW 2^31: not every server echoes the JSON-RPC
+// request id verbatim. codebase-memory-mcp parses the id into a 32-bit signed
+// integer — a 2^52+1 request came back echoed as id=1 (low bits), a 2^31
+// request as -2147483648 (i32 overflow) — so the response could never match
+// the outstanding request and discovery hung until the handshake timeout
+// fired ("discover tools: list_tools timed out"). Every base+counter value
+// below 2^31 round-trips exactly through i32/u32 and (being under 2^53)
+// through mcp-go's float64 re-parse of response IDs, while staying ~2^30
+// requests above anything the client's sequential numbering produces on one
+// connection. DiscoverTools runs once per (re)connect under the server write
+// lock, so its own calls never collide with each other; even one ID per
+// tools/list page never exhausts the 2^30-wide safe window.
+const mcpRawRequestIDBase = int64(1) << 30
 
 var mcpRawRequestID atomic.Int64
 
