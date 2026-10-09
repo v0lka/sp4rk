@@ -169,7 +169,7 @@ Zero (the default) disables the ceiling. `SetToolCallTimeoutExempt(names...)` na
 
 - **Fatal LLM/tool error**: `Run` returns a non-nil error.
 - **Context cancelled**: propagated immediately, no retry.
-- **Cooperative pause**: `Run` returns `ErrPaused` plus the trajectory accumulated through the previous completed boundary; pending post-edit verification is flushed before the checkpoint is returned.
+- **Cooperative pause**: `Run` returns `ErrPaused` plus the trajectory accumulated through the previous completed boundary; pending post-edit verification is flushed before the checkpoint is returned, bounded by a short checkpoint budget (5 s + 250 ms grace) so a slow verify command cannot stall the pause — a command that exceeds the budget is cancelled and dropped, and the edit stays unverified (a `[verify_on_edit]` nudge says so) until the next edit re-arms verification.
 - **Tool call ceiling exceeded**: `Run` returns an error wrapping `ErrToolTimeout` (naming the tool). This arm returns no result, so a pending post-edit verification is deliberately NOT flushed here — with no consumer the note would be discarded, so running the command would be wasted work. Exempt tools (see `SetToolCallTimeoutExempt`) are never bounded.
 - **Verification command failure/timeout**: represented in a `[verify_on_edit]` observation and does not become a `Run` error.
 - **Budget exhausted without finish**: `Finished: false`, treated as incomplete (not an error).

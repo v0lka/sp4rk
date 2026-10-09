@@ -511,6 +511,60 @@ func TestGlobTool_OutOfRootSymlinkPrefixYieldsNothing(t *testing.T) {
 	}
 }
 
+// --- Limits-override constructor -------------------------------------------
+
+// TestGlobTool_OverrideHonorsAllZeroLimits pins the override constructor's
+// contract: an explicitly all-zero GlobLimits is stored verbatim ("0 disables
+// every bound"), not silently replaced by the defaults the way
+// NewGlobToolWithLimits does for a never-populated struct.
+func TestGlobTool_OverrideHonorsAllZeroLimits(t *testing.T) {
+	tool := NewGlobToolWithLimitsOverride(GlobLimits{})
+	if got := tool.Limits(); got != (GlobLimits{}) {
+		t.Errorf("override must keep an all-zero GlobLimits verbatim, got %+v", got)
+	}
+}
+
+// TestGlobTool_OverrideHonorsPartialLimits: mixed zero/non-zero fields are
+// stored as given on the override path too.
+func TestGlobTool_OverrideHonorsPartialLimits(t *testing.T) {
+	want := GlobLimits{MaxEntries: 7}
+	if got := NewGlobToolWithLimitsOverride(want).Limits(); got != want {
+		t.Errorf("limits = %+v, want %+v", got, want)
+	}
+}
+
+// TestGlobTool_WithLimitsZeroStillFallsBackToDefaults keeps the historical
+// zero-value convenience fallback for callers that never populate the struct
+// (the runaway-walk protection stays a property of the tool on that path).
+func TestGlobTool_WithLimitsZeroStillFallsBackToDefaults(t *testing.T) {
+	if got, want := NewGlobToolWithLimits(GlobLimits{}).Limits(), DefaultGlobLimits(); got != want {
+		t.Errorf("fallback limits = %+v, want %+v", got, want)
+	}
+}
+
+// TestGlobTool_OverrideMaxResultsDrivesWalk proves the stored override limits
+// actually drive the walk: a tiny MaxResults aborts early and returns the
+// partial set with the documented warning suffix.
+func TestGlobTool_OverrideMaxResultsDrivesWalk(t *testing.T) {
+	base := setupGlobTestDir(t)
+	tool := NewGlobToolWithLimitsOverride(GlobLimits{MaxResults: 1})
+
+	input, _ := json.Marshal(GlobInput{Pattern: "**/*.go", Path: base})
+	result, err := tool.Execute(context.Background(), input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("unexpected error result: %s", result.Content)
+	}
+	if lines := globResultLines(result.Content); len(lines) != 1 {
+		t.Errorf("expected exactly 1 result under MaxResults=1, got %d: %q", len(lines), result.Content)
+	}
+	if !strings.Contains(result.Content, "results limited to 1") {
+		t.Errorf("expected the results-cap warning, got: %s", result.Content)
+	}
+}
+
 // diffGlobResultSet compares a glob output against the exact expected set
 // (order-insensitive) and returns "" on a match, or a human-readable difference
 // otherwise. An empty expected set renders as the glob's "no matching files

@@ -65,3 +65,19 @@ func checkRegularHandle(f *os.File, path string) error {
 	}
 	return nil
 }
+
+// OpenFileNoFollow is the no-symlink-follow counterpart of OpenFile on unix.
+//
+// Windows parity limitation: this implementation delegates to OpenFile and
+// therefore STILL RESOLVES a symbolic link at the final path component —
+// os.OpenFile follows reparse points, and refusing that would require opening
+// with FILE_FLAG_OPEN_REPARSE_POINT via golang.org/x/sys/windows, a new
+// dependency this package avoids. Callers that must never write through a
+// final symlink should use WriteFileAtomic, whose rename replaces the link
+// itself instead of following it, on every platform.
+//
+// All the OpenFile hardening still applies: the handle-based regularity check
+// refuses a non-regular pre-existing target.
+func OpenFileNoFollow(path string, flag int, perm fs.FileMode) (*os.File, error) {
+	return OpenFile(path, flag, perm)
+}

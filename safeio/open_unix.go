@@ -76,3 +76,29 @@ func checkRegularFD(fd int, path string) error {
 	}
 	return nil
 }
+
+// OpenFileNoFollow is OpenFile with one extra guard: O_NOFOLLOW, which makes
+// the kernel refuse to open a symbolic link at the FINAL path component — the
+// open fails with ELOOP (*fs.PathError wrapping syscall.ELOOP) instead of
+// resolving the link, so a write-open can never be redirected through a
+// planted symlink. With O_CREATE this also means an existing symlink at path
+// is never written through; the caller must remove the link first or use
+// WriteFileAtomic to replace it.
+//
+// All the OpenFile hardening still applies: the open is non-blocking and
+// regularity is verified by fstat on the already-open descriptor, so a FIFO at
+// path is refused without ever blocking.
+//
+// O_NOFOLLOW guards only the final component — intermediate symlinks are
+// still resolved by the kernel, as with open(2) generally; use MkdirAllReal
+// to build intermediate paths out of real directories only.
+func OpenFileNoFollow(path string, flag int, perm fs.FileMode) (*os.File, error) {
+	fd, err := syscall.Open(path, flag|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, uint32(perm.Perm()))
+	if err != nil {
+		return nil, &fs.PathError{Op: "open", Path: path, Err: err}
+	}
+	if err := checkRegularFD(fd, path); err != nil {
+		return nil, err
+	}
+	return os.NewFile(uintptr(fd), path), nil
+}

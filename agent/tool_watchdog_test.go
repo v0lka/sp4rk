@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -294,5 +295,104 @@ func TestNewExecutor_ToolCallTimeoutSurface(t *testing.T) {
 	exec.SetToolCallTimeout(0)
 	if exec.toolCallTimeout != 0 {
 		t.Fatalf("SetToolCallTimeout(0) must disable the ceiling, got %v", exec.toolCallTimeout)
+	}
+}
+
+// --- Exemption set ----------------------------------------------------------
+
+// TestNewExecutor_ToolCallTimeoutExemptDefault pins the built-in default: a
+// fresh executor exempts exactly the documented orchestration tools and
+// nothing else.
+func TestNewExecutor_ToolCallTimeoutExemptDefault(t *testing.T) {
+	exec := NewExecutor(&mockLLMCaller{}, newMockToolExecutor(), 5)
+	for _, name := range DefaultToolCallTimeoutExemptTools() {
+		if !exec.isToolCallTimeoutExempt(name) {
+			t.Errorf("new executor must exempt %q by default", name)
+		}
+	}
+	if exec.isToolCallTimeoutExempt("any_mcp_tool") {
+		t.Error("a tool outside the default set must not be exempt by default")
+	}
+}
+
+// TestDefaultToolCallTimeoutExemptTools_BuiltinSet pins the accessor's shape
+// (sorted, fresh copy) that host config surfaces use as their default.
+func TestDefaultToolCallTimeoutExemptTools_BuiltinSet(t *testing.T) {
+	want := []string{"ask_user", "declare_plan", "delegate", "execute_plan", "propose_goal"}
+	got := DefaultToolCallTimeoutExemptTools()
+	if !slices.Equal(got, want) {
+		t.Fatalf("DefaultToolCallTimeoutExemptTools() = %v, want %v", got, want)
+	}
+	// The returned slice is a copy: mutating it must not corrupt the default.
+	got[0] = "mutated"
+	if again := DefaultToolCallTimeoutExemptTools(); !slices.Equal(again, want) {
+		t.Fatalf("mutating the returned slice changed the default set: %v", again)
+	}
+}
+
+// TestExecutor_SetToolCallTimeoutExempt_ExemptToolSurvivesCeiling pins the
+// host extension point: a tool named in the replacement set is never bounded,
+// even with a ceiling far below the tool's run time — the scenario of an
+// MCP-backed tool that legitimately waits on a slow server.
+func TestExecutor_SetToolCallTimeoutExempt_ExemptToolSurvivesCeiling(t *testing.T) {
+	blocking := newBlockingToolExecutor()
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(blocking.release) }) })
+
+	mockLLM := &mockLLMCaller{
+		responses: []*llm.ChatResponse{
+			llmResponseWithToolCall("call the blocking tool", "block_tool", json.RawMessage(`{}`)),
+			llmResponseFinish("done", "finished"),
+		},
+	}
+	exec := NewExecutor(mockLLM, blocking, 10)
+	exec.SetToolCallTimeout(20 * time.Millisecond)
+	// The extension the setter exists for: cover this host's own long-running
+	// tool. Without it the 20ms ceiling abandons the call and fails the run.
+	exec.SetToolCallTimeoutExempt("block_tool")
+
+	// Release the tool as soon as it is in flight; ordering is channel-driven
+	// (no sleeps), so the ceiling can only fire if the exemption is broken.
+	go func() {
+		<-blocking.started
+		releaseOnce.Do(func() { close(blocking.release) })
+	}()
+
+	result, err := runExecutorBounded(context.Background(), t, exec, blockToolDescriptors())
+	if err != nil {
+		t.Fatalf("exempt tool must not be bounded by the ceiling: %v", err)
+	}
+	released := false
+	for _, s := range result.Steps {
+		if strings.Contains(s.Observation, "released") {
+			released = true
+			break
+		}
+	}
+	if !released {
+		t.Error("expected the exempt blocking tool's result in the trajectory")
+	}
+}
+
+// TestExecutor_SetToolCallTimeoutExempt_ClearRestoresBound: clearing the set
+// (no names) bounds every tool again.
+func TestExecutor_SetToolCallTimeoutExempt_ClearRestoresBound(t *testing.T) {
+	blocking := newBlockingToolExecutor()
+	t.Cleanup(func() { close(blocking.release) })
+
+	mockLLM := &mockLLMCaller{
+		responses: []*llm.ChatResponse{
+			llmResponseWithToolCall("call the blocking tool", "block_tool", json.RawMessage(`{}`)),
+			llmResponseFinish("done", "finished"),
+		},
+	}
+	exec := NewExecutor(mockLLM, blocking, 10)
+	exec.SetToolCallTimeout(20 * time.Millisecond)
+	exec.SetToolCallTimeoutExempt("block_tool")
+	exec.SetToolCallTimeoutExempt() // clear
+
+	_, err := runExecutorBounded(context.Background(), t, exec, blockToolDescriptors())
+	if !errors.Is(err, ErrToolTimeout) {
+		t.Fatalf("cleared exemption must restore the ceiling: got %v, want ErrToolTimeout", err)
 	}
 }

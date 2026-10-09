@@ -436,6 +436,12 @@ type Executor struct {
 	// successful file edits. Set via SetVerifyOnEdit; nil disables it.
 	verifyOnEdit    EditVerifyRunner
 	verifyOnEditCap int
+	// verifyOnEditCheckpointBudget bounds the verify-on-edit flush at a pause
+	// checkpoint (flushPendingVerifyOnEditAtCheckpoint), independent of the
+	// runner's own ceiling, so a pause stays prompt. Zero selects
+	// defaultVerifyOnEditCheckpointBudget (the same defensive-default pattern
+	// as toolWatchdogInterval); tests lower it directly.
+	verifyOnEditCheckpointBudget time.Duration
 
 	// Tool result caching and per-tool truncation (Stage 1).
 	toolCache         *ToolResultCache

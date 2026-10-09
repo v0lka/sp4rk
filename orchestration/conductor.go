@@ -137,6 +137,18 @@ type ConductorConfig struct {
 	// value) for the class-wide guarantee.
 	ToolCallTimeout time.Duration
 
+	// ToolCallTimeoutExemptTools replaces the executor's set of tool names
+	// exempt from the ToolCallTimeout ceiling (installed via
+	// agent.Executor.SetToolCallTimeoutExempt). A nil slice keeps the
+	// executor's built-in default (see agent.DefaultToolCallTimeoutExemptTools);
+	// a non-nil slice — possibly empty — replaces it wholesale, so a host can
+	// extend the exemption to its own long-running tools (e.g. MCP-backed
+	// tools with no internal timeout that legitimately wait on a slow server).
+	// It is consumed wherever the ceiling itself applies (the main executor
+	// here); a host launcher that builds subagent executors mirrors it via the
+	// same setter.
+	ToolCallTimeoutExemptTools []string
+
 	// UserMessageSource, when non-nil, is installed on the Executor via
 	// SetUserMessageSource. It is invoked at every step boundary (immediately
 	// after the pause check and before the LLM call); a non-empty return lands
@@ -410,6 +422,13 @@ func (c *Conductor) Run(
 	// value clears/disables it), mirroring how a nil PauseChecker leaves the
 	// loop non-pausing. See ConductorConfig.ToolCallTimeout.
 	executor.SetToolCallTimeout(c.cfg.ToolCallTimeout)
+
+	// Exemption set for the ceiling above. A nil slice keeps the executor's
+	// built-in default exempt set; a non-nil slice replaces it wholesale (see
+	// ConductorConfig.ToolCallTimeoutExemptTools).
+	if c.cfg.ToolCallTimeoutExemptTools != nil {
+		executor.SetToolCallTimeoutExempt(c.cfg.ToolCallTimeoutExemptTools...)
+	}
 
 	// Live user message source: install it on the executor so Run polls it at
 	// every step boundary (right after the pause check). A non-empty return

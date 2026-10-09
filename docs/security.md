@@ -126,7 +126,7 @@ MCP servers run arbitrary third-party commands. To avoid leaking host secrets (L
 
 ## Harmless device-path exemption
 
-Path-locality confirmation checks (`tools.AllPathsInDir` / `AllPathsInSessionRoots`) exempt harmless special-device paths — `/dev/null` (POSIX) and `NUL` (Windows) — via `tools.IsHarmlessDevicePath`, so referencing `/dev/null` does not force a confirmation when it appears alongside in-root paths. `/dev/full` and `/dev/zero` are deliberately **not** exempt: their reads are unbounded infinite streams that never return EOF, so reading them cannot be bounded by the reader. The symlink gate does not consult this exemption: it resolves every path via `Lstat`, so device paths are still classified by their traversal behaviour. See [Tool Safety](tool-safety.md#path-extraction-helpers) for the extraction primitives.
+Path-locality confirmation checks (`tools.AllPathsInDir` / `AllPathsInSessionRoots`) exempt harmless special-device paths — `/dev/null` (POSIX) and `NUL` (Windows) — via `tools.IsHarmlessDevicePath`, so referencing `/dev/null` does not force a confirmation when it appears alongside in-root paths. `/dev/full` is deliberately NOT exempted: although its writes fail with ENOSPC (nothing is stored), its reads are an infinite zero stream (identical to `/dev/zero` on Linux), so an unbounded read never returns EOF and the "provably safe to read from" half of the harmless invariant does not hold for it. The symlink gate does not consult this exemption: it resolves every path via `Lstat`, so device paths are still classified by their traversal behaviour. See [Tool Safety](tool-safety.md#path-extraction-helpers) for the extraction primitives.
 
 ## Complete Example
 

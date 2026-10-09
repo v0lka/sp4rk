@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/v0lka/sp4rk/llm"
@@ -491,5 +492,124 @@ func TestFormatVerifyNote_NegativeExitCodeIsNotAFailedRun(t *testing.T) {
 	}
 	if !strings.Contains(note, "blocked by security policy") {
 		t.Errorf("note should preserve the runner output: %q", note)
+	}
+}
+
+// --- Pause-checkpoint flush budget ------------------------------------------
+//
+// newCheckpointFlushExecutor builds a minimal executor for direct
+// flushPendingVerifyOnEditAtCheckpoint calls with a lowered checkpoint budget
+// (no Run loop involved: the pause arm invokes the flush synchronously).
+func newCheckpointFlushExecutor(t *testing.T, runner EditVerifyRunner, budget time.Duration) *Executor {
+	t.Helper()
+	exec := newExecutorDefaultHITL(&mockLLMCaller{}, newMockToolExecutor(), &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+	exec.SetVerifyOnEdit(runner, 0)
+	exec.verifyOnEditCheckpointBudget = budget
+	return exec
+}
+
+// TestExecutor_VerifyOnEdit_CheckpointFlush_BoundedByBudget: a
+// cancellation-honoring runner is stopped at the checkpoint budget and its
+// timeout note is injected as a user nudge — the flush returns promptly
+// (watchdog-bounded), never after the runner's own (much larger) ceiling.
+func TestExecutor_VerifyOnEdit_CheckpointFlush_BoundedByBudget(t *testing.T) {
+	budget := 25 * time.Millisecond
+	exec := newCheckpointFlushExecutor(t, func(ctx context.Context) EditVerifyResult {
+		<-ctx.Done() // the command is killed at the budget
+		// A cancelled command reports a timeout, not an infrastructure error
+		// (Err is reserved for "could not start at all").
+		return EditVerifyResult{TimedOut: true, Timeout: budget}
+	}, budget)
+	state := &runState{pendingVerifyEdit: true}
+
+	flushDone := make(chan struct{})
+	go func() {
+		exec.flushPendingVerifyOnEditAtCheckpoint(context.Background(), state)
+		close(flushDone)
+	}()
+	select {
+	case <-flushDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("checkpoint flush did not return within its budget — a pause would be delayed by the runner's whole ceiling")
+	}
+	if len(state.allSteps) != 1 {
+		t.Fatalf("expected exactly one user-nudge step, got %d", len(state.allSteps))
+	}
+	note := state.allSteps[0].UserNudge
+	if !strings.Contains(note, "[verify_on_edit]") || !strings.Contains(note, "NOT verified") {
+		t.Fatalf("expected the runner's timeout note, got %q", note)
+	}
+	if state.pendingVerifyEdit {
+		t.Error("pendingVerifyEdit must stay cleared after the flush")
+	}
+}
+
+// TestExecutor_VerifyOnEdit_CheckpointFlush_IgnoringRunnerDroppedWithinBudget:
+// even a runner that ignores cancellation cannot delay the flush beyond the
+// budget — the late result is dropped at the checkpoint and the injected note
+// says the edit remains unverified. The abandoned goroutine is released via
+// cleanup (its send lands on the buffered channel, so it never leaks).
+func TestExecutor_VerifyOnEdit_CheckpointFlush_IgnoringRunnerDroppedWithinBudget(t *testing.T) {
+	budget := 25 * time.Millisecond
+	never := make(chan struct{})
+	t.Cleanup(func() { close(never) }) // let the abandoned runner's goroutine exit
+	exec := newCheckpointFlushExecutor(t, func(context.Context) EditVerifyResult {
+		<-never // ignores ctx cancellation entirely
+		return EditVerifyResult{Output: "late result", ExitCode: 0}
+	}, budget)
+	state := &runState{pendingVerifyEdit: true}
+
+	flushDone := make(chan struct{})
+	go func() {
+		exec.flushPendingVerifyOnEditAtCheckpoint(context.Background(), state)
+		close(flushDone)
+	}()
+	select {
+	case <-flushDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("checkpoint flush must return within its budget even for a cancellation-ignoring runner")
+	}
+	if len(state.allSteps) != 1 {
+		t.Fatalf("expected exactly one user-nudge step, got %d", len(state.allSteps))
+	}
+	if note := state.allSteps[0].UserNudge; !strings.Contains(note, "pause-checkpoint budget") || !strings.Contains(note, "UNVERIFIED") {
+		t.Fatalf("expected the dropped-verification nudge, got %q", note)
+	}
+}
+
+// TestExecutor_VerifyOnEdit_CheckpointFlush_FastRunnerInjectsNote: a runner
+// finishing within the budget keeps today's behavior — the real verification
+// note is injected as a user nudge, not the budget notice.
+func TestExecutor_VerifyOnEdit_CheckpointFlush_FastRunnerInjectsNote(t *testing.T) {
+	exec := newCheckpointFlushExecutor(t, func(context.Context) EditVerifyResult {
+		return EditVerifyResult{Output: "FAIL: 1 test", ExitCode: 1}
+	}, time.Second)
+	state := &runState{pendingVerifyEdit: true}
+
+	exec.flushPendingVerifyOnEditAtCheckpoint(context.Background(), state)
+	if len(state.allSteps) != 1 {
+		t.Fatalf("expected exactly one user-nudge step, got %d", len(state.allSteps))
+	}
+	if note := state.allSteps[0].UserNudge; !strings.Contains(note, "VERIFICATION FAILED") {
+		t.Fatalf("expected the runner's own note, got %q", note)
+	}
+}
+
+// TestExecutor_VerifyOnEdit_CheckpointFlush_NoopWithoutPending: no pending
+// edit (or no runner) means no command runs and no nudge is added.
+func TestExecutor_VerifyOnEdit_CheckpointFlush_NoopWithoutPending(t *testing.T) {
+	calls := 0
+	exec := newCheckpointFlushExecutor(t, func(context.Context) EditVerifyResult {
+		calls++
+		return EditVerifyResult{Output: "ok", ExitCode: 0}
+	}, time.Second)
+
+	state := &runState{}
+	exec.flushPendingVerifyOnEditAtCheckpoint(context.Background(), state)
+	if calls != 0 {
+		t.Errorf("runner called %d times without a pending edit, want 0", calls)
+	}
+	if len(state.allSteps) != 0 {
+		t.Errorf("expected no nudges, got %+v", state.allSteps)
 	}
 }

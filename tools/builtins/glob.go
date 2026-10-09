@@ -44,10 +44,35 @@ func NewGlobTool() *GlobTool {
 // is why the fallback is all-or-nothing rather than per-field: a per-field fill
 // would silently convert a deliberate `0` (disable this budget) into the default
 // and make the published "0 disables" contract unreachable.
+//
+// A host whose config resolution already distinguishes "never populated" from
+// "explicitly zeroed on every knob" — and wants the all-zero combination to
+// mean "all bounds disabled", not "the defaults" — uses
+// NewGlobToolWithLimitsOverride instead, which stores the values verbatim.
 func NewGlobToolWithLimits(limits GlobLimits) *GlobTool {
 	if limits == (GlobLimits{}) {
 		limits = DefaultGlobLimits()
 	}
+	return newGlobTool(limits)
+}
+
+// NewGlobToolWithLimitsOverride creates a new GlobTool instance that uses the
+// given limits EXACTLY as provided: unlike NewGlobToolWithLimits, an all-zero
+// GlobLimits is NOT replaced by DefaultGlobLimits(). It exists for hosts whose
+// config layer has already separated "unset" (take the defaults) from
+// "explicitly zero" (the documented "0 = no budget" per field), so an
+// operator's explicit zero on every knob — "disable the runaway-walk
+// protection entirely" — is honored instead of being silently re-armed.
+//
+// Callers that cannot make that distinction (a zero-value struct may merely
+// mean "never populated") must keep using NewGlobToolWithLimits, whose
+// fallback guarantees the walk can never register unbounded by accident.
+func NewGlobToolWithLimitsOverride(limits GlobLimits) *GlobTool {
+	return newGlobTool(limits)
+}
+
+// newGlobTool is the shared constructor; the limits are stored verbatim.
+func newGlobTool(limits GlobLimits) *GlobTool {
 	return &GlobTool{
 		BaseTool: &tools.BaseTool{
 			ToolName:        "glob",
@@ -78,6 +103,12 @@ func NewGlobToolWithLimits(limits GlobLimits) *GlobTool {
 		limits: limits,
 	}
 }
+
+// Limits returns the walk bounds the tool was constructed with. Hosts use it
+// to verify that explicitly configured limits survived registration verbatim —
+// e.g. that an all-zero override (NewGlobToolWithLimitsOverride) was not
+// silently replaced by the defaults.
+func (t *GlobTool) Limits() GlobLimits { return t.limits }
 
 // GlobInput represents the input parameters for glob search.
 type GlobInput struct {

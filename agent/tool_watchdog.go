@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/v0lka/sp4rk/tools"
@@ -33,6 +34,20 @@ var defaultToolCallTimeoutExemptTools = map[string]struct{}{
 	"propose_goal": {},
 	"delegate":     {},
 	"execute_plan": {},
+}
+
+// DefaultToolCallTimeoutExemptTools returns the built-in exempt set (see
+// defaultToolCallTimeoutExemptTools) in sorted order, as a fresh slice the
+// caller may mutate. A host that threads a configurable exemption list uses it
+// as the documented default, so the config surface cannot drift from the set
+// the executor actually installs when the knob is left unset.
+func DefaultToolCallTimeoutExemptTools() []string {
+	names := make([]string, 0, len(defaultToolCallTimeoutExemptTools))
+	for name := range defaultToolCallTimeoutExemptTools {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // toolCallOutcome carries the result of the detached tools.Execute call back to

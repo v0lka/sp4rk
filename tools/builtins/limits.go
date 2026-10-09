@@ -143,7 +143,10 @@ func DefaultRipgrepLimits() RipgrepLimits {
 // NewGlobToolWithLimits, so a zero-value GlobLimits cannot register an
 // unbounded walk (the bounds are a property of the tool, not of every caller).
 // An individual zero field on an otherwise-populated struct is honored as
-// "disabled" (see the field comments below).
+// "disabled" (see the field comments below). A host that has already
+// distinguished "unset" from "explicitly zero on every knob" and wants the
+// all-zero combination honored verbatim registers via
+// NewGlobToolWithLimitsOverride, which performs no substitution.
 type GlobLimits struct {
 	MaxEntries int           // max filesystem entries visited (directory entries read, plus Open/Stat calls) before the walk is aborted (0 = no entry budget)
 	MaxResults int           // max matching paths collected before the walk is aborted (0 = unlimited)

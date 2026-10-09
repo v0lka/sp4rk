@@ -40,6 +40,23 @@ type EditVerifyRunner func(ctx context.Context) EditVerifyResult
 // verification output injected into the observation.
 const DefaultVerifyOnEditCap = 4000
 
+// defaultVerifyOnEditCheckpointBudget bounds the verify-on-edit flush at a
+// pause checkpoint (see flushPendingVerifyOnEditAtCheckpoint). It is
+// deliberately short and independent of the runner's own ceiling (the host
+// typically caps that at its bash max timeout — minutes), so a pause remains a
+// prompt cooperative stop instead of waiting out the user's whole test/linter
+// run.
+const defaultVerifyOnEditCheckpointBudget = 5 * time.Second
+
+// verifyOnEditCheckpointAbandonGrace is how long the checkpoint flush waits
+// PAST the budget for an already-cancelled runner to deliver its final result
+// before dropping it (see flushPendingVerifyOnEditAtCheckpoint). The runner's
+// context fires at the budget; the grace is only a fairness window so the
+// runner's real timeout note wins over the synthetic dropped-verification
+// note. It is NOT part of the command's budget: the command is cancelled at
+// the budget either way.
+const verifyOnEditCheckpointAbandonGrace = 250 * time.Millisecond
+
 // verifyOnEditTools are the tool names that count as a file edit. Only
 // content-changing file tools trigger verification; directory operations
 // and deletions do not produce code that a test/linter run would validate
@@ -178,8 +195,61 @@ func (e *Executor) flushPendingVerifyOnEdit(ctx context.Context, state *runState
 // the run leaves the tool-dispatch path — and a resumed run, which starts with
 // a fresh runState, would never verify the edit (the same silent loss the
 // HITL-reject path already guards against).
+//
+// The flush is bounded by its OWN short budget
+// (defaultVerifyOnEditCheckpointBudget), independent of the runner's ceiling:
+//
+//   - the runner's context carries the budget as a deadline, so a
+//     cancellation-honoring runner is stopped at the budget and its (partial)
+//     result is formatted and injected as usual — the [verify_on_edit] timeout
+//     note already tells the model the edit was NOT verified;
+//   - the select below additionally guarantees the flush RETURNS within the
+//     budget (plus a short abandon grace that only waits for an
+//     already-cancelled runner's final result) even for a runner that ignores
+//     cancellation. A result arriving after that is dropped at the checkpoint
+//     and the edit stays unverified: the injected note says so, and the
+//     command re-runs at the next regular verification (or is re-run
+//     manually). The abandoned runner's goroutine ends when the runner
+//     finally returns — bounded by the runner's own timeout handling, the
+//     same containment the tool-call watchdog documents for a tool that
+//     ignores its cancellation.
 func (e *Executor) flushPendingVerifyOnEditAtCheckpoint(ctx context.Context, state *runState) {
-	if note := e.flushPendingVerifyOnEdit(ctx, state); note != "" {
+	if e.verifyOnEdit == nil || !state.pendingVerifyEdit {
+		return
+	}
+	state.pendingVerifyEdit = false
+
+	budget := e.verifyOnEditCheckpointBudget
+	if budget <= 0 {
+		budget = defaultVerifyOnEditCheckpointBudget
+	}
+	flushCtx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+
+	// Buffered: an abandoned runner's goroutine must never block on the send.
+	done := make(chan EditVerifyResult, 1)
+	go func() { done <- e.verifyOnEdit(flushCtx) }()
+
+	// The hard bound is the budget plus the abandon grace: at the budget the
+	// runner's context is already cancelled, so the grace only waits for an
+	// honoring runner to deliver its final (timeout) result — a runner that
+	// ignores cancellation is dropped right after it.
+	timer := time.NewTimer(budget + verifyOnEditCheckpointAbandonGrace)
+	defer timer.Stop()
+
+	var res EditVerifyResult
+	select {
+	case res = <-done:
+	case <-timer.C:
+		// Dismiss a still-running command (cooperative, like the watchdog's
+		// cancelCall) and proceed with the pause on time.
+		cancel()
+		state.allSteps = append(state.allSteps, Step{UserNudge: fmt.Sprintf(
+			"[verify_on_edit] verification did not complete within the %s pause-checkpoint budget; the pause proceeds without it and the edit remains UNVERIFIED — re-run the command manually or after the next edit.",
+			budget)})
+		return
+	}
+	if note := FormatVerifyNote(res, e.verifyOnEditCap); note != "" {
 		state.allSteps = append(state.allSteps, Step{UserNudge: note})
 	}
 }
