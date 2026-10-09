@@ -1,6 +1,6 @@
 module github.com/v0lka/sp4rk
 
-go 1.27.1
+go 1.27.2
 
 require (
 	codeberg.org/readeck/go-readability/v2 v2.1.2
@@ -14,9 +14,9 @@ require (
 	github.com/sugarme/tokenizer v0.3.0
 	github.com/v0lka/flowsh v0.5.0
 	github.com/yalue/onnxruntime_go v1.27.0
-	golang.org/x/net v0.57.0
-	golang.org/x/sys v0.47.0
-	golang.org/x/text v0.41.0
+	golang.org/x/net v0.60.0
+	golang.org/x/sys v0.48.0
+	golang.org/x/text v0.42.0
 	gopkg.in/yaml.v3 v3.0.1
 	mvdan.cc/sh/v3 v3.10.0
 )

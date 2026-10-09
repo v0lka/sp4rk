@@ -19,7 +19,7 @@ jobs:
           # Must match the `go` directive in go.mod: govulncheck below scans
           # this toolchain's stdlib and fails the build on known CVEs, so bump
           # go.mod and this pin together whenever Go ships a security patch.
-          go-version: "1.27.1"
+          go-version: "1.27.2"
 
       - name: Install system dependencies
         # build-essential provides gcc, which is required for cgo: the
@@ -55,7 +55,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.27.1"
+          go-version: "1.27.2"
 
       - name: Install system dependencies
         # macOS ships clang, satisfying the cgo requirement. ripgrep is
@@ -82,7 +82,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.27.1"
+          go-version: "1.27.2"
 
       - name: Install system dependencies
         # The windows-2022 image ships gcc 14.2.0, satisfying the cgo

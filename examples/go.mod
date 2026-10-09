@@ -1,6 +1,6 @@
 module sp4rk-examples
 
-go 1.27.1
+go 1.27.2
 
 require github.com/v0lka/sp4rk v0.0.0-00010101000000-000000000000
 
@@ -32,9 +32,9 @@ require (
 	github.com/v0lka/flowsh v0.5.0 // indirect
 	github.com/wk8/go-ordered-map/v2 v2.1.8 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
-	golang.org/x/net v0.57.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/text v0.41.0 // indirect
+	golang.org/x/net v0.60.0 // indirect
+	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	mvdan.cc/sh/v3 v3.10.0 // indirect
 )
