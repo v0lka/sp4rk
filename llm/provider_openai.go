@@ -106,6 +106,13 @@ func (p *OpenAIProvider) log() *slog.Logger {
 func NewOpenAIProvider(cfg OpenAIProviderConfig) (*OpenAIProvider, error) {
 	opts := []option.RequestOption{
 		option.WithAPIKey(cfg.APIKey),
+		// Normalize streaming (SSE) response bodies so data-less and truncated
+		// events from the endpoint cannot abort the call — see sse_sanitize.go.
+		// The pinned openai-go v1 ssestream decoder json.Unmarshals an event's
+		// payload without checking it is complete JSON, so it dies with
+		// "unexpected end of JSON input" on the empty and split events the
+		// ChatGPT subscription Codex backend emits.
+		option.WithMiddleware(sseSanitizingMiddleware(cfg.Logger)),
 	}
 	if cfg.BaseURL != "" {
 		opts = append(opts, option.WithBaseURL(cfg.BaseURL))
@@ -130,7 +137,7 @@ func NewOpenAIProvider(cfg OpenAIProviderConfig) (*OpenAIProvider, error) {
 	}
 	client := oai.NewClient(opts...)
 
-	responsesClient := newResponsesClient(cfg.APIKey, cfg.BaseURL, cfg.HTTPClient, cfg.TokenSource)
+	responsesClient := newResponsesClient(cfg.APIKey, cfg.BaseURL, cfg.HTTPClient, cfg.TokenSource, cfg.Logger)
 
 	// Build a co-located Anthropic provider so ProtocolAnthropic models (Claude)
 	// served by an OpenAI-compatible gateway (e.g. Zen) can be delegated to the

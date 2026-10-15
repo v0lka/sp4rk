@@ -72,9 +72,15 @@ func responsesSSEError(providerName, kind, code, message string) *Error {
 // newResponsesClient creates an official OpenAI SDK client for the Responses API.
 // tokenSource optionally injects per-request bearer credentials (nil = static
 // apiKey only); see TokenSource and tokenSourceMiddleware.
-func newResponsesClient(apiKey, baseURL string, httpClient *http.Client, tokenSource TokenSource) *oai.Client {
+func newResponsesClient(apiKey, baseURL string, httpClient *http.Client, tokenSource TokenSource, logger *slog.Logger) *oai.Client {
 	opts := []option.RequestOption{
 		option.WithAPIKey(apiKey),
+		// Normalize streaming (SSE) response bodies so data-less and truncated
+		// events cannot abort the call — see sse_sanitize.go. The Responses
+		// streaming path is where a ChatGPT OAuth Codex backend's empty/split
+		// events previously produced `responses API: unexpected end of JSON
+		// input`.
+		option.WithMiddleware(sseSanitizingMiddleware(logger)),
 	}
 	if baseURL != "" {
 		opts = append(opts, option.WithBaseURL(baseURL))
