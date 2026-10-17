@@ -177,12 +177,10 @@ func TransportKind(err error) string {
 	}
 	var errno syscall.Errno
 	if errors.As(err, &errno) {
-		switch errno {
-		case syscall.ECONNRESET, syscall.EPIPE:
-			return "reset"
-		case syscall.ECONNREFUSED, syscall.EHOSTUNREACH, syscall.ENETUNREACH,
-			syscall.ETIMEDOUT, syscall.ECONNABORTED:
-			return "connect"
+		// Per-OS classification: on Windows real failures carry raw Winsock
+		// codes, not the invented POSIX sentinels (see errno_windows.go).
+		if kind := transportKindForErrno(errno); kind != "" {
+			return kind
 		}
 	}
 	var tlsErr *tls.CertificateVerificationError

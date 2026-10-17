@@ -1155,13 +1155,19 @@ func readOpenAIErrorBody(apiErr *oai.Error) string {
 // payload-size-dependent gateway rejection — the triage data they need when a
 // failure reproduces on specific payloads across runs. The suffix is appended
 // OUTSIDE the *Error wrapper so retryability classification (which inspects
-// the error chain, not the message) is untouched; HTTP-carrying failures and
-// pre-call validation failures pass through unchanged. The size estimate is
+// the error chain, not the message) is untouched; HTTP-carrying failures,
+// pre-call validation failures and caller-initiated cancellation
+// (errors.Is(err, context.Canceled) — a routine host decision such as
+// shutdown, pause, or a step budget, not a connection-level provider
+// failure) pass through unchanged. The size estimate is
 // the marshaled request body (one marshal on the failure path only), and -1
 // when marshaling fails, so the number is always interpreted as approximate.
 func (p *OpenAIProvider) annotateChatTransport(err error, params oai.ChatCompletionNewParams) error {
 	if err == nil {
 		return nil
+	}
+	if errors.Is(err, context.Canceled) {
+		return err
 	}
 	var llmErr *Error
 	if !errors.As(err, &llmErr) || llmErr.StatusCode != 0 {
@@ -1176,7 +1182,7 @@ func (p *OpenAIProvider) annotateChatTransport(err error, params oai.ChatComplet
 		reqBytes = int64(len(b))
 	}
 	p.log().Warn("openai: connection-level chat completion failure",
-		"provider", p.name, "model", llmErr.Provider, "transport", kind,
+		"provider", p.name, "model", params.Model, "transport", kind,
 		"request_bytes", reqBytes, "err", err.Error())
 	return fmt.Errorf("%w (transport=%s, request_bytes=%d)", err, kind, reqBytes)
 }

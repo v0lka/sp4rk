@@ -20,3 +20,19 @@ func isTransientConnErrno(errno syscall.Errno) bool {
 	}
 	return false
 }
+
+// transportKindForErrno maps a raw syscall.Errno to the TransportKind
+// diagnostic label ("reset" or "connect"), or "" when the errno carries no
+// transport signal. On Unix-like systems the POSIX errno sentinels
+// (ECONNRESET, ECONNREFUSED, …) are the real OS errno values, so a direct
+// comparison is authoritative.
+func transportKindForErrno(errno syscall.Errno) string {
+	switch errno {
+	case syscall.ECONNRESET, syscall.EPIPE:
+		return "reset"
+	case syscall.ECONNREFUSED, syscall.EHOSTUNREACH, syscall.ENETUNREACH,
+		syscall.ETIMEDOUT, syscall.ECONNABORTED:
+		return "connect"
+	}
+	return ""
+}

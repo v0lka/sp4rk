@@ -16,11 +16,14 @@ import "syscall"
 //
 // The fix is to match the raw WSA errno values directly. WSAECONNRESET and
 // WSAECONNABORTED are the exceptions: the syscall package DOES export them
-// with their real values, so they are referenced by name. WSAECONNREFUSED and
-// WSAEHOSTUNREACH are not exported, so they are defined here.
+// with their real values, so they are referenced by name. WSAECONNREFUSED,
+// WSAEHOSTUNREACH, WSAENETUNREACH and WSAETIMEDOUT are not exported, so they
+// are defined here.
 const (
 	wsaECONNREFUSED syscall.Errno = 10061 // WSAECONNREFUSED: connection refused
 	wsaEHOSTUNREACH syscall.Errno = 10065 // WSAEHOSTUNREACH: no route to host
+	wsaENETUNREACH  syscall.Errno = 10051 // WSAENETUNREACH: network unreachable
+	wsaETIMEDOUT    syscall.Errno = 10060 // WSAETIMEDOUT: connection timed out
 )
 
 // isTransientConnErrno reports whether a raw syscall.Errno represents a
@@ -41,4 +44,30 @@ func isTransientConnErrno(errno syscall.Errno) bool {
 		return true
 	}
 	return false
+}
+
+// transportKindForErrno maps a raw syscall.Errno to the TransportKind
+// diagnostic label ("reset" or "connect"), or "" when the errno carries no
+// transport signal. It mirrors isTransientConnErrno's two families: the raw
+// Winsock codes that real Windows network failures carry, plus the invented
+// POSIX sentinels for parity with the Unix helper and directly constructed
+// errors. Without the raw-WSA cases every real HTTP-0 failure would fall
+// through to TransportKind's url.Error fallback and misclassify as
+// "connect" (e.g. a mid-flight reset, WSAECONNRESET 10054, as "connect"
+// instead of "reset"). Note wsaETIMEDOUT labels "connect", matching the
+// POSIX switch's ETIMEDOUT arm: Errno.Timeout() only recognizes the
+// invented Windows sentinel, so an OS-level Winsock connect timeout reaches
+// this helper and gets the coarser "connect" label on Windows where Unix
+// reports "timeout".
+func transportKindForErrno(errno syscall.Errno) string {
+	switch errno {
+	case syscall.ECONNRESET, syscall.EPIPE,
+		syscall.WSAECONNRESET, syscall.WSAECONNABORTED:
+		return "reset"
+	case syscall.ECONNREFUSED, syscall.EHOSTUNREACH, syscall.ENETUNREACH,
+		syscall.ETIMEDOUT, syscall.ECONNABORTED,
+		wsaECONNREFUSED, wsaEHOSTUNREACH, wsaENETUNREACH, wsaETIMEDOUT:
+		return "connect"
+	}
+	return ""
 }
