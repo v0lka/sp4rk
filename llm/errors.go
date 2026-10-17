@@ -1,10 +1,13 @@
 package llm
 
 import (
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/url"
+	"strings"
 	"syscall"
 )
 
@@ -150,6 +153,69 @@ func classifyNetError(err error) bool {
 // ErrContextWindowExceeded is a sentinel error for pre-call context window validation failures.
 // Use errors.Is(err, ErrContextWindowExceeded) to detect this condition.
 var ErrContextWindowExceeded = errors.New("context window exceeded")
+
+// TransportKind classifies a connection-level provider error into a short,
+// stable diagnostic label: "timeout", "dns", "connect" (refused/unreachable),
+// "reset", "tls", "eof", or "other" for any other non-nil error. It is
+// observability only — retryability is still decided by classifyNetError and
+// classifyHTTPStatus — and exists because an "HTTP 0" failure (the OpenAI-
+// compatible SDK surfaced no HTTP response at all) otherwise reaches callers
+// as an opaque string with no hint whether the request ever left the process,
+// which upstream consumers (e.g. census callers curating per-app failures)
+// need to triage reproducible connection-level rejections.
+func TransportKind(err error) string {
+	if err == nil {
+		return ""
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "timeout"
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return "dns"
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		switch errno {
+		case syscall.ECONNRESET, syscall.EPIPE:
+			return "reset"
+		case syscall.ECONNREFUSED, syscall.EHOSTUNREACH, syscall.ENETUNREACH,
+			syscall.ETIMEDOUT, syscall.ECONNABORTED:
+			return "connect"
+		}
+	}
+	var tlsErr *tls.CertificateVerificationError
+	if errors.As(err, &tlsErr) {
+		return "tls"
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return "eof"
+	}
+	// url.Error wraps the whole outbound request/round-trip; its inner error
+	// may still classify, and TLS handshake failures surface as *url.Error
+	// wrapping an OpError wrapping the tls handshake error. Classify any
+	// remaining url.Error (or net.OpError) chain as "connect" — the request
+	// never produced a response from the endpoint.
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		if inner := TransportKind(urlErr.Err); inner != "" && inner != "other" {
+			return inner
+		}
+		return "connect"
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		if inner := TransportKind(opErr.Err); inner != "" && inner != "other" {
+			return inner
+		}
+		return "connect"
+	}
+	if strings.Contains(err.Error(), "tls:") {
+		return "tls"
+	}
+	return "other"
+}
 
 // NewContextWindowError creates a non-retryable Error for context window overflow.
 func NewContextWindowError(model string, estimatedTokens, effectiveMax, contextWindow, outputReserve int) *Error {

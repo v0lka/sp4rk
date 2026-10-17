@@ -349,7 +349,7 @@ func (p *OpenAIProvider) ChatCompletion(ctx context.Context, req ChatRequest) (*
 
 	resp, err := p.client.Chat.Completions.New(ctx, params)
 	if err != nil {
-		return nil, p.wrapError(fmt.Errorf("openai chat completion: %w", err))
+		return nil, p.annotateChatTransport(p.wrapError(fmt.Errorf("openai chat completion: %w", err)), params)
 	}
 	// The OpenAI SDK decodes an HTTP 200 response whose JSON body is the
 	// literal `null` into a nil response pointer with a nil error (JSON null
@@ -476,7 +476,7 @@ func (p *OpenAIProvider) chatCompletionStream(ctx context.Context, req ChatReque
 		}
 	}
 	if err := stream.Err(); err != nil {
-		return nil, p.wrapError(fmt.Errorf("openai chat completion (stream): %w", err))
+		return nil, p.annotateChatTransport(p.wrapError(fmt.Errorf("openai chat completion (stream): %w", err)), params)
 	}
 	// A stream that ended (plain EOF, no SDK-level transport error) without a
 	// terminal finish_reason on choice 0 is a truncated response: a
@@ -1145,6 +1145,40 @@ func readOpenAIErrorBody(apiErr *oai.Error) string {
 		return string(body[:maxErrorBodySize]) + "..."
 	}
 	return string(body)
+}
+
+// annotateChatTransport decorates connection-level chat completion failures
+// (HTTP 0 — the SDK surfaced no HTTP response at all) with the classified
+// transport kind and the serialized request size, and logs the same at WARN.
+// An "HTTP 0" failure otherwise reaches callers as an opaque string, leaving
+// upstream consumers unable to tell a timeout from a mid-body reset from a
+// payload-size-dependent gateway rejection — the triage data they need when a
+// failure reproduces on specific payloads across runs. The suffix is appended
+// OUTSIDE the *Error wrapper so retryability classification (which inspects
+// the error chain, not the message) is untouched; HTTP-carrying failures and
+// pre-call validation failures pass through unchanged. The size estimate is
+// the marshaled request body (one marshal on the failure path only), and -1
+// when marshaling fails, so the number is always interpreted as approximate.
+func (p *OpenAIProvider) annotateChatTransport(err error, params oai.ChatCompletionNewParams) error {
+	if err == nil {
+		return nil
+	}
+	var llmErr *Error
+	if !errors.As(err, &llmErr) || llmErr.StatusCode != 0 {
+		return err
+	}
+	kind := TransportKind(err)
+	if kind == "" {
+		kind = "other"
+	}
+	reqBytes := int64(-1)
+	if b, mErr := json.Marshal(params); mErr == nil {
+		reqBytes = int64(len(b))
+	}
+	p.log().Warn("openai: connection-level chat completion failure",
+		"provider", p.name, "model", llmErr.Provider, "transport", kind,
+		"request_bytes", reqBytes, "err", err.Error())
+	return fmt.Errorf("%w (transport=%s, request_bytes=%d)", err, kind, reqBytes)
 }
 
 // wrapError maps OpenAI SDK error types to *Error.
