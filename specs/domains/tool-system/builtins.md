@@ -110,7 +110,9 @@ Allowed outcomes carry an empty code (nothing to classify), as do plain `PolicyU
 
 ### Web search providers
 
-`web_search` is optional: it is silently not registered when no search-provider config/API key is supplied. The provider abstraction supports Brave, DuckDuckGo, Exa, and Tavily.
+`web_search` is optional: it is silently not registered when no search-provider config/API key is supplied. The provider abstraction supports Brave, DuckDuckGo, Exa, SearXNG, and Tavily.
+
+The DuckDuckGo provider is a best-effort HTML scraper (no official API): it POSTs the query form with a same-origin `Referer`, paces consecutive requests (minimum interval plus jitter) and retries an anti-bot anomaly/CAPTCHA challenge (HTTP 202, or any body carrying the anomaly signature) with bounded exponential backoff before surfacing an explicit, actionable error — a challenged response is never reported as a silent empty result. The SearXNG provider targets a self-hosted instance's JSON API (`/search?q=…&format=json`; the instance must enable JSON output via `search.formats: [html, json]`) and is the ToS-clean path for fully self-hosted setups.
 
 ### Ignore filtering (glob, ripgrep)
 

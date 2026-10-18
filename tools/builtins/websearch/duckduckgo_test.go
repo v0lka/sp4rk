@@ -29,22 +29,32 @@ func TestDuckDuckGoProvider_Search(t *testing.T) {
 </body>
 </html>`
 
+	var wantReferer string // captured after the server starts; requests happen later
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Verify request method
-		if r.Method != http.MethodGet {
-			t.Errorf("Expected GET request, got %s", r.Method)
+		// Verify request method: the scraper POSTs the query form (hardened
+		// against DuckDuckGo's anti-bot flag; see duckduckgo.go).
+		if r.Method != http.MethodPost {
+			t.Errorf("Expected POST request, got %s", r.Method)
 		}
 
-		// Verify query parameter
-		q := r.URL.Query().Get("q")
-		if q != "golang testing" {
+		// Verify query form parameters
+		if q := r.PostFormValue("q"); q != "golang testing" {
 			t.Errorf("Expected query 'golang testing', got %s", q)
+		}
+		if kl := r.PostFormValue("kl"); kl != "wt-wt" {
+			t.Errorf("Expected region 'wt-wt', got %s", kl)
+		}
+		// Verify the same-origin Referer the POST form shape relies on.
+		if ref := r.Referer(); ref != wantReferer {
+			t.Errorf("Expected Referer %q, got %q", wantReferer, ref)
 		}
 
 		w.Header().Set("Content-Type", "text/html")
 		_, _ = w.Write([]byte(mockHTML))
 	}))
 	defer server.Close()
+	wantReferer = server.URL
 
 	provider := NewDuckDuckGoProviderWithClient(30*time.Second, nil)
 	provider.SetBaseURL(server.URL)
