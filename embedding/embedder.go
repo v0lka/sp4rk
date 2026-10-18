@@ -121,10 +121,15 @@ type EmbedderConfig struct {
 	ExecutionProvider string
 
 	// DeviceID is the GPU device index used when ExecutionProvider resolves
-	// to "cuda" (explicitly or via "auto"'s first attempt). Defaults to 0,
-	// which is the right choice on single-GPU machines and selects the first
-	// device reported by the driver on multi-GPU ones. It is ignored by the
-	// CPU provider. Negative values are rejected by NewEmbedder for every
+	// to a hardware provider. On "cuda" — explicitly or via "auto" — it
+	// selects the device reported by the driver. Under an explicit
+	// "openvino" request a non-zero value is a hard configuration error (the
+	// wrapper exposes no per-device selection for OpenVINO devices), while 0
+	// lets OpenVINO pick its best device; under "auto" a non-zero DeviceID
+	// fails the OpenVINO rung the same way. Defaults to 0, which is the
+	// right choice on single-GPU machines and selects the first device
+	// reported by the driver on multi-GPU ones. It is ignored by the CPU
+	// provider. Negative values are rejected by NewEmbedder for every
 	// provider including cpu, so one config struct validates uniformly.
 	DeviceID int
 
@@ -171,18 +176,24 @@ type Embedder struct {
 	bucketSessions map[sessionKey]*onnxSession
 	sessOpts       *ort.SessionOptions
 	// executionProvider is the provider inference actually runs on: always
-	// ExecutionProviderCPU or ExecutionProviderCUDA, never "auto" — the auto
-	// request is resolved during NewEmbedder, and ExecutionProvider() reports
-	// the winner.
+	// ExecutionProviderCPU, ExecutionProviderCUDA or
+	// ExecutionProviderOpenVINO, never "auto" — the auto request is resolved
+	// during NewEmbedder, and ExecutionProvider() reports the winner.
 	executionProvider string
 	// runner pins every ONNX Runtime call to one OS thread; nil for the CPU
 	// provider, which does not need the pinning. See ortRunner.
 	runner *ortRunner
 	// deviceID and intraOpThreads retain the config NewEmbedder used to build
 	// session options, so a later session-creation failure can rebuild them on
-	// the CPU provider (see degradeToCPU).
+	// the CPU provider or on the ladder's next rung (see degradeToCPU and
+	// advanceAutoLadderSession).
 	deviceID       int
 	intraOpThreads int
+	// libraryPath retains the config NewEmbedder used, so a later session-
+	// creation failure can rebuild options for another hardware ladder rung:
+	// the OpenVINO provider locates its plugin beside it, while the CPU and
+	// CUDA providers never read it (degradeToCPU passes an empty path).
+	libraryPath string
 	// fallbackPending is true while inference runs on a hardware provider
 	// (CUDA or OpenVINO) that an "auto" request selected. A lazily created
 	// session that cannot be built on that provider then degrades the embedder
@@ -214,8 +225,64 @@ func (e *Embedder) onORTThread(fn func()) {
 // fast and side-effect-free for a missing driver or plugin — in particular an
 // absent OpenVINO plugin is detected from the filesystem before any ORT call,
 // so auto neither registers nor enumerates anything when the plugin is not
-// installed, and the recorded reason says exactly that.
+// installed, and the recorded reason says exactly that. The ladder is walked
+// at the session stage too: when the winning rung's options build but its
+// session cannot be created, the remaining rungs are attempted before the
+// terminal CPU fallback (advanceAutoLadderSession), so a CUDA session failure
+// cannot silently skip a working OpenVINO plugin.
 var autoAttemptLadder = [...]string{ExecutionProviderCUDA, ExecutionProviderOpenVINO}
+
+// ladderIndex returns the index of provider in autoAttemptLadder, or -1 when
+// the provider is not a ladder rung (the CPU fallback).
+func ladderIndex(provider string) int {
+	for i, rung := range autoAttemptLadder {
+		if rung == provider {
+			return i
+		}
+	}
+	return -1
+}
+
+// advanceAutoLadderSession continues the "auto" ladder at the session stage:
+// every autoAttemptLadder rung after index from gets its session options
+// built, hands them to install — which must destroy the failed rung's
+// options, commit the new ones, and record the rung as the active provider —
+// and retries session creation there through createSess. The first rung whose
+// session is created wins: the session is returned with ok == true and the
+// caller's state already describes that rung. When every remaining rung
+// fails, ok == false and the caller falls through to the terminal CPU
+// fallback; each failed attempt has been appended to reasons verbatim and
+// warned through warn, so no rung is skipped silently. This is the
+// session-stage counterpart of the options-stage ladder in NewEmbedder: a
+// provider whose options build but whose session cannot be created (wedged
+// driver, out-of-device memory at graph allocation, a model the provider
+// cannot compile) must still let the remaining rungs try.
+func advanceAutoLadderSession(
+	from int,
+	buildOpts func(string) (*ort.SessionOptions, error),
+	install func(rung string, opts *ort.SessionOptions),
+	createSess func() (*onnxSession, error),
+	warn func(msg, provider, cause string),
+	reasons *[]string,
+) (sess *onnxSession, ok bool, lastErr error) {
+	for _, rung := range autoAttemptLadder[from:] {
+		opts, optsErr := buildOpts(rung)
+		if optsErr != nil {
+			*reasons = append(*reasons, rung+": "+optsErr.Error())
+			warn("hardware provider options failed, trying next rung", rung, optsErr.Error())
+			continue
+		}
+		install(rung, opts)
+		s, sErr := createSess()
+		if sErr == nil {
+			return s, true, nil
+		}
+		lastErr = sErr
+		*reasons = append(*reasons, rung+": "+sErr.Error())
+		warn("hardware provider session creation failed, trying next rung", rung, sErr.Error())
+	}
+	return nil, false, lastErr
+}
 
 // NewEmbedder creates a new Embedder by loading the tokenizer and initializing
 // the ONNX Runtime environment.
@@ -349,6 +416,12 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 		return opts, err
 	}
 	var sessOpts *ort.SessionOptions
+	// reasons accumulates every failed "auto" ladder attempt — options-stage
+	// and session-stage alike — for the terminal fallback WARN. ladderIdx is
+	// the index in autoAttemptLadder of the rung whose options won; -1 means
+	// the options stage already degraded to the CPU.
+	var reasons []string
+	ladderIdx := -1
 	if effective != ExecutionProviderAuto {
 		sessOpts, err = buildOpts(effective)
 		if err != nil {
@@ -356,12 +429,12 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 			return nil, fmt.Errorf("building ONNX session options: %w", err)
 		}
 	} else {
-		var reasons []string
-		for _, candidate := range autoAttemptLadder {
+		for i, candidate := range autoAttemptLadder {
 			var attemptErr error
 			sessOpts, attemptErr = buildOpts(candidate)
 			if attemptErr == nil {
 				effective = candidate
+				ladderIdx = i
 				break
 			}
 			// The failed rung's own error already names the concrete cause
@@ -369,7 +442,7 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 			// keep it verbatim for the fallback WARN.
 			reasons = append(reasons, candidate+": "+attemptErr.Error())
 		}
-		if effective == ExecutionProviderAuto {
+		if ladderIdx == -1 {
 			// Every hardware rung failed: degrade to the CPU loudly, with
 			// each rung's reason in the WARN (ADR-045: a fallback is tracked
 			// and warned, never silent). A failed attempt allocated nothing
@@ -431,30 +504,68 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 				cleanup(sessOpts)
 				return nil, fmt.Errorf("creating persistent ONNX session: %w", err)
 			}
+			if ladderIdx < 0 {
+				// The options stage already degraded to the CPU and even the
+				// CPU session cannot be created — there is nothing left to
+				// fall back to.
+				cleanup(sessOpts)
+				return nil, fmt.Errorf("creating persistent ONNX session: %w", err)
+			}
 			// auto + hardware options: the provider accepted the options but
 			// the session itself could not be built on the device (driver
 			// trouble, out of device memory at graph allocation, a model the
-			// provider cannot compile). Retry once on the CPU provider before
-			// giving up — a failed attempt has already released its own
-			// tensors, and the CPU retry cannot make things worse.
+			// provider cannot compile). Continue the ladder at the session
+			// stage before the terminal CPU fallback — each remaining rung
+			// gets its options built and the session retried there, so a
+			// CUDA session failure can still land on a working OpenVINO
+			// plugin. A failed attempt has already released its own tensors,
+			// and a later rung cannot make things worse.
 			hardwareSessErr := err
-			logger.Warn("hardware session creation failed, falling back to CPU",
+			reasons = append(reasons, effective+": "+err.Error())
+			logger.Warn("hardware session creation failed, trying remaining providers",
 				"provider", effective, "error", err.Error(), "deviceID", cfg.DeviceID)
-			cleanup(sessOpts)
-			runner = nil
-			effective = ExecutionProviderCPU
-			sessOpts, err = buildOpts(effective)
-			if err != nil {
-				cleanup(sessOpts)
-				return nil, fmt.Errorf("building ONNX session options: %w", err)
+			installOpts := func(rung string, opts *ort.SessionOptions) {
+				runOnORTThread(runner, func() {
+					if sessOpts != nil {
+						_ = sessOpts.Destroy()
+					}
+				})
+				sessOpts = opts
+				effective = rung
 			}
-			// Measure the CPU retry from its own start; the failed hardware
-			// attempt above is not part of this session-create observation.
-			sessionStarted = time.Now()
-			sess, err = newSess()
-			if err != nil {
+			attemptSess := func() (*onnxSession, error) {
+				// Measure each retry from its own start; the failed attempts
+				// are not part of a session-create observation.
+				sessionStarted = time.Now()
+				return newSess()
+			}
+			warn := func(msg, provider, cause string) {
+				logger.Warn(msg, "provider", provider, "error", cause, "deviceID", cfg.DeviceID)
+			}
+			var advanced bool
+			sess, advanced, _ = advanceAutoLadderSession(ladderIdx+1, buildOpts, installOpts, attemptSess, warn, &reasons)
+			if !advanced {
+				// Every hardware rung failed at the session stage too:
+				// degrade to the CPU loudly, with each failed attempt's
+				// reason in the WARN (ADR-045: a fallback is tracked and
+				// warned, never silent). The abandoned hardware options are
+				// released and the dedicated thread retired; the fallback
+				// proceeds inline like a plain CPU embedder.
+				logger.Warn("no hardware execution provider available, falling back to CPU",
+					"reasons", strings.Join(reasons, "; "), "deviceID", cfg.DeviceID)
 				cleanup(sessOpts)
-				return nil, fmt.Errorf("creating persistent ONNX session after hardware->CPU fallback (original error: %w): %w", hardwareSessErr, err)
+				runner = nil
+				effective = ExecutionProviderCPU
+				sessOpts, err = buildOpts(effective)
+				if err != nil {
+					cleanup(sessOpts)
+					return nil, fmt.Errorf("building ONNX session options: %w", err)
+				}
+				sess, err = attemptSess()
+				if err != nil {
+					cleanup(sessOpts)
+					return nil, fmt.Errorf("creating persistent ONNX session after hardware->CPU fallback (original error: %w): %w", hardwareSessErr, err)
+				}
 			}
 		}
 	}
@@ -494,6 +605,7 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 		runner:            runner,
 		deviceID:          cfg.DeviceID,
 		intraOpThreads:    cfg.IntraOpThreads,
+		libraryPath:       cfg.LibraryPath,
 		// Only an auto request that is still (or again) on a hardware provider
 		// can degrade to the CPU from a later lazy session-creation failure. If
 		// the eager-session fallback above already ran, effective is CPU and
@@ -718,11 +830,12 @@ func (e *Embedder) newSession(batchSize, seqLen int) (*onnxSession, error) {
 // newSessionWithFallback builds a persistent ONNX session, honouring the "auto"
 // contract for the lazily created sessions (length buckets and the batch
 // session), not just the eager one: when the session cannot be built on the
-// hardware provider an "auto" request selected, the embedder degrades to the
-// CPU provider once and retries — the same hardware->CPU degrade the eager
-// session performs inside NewEmbedder. An explicit "cuda" or "openvino"
-// request still fails loudly (fallbackPending is false for it). The caller
-// must hold e.mu.
+// hardware provider an "auto" request selected, the remaining ladder rungs are
+// attempted at the session stage (advanceAutoLadderSession) before the embedder
+// degrades to the CPU provider once and retries — the same session-stage ladder
+// walk and degrade the eager session performs inside NewEmbedder. An explicit
+// "cuda" or "openvino" request still fails loudly (fallbackPending is false
+// for it). The caller must hold e.mu.
 func (e *Embedder) newSessionWithFallback(batchSize, seqLen int) (*onnxSession, error) {
 	sess, err := e.newSession(batchSize, seqLen)
 	if err == nil || !e.canDegradeToCPU() {
@@ -730,7 +843,43 @@ func (e *Embedder) newSessionWithFallback(batchSize, seqLen int) (*onnxSession, 
 	}
 	hardwareProvider := e.executionProvider
 	hardwareErr := err
-	if fbErr := e.degradeToCPU(hardwareErr); fbErr != nil {
+	var reasons []string
+	buildOpts := func(provider string) (*ort.SessionOptions, error) {
+		var (
+			opts    *ort.SessionOptions
+			optsErr error
+		)
+		e.onORTThread(func() {
+			opts, optsErr = buildSessionOptions(provider, e.libraryPath, e.deviceID, e.intraOpThreads)
+		})
+		return opts, optsErr
+	}
+	install := func(rung string, opts *ort.SessionOptions) {
+		e.onORTThread(func() {
+			if e.sessOpts != nil {
+				_ = e.sessOpts.Destroy()
+			}
+		})
+		e.sessOpts = opts
+		e.executionProvider = rung
+	}
+	warn := func(msg, provider, cause string) {
+		e.logger.Warn(msg, "provider", provider, "error", cause, "deviceID", e.deviceID)
+	}
+	s, ok, lastErr := advanceAutoLadderSession(ladderIndex(hardwareProvider)+1, buildOpts, install,
+		func() (*onnxSession, error) { return e.newSession(batchSize, seqLen) }, warn, &reasons)
+	if ok {
+		return s, nil
+	}
+	// Every remaining rung failed: degrade to the CPU provider (the terminal
+	// fallback). The WARN names the provider actually being degraded from —
+	// the last attempted rung — whose own failure the ladder walk above
+	// already reported.
+	cause := hardwareErr
+	if lastErr != nil {
+		cause = lastErr
+	}
+	if fbErr := e.degradeToCPU(cause); fbErr != nil {
 		return nil, fmt.Errorf("creating persistent ONNX session on %s failed (%w); CPU fallback also failed: %w", hardwareProvider, hardwareErr, fbErr)
 	}
 	sess, err = e.newSession(batchSize, seqLen)

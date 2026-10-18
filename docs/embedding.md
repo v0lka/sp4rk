@@ -34,6 +34,37 @@ type EmbedderConfig struct {
     IntraOpThreads int
     // Logger for structured logging. If nil, a no-op logger is used.
     Logger *slog.Logger
+    // BatchSize is the fixed row capacity of the persistent batch ONNX
+    // session used when EmbedDocuments receives more than one text.
+    // Multi-text batches are processed in chunks of at most BatchSize rows
+    // (smaller chunks are zero-padded; padded rows are masked out during
+    // pooling). 0 selects DefaultBatchSize (32).
+    BatchSize int
+    // EnableBatchPipeline overlaps tokenization of fixed-mode batch N+1 with
+    // ONNX inference of batch N. Opt-in; has no effect while
+    // EnableLengthBuckets is enabled (bucket mode wins, and NewEmbedder
+    // logs a warning about that).
+    EnableBatchPipeline bool
+    // EnableLengthBuckets groups tokenized documents into the smallest
+    // fitting fixed sequence length (64, 128, 256, or MaxSeqLength) and
+    // lazily creates one persistent ONNX session per used bucket. Opt-in.
+    EnableLengthBuckets bool
+    // ExecutionProvider selects the ONNX Runtime execution provider:
+    // "cpu" (also the empty-string default), "cuda", "openvino", or "auto"
+    // (the ladder CUDA → OpenVINO → CPU with a WARN naming each failure).
+    // "cuda" and "openvino" require the provider libraries beside LibraryPath
+    // and fail loudly when they are missing; unknown values are rejected.
+    // See the initialization sequence below.
+    ExecutionProvider string
+    // DeviceID is the GPU device index used when ExecutionProvider resolves
+    // to a hardware provider: the CUDA device on "cuda"/"auto"; under an
+    // explicit "openvino" request a non-zero value is a hard configuration
+    // error, while 0 lets OpenVINO pick its best device. Ignored by the CPU
+    // provider; negative values are rejected for every provider.
+    DeviceID int
+    // Telemetry optionally collects bounded, content-free stage aggregates.
+    // Nil disables collection.
+    Telemetry *Telemetry
 }
 ```
 
@@ -43,6 +74,12 @@ type EmbedderConfig struct {
 const (
     DefaultMaxSeqLength = 512 // jina-v2-small supports up to 8192; 512 is practical
     DefaultHiddenDim    = 512 // embedding dimension for jina-embeddings-v2-small-en
+    DefaultBatchSize    = 32  // fixed row capacity of the persistent batch session
+
+    ExecutionProviderCPU      = "cpu"      // default; the empty string means "cpu"
+    ExecutionProviderCUDA     = "cuda"     // NVIDIA GPU via the CUDA execution provider
+    ExecutionProviderOpenVINO = "openvino" // Intel hardware via the OpenVINO plugin
+    ExecutionProviderAuto     = "auto"     // ladder CUDA → OpenVINO → CPU with a WARN
 )
 ```
 
@@ -57,11 +94,11 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error)
 The initialization sequence is:
 
 1. `initONNXRuntime(libraryPath)` — sets the shared library path and initializes the global ONNX Runtime environment.
-2. `buildSessionOptions(provider, deviceID, intraOpThreads)` — builds `*ort.SessionOptions` that select the execution provider (CPU, or CUDA with `deviceID`) and limit intra-op threads when `intraOpThreads` is positive; returns `nil` for the legacy CPU default (session created with nil options). Must run after `initONNXRuntime`.
+2. `buildSessionOptions(provider, ortLibraryPath, deviceID, intraOpThreads)` — builds `*ort.SessionOptions` that select the execution provider (CPU, CUDA, or OpenVINO; `deviceID` applies to the CUDA provider) and limit intra-op threads when `intraOpThreads` is positive; returns `nil` for the legacy CPU default (session created with nil options). Must run after `initONNXRuntime`.
 3. `NewTokenizer(tokenizerPath)` — loads the HuggingFace tokenizer.
 4. `newONNXSession(modelPath, batchSize, seqLen, hiddenDim, sessOpts, telemetry)` — creates a persistent ONNX session with pre-allocated tensors for the fast path.
 
-The resulting `sessOpts` is reused for the persistent single-text session, the batch session, and the per-bucket sessions. `EmbedderConfig.ExecutionProvider` / `DeviceID` select the provider: `"auto"` prefers CUDA and, when the CUDA *options* — or the *session* itself — cannot be built on the GPU, logs a WARN and continues on the CPU (the eager session, and, in length-bucket mode, the first lazily created bucket session). `Embedder.ExecutionProvider()` reports which provider inference actually runs on.
+The resulting `sessOpts` is reused for the persistent single-text session, the batch session, and the per-bucket sessions. `EmbedderConfig.ExecutionProvider` / `DeviceID` select the provider: `"cuda"` and `"openvino"` request a specific hardware provider (an `"openvino"` request rejects a non-zero `DeviceID` loudly — `0` lets OpenVINO pick its best device). `"auto"` walks the ladder CUDA → OpenVINO; when a rung fails at the options stage — or when the winning provider accepts the *options* but the *session* itself cannot be built on it, the remaining rungs are retried at the session stage first — and only when every attempt has failed, a WARN naming each failure is logged and initialization continues on the CPU (the eager session, and, in length-bucket mode, the first lazily created bucket session). `Embedder.ExecutionProvider()` reports which provider inference actually runs on (`cpu`, `cuda`, or `openvino`).
 
 On any failure the session options are cleaned up before returning the error, but the ONNX Runtime **environment is deliberately NOT destroyed**: `initONNXRuntime` is `sync.Once`-guarded per process, so a destroyed environment could never be reinitialized — not for an `"auto"` CPU-fallback retry, and not for a later `NewEmbedder`. Only `Embedder.Close` performs the full teardown. `sessOpts` is released by `Close()`.
 
@@ -77,8 +114,9 @@ The ONNX Runtime is a **process-global singleton** — only one `Embedder` can e
 | `EmbedQuery(ctx, text string) ([]float32, error)` | Embeds a single text query and returns its embedding vector. |
 | `EmbeddingFunc() chromem.EmbeddingFunc` | Returns a chromem-go compatible embedding function for use with `chromem.NewCollection`. |
 | `Close() error` | Releases the ONNX Runtime environment and associated resources. |
+| `ExecutionProvider() string` | Reports which execution provider inference actually runs on (`cpu`, `cuda`, or `openvino`). |
 
-`EmbedDocuments` uses a **fast path** for single-text embedding: a persistent ONNX session with pre-allocated tensors is reused, eliminating per-call session creation overhead. Creating an ONNX session is expensive (~2s for model loading and graph optimization), while inference is fast (~50ms). For larger batches, a temporary session is created for the batch.
+`EmbedDocuments` uses a **fast path** for single-text embedding: a persistent ONNX session with pre-allocated tensors is reused, eliminating per-call session creation overhead. Creating an ONNX session is expensive (~2s for model loading and graph optimization), while inference is fast (~50ms). For multi-text batches, a persistent batch ONNX session (fixed row capacity `BatchSize`, default 32) is created lazily on the first multi-text call — a one-time ~2s init — and reused for every later call; batches larger than the capacity are processed in zero-padded chunks with a single inference per chunk.
 
 All embeddings are **mean-pooled** (using the attention mask) and **L2-normalized** before being returned.
 
@@ -117,8 +155,8 @@ The `onnx.go` file manages the ONNX Runtime lifecycle:
 
 - `initONNXRuntime(libraryPath)` — sets the shared library path via `ort.SetSharedLibraryPath` and initializes the global environment. Must be called once before creating any sessions.
 - `destroyONNXRuntime()` — cleans up the global ONNX Runtime environment.
-- `onnxSession` — a reusable session with pre-allocated tensors for `batchSize=1` inference. The session and its tensors are kept alive for reuse across multiple calls.
-- `runInferenceBatch` — runs the model on a batch of tokenized inputs, creating a temporary session for the batch.
+- `newONNXSession(modelPath, batchSize, seqLen, hiddenDim, sessOpts, telemetry)` — builds a reusable `onnxSession` with pre-allocated tensors for a fixed `[batchSize, seqLen]` shape; the session and its tensors are kept alive for reuse across calls (the single-text session uses `batchSize=1`; the batch and bucket sessions use their own capacities).
+- `(*onnxSession).run(...)` / `(*onnxSession).runBatch(n, ...)` — run the model for a single row or the first `n` rows of the pre-allocated batch, then mean-pool (with the attention mask) and L2-normalize.
 
 For `jina-embeddings-v2-small-en`:
 
@@ -134,8 +172,8 @@ For `jina-embeddings-v2-small-en`:
 type Tokenizer struct { /* ... */ }
 
 func NewTokenizer(path string) (*Tokenizer, error)
-func (t *Tokenizer) Encode(text string, maxLen int) (inputIDs, attentionMask, tokenTypeIDs []int64)
-func (t *Tokenizer) EncodeBatch(texts []string, maxLen int) (inputIDs, attentionMask, tokenTypeIDs []int64)
+func (t *Tokenizer) Encode(text string, maxLen int) (inputIDs, attentionMask, tokenTypeIDs []int64, err error)
+func (t *Tokenizer) EncodeBatch(texts []string, maxLen int) (inputIDs, attentionMask, tokenTypeIDs []int64, err error)
 ```
 
 `Encode` tokenizes a single text and returns padded/truncated tensors ready for ONNX inference. `maxLen` controls the maximum sequence length (including the `[CLS]` and `[SEP]` special tokens). `EncodeBatch` tokenizes multiple texts and returns flattened, row-major tensors of shape `[batch_size * maxLen]`.

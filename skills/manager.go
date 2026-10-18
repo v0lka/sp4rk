@@ -2,6 +2,7 @@ package skills
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"sync"
 
 	"github.com/v0lka/sp4rk/pathutil"
+	"github.com/v0lka/sp4rk/safeio"
 	sdktools "github.com/v0lka/sp4rk/tools"
 )
 
@@ -90,8 +92,16 @@ func (m *SkillManager) scanDir(dir string) {
 
 		skill, err := ParseSkill(skillMD, skillDir)
 		if err != nil {
-			// Skip invalid skills silently (they may not be agent skills at all)
-			m.log().Debug("skipped invalid skill", "dir", skillDir, "error", err)
+			if errors.Is(err, safeio.ErrTooLarge) {
+				// A SKILL.md exists but exceeds the safeio read cap — the
+				// operator loses that skill from the catalog. Warn so the
+				// skip is visible; discovery of the remaining skills
+				// continues.
+				m.log().Warn("skipped oversized skill", "dir", skillDir, "error", err)
+			} else {
+				// Skip invalid skills silently (they may not be agent skills at all)
+				m.log().Debug("skipped invalid skill", "dir", skillDir, "error", err)
+			}
 			continue
 		}
 

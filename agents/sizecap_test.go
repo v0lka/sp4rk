@@ -12,8 +12,10 @@ import (
 // TestParseAgent_TooLargeRefused is the OOM regression: an oversized
 // AGENT.md planted in a scanned profile directory is refused with the
 // explicit safeio error instead of being read into memory. The failure is a
-// read error, not a *ParseError, so discovery keeps classifying the directory
-// as ordinary noise (debug log) rather than warning about an invalid profile.
+// read error, not a *ParseError, and discovery classifies it as an oversized
+// skip (Warn — the operator loses a profile that exists but cannot be read)
+// while discovery of the remaining profiles continues; see
+// TestAgentManager_OversizedAgentSkippedWithWarn.
 func TestParseAgent_TooLargeRefused(t *testing.T) {
 	t.Parallel()
 

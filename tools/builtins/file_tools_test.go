@@ -424,6 +424,96 @@ func TestEditFileTool_EditFile_NotFound(t *testing.T) {
 	}
 }
 
+// TestEditFileTool_Execute_RefusesOversizedTarget is the regression test for
+// review finding #24: edit_file slurps the entire target (plus two to three
+// transient copies of its content) in one read, so a target above the
+// configured MaxEditFileBytes must be refused before any slurp, with the
+// file left untouched.
+func TestEditFileTool_Execute_RefusesOversizedTarget(t *testing.T) {
+	const capBytes = 1024
+	tool := NewEditFileToolWithLimits(FileLimits{MaxEditFileBytes: capBytes})
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+
+	testFile := filepath.Join(tmpDir, "huge.txt")
+	originalContent := strings.Repeat("a", capBytes+1) + "\nneedle\n"
+	if err := os.WriteFile(testFile, []byte(originalContent), 0o644); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	input, _ := json.Marshal(map[string]string{
+		"path":       testFile,
+		"old_string": "needle",
+		"new_string": "replaced",
+	})
+
+	result, err := tool.Execute(ctx, input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.IsError {
+		t.Error("expected IsError=true for an over-limit edit target")
+	}
+	if !strings.Contains(result.Content, "edit limit") {
+		t.Errorf("expected the edit-limit refusal in the error message, got: %s", result.Content)
+	}
+
+	// The refusal must be side-effect free: the oversized file is untouched.
+	data, err := os.ReadFile(testFile)
+	if err != nil {
+		t.Fatalf("failed to re-read the refused target: %v", err)
+	}
+	if string(data) != originalContent {
+		t.Error("refused edit must not modify the target file")
+	}
+}
+
+// TestEditFileTool_Execute_EditLimitScoping pins the guard's two documented
+// edge cases: an edit under the configured cap still succeeds, and
+// MaxEditFileBytes=0 disables the edit-specific cap (safeio.ReadFile's own
+// DefaultMaxFileSize read bound still applies, well above this test's
+// target sizes).
+func TestEditFileTool_Execute_EditLimitScoping(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	content := strings.Repeat("a", 2048) + "\nneedle\n"
+
+	testFile := filepath.Join(tmpDir, "file.txt")
+	if err := os.WriteFile(testFile, []byte(content), 0o644); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	edit := func(tool *EditFileTool) tools.ToolResult {
+		t.Helper()
+		input, _ := json.Marshal(map[string]string{
+			"path":       testFile,
+			"old_string": "needle",
+			"new_string": "replaced",
+		})
+		res, err := tool.Execute(ctx, input)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		return res
+	}
+
+	// Under the cap: the edit goes through.
+	if res := edit(NewEditFileToolWithLimits(FileLimits{MaxEditFileBytes: 4096})); res.IsError {
+		t.Errorf("under-cap edit was refused: %s", res.Content)
+	}
+	// Restore the needle for the second case.
+	if err := os.WriteFile(testFile, []byte(content), 0o644); err != nil {
+		t.Fatalf("failed to reset test file: %v", err)
+	}
+
+	// A zero cap disables the edit-specific bound: the same small file is
+	// edited without a refusal (safeio.ReadFile's own DefaultMaxFileSize
+	// read cap still applies for genuinely large targets).
+	if res := edit(NewEditFileToolWithLimits(FileLimits{MaxEditFileBytes: 0})); res.IsError {
+		t.Errorf("edit with MaxEditFileBytes=0 (cap disabled) was refused: %s", res.Content)
+	}
+}
+
 // --- List test ---
 
 func TestListDirectoryTool_ListDirectory(t *testing.T) {
@@ -1431,6 +1521,9 @@ func TestDefaultFileLimits(t *testing.T) {
 	}
 	if limits.MaxWindowLines != 50000 {
 		t.Errorf("expected MaxWindowLines=50000, got %d", limits.MaxWindowLines)
+	}
+	if limits.MaxEditFileBytes != 64<<20 {
+		t.Errorf("expected MaxEditFileBytes=%d, got %d", 64<<20, limits.MaxEditFileBytes)
 	}
 }
 

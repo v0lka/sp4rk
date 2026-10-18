@@ -22,10 +22,30 @@ Anti-example: not for creating files or full rewrites (write_file); one call fix
 // EditFileTool performs find-and-replace edits on files.
 type EditFileTool struct {
 	*tools.BaseTool
+	limits FileLimits
 }
 
-// NewEditFileTool creates a new EditFileTool instance.
+// NewEditFileTool creates a new EditFileTool instance with default limits.
 func NewEditFileTool() *EditFileTool {
+	return NewEditFileToolWithLimits(DefaultFileLimits())
+}
+
+// NewEditFileToolWithLimits creates a new EditFileTool instance with the
+// given limits. MaxEditFileBytes caps the size of a file the tool will read
+// and rewrite: edit_file slurps the entire target into memory (and makes two
+// to three more transient copies of its content while replacing), so the cap
+// keeps an edit's peak memory proportional to a known, configured file
+// ceiling — in-workspace writes are auto-executed, before the executor's
+// central truncation layer can intervene. safeio.ReadFile already bounds
+// whole-file reads at its own DefaultMaxFileSize (10 MiB) and refuses
+// non-regular targets; the edit-specific cap (default 64 MiB) deliberately
+// raises that read ceiling for edits while adding a cheap stat guard that
+// refuses an oversized target with a clear error before any slurp. The cap
+// bounds both the pre-read stat guard and the read itself
+// (safeio.ReadFileLimited), so a target that grows between the stat and the
+// read is still refused. 0 disables the edit-specific cap; safeio.ReadFile
+// then still enforces its own DefaultMaxFileSize read bound.
+func NewEditFileToolWithLimits(limits FileLimits) *EditFileTool {
 	return &EditFileTool{
 		BaseTool: &tools.BaseTool{
 			ToolName:        "edit_file",
@@ -51,6 +71,7 @@ func NewEditFileTool() *EditFileTool {
 			}`),
 			Policy: tools.PolicyUserConfirm,
 		},
+		limits: limits,
 	}
 }
 
@@ -159,12 +180,32 @@ func (t *EditFileTool) Execute(ctx context.Context, input json.RawMessage) (tool
 		defer checker.Unlock(writePath)
 	}
 
-	// safeio.ReadFile refuses a non-regular target (FIFO/socket/device) via
-	// fstat on the O_NONBLOCK descriptor, so editing through a path that a
-	// FIFO was planted at returns a clean error instead of hanging the open.
-	data, err := safeio.ReadFile(writePath)
-	if err != nil {
-		return tools.ToolResult{Content: fmt.Sprintf("failed to read file: %v", err), IsError: true}, nil
+	// Size guard before the slurping read: edit_file holds the whole file
+	// (plus transient copies) in memory, and in-workspace writes are
+	// auto-executed before the executor's central truncation layer can
+	// intervene. A stat failure here is deliberately ignored — the read
+	// below reports a missing target with its own error.
+	var data []byte
+	var readErr error
+	if t.limits.MaxEditFileBytes > 0 {
+		if info, statErr := os.Stat(writePath); statErr == nil && info.Size() > int64(t.limits.MaxEditFileBytes) {
+			return tools.ToolResult{
+				Content: fmt.Sprintf("refusing to edit: file is %d bytes, exceeding the %d byte edit limit: %s",
+					info.Size(), t.limits.MaxEditFileBytes, writePath),
+				IsError: true,
+			}, nil
+		}
+		// The read enforces the same bound (safeio.ReadFileLimited), so a
+		// target that grows between the stat and the read is still refused.
+		data, readErr = safeio.ReadFileLimited(writePath, int64(t.limits.MaxEditFileBytes))
+	} else {
+		// Cap disabled: safeio.ReadFile still refuses non-regular targets
+		// (FIFO/socket/device) via fstat on the O_NONBLOCK descriptor and
+		// enforces its own DefaultMaxFileSize read bound.
+		data, readErr = safeio.ReadFile(writePath)
+	}
+	if readErr != nil {
+		return tools.ToolResult{Content: fmt.Sprintf("failed to read file: %v", readErr), IsError: true}, nil
 	}
 
 	content := string(data)

@@ -102,9 +102,12 @@ const (
 	// provider and fall back to the CPU provider when none is available.
 	// The attempts run in a fixed ladder — CUDA first (the largest measured
 	// win), then the OpenVINO plugin — and the CPU provider is the terminal
-	// fallback. A rung is skipped or fails for concrete reasons: the CPU-only
-	// ONNX Runtime build, a missing driver, a missing OpenVINO plugin, an
-	// invalid device id. Unlike an explicit ExecutionProviderCUDA or
+	// fallback, reached only after the last rung. A rung is skipped or fails
+	// for concrete reasons: the CPU-only ONNX Runtime build, a missing
+	// driver, a missing OpenVINO plugin, an invalid device id — and a rung
+	// whose options build but whose session cannot be created on the device
+	// advances the ladder at the session stage the same way (see
+	// advanceAutoLadderSession). Unlike an explicit ExecutionProviderCUDA or
 	// ExecutionProviderOpenVINO request, the fallback downgrades the request
 	// to a WARN log naming every failed attempt instead of failing
 	// NewEmbedder. Which provider actually won is observable via

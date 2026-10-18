@@ -5,7 +5,10 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/v0lka/sp4rk/safeio"
 )
 
 func TestAgentManager_PriorityFirstWins(t *testing.T) {
@@ -269,5 +272,37 @@ func TestAgentManager_ScanSkipLogging(t *testing.T) {
 	}
 	if _, ok := mgr.Get("reviewer"); ok {
 		t.Error("invalid profile must not be in the catalog")
+	}
+}
+
+// TestAgentManager_OversizedAgentSkippedWithWarn pins the discovery-side
+// handling of a too-large AGENT.md (review finding 33): the profile is
+// skipped and discovery of the remaining directories continues, and the skip
+// is logged at Warn — the operator loses a profile that exists but could not
+// be read (the safeio read cap refused it), which is the same visibility
+// class as a profile that fails validation.
+func TestAgentManager_OversizedAgentSkippedWithWarn(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	// A valid agent the scan must still find.
+	writeAgent(t, dir, "good", "---\nname: good\ndescription: ok\n---\nG.\n")
+	// An oversized AGENT.md: exists, but exceeds the safeio read cap.
+	writeAgent(t, dir, "oversized", strings.Repeat("a", int(safeio.DefaultMaxFileSize)+1))
+
+	h := &recordingHandler{}
+	mgr := NewAgentManager([]string{dir}, slog.New(h))
+	if err := mgr.Scan(); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+
+	if !h.hasRecord(slog.LevelWarn, "skipped oversized agent") {
+		t.Errorf("expected a Warn record %q for the oversized profile, got records: %+v", "skipped oversized agent", h.records)
+	}
+	if _, ok := mgr.Get("good"); !ok {
+		t.Error("expected 'good' to be loaded: an oversized profile must not break discovery of the others")
+	}
+	if _, ok := mgr.Get("oversized"); ok {
+		t.Error("oversized profile must not be in the catalog")
 	}
 }

@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+
+	"github.com/v0lka/sp4rk/safeio"
 )
 
 // agentFileName is the marker file scanned for inside each agent directory.
@@ -48,8 +50,10 @@ func (m *AgentManager) log() *slog.Logger {
 // performed in reverse priority order so that earlier (higher-priority)
 // directories are visited last and overwrite later entries. An AGENT.md that
 // exists but fails validation is logged at Warn (the operator loses that
-// profile from the catalog); a directory without a readable AGENT.md is logged
-// at Debug. Skipped entries never abort a scan.
+// profile from the catalog); an AGENT.md that exists but exceeds the safeio
+// read cap is also logged at Warn ("skipped oversized agent"); a directory
+// without a readable AGENT.md is logged at Debug. Skipped entries never abort
+// a scan.
 func (m *AgentManager) Scan() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -98,13 +102,20 @@ func (m *AgentManager) scanDir(dir string) {
 		agent, err := ParseAgent(agentMD, agentDir)
 		if err != nil {
 			var parseErr *ParseError
-			if errors.As(err, &parseErr) {
+			switch {
+			case errors.Is(err, safeio.ErrTooLarge):
+				// An AGENT.md exists but exceeds the safeio read cap — the
+				// operator loses that profile from the catalog. Warn so the
+				// skip is visible; discovery of the remaining directories
+				// continues.
+				m.log().Warn("skipped oversized agent", "dir", agentDir, "error", err)
+			case errors.As(err, &parseErr):
 				// An AGENT.md exists but fails validation — a profile the
 				// operator loses from the catalog. Warn so the skip is
 				// visible (e.g. a `tools:` list still using pre-group tool
 				// names after an SDK upgrade).
 				m.log().Warn("skipped invalid agent", "dir", agentDir, "error", err)
-			} else {
+			default:
 				// No AGENT.md or an unreadable one — most directories are
 				// simply not agent profiles.
 				m.log().Debug("skipped non-agent directory", "dir", agentDir, "error", err)

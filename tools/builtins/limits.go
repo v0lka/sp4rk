@@ -75,6 +75,20 @@ type FileLimits struct {
 	ReadDefaultLines int // max lines per read call when no explicit range is given
 	MaxLineBytes     int // per-line byte cap; lines exceeding this are truncated (0 = no cap)
 	MaxWindowLines   int // hard cap on lines returned per call even for explicit ranges (0 = no cap)
+	// MaxEditFileBytes caps the size of a file edit_file will read and
+	// rewrite: edit_file slurps the whole target into memory (plus two to
+	// three transient copies of its content while replacing), so the cap
+	// keeps an edit's peak memory proportional to a known, configured file
+	// ceiling. safeio.ReadFile already bounds whole-file reads at its own
+	// DefaultMaxFileSize (10 MiB) and refuses non-regular targets; this
+	// edit-specific cap deliberately raises that read ceiling for edits
+	// (default 64 MiB) while adding a cheap stat guard that refuses an
+	// oversized target before any slurp. The cap bounds both the pre-read
+	// stat guard and the read itself (safeio.ReadFileLimited), so a target
+	// that grows between the stat and the read is still refused.
+	// 0 disables the edit-specific cap and falls back to safeio.ReadFile's
+	// DefaultMaxFileSize read bound.
+	MaxEditFileBytes int
 }
 
 // BashTimeouts holds configurable timeout values for the bash_exec tool.
@@ -117,6 +131,7 @@ func DefaultFileLimits() FileLimits {
 		ReadDefaultLines: 2000,
 		MaxLineBytes:     1 << 20, // 1 MiB
 		MaxWindowLines:   50000,
+		MaxEditFileBytes: 64 << 20, // 64 MiB
 	}
 }
 

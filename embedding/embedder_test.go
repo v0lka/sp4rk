@@ -885,30 +885,200 @@ func requireXpuSMI(t *testing.T) string {
 	return path
 }
 
-// xpuComputeMaxUtilization takes `samples` bounded xpu-smi readings of the
-// compute-utilization counter and returns the highest percentage seen. This
-// is the Intel counterpart of ADR-045's nvidia-smi PID rule: the counter
-// reads 0% at idle and jumps above 80% when the jina model computes on the
-// iGPU, so a silent CPU slide inside the plugin cannot hide behind a green
+// xpuComputeMaxUtilization takes `samples` bounded readings of the
+// compute-engine utilization counter through the production probe
+// (xpuComputeUtilization — the same `xpu-smi stats --device 0 -j`
+// invocation and parser the verification itself uses), each bounded by
+// xpuSMIProbeTimeout, and returns the highest percentage seen. This is the
+// Intel counterpart of ADR-045's nvidia-smi PID rule: the counter reads 0
+// at idle and jumps above 80% when the jina model computes on the iGPU, so
+// a silent CPU slide inside the plugin cannot hide behind a green
 // inference call. There is deliberately no sleep between samples — the
 // sampling cadence comes from the xpu-smi process spawn itself.
 func xpuComputeMaxUtilization(xpuSMI string, samples int) float64 {
 	var maxPct float64
 	for range samples {
 		ctx, cancel := context.WithTimeout(context.Background(), xpuSMIProbeTimeout)
-		out, err := exec.CommandContext(ctx, xpuSMI,
-			"--query-gpu=utilization.compute", "--id=0").Output()
+		pct, err := xpuComputeUtilization(ctx, xpuSMI)
 		cancel()
 		if err != nil {
 			continue
 		}
-		for _, field := range strings.Fields(string(out)) {
-			if pct, perr := strconv.ParseFloat(field, 64); perr == nil && pct > maxPct {
-				maxPct = pct
-			}
+		if pct > maxPct {
+			maxPct = pct
 		}
 	}
 	return maxPct
+}
+
+// TestLadderIndex pins the rung lookup the session-stage ladder walk starts
+// from: hardware providers map to their ladder position, the CPU fallback is
+// not a rung.
+func TestLadderIndex(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		provider string
+		want     int
+	}{
+		{ExecutionProviderCUDA, 0},
+		{ExecutionProviderOpenVINO, 1},
+		{ExecutionProviderCPU, -1},
+		{ExecutionProviderAuto, -1},
+	} {
+		if got := ladderIndex(tc.provider); got != tc.want {
+			t.Errorf("ladderIndex(%q) = %d, want %d", tc.provider, got, tc.want)
+		}
+	}
+}
+
+// TestAdvanceAutoLadderSession unit-tests the session-stage ladder walk over
+// fake rungs (no ONNX Runtime involved): only the rungs after `from` are
+// attempted, in ladder order; each failed attempt appends its verbatim reason
+// and warns; the walk stops at the first rung whose session is created; and
+// install is invoked exactly for the rungs that got as far as session
+// creation. This pins the session-stage contract: a winning rung's session
+// failure must not silently skip the remaining rungs — the terminal CPU
+// fallback happens only after the last rung.
+func TestAdvanceAutoLadderSession(t *testing.T) {
+	t.Parallel()
+	// fakeRungs builds ladder callbacks where optsFails[rung] makes
+	// buildSessionOptions fail for that rung and sessFails[rung] makes
+	// session creation fail for it; the returned slices record what the walk
+	// did.
+	fakeRungs := func(optsFails, sessFails map[string]bool) (
+		buildOpts func(string) (*ort.SessionOptions, error),
+		install func(string, *ort.SessionOptions),
+		createSess func() (*onnxSession, error),
+		installed *[]string,
+		reasons *[]string,
+	) {
+		var didInstall, didReasons []string
+		buildOpts = func(rung string) (*ort.SessionOptions, error) {
+			if optsFails[rung] {
+				return nil, fmt.Errorf("%s: options failed", rung)
+			}
+			return &ort.SessionOptions{}, nil
+		}
+		install = func(rung string, _ *ort.SessionOptions) {
+			didInstall = append(didInstall, rung)
+		}
+		createSess = func() (*onnxSession, error) {
+			rung := didInstall[len(didInstall)-1]
+			if sessFails[rung] {
+				return nil, fmt.Errorf("%s: session failed", rung)
+			}
+			return &onnxSession{}, nil
+		}
+		return buildOpts, install, createSess, &didInstall, &didReasons
+	}
+
+	t.Run("stops at the first successful rung", func(t *testing.T) {
+		t.Parallel()
+		buildOpts, install, createSess, installed, reasons := fakeRungs(
+			nil, map[string]bool{ExecutionProviderCUDA: true})
+		sess, ok, _ := advanceAutoLadderSession(0, buildOpts, install, createSess,
+			func(string, string, string) {}, reasons)
+		if !ok {
+			t.Fatalf("advanceAutoLadderSession() ok = false, want true (OpenVINO rung succeeds)")
+		}
+		if sess == nil {
+			t.Fatal("advanceAutoLadderSession() session = nil, want non-nil")
+		}
+		if want := []string{ExecutionProviderCUDA, ExecutionProviderOpenVINO}; !equalStrings(*installed, want) {
+			t.Errorf("installed rungs = %v, want %v", *installed, want)
+		}
+		if len(*reasons) != 1 {
+			t.Errorf("reasons = %v, want only the failed CUDA session attempt recorded", *reasons)
+		}
+	})
+
+	t.Run("all rungs fail at options", func(t *testing.T) {
+		t.Parallel()
+		buildOpts, install, createSess, installed, reasons := fakeRungs(
+			map[string]bool{ExecutionProviderCUDA: true, ExecutionProviderOpenVINO: true}, nil)
+		sess, ok, lastErr := advanceAutoLadderSession(0, buildOpts, install, createSess,
+			func(string, string, string) {}, reasons)
+		if ok || sess != nil {
+			t.Fatalf("advanceAutoLadderSession() = (%v, %v), want no session and ok=false", sess, ok)
+		}
+		if lastErr != nil {
+			t.Errorf("lastErr = %v, want nil (no rung reached session creation)", lastErr)
+		}
+		if len(*installed) != 0 {
+			t.Errorf("installed rungs = %v, want none (options never built)", *installed)
+		}
+		if len(*reasons) != 2 {
+			t.Errorf("reasons = %v, want one verbatim reason per rung", *reasons)
+		}
+	})
+
+	t.Run("every remaining rung fails at session creation", func(t *testing.T) {
+		t.Parallel()
+		buildOpts, install, createSess, installed, reasons := fakeRungs(nil,
+			map[string]bool{ExecutionProviderCUDA: true, ExecutionProviderOpenVINO: true})
+		_, ok, lastErr := advanceAutoLadderSession(0, buildOpts, install, createSess,
+			func(string, string, string) {}, reasons)
+		if ok {
+			t.Fatal("advanceAutoLadderSession() ok = true, want false (both sessions failed)")
+		}
+		if lastErr == nil {
+			t.Fatal("lastErr = nil, want the last attempted rung's session error")
+		}
+		if got := lastErr.Error(); !strings.HasPrefix(got, ExecutionProviderOpenVINO+": ") {
+			t.Errorf("lastErr = %v, want the last attempted rung's session error", lastErr)
+		}
+		if want := []string{ExecutionProviderCUDA, ExecutionProviderOpenVINO}; !equalStrings(*installed, want) {
+			t.Errorf("installed rungs = %v, want %v", *installed, want)
+		}
+		if len(*reasons) != 2 {
+			t.Errorf("reasons = %v, want one verbatim reason per failed session", *reasons)
+		}
+	})
+
+	t.Run("only the rungs after from are attempted", func(t *testing.T) {
+		t.Parallel()
+		buildOpts, install, createSess, installed, reasons := fakeRungs(
+			map[string]bool{ExecutionProviderOpenVINO: true}, nil)
+		_, ok, lastErr := advanceAutoLadderSession(1, buildOpts, install, createSess,
+			func(string, string, string) {}, reasons)
+		if ok || lastErr != nil {
+			t.Fatalf("advanceAutoLadderSession(from=1) = (%v, %v), want no successful rung", lastErr, ok)
+		}
+		// The CUDA rung sits before `from` (it already won the options
+		// stage): only the OpenVINO rung may be attempted here.
+		if len(*installed) != 0 {
+			t.Errorf("installed = %v, want empty (options never built)", *installed)
+		}
+		if len(*reasons) != 1 || strings.Contains((*reasons)[0], ExecutionProviderCUDA) {
+			t.Errorf("reasons = %v, want exactly the OpenVINO rung's failure", *reasons)
+		}
+	})
+
+	t.Run("beyond the last rung", func(t *testing.T) {
+		t.Parallel()
+		buildOpts, install, createSess, installed, reasons := fakeRungs(nil, nil)
+		_, ok, lastErr := advanceAutoLadderSession(len(autoAttemptLadder), buildOpts, install, createSess,
+			func(string, string, string) {}, reasons)
+		if ok || lastErr != nil {
+			t.Fatalf("advanceAutoLadderSession(from=len) = (%v, %v), want nothing attempted", lastErr, ok)
+		}
+		if len(*installed) != 0 || len(*reasons) != 0 {
+			t.Errorf("installed = %v, reasons = %v, want both empty", *installed, *reasons)
+		}
+	})
+}
+
+// equalStrings reports whether a and b hold the same strings in order.
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // TestNewEmbedder_ExecutionProviderOpenVINO_Live is the OpenVINO counterpart
