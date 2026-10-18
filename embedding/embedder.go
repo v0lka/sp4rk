@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -96,21 +97,25 @@ type EmbedderConfig struct {
 
 	// ExecutionProvider selects the ONNX Runtime execution provider used for
 	// inference: ExecutionProviderCPU ("cpu"), ExecutionProviderCUDA ("cuda"),
-	// or ExecutionProviderAuto ("auto"). The empty string (the default) means
-	// "cpu" and preserves the legacy behavior exactly.
+	// ExecutionProviderOpenVINO ("openvino"), or ExecutionProviderAuto
+	// ("auto"). The empty string (the default) means "cpu" and preserves the
+	// legacy behavior exactly.
 	//
 	// ONNX Runtime does not pick a GPU on its own — pointing LibraryPath at a
 	// GPU build changes nothing unless the provider is requested here. "cuda"
 	// additionally requires the CUDA provider shared libraries next to
-	// LibraryPath and a working driver/toolkit; when any of that is missing,
-	// NewEmbedder fails loudly rather than silently falling back to the CPU.
+	// LibraryPath and a working driver/toolkit; "openvino" requires the
+	// OpenVINO plugin library next to LibraryPath (see openvino.go). When any
+	// of that is missing, NewEmbedder fails loudly rather than silently
+	// falling back to the CPU.
 	//
-	// "auto" prefers CUDA and degrades gracefully: NewEmbedder attempts the
-	// CUDA provider and, when that attempt fails (CPU-only ONNX Runtime build,
-	// missing driver, invalid device id, ...), logs a WARN and continues on
-	// the CPU provider instead of failing. Which side won is observable via
-	// Embedder.ExecutionProvider. DeviceID participates only in the CUDA
-	// attempt, never in the CPU fallback.
+	// "auto" prefers hardware providers over the CPU and degrades gracefully:
+	// NewEmbedder attempts the ladder CUDA → OpenVINO and, when every attempt
+	// fails (CPU-only ONNX Runtime build, missing driver, missing OpenVINO
+	// plugin, invalid device id, ...), logs a WARN naming each failure and
+	// continues on the CPU provider instead of failing. Which side won is
+	// observable via Embedder.ExecutionProvider. DeviceID participates only
+	// in the hardware attempts, never in the CPU fallback.
 	//
 	// Unknown values are rejected.
 	ExecutionProvider string
@@ -178,12 +183,12 @@ type Embedder struct {
 	// the CPU provider (see degradeToCPU).
 	deviceID       int
 	intraOpThreads int
-	// cudaFallbackPending is true while inference runs on a CUDA provider that
-	// an "auto" request selected. A lazily created session that cannot be built
-	// on the GPU then degrades the embedder to the CPU provider once and retries
-	// (see newSessionWithFallback), mirroring the eager-session fallback in
-	// NewEmbedder.
-	cudaFallbackPending bool
+	// fallbackPending is true while inference runs on a hardware provider
+	// (CUDA or OpenVINO) that an "auto" request selected. A lazily created
+	// session that cannot be built on that provider then degrades the embedder
+	// to the CPU provider once and retries (see newSessionWithFallback),
+	// mirroring the eager-session fallback in NewEmbedder.
+	fallbackPending bool
 }
 
 // runOnORTThread executes fn on r's dedicated thread, or inline when r is nil.
@@ -201,6 +206,16 @@ func runOnORTThread(r *ortRunner, fn func()) {
 func (e *Embedder) onORTThread(fn func()) {
 	runOnORTThread(e.runner, fn)
 }
+
+// autoAttemptLadder is the ordered hardware providers an "auto" request tries
+// before the terminal CPU fallback: CUDA first (the measured ~20x winner on
+// the reference hardware, ADR-045), then the OpenVINO plugin for Intel
+// hardware. Each rung is attempted through buildSessionOptions, which fails
+// fast and side-effect-free for a missing driver or plugin — in particular an
+// absent OpenVINO plugin is detected from the filesystem before any ORT call,
+// so auto neither registers nor enumerates anything when the plugin is not
+// installed, and the recorded reason says exactly that.
+var autoAttemptLadder = [...]string{ExecutionProviderCUDA, ExecutionProviderOpenVINO}
 
 // NewEmbedder creates a new Embedder by loading the tokenizer and initializing
 // the ONNX Runtime environment.
@@ -269,24 +284,18 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 		logger.Warn("EnableBatchPipeline is ignored while EnableLengthBuckets is enabled; running in bucket mode")
 	}
 
-	// GPU providers keep per-thread state that must not be duplicated across
-	// Go's scheduler threads (see ortRunner). Every ONNX call below — and
-	// every one made later through the returned Embedder — is funnelled onto
-	// this single thread. The CPU provider needs none of it and keeps calling
-	// ONNX inline, exactly as before. "auto" starts on the runner because its
-	// first attempt is CUDA; the runner is stopped when that attempt fails
-	// and the CPU fallback continues inline.
+	// Hardware providers keep per-thread state that must not be duplicated
+	// across Go's scheduler threads (see ortRunner and
+	// providerUsesDedicatedThread). Every ONNX call below — and every one
+	// made later through the returned Embedder — is funnelled onto this
+	// single thread. The CPU provider needs none of it and keeps calling ONNX
+	// inline, exactly as before. "auto" starts on the runner because its
+	// ladder begins on a hardware provider; the runner is stopped only when
+	// the whole ladder fails and the CPU fallback continues inline.
 	effective := requested
 	var runner *ortRunner
-	if effective == ExecutionProviderCUDA || effective == ExecutionProviderAuto {
+	if providerUsesDedicatedThread(effective) {
 		runner = newORTRunner()
-	}
-	// attempt is the provider buildSessionOptions is asked for: "auto" is not
-	// a constructible provider, its first attempt is CUDA. Only used for the
-	// build call; `effective` tracks what inference will run on.
-	attempt := effective
-	if attempt == ExecutionProviderAuto {
-		attempt = ExecutionProviderCUDA
 	}
 
 	// cleanup releases whatever the aborted initialization already acquired
@@ -326,51 +335,65 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 	// initialized. A nil result preserves the legacy behavior (session created
 	// with nil *SessionOptions).
 	//
-	// For "auto" this is the CUDA attempt: a CPU-only ONNX Runtime build, a
-	// missing driver or an invalid device id all fail here, and the request
-	// degrades to the CPU provider with a WARN instead of an error.
+	// For "auto" this walks autoAttemptLadder: each failed rung's reason is
+	// kept for the fallback WARN, and the first rung whose options build
+	// becomes the winner.
 	buildOpts := func(provider string) (*ort.SessionOptions, error) {
 		var (
 			opts *ort.SessionOptions
 			err  error
 		)
 		runOnORTThread(runner, func() {
-			opts, err = buildSessionOptions(provider, cfg.DeviceID, cfg.IntraOpThreads)
+			opts, err = buildSessionOptions(provider, cfg.LibraryPath, cfg.DeviceID, cfg.IntraOpThreads)
 		})
 		return opts, err
 	}
-	sessOpts, err := buildOpts(attempt)
-	if err != nil {
-		if effective != ExecutionProviderAuto {
+	var sessOpts *ort.SessionOptions
+	if effective != ExecutionProviderAuto {
+		sessOpts, err = buildOpts(effective)
+		if err != nil {
 			cleanup(nil)
 			return nil, fmt.Errorf("building ONNX session options: %w", err)
 		}
-		// auto: WARN and continue on CPU. The CUDA attempt may already have
-		// allocated nothing beyond options internals (buildSessionOptions
-		// destroys its own partial options on failure), so the fallback just
-		// abandons the dedicated thread and proceeds inline like a plain CPU
-		// embedder.
-		logger.Warn("CUDA execution provider unavailable, falling back to CPU",
-			"error", err.Error(), "deviceID", cfg.DeviceID)
-		runner.stop()
-		runner = nil
-		effective = ExecutionProviderCPU
-		sessOpts, err = buildOpts(effective)
-		if err != nil {
-			cleanup(sessOpts)
-			return nil, fmt.Errorf("building ONNX session options: %w", err)
+	} else {
+		var reasons []string
+		for _, candidate := range autoAttemptLadder {
+			var attemptErr error
+			sessOpts, attemptErr = buildOpts(candidate)
+			if attemptErr == nil {
+				effective = candidate
+				break
+			}
+			// The failed rung's own error already names the concrete cause
+			// (CPU-only build, missing driver, missing plugin file, ...);
+			// keep it verbatim for the fallback WARN.
+			reasons = append(reasons, candidate+": "+attemptErr.Error())
+		}
+		if effective == ExecutionProviderAuto {
+			// Every hardware rung failed: degrade to the CPU loudly, with
+			// each rung's reason in the WARN (ADR-045: a fallback is tracked
+			// and warned, never silent). A failed attempt allocated nothing
+			// beyond options internals (buildSessionOptions destroys its own
+			// partial options on failure), so the fallback just abandons the
+			// dedicated thread and proceeds inline like a plain CPU embedder.
+			logger.Warn("no hardware execution provider available, falling back to CPU",
+				"reasons", strings.Join(reasons, "; "), "deviceID", cfg.DeviceID)
+			runner.stop()
+			runner = nil
+			effective = ExecutionProviderCPU
+			sessOpts, err = buildOpts(effective)
+			if err != nil {
+				cleanup(sessOpts)
+				return nil, fmt.Errorf("building ONNX session options: %w", err)
+			}
 		}
 	}
 	// From here on sessOpts is owned by the embedder-to-be; cleanup(sessOpts)
-	// releases it on failure. A successful CUDA attempt also resolves "auto"
-	// to its winner — but the eager-session block below still needs to know
-	// whether this was an "auto" request that landed on CUDA, so it can retry
-	// on the CPU provider when the GPU session itself cannot be built. Once
-	// resolved, `effective` is never "auto" again, so capture the auto-ness here.
-	autoOnCUDA := effective == ExecutionProviderAuto
-	if effective == ExecutionProviderAuto {
-		effective = ExecutionProviderCUDA
-	}
+	// releases it on failure. `effective` is resolved now — never "auto"
+	// again — but the eager-session block below still needs to know whether
+	// this was an "auto" request that landed on a hardware provider, so it
+	// can retry on the CPU provider when the session itself cannot be built.
+	requestedAuto := requested == ExecutionProviderAuto
 
 	logger.Info("loading tokenizer", "path", cfg.TokenizerPath)
 	tok, err := NewTokenizer(cfg.TokenizerPath)
@@ -404,18 +427,19 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 		sessionStarted = time.Now()
 		sess, err = newSess()
 		if err != nil {
-			if !autoOnCUDA {
+			if !requestedAuto {
 				cleanup(sessOpts)
 				return nil, fmt.Errorf("creating persistent ONNX session: %w", err)
 			}
-			// auto + CUDA options: the provider accepted the options but the
-			// session itself could not be built on the GPU (driver/device trouble,
-			// out of device memory at graph allocation). Retry once on the CPU
-			// provider before giving up — a failed attempt has already released
-			// its own tensors, and the CPU retry cannot make things worse.
-			cudaSessErr := err
-			logger.Warn("CUDA session creation failed, falling back to CPU",
-				"error", err.Error(), "deviceID", cfg.DeviceID)
+			// auto + hardware options: the provider accepted the options but
+			// the session itself could not be built on the device (driver
+			// trouble, out of device memory at graph allocation, a model the
+			// provider cannot compile). Retry once on the CPU provider before
+			// giving up — a failed attempt has already released its own
+			// tensors, and the CPU retry cannot make things worse.
+			hardwareSessErr := err
+			logger.Warn("hardware session creation failed, falling back to CPU",
+				"provider", effective, "error", err.Error(), "deviceID", cfg.DeviceID)
 			cleanup(sessOpts)
 			runner = nil
 			effective = ExecutionProviderCPU
@@ -424,13 +448,13 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 				cleanup(sessOpts)
 				return nil, fmt.Errorf("building ONNX session options: %w", err)
 			}
-			// Measure the CPU retry from its own start; the failed CUDA
+			// Measure the CPU retry from its own start; the failed hardware
 			// attempt above is not part of this session-create observation.
 			sessionStarted = time.Now()
 			sess, err = newSess()
 			if err != nil {
 				cleanup(sessOpts)
-				return nil, fmt.Errorf("creating persistent ONNX session after CUDA->CPU fallback (original CUDA error: %w): %w", cudaSessErr, err)
+				return nil, fmt.Errorf("creating persistent ONNX session after hardware->CPU fallback (original error: %w): %w", hardwareSessErr, err)
 			}
 		}
 	}
@@ -470,21 +494,23 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 		runner:            runner,
 		deviceID:          cfg.DeviceID,
 		intraOpThreads:    cfg.IntraOpThreads,
-		// Only an auto request that is still (or again) on CUDA can degrade to
-		// the CPU from a later lazy session-creation failure. If the eager-session
-		// fallback above already ran, effective is CPU and this stays false.
-		cudaFallbackPending: autoOnCUDA && effective == ExecutionProviderCUDA,
+		// Only an auto request that is still (or again) on a hardware provider
+		// can degrade to the CPU from a later lazy session-creation failure. If
+		// the eager-session fallback above already ran, effective is CPU and
+		// this stays false.
+		fallbackPending: requestedAuto && effective != ExecutionProviderCPU,
 	}, nil
 }
 
 // ExecutionProvider reports the execution provider the embedder actually runs
-// on: ExecutionProviderCPU ("cpu") or ExecutionProviderCUDA ("cuda"). The
-// "auto" request is resolved inside NewEmbedder, so this never returns "auto";
-// comparing the return value against the requested one is how callers detect
-// a silent CUDA->CPU slide — including the zero-value embedder, which reports
+// on: ExecutionProviderCPU ("cpu"), ExecutionProviderCUDA ("cuda") or
+// ExecutionProviderOpenVINO ("openvino"). The "auto" request is resolved
+// inside NewEmbedder, so this never returns "auto"; comparing the return value
+// against the requested one is how callers detect a silent hardware->CPU
+// slide — including the zero-value embedder, which reports
 // "cpu" (the legacy default).
 func (e *Embedder) ExecutionProvider() string {
-	// The provider is written at runtime by the lazy CUDA->CPU fallback
+	// The provider is written at runtime by the lazy hardware->CPU fallback
 	// (degradeToCPU, under e.mu), so take the read lock: a concurrent getter
 	// must not race the writer. Embedder is documented "safe for concurrent
 	// use", and the getter is a consumed surface (hosts poll it to detect a
@@ -692,60 +718,66 @@ func (e *Embedder) newSession(batchSize, seqLen int) (*onnxSession, error) {
 // newSessionWithFallback builds a persistent ONNX session, honouring the "auto"
 // contract for the lazily created sessions (length buckets and the batch
 // session), not just the eager one: when the session cannot be built on the
-// CUDA provider an "auto" request selected, the embedder degrades to the CPU
-// provider once and retries — the same CUDA->CPU degrade the eager session
-// performs inside NewEmbedder. An explicit "cuda" request still fails loudly
-// (cudaFallbackPending is false for it). The caller must hold e.mu.
+// hardware provider an "auto" request selected, the embedder degrades to the
+// CPU provider once and retries — the same hardware->CPU degrade the eager
+// session performs inside NewEmbedder. An explicit "cuda" or "openvino"
+// request still fails loudly (fallbackPending is false for it). The caller
+// must hold e.mu.
 func (e *Embedder) newSessionWithFallback(batchSize, seqLen int) (*onnxSession, error) {
 	sess, err := e.newSession(batchSize, seqLen)
 	if err == nil || !e.canDegradeToCPU() {
 		return sess, err
 	}
-	cudaErr := err
-	if fbErr := e.degradeToCPU(cudaErr); fbErr != nil {
-		return nil, fmt.Errorf("creating persistent ONNX session on CUDA failed (%w); CPU fallback also failed: %w", cudaErr, fbErr)
+	hardwareProvider := e.executionProvider
+	hardwareErr := err
+	if fbErr := e.degradeToCPU(hardwareErr); fbErr != nil {
+		return nil, fmt.Errorf("creating persistent ONNX session on %s failed (%w); CPU fallback also failed: %w", hardwareProvider, hardwareErr, fbErr)
 	}
 	sess, err = e.newSession(batchSize, seqLen)
 	if err != nil {
-		return nil, fmt.Errorf("creating persistent ONNX session after CUDA->CPU fallback (original CUDA error: %w): %w", cudaErr, err)
+		return nil, fmt.Errorf("creating persistent ONNX session after %s->CPU fallback (original error: %w): %w", hardwareProvider, hardwareErr, err)
 	}
 	return sess, nil
 }
 
 // canDegradeToCPU reports whether the embedder can safely retry session creation
-// on the CPU provider: the request was an "auto" one now running on CUDA, and no
-// CUDA-backed session is live yet — a live session needs the dedicated ONNX
-// thread the fallback stops, so degrading mid-flight would strand it. In
-// practice this is the first session creation in length-bucket mode, which is
-// exactly the path the eager fallback does not cover.
+// on the CPU provider: the request was an "auto" one now running on a hardware
+// provider (CUDA or OpenVINO), and no hardware-backed session is live yet — a
+// live session needs the dedicated ONNX thread the fallback stops, so
+// degrading mid-flight would strand it. In practice this is the first session
+// creation in length-bucket mode, which is exactly the path the eager fallback
+// does not cover.
 func (e *Embedder) canDegradeToCPU() bool {
-	return e.cudaFallbackPending && e.sess == nil && e.batchSess == nil && len(e.bucketSessions) == 0
+	return e.fallbackPending && e.sess == nil && e.batchSess == nil && len(e.bucketSessions) == 0
 }
 
 // degradeToCPU rebuilds the session options on the CPU provider, stops the
 // dedicated ONNX thread, and records that inference now runs on the CPU. It is
-// called when a session could not be built on a CUDA provider chosen by an
+// called when a session could not be built on a hardware provider chosen by an
 // "auto" request. The caller must hold e.mu, must have verified
 // canDegradeToCPU, and must retry session creation afterwards.
 func (e *Embedder) degradeToCPU(cause error) error {
-	e.logger.Warn("CUDA execution provider unavailable, falling back to CPU",
-		"error", cause.Error(), "deviceID", e.deviceID)
+	e.logger.Warn("execution provider unavailable, falling back to CPU",
+		"provider", e.executionProvider, "error", cause.Error(), "deviceID", e.deviceID)
 	var (
 		opts *ort.SessionOptions
 		err  error
 	)
-	// Build the CPU options FIRST, before tearing down the CUDA handle: if
+	// Build the CPU options FIRST, before tearing down the hardware handle: if
 	// this fails (ort.NewSessionOptions error) the embedder must be left
-	// exactly as it was — still on CUDA with its options intact — never in a
-	// half-degraded state with sessOpts == nil but executionProvider still CUDA.
+	// exactly as it was — still on the hardware provider with its options
+	// intact — never in a half-degraded state with sessOpts == nil but
+	// executionProvider still reporting hardware. The library path is empty
+	// because the CPU provider never reads it (no provider lookup happens on
+	// the CPU path).
 	e.onORTThread(func() {
-		opts, err = buildSessionOptions(ExecutionProviderCPU, e.deviceID, e.intraOpThreads)
+		opts, err = buildSessionOptions(ExecutionProviderCPU, "", e.deviceID, e.intraOpThreads)
 	})
 	if err != nil {
 		return fmt.Errorf("building ONNX session options: %w", err)
 	}
-	// The CPU options are in hand; now destroy the CUDA handle and commit the
-	// new state, so every mutation that follows is unconditional.
+	// The CPU options are in hand; now destroy the hardware handle and commit
+	// the new state, so every mutation that follows is unconditional.
 	e.onORTThread(func() {
 		if e.sessOpts != nil {
 			_ = e.sessOpts.Destroy()
@@ -757,7 +789,7 @@ func (e *Embedder) degradeToCPU(cause error) error {
 	}
 	e.sessOpts = opts
 	e.executionProvider = ExecutionProviderCPU
-	e.cudaFallbackPending = false
+	e.fallbackPending = false
 	return nil
 }
 

@@ -13,7 +13,7 @@ import (
 
 func TestParseGPUDevices_SingleGPU(t *testing.T) {
 	got := parseGPUDevices("0, NVIDIA GeForce RTX 4070\n")
-	want := []GPUDevice{{Index: 0, Name: "NVIDIA GeForce RTX 4070"}}
+	want := []GPUDevice{{Index: 0, Name: "NVIDIA GeForce RTX 4070", Provider: ExecutionProviderCUDA}}
 	if !devicesEqual(got, want) {
 		t.Errorf("parseGPUDevices(single) = %v, want %v", got, want)
 	}
@@ -23,9 +23,9 @@ func TestParseGPUDevices_MultipleGPUs(t *testing.T) {
 	out := "0, NVIDIA GeForce RTX 4090\n1, NVIDIA GeForce RTX 4090\n2, Tesla T4\n"
 	got := parseGPUDevices(out)
 	want := []GPUDevice{
-		{Index: 0, Name: "NVIDIA GeForce RTX 4090"},
-		{Index: 1, Name: "NVIDIA GeForce RTX 4090"},
-		{Index: 2, Name: "Tesla T4"},
+		{Index: 0, Name: "NVIDIA GeForce RTX 4090", Provider: ExecutionProviderCUDA},
+		{Index: 1, Name: "NVIDIA GeForce RTX 4090", Provider: ExecutionProviderCUDA},
+		{Index: 2, Name: "Tesla T4", Provider: ExecutionProviderCUDA},
 	}
 	if !devicesEqual(got, want) {
 		t.Errorf("parseGPUDevices(multi) = %v, want %v", got, want)
@@ -55,8 +55,8 @@ func TestParseGPUDevices_CRLFLineEndings(t *testing.T) {
 	out := "0, NVIDIA GeForce RTX 4070\r\n1, Tesla T4\r\n"
 	got := parseGPUDevices(out)
 	want := []GPUDevice{
-		{Index: 0, Name: "NVIDIA GeForce RTX 4070"},
-		{Index: 1, Name: "Tesla T4"},
+		{Index: 0, Name: "NVIDIA GeForce RTX 4070", Provider: ExecutionProviderCUDA},
+		{Index: 1, Name: "Tesla T4", Provider: ExecutionProviderCUDA},
 	}
 	if !devicesEqual(got, want) {
 		t.Errorf("parseGPUDevices(CRLF) = %v, want %v", got, want)
@@ -95,8 +95,8 @@ func TestParseGPUDevices_GarbageMixedWithValid(t *testing.T) {
 	}, "\n") + "\n"
 	got := parseGPUDevices(out)
 	want := []GPUDevice{
-		{Index: 0, Name: "NVIDIA GeForce RTX 4070"},
-		{Index: 1, Name: "Tesla T4"},
+		{Index: 0, Name: "NVIDIA GeForce RTX 4070", Provider: ExecutionProviderCUDA},
+		{Index: 1, Name: "Tesla T4", Provider: ExecutionProviderCUDA},
 	}
 	if !devicesEqual(got, want) {
 		t.Errorf("parseGPUDevices(garbage) = %v, want %v", got, want)
@@ -108,7 +108,7 @@ func TestParseGPUDevices_NameWithComma(t *testing.T) {
 	// comma as the field separator, so the rest of the line stays in the
 	// name verbatim.
 	got := parseGPUDevices("0, NVIDIA Graphics Device, rev a1\n")
-	want := []GPUDevice{{Index: 0, Name: "NVIDIA Graphics Device, rev a1"}}
+	want := []GPUDevice{{Index: 0, Name: "NVIDIA Graphics Device, rev a1", Provider: ExecutionProviderCUDA}}
 	if !devicesEqual(got, want) {
 		t.Errorf("parseGPUDevices(comma in name) = %v, want %v", got, want)
 	}
@@ -116,7 +116,7 @@ func TestParseGPUDevices_NameWithComma(t *testing.T) {
 
 func TestParseGPUDevices_SurroundingWhitespace(t *testing.T) {
 	got := parseGPUDevices("  0 ,   NVIDIA A100-SXM4-40GB  \n")
-	want := []GPUDevice{{Index: 0, Name: "NVIDIA A100-SXM4-40GB"}}
+	want := []GPUDevice{{Index: 0, Name: "NVIDIA A100-SXM4-40GB", Provider: ExecutionProviderCUDA}}
 	if !devicesEqual(got, want) {
 		t.Errorf("parseGPUDevices(whitespace) = %v, want %v", got, want)
 	}
@@ -158,9 +158,12 @@ func TestListGPUDevices_AbsentNvidiaSmi(t *testing.T) {
 }
 
 // TestListGPUDevices_LocalCallRunsUnblocked is the runnable-on-any-machine
-// smoke test: wherever nvidia-smi exists the call completes quickly;
+// smoke test: wherever a probe tool exists the call completes quickly;
 // wherever it does not, the absent-path returns immediately. Either way the
-// context cap must bound the call.
+// context cap must bound the call. An error is legitimate only in the
+// "hardware present, probe failed" corner — every present source failed —
+// and must then come with no devices; a healthy source (or absent tools)
+// yields a nil error.
 func TestListGPUDevices_LocalCallRunsUnblocked(t *testing.T) {
 	start := time.Now()
 	devices, err := ListGPUDevices(t.Context())
@@ -170,11 +173,17 @@ func TestListGPUDevices_LocalCallRunsUnblocked(t *testing.T) {
 		t.Errorf("ListGPUDevices took %v, exceeding probe timeout %v + slack", elapsed, gpuProbeTimeout)
 	}
 	if err != nil {
-		t.Errorf("ListGPUDevices() error = %v, want nil on a healthy machine or one without nvidia-smi", err)
+		if devices != nil {
+			t.Errorf("ListGPUDevices() = (%v, %v): an error must never travel with devices", devices, err)
+		}
+		t.Logf("every present probe source failed on this machine (legitimate): %v", err)
 	}
 	for _, d := range devices {
 		if d.Index < 0 {
-			t.Errorf("parsed negative GPU index %d from real nvidia-smi output", d.Index)
+			t.Errorf("parsed negative GPU index %d from real probe output", d.Index)
+		}
+		if d.Provider != ExecutionProviderCUDA && d.Provider != ExecutionProviderOpenVINO {
+			t.Errorf("device %q carries unknown provider %q", d.Name, d.Provider)
 		}
 	}
 	t.Logf("ListGPUDevices() = (%d devices, %v) in %v", len(devices), err, elapsed)

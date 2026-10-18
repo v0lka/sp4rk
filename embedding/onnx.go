@@ -85,12 +85,30 @@ const (
 	// beside it (the runtime dlopens them from the main library's directory).
 	ExecutionProviderCUDA = "cuda"
 
-	// ExecutionProviderAuto asks NewEmbedder to prefer the CUDA execution
-	// provider and fall back to the CPU provider when CUDA is unavailable —
-	// the CPU-only ONNX Runtime build, a missing driver, or an invalid device
-	// id. Unlike an explicit ExecutionProviderCUDA, the fallback downgrades
-	// the request to a WARN log instead of failing NewEmbedder. Which provider
-	// actually won is observable via Embedder.ExecutionProvider.
+	// ExecutionProviderOpenVINO runs inference on Intel hardware (integrated
+	// or discrete GPUs, Intel CPUs, NPUs) via the OpenVINO execution provider
+	// plugin. Unlike CUDA the provider is not compiled into libonnxruntime:
+	// the plugin shared library (libonnxruntime_providers_openvino_plugin.so,
+	// from Intel's onnxruntime-ep-openvino distribution, which the c0wrk
+	// `make fetch-onnx-openvino` flavor installs) must sit beside LibraryPath
+	// and is registered through the V2 execution-provider API. Without the
+	// plugin an explicit openvino request is a hard error — the same
+	// loud-failure invariant as an explicit cuda request (ADR-045). Device
+	// selection and the locked-thread policy mirror the CUDA provider; see
+	// openvino.go.
+	ExecutionProviderOpenVINO = "openvino"
+
+	// ExecutionProviderAuto asks NewEmbedder to prefer a hardware execution
+	// provider and fall back to the CPU provider when none is available.
+	// The attempts run in a fixed ladder — CUDA first (the largest measured
+	// win), then the OpenVINO plugin — and the CPU provider is the terminal
+	// fallback. A rung is skipped or fails for concrete reasons: the CPU-only
+	// ONNX Runtime build, a missing driver, a missing OpenVINO plugin, an
+	// invalid device id. Unlike an explicit ExecutionProviderCUDA or
+	// ExecutionProviderOpenVINO request, the fallback downgrades the request
+	// to a WARN log naming every failed attempt instead of failing
+	// NewEmbedder. Which provider actually won is observable via
+	// Embedder.ExecutionProvider.
 	ExecutionProviderAuto = "auto"
 )
 
@@ -103,11 +121,11 @@ func normalizeExecutionProvider(provider string) (string, error) {
 	switch provider {
 	case "":
 		return ExecutionProviderCPU, nil
-	case ExecutionProviderCPU, ExecutionProviderCUDA, ExecutionProviderAuto:
+	case ExecutionProviderCPU, ExecutionProviderCUDA, ExecutionProviderOpenVINO, ExecutionProviderAuto:
 		return provider, nil
 	default:
-		return "", fmt.Errorf("unknown execution provider %q (want %q, %q or %q)",
-			provider, ExecutionProviderCPU, ExecutionProviderCUDA, ExecutionProviderAuto)
+		return "", fmt.Errorf("unknown execution provider %q (want %q, %q, %q or %q)",
+			provider, ExecutionProviderCPU, ExecutionProviderCUDA, ExecutionProviderOpenVINO, ExecutionProviderAuto)
 	}
 }
 
@@ -119,22 +137,27 @@ func normalizeExecutionProvider(provider string) (string, error) {
 // preserving the legacy behavior in which NewAdvancedSession is called with a
 // nil *SessionOptions (byte-identical to the pre-existing code path).
 // Otherwise a fresh *SessionOptions is allocated via ort.NewSessionOptions and
-// configured: SetIntraOpNumThreads for a positive intraOpThreads, and an
-// appended CUDA execution provider for provider == ExecutionProviderCUDA.
+// configured: SetIntraOpNumThreads for a positive intraOpThreads, an appended
+// CUDA execution provider for provider == ExecutionProviderCUDA, and an
+// appended OpenVINO execution provider for provider ==
+// ExecutionProviderOpenVINO. ortLibraryPath is the main ONNX Runtime shared
+// library path; only the OpenVINO provider reads it (to locate its plugin
+// beside the library) — the CPU and CUDA providers ignore it.
 //
 // ONNX Runtime never selects a GPU on its own: without an explicit
 // AppendExecutionProviderCUDA call it executes the graph on the CPU provider
 // even when the shared library is a GPU build. That is why a non-nil
-// *SessionOptions is mandatory for CUDA regardless of the thread count.
+// *SessionOptions is mandatory for the hardware providers (cuda, openvino)
+// regardless of the thread count.
 //
 // The ONNX Runtime environment must be initialized before calling this with
 // anything but the legacy nil-returning combination, because
 // ort.NewSessionOptions requires it. The caller owns the returned options and
 // must call Destroy() exactly once when they are no longer needed (typically
-// in Embedder.Close). The CUDA provider options are owned by this function:
-// AppendExecutionProviderCUDA copies what it needs, so they are destroyed
-// before returning.
-func buildSessionOptions(provider string, deviceID, intraOpThreads int) (*ort.SessionOptions, error) {
+// in Embedder.Close). The provider-specific option objects are owned by this
+// function: the append calls copy what they need, so partial options are
+// destroyed before returning.
+func buildSessionOptions(provider, ortLibraryPath string, deviceID, intraOpThreads int) (*ort.SessionOptions, error) {
 	normalized, err := normalizeExecutionProvider(provider)
 	if err != nil {
 		return nil, err
@@ -144,7 +167,8 @@ func buildSessionOptions(provider string, deviceID, intraOpThreads int) (*ort.Se
 	}
 
 	cuda := normalized == ExecutionProviderCUDA
-	if !cuda && intraOpThreads <= 0 {
+	openvino := normalized == ExecutionProviderOpenVINO
+	if !cuda && !openvino && intraOpThreads <= 0 {
 		return nil, nil
 	}
 
@@ -160,6 +184,12 @@ func buildSessionOptions(provider string, deviceID, intraOpThreads int) (*ort.Se
 	}
 	if cuda {
 		if err := appendCUDAProvider(opts, deviceID); err != nil {
+			_ = opts.Destroy()
+			return nil, err
+		}
+	}
+	if openvino {
+		if err := appendOpenVINOProvider(opts, ortLibraryPath, deviceID); err != nil {
 			_ = opts.Destroy()
 			return nil, err
 		}

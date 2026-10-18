@@ -2,6 +2,7 @@ package embedding
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strconv"
@@ -10,49 +11,105 @@ import (
 	"github.com/v0lka/sp4rk/sysproc"
 )
 
-// GPUDevice describes one GPU reported by the NVIDIA driver.
+// GPUDevice describes one GPU reported by a driver stack, as offered to the
+// vector-index device picker.
 type GPUDevice struct {
-	// Index is the driver-assigned ordinal of the device, as used by
+	// Index is the driver-assigned ordinal of the device as used by
 	// CUDA_VISIBLE_DEVICES and other ordinal-keyed tooling ("0" is the
-	// primary GPU).
+	// primary GPU). The ordinal is only meaningful within its Provider:
+	// the caller selects a (provider, index) pair, never a bare index —
+	// vector_index.device_id is scoped to vector_index.execution_provider.
 	Index int
-	// Name is the product name as reported by nvidia-smi ("NVIDIA GeForce
-	// RTX 4070"). It is informational only.
+	// Name is the product name as reported by the driver ("NVIDIA GeForce
+	// RTX 4070", "Intel(R) Graphics (ARL)"). It is informational only.
 	Name string
+	// Provider names the execution provider this device belongs to:
+	// ExecutionProviderCUDA for nvidia-smi-enumerated devices,
+	// ExecutionProviderOpenVINO for Intel devices enumerated through
+	// vulkaninfo. Selecting an Intel device maps to device_id 0 — the
+	// plugin-based OpenVINO surface currently exposes no per-device
+	// selection (see appendOpenVINOProvider), so 0 is the only valid
+	// OpenVINO device index and Intel entries always carry it.
+	Provider string
 }
 
-// ListGPUDevices returns the NVIDIA GPUs visible on the machine.
+// ListGPUDevices returns the GPUs visible on the machine across every
+// enumeration source the embedding layer knows, each tagged with the
+// execution provider it can be reached through:
 //
-// The call shells out to
+//   - NVIDIA GPUs via `nvidia-smi --query-gpu=index,name --format=csv,noheader`
+//     (Provider "cuda");
+//   - Intel GPUs via `vulkaninfo --summary` (Provider "openvino"), filtered
+//     to the Intel PCI vendor — the hardware the OpenVINO execution provider
+//     runs on. The name travels verbatim from the Vulkan driver ("Intel(R)
+//     Graphics (ARL)" on Mesa): vulkaninfo is an external probe under the
+//     caller's control, unlike the EP metadata inside the ONNX Runtime
+//     process, which registers state once per process and whose wrapper
+//     surface exposes no device-name accessor.
 //
-//	nvidia-smi --query-gpu=index,name --format=csv,noheader
+// Every source runs under the same gpuProbeTimeout budget as GPUInUse, so a
+// wedged driver can never stall the caller.
 //
-// bounded by the same gpuProbeTimeout budget as GPUInUse, so a wedged
-// driver can never stall the caller.
+// Each source follows the GPUInUse result semantics independently:
+//   - source tool not found in PATH → that source contributes no devices and
+//     no error. Absence of a driver's userspace means "no GPUs from that
+//     vendor", not a failure.
+//   - source tool found but the invocation fails (driver down, non-zero
+//     exit, timeout) → that source contributes an error and no devices.
 //
-// Result semantics (mirroring GPUInUse):
-//   - nvidia-smi not found in PATH → (nil, nil). The machine has no NVIDIA
-//     userspace, hence no GPUs to report; absence of the tool is not an
-//     error.
-//   - nvidia-smi found but the invocation fails (driver down, non-zero
-//     exit, timeout) → (nil, err). The tool exists yet could not answer.
-//   - Otherwise a device per parseable output line; empty output (or output
-//     consisting entirely of prose such as "No running processes found" or
-//     "[N/A]") yields an empty, non-nil slice with a nil error.
+// Merge semantics: devices from every source that answered are concatenated
+// (NVIDIA first, then Intel). One broken driver stack must not hide the GPUs
+// another driver still reports, so a partial answer wins: the merged list is
+// returned with a nil error as long as at least one source answered. Only
+// when no source produced a device AND at least one present source failed
+// does the call fail, with the errors joined — the caller then sees
+// "hardware present, probe failed" instead of a bare "no GPUs".
 //
-// Cancellation: the caller-supplied ctx governs cancellation. The call
+// Cancellation: the caller-supplied ctx governs cancellation. Every source
 // derives its working context with context.WithTimeout(ctx,
 // gpuProbeTimeout), so the effective deadline is min(caller deadline, 2s) —
 // an earlier caller deadline always wins, while the internal cap remains the
 // upper bound for callers without one. A cancelled or expired context
-// surfaces as an error, but only once nvidia-smi is actually invoked: the
-// absent-tool fast path below returns the no-error empty result without
+// surfaces as an error from the sources that were actually invoked: the
+// absent-tool fast paths return their no-error empty result without
 // consulting ctx.
 func ListGPUDevices(ctx context.Context) ([]GPUDevice, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
+	var (
+		merged   = make([]GPUDevice, 0, 4)
+		failures []error
+	)
+
+	nvidia, nvidiaErr := listNvidiaGPUDevices(ctx)
+	merged = append(merged, nvidia...)
+	if nvidiaErr != nil {
+		failures = append(failures, nvidiaErr)
+	}
+
+	intel, intelErr := listIntelGPUDevices(ctx)
+	merged = append(merged, intel...)
+	if intelErr != nil {
+		failures = append(failures, intelErr)
+	}
+
+	if len(merged) == 0 {
+		// No source answered with a device: "no GPUs" stays the nil slice
+		// (the documented absent-tools shape) when nothing failed, and the
+		// joined "hardware present, probe failed" error otherwise.
+		if len(failures) > 0 {
+			return nil, errors.Join(failures...)
+		}
+		return nil, nil
+	}
+	return merged, nil
+}
+
+// listNvidiaGPUDevices enumerates the NVIDIA GPUs through nvidia-smi,
+// following the result semantics documented on ListGPUDevices.
+func listNvidiaGPUDevices(ctx context.Context) ([]GPUDevice, error) {
 	bin, ok := nvidiaSmiPath()
 	if !ok {
 		return nil, nil
@@ -90,7 +147,8 @@ func ListGPUDevices(ctx context.Context) ([]GPUDevice, error) {
 // when the index parses as a non-negative decimal integer. Everything else
 // — empty lines, prose, hex, negatives — is dropped, so garbage output
 // degrades to "no GPUs" instead of an error. GPU index 0 is the primary
-// device and is valid, unlike a PID of 0.
+// device and is valid, unlike a PID of 0. Every parsed device is tagged
+// with the CUDA provider.
 func parseGPUDevices(out string) []GPUDevice {
 	lines := strings.Split(out, "\n")
 	devices := make([]GPUDevice, 0, len(lines))
@@ -104,8 +162,9 @@ func parseGPUDevices(out string) []GPUDevice {
 			continue
 		}
 		devices = append(devices, GPUDevice{
-			Index: index,
-			Name:  strings.TrimSpace(nameField),
+			Index:    index,
+			Name:     strings.TrimSpace(nameField),
+			Provider: ExecutionProviderCUDA,
 		})
 	}
 	return devices

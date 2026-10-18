@@ -4,21 +4,22 @@ package embedding
 
 import "testing"
 
-// TestEmbedder_canDegradeToCPU pins the lazy CUDA->CPU fallback gate: a pending
-// auto-on-CUDA request may degrade only while no CUDA-backed session is live.
-// A live session runs on the dedicated ONNX thread the fallback stops, so
-// degrading mid-flight would strand it — the gate must say no.
+// TestEmbedder_canDegradeToCPU pins the lazy hardware->CPU fallback gate: a
+// pending auto-on-hardware request may degrade only while no session backed by
+// that provider is live. A live session runs on the dedicated ONNX thread the
+// fallback stops, so degrading mid-flight would strand it — the gate must say
+// no.
 func TestEmbedder_canDegradeToCPU(t *testing.T) {
 	cases := []struct {
 		name string
 		e    *Embedder
 		want bool
 	}{
-		{"pending with no live session", &Embedder{cudaFallbackPending: true}, true},
+		{"pending with no live session", &Embedder{fallbackPending: true}, true},
 		{"not pending", &Embedder{}, false},
-		{"pending but the legacy session is live", &Embedder{cudaFallbackPending: true, sess: &onnxSession{}}, false},
-		{"pending but the batch session is live", &Embedder{cudaFallbackPending: true, batchSess: &onnxSession{}}, false},
-		{"pending but a bucket session is live", &Embedder{cudaFallbackPending: true, bucketSessions: map[sessionKey]*onnxSession{{}: {}}}, false},
+		{"pending but the legacy session is live", &Embedder{fallbackPending: true, sess: &onnxSession{}}, false},
+		{"pending but the batch session is live", &Embedder{fallbackPending: true, batchSess: &onnxSession{}}, false},
+		{"pending but a bucket session is live", &Embedder{fallbackPending: true, bucketSessions: map[sessionKey]*onnxSession{{}: {}}}, false},
 	}
 	for _, tc := range cases {
 		if got := tc.e.canDegradeToCPU(); got != tc.want {

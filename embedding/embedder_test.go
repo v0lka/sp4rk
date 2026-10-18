@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -377,12 +378,12 @@ func TestBuildSessionOptions_Zero(t *testing.T) {
 	// must not require the shared library to be initialized. The empty
 	// provider string is the zero value and a synonym for "cpu".
 	for _, provider := range []string{"", ExecutionProviderCPU} {
-		opts, err := buildSessionOptions(provider, 0, 0)
+		opts, err := buildSessionOptions(provider, "", 0, 0)
 		if err != nil {
-			t.Fatalf("buildSessionOptions(%q, 0, 0) error = %v, want nil", provider, err)
+			t.Fatalf("buildSessionOptions(%q, \"\", 0, 0) error = %v, want nil", provider, err)
 		}
 		if opts != nil {
-			t.Errorf("buildSessionOptions(%q, 0, 0) opts = %p, want nil", provider, opts)
+			t.Errorf("buildSessionOptions(%q, \"\", 0, 0) opts = %p, want nil", provider, opts)
 		}
 	}
 }
@@ -390,12 +391,12 @@ func TestBuildSessionOptions_Zero(t *testing.T) {
 func TestBuildSessionOptions_Negative(t *testing.T) {
 	// Negative values are treated like 0: return (nil, nil).
 	for _, n := range []int{-1, -42} {
-		opts, err := buildSessionOptions("", 0, n)
+		opts, err := buildSessionOptions("", "", 0, n)
 		if err != nil {
-			t.Fatalf("buildSessionOptions(\"\", 0, %d) error = %v, want nil", n, err)
+			t.Fatalf("buildSessionOptions(\"\", \"\", 0, %d) error = %v, want nil", n, err)
 		}
 		if opts != nil {
-			t.Errorf("buildSessionOptions(\"\", 0, %d) opts = %p, want nil", n, opts)
+			t.Errorf("buildSessionOptions(\"\", \"\", 0, %d) opts = %p, want nil", n, opts)
 		}
 	}
 }
@@ -407,12 +408,12 @@ func TestBuildSessionOptions_UnknownProvider(t *testing.T) {
 	// directive, not a constructible provider. Rejection happens before any
 	// ONNX call, so this test needs no shared library.
 	for _, provider := range []string{"CUDA", "gpu", "cuda11", "coreml", ExecutionProviderAuto} {
-		opts, err := buildSessionOptions(provider, 0, 0)
+		opts, err := buildSessionOptions(provider, "", 0, 0)
 		if err == nil {
-			t.Errorf("buildSessionOptions(%q, 0, 0) error = nil, want non-nil", provider)
+			t.Errorf("buildSessionOptions(%q, \"\", 0, 0) error = nil, want non-nil", provider)
 		}
 		if opts != nil {
-			t.Errorf("buildSessionOptions(%q, 0, 0) opts = %p, want nil", provider, opts)
+			t.Errorf("buildSessionOptions(%q, \"\", 0, 0) opts = %p, want nil", provider, opts)
 		}
 	}
 }
@@ -451,7 +452,7 @@ func (p *providerLogs) contains(substr string) bool {
 // loud-rejection requirement: a typo must produce an error, never a silent
 // CPU degradation.
 func TestNormalizeExecutionProvider(t *testing.T) {
-	for _, provider := range []string{"", ExecutionProviderCPU, ExecutionProviderCUDA, ExecutionProviderAuto} {
+	for _, provider := range []string{"", ExecutionProviderCPU, ExecutionProviderCUDA, ExecutionProviderOpenVINO, ExecutionProviderAuto} {
 		got, err := normalizeExecutionProvider(provider)
 		if err != nil {
 			t.Errorf("normalizeExecutionProvider(%q) error = %v, want nil", provider, err)
@@ -465,7 +466,7 @@ func TestNormalizeExecutionProvider(t *testing.T) {
 			t.Errorf("normalizeExecutionProvider(%q) = %q, want %q", provider, got, want)
 		}
 	}
-	for _, provider := range []string{"CUDA", "gpu", "cuda11", "coreml", "Auto"} {
+	for _, provider := range []string{"CUDA", "gpu", "cuda11", "coreml", "OpenVINO", "Auto"} {
 		if _, err := normalizeExecutionProvider(provider); err == nil {
 			t.Errorf("normalizeExecutionProvider(%q) error = nil, want non-nil", provider)
 		}
@@ -504,7 +505,7 @@ func TestNewEmbedder_UnknownExecutionProvider(t *testing.T) {
 // touched.
 func TestNewEmbedder_NegativeDeviceID(t *testing.T) {
 	destroys := onnxEnvDestroys.Load()
-	for _, provider := range []string{ExecutionProviderCPU, ExecutionProviderCUDA, ExecutionProviderAuto} {
+	for _, provider := range []string{ExecutionProviderCPU, ExecutionProviderCUDA, ExecutionProviderOpenVINO, ExecutionProviderAuto} {
 		_, err := NewEmbedder(EmbedderConfig{
 			ModelPath:         "m.onnx",
 			TokenizerPath:     "t.json",
@@ -565,8 +566,8 @@ func TestNewEmbedder_FailurePaths_NeverDestroyEnv(t *testing.T) {
 
 	// Negative DeviceID (validation): rejected for every provider before
 	// ONNX is touched, unlike an out-of-range positive ordinal, which stays a
-	// runtime CUDA rejection.
-	for _, provider := range []string{ExecutionProviderCPU, ExecutionProviderCUDA, ExecutionProviderAuto} {
+	// runtime provider rejection.
+	for _, provider := range []string{ExecutionProviderCPU, ExecutionProviderCUDA, ExecutionProviderOpenVINO, ExecutionProviderAuto} {
 		if _, err := NewEmbedder(EmbedderConfig{
 			ModelPath: "m.onnx", TokenizerPath: "t.json", LibraryPath: "lib.so",
 			ExecutionProvider: provider,
@@ -613,19 +614,25 @@ func TestNewEmbedder_FailurePaths_NeverDestroyEnv(t *testing.T) {
 }
 
 // TestNewEmbedder_ExecutionProviderAuto_CPUOnlyBuild covers "auto" on a
-// CPU-only ONNX Runtime build: the CUDA attempt fails at provider-options
-// creation, a WARN naming the reason is logged, and the caller still receives
-// a fully working CPU embedder whose ExecutionProvider() reports "cpu".
+// CPU-only ONNX Runtime build with no OpenVINO plugin either: every ladder
+// rung fails, a WARN naming each reason is logged, and the caller still
+// receives a fully working CPU embedder whose ExecutionProvider() reports
+// "cpu".
 //
 // Which library the process loaded is decided once by TestMain, so this test
 // is driven by probing the loaded environment: it runs (rather than skips)
-// exactly when the initialized library is a CPU-only build.
+// exactly when the initialized library is a CPU-only build AND the OpenVINO
+// plugin is absent — with the plugin present the ladder legitimately lands on
+// openvino instead of degrading to the CPU.
 func TestNewEmbedder_ExecutionProviderAuto_CPUOnlyBuild(t *testing.T) {
 	libPath := testLibraryPath(t)
 	tokPath := testTokenizerPath(t)
 	modelPath := testModelPath(t)
 	if librarySupportsCUDA(t) {
 		t.Skip("ONNX Runtime library is a CUDA build; run with a CPU-only EMBEDDING_TEST_LIBRARY_PATH to exercise the CPU fallback")
+	}
+	if openVINOPluginAvailable(t) {
+		t.Skip("OpenVINO plugin is installed; auto resolves to openvino instead of degrading to the CPU")
 	}
 
 	logs := newProviderLogs()
@@ -665,13 +672,18 @@ func TestNewEmbedder_ExecutionProviderAuto_CPUOnlyBuild(t *testing.T) {
 // TestNewEmbedder_ExecutionProviderAuto_InvalidDevice covers "auto" on a CUDA
 // build when CUDA init fails for a non-build reason — here an invalid device
 // id, rejected by the CUDA provider while parsing provider options. The
-// embedder must still come up on CPU with a WARN.
+// embedder must still come up on CPU with a WARN. The premise includes the
+// OpenVINO plugin being absent: with the plugin installed the ladder's second
+// rung wins instead of degrading to the CPU.
 func TestNewEmbedder_ExecutionProviderAuto_InvalidDevice(t *testing.T) {
 	libPath := testLibraryPath(t)
 	tokPath := testTokenizerPath(t)
 	modelPath := testModelPath(t)
 	if !librarySupportsCUDA(t) {
 		t.Skip("ONNX Runtime library is not a CUDA build; skipping auto-with-failed-CUDA test")
+	}
+	if openVINOPluginAvailable(t) {
+		t.Skip("OpenVINO plugin is installed; auto resolves to openvino instead of degrading to the CPU")
 	}
 
 	logs := newProviderLogs()
@@ -728,6 +740,243 @@ func TestNewEmbedder_ExecutionProviderCUDA_InvalidDeviceFails(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "building ONNX session options") {
 		t.Errorf("error should originate from session-options build, got: %v", err)
+	}
+}
+
+// openVINOPluginAvailable reports whether the OpenVINO execution provider
+// plugin sits beside the ONNX Runtime library this test run initialized.
+// Unlike testLibraryPath it answers a question, not a requirement: callers
+// use it to pick which of the complementary openvino tests can run (the
+// missing-plugin pair vs. the live test), so an unset library path simply
+// means "not available".
+func openVINOPluginAvailable(t *testing.T) bool {
+	t.Helper()
+	libPath := os.Getenv("EMBEDDING_TEST_LIBRARY_PATH")
+	if libPath == "" || !onnxEnvManagedForTests {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(filepath.Dir(libPath), openVINOPluginLibrary))
+	return err == nil
+}
+
+// TestNewEmbedder_ExecutionProviderOpenVINO_MissingPluginFails pins the
+// ADR-045 loud-failure invariant for the plugin-based provider: an explicit
+// "openvino" request on a machine without the plugin library beside the ONNX
+// Runtime library must fail NewEmbedder with an error naming the missing
+// file — never a silent CPU degradation — and the failure path must not
+// destroy the shared ONNX environment. The check is a filesystem stat that
+// runs before any ORT call, so this test also proves the failed request
+// leaves the process-global plugin registration untouched. Skipped on
+// machines where the plugin IS installed; the live test covers that case.
+func TestNewEmbedder_ExecutionProviderOpenVINO_MissingPluginFails(t *testing.T) {
+	libPath := testLibraryPath(t)
+	if openVINOPluginAvailable(t) {
+		t.Skip("OpenVINO plugin is installed next to the test library; skipping the missing-plugin test")
+	}
+	destroys := onnxEnvDestroys.Load()
+	_, err := NewEmbedder(EmbedderConfig{
+		ModelPath:         "m.onnx",
+		TokenizerPath:     "t.json",
+		LibraryPath:       libPath,
+		ExecutionProvider: ExecutionProviderOpenVINO,
+		Logger:            slog.New(slog.DiscardHandler),
+	})
+	if err == nil {
+		t.Fatal("NewEmbedder(explicit openvino without plugin) error = nil, want non-nil (loud failure)")
+	}
+	if !strings.Contains(err.Error(), openVINOPluginLibrary) {
+		t.Errorf("error should name the missing plugin library %q, got: %v", openVINOPluginLibrary, err)
+	}
+	if got := onnxEnvDestroys.Load() - destroys; got != 0 {
+		t.Errorf("destroyONNXRuntime called %d times after explicit-openvino failure, want 0", got)
+	}
+}
+
+// TestNewEmbedder_ExecutionProviderOpenVINO_NonZeroDeviceIDFails pins the
+// loud-configuration rule for the knob the provider cannot honor yet: the
+// onnxruntime_go wrapper exposes no per-device selection for OpenVINO
+// devices, so a non-zero DeviceID under "openvino" must fail the request
+// instead of being silently ignored (the exact silent-failure shape the
+// DeviceID validation exists to prevent). The rejection precedes the plugin
+// lookup, so the test runs on every machine.
+func TestNewEmbedder_ExecutionProviderOpenVINO_NonZeroDeviceIDFails(t *testing.T) {
+	libPath := testLibraryPath(t)
+	destroys := onnxEnvDestroys.Load()
+	_, err := NewEmbedder(EmbedderConfig{
+		ModelPath:         "m.onnx",
+		TokenizerPath:     "t.json",
+		LibraryPath:       libPath,
+		ExecutionProvider: ExecutionProviderOpenVINO,
+		DeviceID:          7,
+		Logger:            slog.New(slog.DiscardHandler),
+	})
+	if err == nil {
+		t.Fatal("NewEmbedder(explicit openvino, DeviceID=7) error = nil, want non-nil (loud failure)")
+	}
+	if !strings.Contains(err.Error(), "device_id=7") {
+		t.Errorf("error should name the unsupported device_id, got: %v", err)
+	}
+	if got := onnxEnvDestroys.Load() - destroys; got != 0 {
+		t.Errorf("destroyONNXRuntime called %d times after rejected config, want 0", got)
+	}
+}
+
+// TestNewEmbedder_ExecutionProviderAuto_NamesOpenVINOReason covers the auto
+// ladder on a machine with neither CUDA nor the OpenVINO plugin: both rungs
+// must fail with concrete reasons, the WARN must name the OpenVINO rung's
+// reason (an absent plugin is detected from the filesystem, so the rung is
+// skipped without registering anything), and the caller still receives a
+// fully working CPU embedder.
+func TestNewEmbedder_ExecutionProviderAuto_NamesOpenVINOReason(t *testing.T) {
+	libPath := testLibraryPath(t)
+	tokPath := testTokenizerPath(t)
+	modelPath := testModelPath(t)
+	if librarySupportsCUDA(t) {
+		t.Skip("ONNX Runtime library is a CUDA build; the CUDA rung would win the ladder")
+	}
+	if openVINOPluginAvailable(t) {
+		t.Skip("OpenVINO plugin is installed; the OpenVINO rung would win the ladder")
+	}
+
+	logs := newProviderLogs()
+	destroys := onnxEnvDestroys.Load()
+	emb, err := NewEmbedder(EmbedderConfig{
+		ModelPath:         modelPath,
+		TokenizerPath:     tokPath,
+		LibraryPath:       libPath,
+		ExecutionProvider: ExecutionProviderAuto,
+		Logger:            logs.logger(),
+	})
+	if err != nil {
+		t.Fatalf("auto with neither CUDA nor OpenVINO: NewEmbedder() error = %v, want working CPU fallback", err)
+	}
+	t.Cleanup(func() { closeSessionOnly(emb) })
+
+	if got := emb.ExecutionProvider(); got != ExecutionProviderCPU {
+		t.Errorf("ExecutionProvider() = %q, want %q (both ladder rungs failed)", got, ExecutionProviderCPU)
+	}
+	if !logs.contains("falling back to CPU") {
+		t.Errorf("missing WARN about the fallback in logs:\n%s", logs.buf.String())
+	}
+	if !logs.contains("cuda: ") {
+		t.Errorf("fallback WARN must carry the CUDA rung's reason, logs:\n%s", logs.buf.String())
+	}
+	if !logs.contains("openvino: ") || !logs.contains("plugin not found") {
+		t.Errorf("fallback WARN must carry the OpenVINO rung's reason (plugin not found), logs:\n%s", logs.buf.String())
+	}
+	if got := onnxEnvDestroys.Load() - destroys; got != 0 {
+		t.Errorf("destroyONNXRuntime called %d times during auto fallback, want 0", got)
+	}
+}
+
+// xpuSMIProbeTimeout bounds one xpu-smi invocation in test assertions: a
+// healthy xpu-smi answers in tens of milliseconds, and a wedged driver must
+// never hang a test run.
+const xpuSMIProbeTimeout = 10 * time.Second
+
+// requireXpuSMI skips the test when xpu-smi is unavailable (no Intel GPU
+// tooling on this machine) and otherwise returns its path.
+func requireXpuSMI(t *testing.T) string {
+	t.Helper()
+	path, err := exec.LookPath("xpu-smi")
+	if err != nil {
+		t.Skip("xpu-smi not found; skipping Intel-GPU-visibility assertion")
+	}
+	return path
+}
+
+// xpuComputeMaxUtilization takes `samples` bounded xpu-smi readings of the
+// compute-utilization counter and returns the highest percentage seen. This
+// is the Intel counterpart of ADR-045's nvidia-smi PID rule: the counter
+// reads 0% at idle and jumps above 80% when the jina model computes on the
+// iGPU, so a silent CPU slide inside the plugin cannot hide behind a green
+// inference call. There is deliberately no sleep between samples — the
+// sampling cadence comes from the xpu-smi process spawn itself.
+func xpuComputeMaxUtilization(xpuSMI string, samples int) float64 {
+	var maxPct float64
+	for range samples {
+		ctx, cancel := context.WithTimeout(context.Background(), xpuSMIProbeTimeout)
+		out, err := exec.CommandContext(ctx, xpuSMI,
+			"--query-gpu=utilization.compute", "--id=0").Output()
+		cancel()
+		if err != nil {
+			continue
+		}
+		for _, field := range strings.Fields(string(out)) {
+			if pct, perr := strconv.ParseFloat(field, 64); perr == nil && pct > maxPct {
+				maxPct = pct
+			}
+		}
+	}
+	return maxPct
+}
+
+// TestNewEmbedder_ExecutionProviderOpenVINO_Live is the OpenVINO counterpart
+// of the CUDA GPU tests: on a machine where the plugin is installed beside
+// the ONNX Runtime library, an explicit "openvino" request must produce a
+// working embedder whose ExecutionProvider() reports "openvino", and — the
+// core requirement — a sustained real inference must drive xpu-smi's
+// compute-utilization counter up, so inference provably reaches the Intel
+// GPU instead of sliding to a CPU device inside the plugin.
+func TestNewEmbedder_ExecutionProviderOpenVINO_Live(t *testing.T) {
+	libPath := testLibraryPath(t)
+	tokPath := testTokenizerPath(t)
+	modelPath := testModelPath(t)
+	if !openVINOPluginAvailable(t) {
+		t.Skip("OpenVINO plugin is not installed next to the test library; skipping live OpenVINO test")
+	}
+	xpuSMI := requireXpuSMI(t)
+
+	emb, err := NewEmbedder(EmbedderConfig{
+		ModelPath:         modelPath,
+		TokenizerPath:     tokPath,
+		LibraryPath:       libPath,
+		ExecutionProvider: ExecutionProviderOpenVINO,
+		Logger:            slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatalf("NewEmbedder(explicit openvino) error = %v", err)
+	}
+	t.Cleanup(func() { closeSessionOnly(emb) })
+
+	if got := emb.ExecutionProvider(); got != ExecutionProviderOpenVINO {
+		t.Fatalf("ExecutionProvider() = %q, want %q", got, ExecutionProviderOpenVINO)
+	}
+
+	vec, err := emb.EmbedQuery(context.Background(), "real inference on the OpenVINO provider")
+	if err != nil {
+		t.Fatalf("EmbedQuery() error = %v", err)
+	}
+	if len(vec) != DefaultHiddenDim {
+		t.Errorf("embedding dim = %d, want %d", len(vec), DefaultHiddenDim)
+	}
+
+	// Sustained inference on the embedder's locked ONNX thread while the main
+	// goroutine samples the GPU: the compute-utilization discriminator needs
+	// load DURING the sample window (idle reads 0%).
+	stop := make(chan struct{})
+	var inferWG sync.WaitGroup
+	inferWG.Add(1)
+	go func() {
+		defer inferWG.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				if _, err := emb.EmbedQuery(context.Background(), "sustained inference for utilization sampling"); err != nil {
+					t.Errorf("sustained EmbedQuery() error = %v", err)
+					return
+				}
+			}
+		}
+	}()
+	maxPct := xpuComputeMaxUtilization(xpuSMI, 12)
+	close(stop)
+	inferWG.Wait()
+
+	if maxPct < 25 {
+		t.Errorf("max xpu-smi utilization.compute = %.1f%%, want >= 25%% — inference did not reach the Intel GPU", maxPct)
 	}
 }
 
@@ -847,12 +1096,12 @@ func TestBuildSessionOptions_Positive(t *testing.T) {
 	// when EMBEDDING_TEST_LIBRARY_PATH is unset.
 	_ = testLibraryPath(t)
 
-	opts, err := buildSessionOptions("", 0, 4)
+	opts, err := buildSessionOptions("", "", 0, 4)
 	if err != nil {
-		t.Fatalf("buildSessionOptions(\"\", 0, 4) error = %v, want nil", err)
+		t.Fatalf("buildSessionOptions(\"\", \"\", 0, 4) error = %v, want nil", err)
 	}
 	if opts == nil {
-		t.Fatal("buildSessionOptions(\"\", 0, 4) opts = nil, want non-nil")
+		t.Fatal("buildSessionOptions(\"\", \"\", 0, 4) opts = nil, want non-nil")
 	}
 	t.Cleanup(func() {
 		if err := opts.Destroy(); err != nil {

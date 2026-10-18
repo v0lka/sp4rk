@@ -19,9 +19,28 @@ import (
 // locked thread holds the footprint flat.
 //
 // The CPU provider has no such per-thread cost, so Embedder only creates a
-// runner for GPU providers and calls ONNX directly otherwise.
+// runner for hardware providers and calls ONNX directly otherwise. The
+// OpenVINO provider gets the same pinning as CUDA: its runtime builds device
+// contexts and thread pools around the threads that enter Session.Run, and
+// holding every ORT touch to one thread keeps that bookkeeping flat no matter
+// how Go's scheduler migrates the calling goroutines.
 type ortRunner struct {
 	jobs chan func()
+}
+
+// providerUsesDedicatedThread reports whether inference under the named
+// execution provider must run on the ortRunner's single locked OS thread.
+// Everything except the CPU provider (including "auto", whose ladder starts
+// on a hardware provider) is pinned.
+func providerUsesDedicatedThread(provider string) bool {
+	switch provider {
+	case ExecutionProviderCPU:
+		return false
+	case ExecutionProviderCUDA, ExecutionProviderOpenVINO, ExecutionProviderAuto:
+		return true
+	default:
+		return false
+	}
 }
 
 // newORTRunner starts the dedicated thread and returns a runner bound to it.

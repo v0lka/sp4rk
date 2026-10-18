@@ -48,6 +48,28 @@ func goroutineID(t *testing.T) uint64 {
 	return id
 }
 
+func TestProviderUsesDedicatedThread(t *testing.T) {
+	// The runner policy in table form: the CPU provider stays inline (the
+	// byte-for-byte-unchanged legacy path), every hardware provider — and
+	// "auto", whose ladder begins on a hardware provider — is pinned to the
+	// single locked ONNX thread.
+	cases := []struct {
+		provider string
+		want     bool
+	}{
+		{ExecutionProviderCPU, false},
+		{"", false},
+		{ExecutionProviderCUDA, true},
+		{ExecutionProviderOpenVINO, true},
+		{ExecutionProviderAuto, true},
+	}
+	for _, tc := range cases {
+		if got := providerUsesDedicatedThread(tc.provider); got != tc.want {
+			t.Errorf("providerUsesDedicatedThread(%q) = %v, want %v", tc.provider, got, tc.want)
+		}
+	}
+}
+
 func TestORTRunner_SingleThreadAcrossCallers(t *testing.T) {
 	// The whole point of the runner: no matter how many different goroutines
 	// (and therefore OS threads) call in, ONNX work lands on exactly one.
