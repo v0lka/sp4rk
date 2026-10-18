@@ -92,7 +92,16 @@ type searxngResult struct {
 }
 
 // Search performs a web search using the SearXNG JSON API.
+//
+// maxResults caps the number of returned results client-side (the JSON API
+// has no count parameter). A negative count is not an error: like the
+// DuckDuckGo loop-guard, it degrades to an empty result — never a
+// negative-cap make() panic — so a sign-slipped caller configuration cannot
+// crash the host.
 func (p *SearXNGProvider) Search(ctx context.Context, query string, maxResults int) ([]SearchResult, error) {
+	if maxResults < 0 {
+		maxResults = 0
+	}
 	if p.baseURL == "" {
 		return nil, errors.New("searxng: base URL is not configured")
 	}

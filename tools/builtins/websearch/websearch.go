@@ -36,8 +36,18 @@ type SearchResult struct {
 
 // SearchProvider defines the interface for web search providers.
 // Built-in implementations include BraveProvider, DuckDuckGoProvider,
-// ExaProvider, and TavilyProvider. To add a custom provider, implement this
-// interface and pass it to NewTool.
+// ExaProvider, TavilyProvider, and SearXNGProvider. To add a custom provider,
+// implement this interface and pass it to NewTool.
+//
+// Implementations must never panic on a non-positive maxResults. Beyond that
+// invariant the handling is provider-specific: SearXNG clamps the count to
+// an empty result on entry and DuckDuckGo's parser loop-guard yields an
+// empty result, while Brave, Tavily, and Exa forward the count to their
+// HTTP APIs, where a non-positive value is handled by the remote service.
+// The tool layer always passes a positive count (NewTool normalizes the
+// configured limit; Execute substitutes it for a non-positive argument),
+// but Search is exported and callable directly — pass a positive count when
+// bypassing the tool.
 type SearchProvider interface {
 	Search(ctx context.Context, query string, maxResults int) ([]SearchResult, error)
 	Name() string
@@ -56,7 +66,19 @@ type Tool struct {
 }
 
 // NewTool creates a new Tool with the given SearchProvider and specified limits.
+//
+// A non-positive limits.MaxResults is normalized to
+// builtins.DefaultWebSearchLimits().MaxResults: Execute substitutes the
+// configured limit whenever the model omits (or passes a non-positive)
+// max_results, so a negative configured value — a plausible "unlimited"
+// idiom or a sign slip — would otherwise flow through to the provider
+// verbatim. Providers add local guards only where they use the count
+// locally (SearXNG clamps on entry, DuckDuckGo loop-guards its parser),
+// so the boundary fix is what covers every current and future provider.
 func NewTool(provider SearchProvider, limits Limits) *Tool {
+	if limits.MaxResults <= 0 {
+		limits.MaxResults = builtins.DefaultWebSearchLimits().MaxResults
+	}
 	schema := `{
 		"type": "object",
 		"properties": {

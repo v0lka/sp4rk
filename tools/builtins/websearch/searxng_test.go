@@ -210,6 +210,53 @@ func TestSearXNGTool_Execute(t *testing.T) {
 	}
 }
 
+// TestSearXNGProvider_NegativeMaxResults pins the provider's negative-count
+// contract: a negative maxResults degrades to an empty result (the same
+// semantics as the DuckDuckGo loop-guard) instead of reaching
+// make([]SearchResult, 0, n) with n < 0 — a makeslice panic.
+func TestSearXNGProvider_NegativeMaxResults(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"results": [{"title": "Answer", "url": "https://example.com/a", "content": "content"}]}`))
+	}))
+	defer server.Close()
+
+	provider := NewSearXNGProviderWithClient(server.URL, 30*time.Second, nil)
+	results, err := provider.Search(context.Background(), "test", -1)
+	if err != nil {
+		t.Fatalf("Search() returned error: %v", err)
+	}
+	if len(results) != 0 {
+		t.Errorf("expected an empty result set for a negative maxResults, got %d results", len(results))
+	}
+}
+
+// TestSearXNGTool_NegativeConfiguredLimit reproduces the original defect
+// end to end: a host-configured Limits{MaxResults: -1} ("unlimited" idiom
+// or sign slip) with default tool arguments must complete normally — the
+// boundary-normalized limit reaches the provider, the stub result is
+// returned, and no makeslice panic fires on the provider's result slice.
+func TestSearXNGTool_NegativeConfiguredLimit(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"results": [{"title": "Answer", "url": "https://example.com/a", "content": "content"}]}`))
+	}))
+	defer server.Close()
+
+	tool := NewTool(NewSearXNGProviderWithClient(server.URL, 30*time.Second, nil), Limits{MaxResults: -1})
+	input, _ := json.Marshal(map[string]any{"query": "test"})
+	result, err := tool.Execute(context.Background(), input)
+	if err != nil {
+		t.Fatalf("Execute() returned error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("Execute() returned IsError=true: %s", result.Content)
+	}
+	if !strings.Contains(result.Content, "Answer") {
+		t.Errorf("expected the formatted stub result, got: %s", result.Content)
+	}
+}
+
 // TestSearXNGProvider_RealSearch is the integration test against a real
 // self-hosted instance; it is env-guarded like the other provider
 // integration tests (set SEARXNG_TEST_URL, e.g.

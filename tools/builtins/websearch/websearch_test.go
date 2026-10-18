@@ -16,13 +16,51 @@ type mockSearchProvider struct {
 	name    string
 	results []SearchResult
 	err     error
+	// gotMaxResults records the maxResults value of the last Search call, so
+	// tests can assert what count the tool layer handed to the provider.
+	gotMaxResults int
 }
 
-func (m *mockSearchProvider) Search(_ context.Context, _ string, _ int) ([]SearchResult, error) {
+func (m *mockSearchProvider) Search(_ context.Context, _ string, maxResults int) ([]SearchResult, error) {
+	m.gotMaxResults = maxResults
 	return m.results, m.err
 }
 
 func (m *mockSearchProvider) Name() string { return m.name }
+
+// TestNewTool_NormalizesNonPositiveLimit pins the boundary fix for finding
+// #66: NewTool normalizes a non-positive configured MaxResults to the
+// documented default, so Execute's default-arguments path (max_results
+// omitted → the configured limit) can never deliver a negative count to any
+// provider.
+func TestNewTool_NormalizesNonPositiveLimit(t *testing.T) {
+	def := builtins.DefaultWebSearchLimits().MaxResults
+	if def <= 0 {
+		t.Fatalf("DefaultWebSearchLimits().MaxResults = %d, want a positive default", def)
+	}
+	tests := []struct {
+		name      string
+		limit     int
+		wantLimit int
+	}{
+		{name: "negative limit normalized to default", limit: -1, wantLimit: def},
+		{name: "zero limit normalized to default", limit: 0, wantLimit: def},
+		{name: "positive limit preserved", limit: 7, wantLimit: 7},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &mockSearchProvider{name: "capture"}
+			tool := NewTool(p, Limits{MaxResults: tc.limit})
+			input, _ := json.Marshal(map[string]any{"query": "q"})
+			if _, err := tool.Execute(context.Background(), input); err != nil {
+				t.Fatalf("Execute() returned error: %v", err)
+			}
+			if p.gotMaxResults != tc.wantLimit {
+				t.Errorf("provider received maxResults=%d, want %d", p.gotMaxResults, tc.wantLimit)
+			}
+		})
+	}
+}
 
 func TestTool_Descriptor(t *testing.T) {
 	tool := NewTool(&mockSearchProvider{name: "mock"}, builtins.DefaultWebSearchLimits())
