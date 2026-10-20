@@ -59,8 +59,10 @@ type EmbedderConfig struct {
     // DeviceID is the GPU device index used when ExecutionProvider resolves
     // to a hardware provider: the CUDA device on "cuda"/"auto"; under an
     // explicit "openvino" request a non-zero value is a hard configuration
-    // error, while 0 lets OpenVINO pick its best device. Ignored by the CPU
-    // provider; negative values are rejected for every provider.
+    // error, while 0 lets the OpenVINO rung resolve the device itself (the
+    // plugin's first device, then the remaining ones when it cannot compile
+    // the model). Ignored by the CPU provider; negative values are rejected
+    // for every provider.
     DeviceID int
     // Telemetry optionally collects bounded, content-free stage aggregates.
     // Nil disables collection.
@@ -98,7 +100,9 @@ The initialization sequence is:
 3. `NewTokenizer(tokenizerPath)` — loads the HuggingFace tokenizer.
 4. `newONNXSession(modelPath, batchSize, seqLen, hiddenDim, sessOpts, telemetry)` — creates a persistent ONNX session with pre-allocated tensors for the fast path.
 
-The resulting `sessOpts` is reused for the persistent single-text session, the batch session, and the per-bucket sessions. `EmbedderConfig.ExecutionProvider` / `DeviceID` select the provider: `"cuda"` and `"openvino"` request a specific hardware provider (an `"openvino"` request rejects a non-zero `DeviceID` loudly — `0` lets OpenVINO pick its best device). `"auto"` walks the ladder CUDA → OpenVINO; when a rung fails at the options stage — or when the winning provider accepts the *options* but the *session* itself cannot be built on it, the remaining rungs are retried at the session stage first — and only when every attempt has failed, a WARN naming each failure is logged and initialization continues on the CPU (the eager session, and, in length-bucket mode, the first lazily created bucket session). `Embedder.ExecutionProvider()` reports which provider inference actually runs on (`cpu`, `cuda`, or `openvino`).
+The resulting `sessOpts` is reused for the persistent single-text session, the batch session, and the per-bucket sessions. `EmbedderConfig.ExecutionProvider` / `DeviceID` select the provider: `"cuda"` and `"openvino"` request a specific hardware provider (an `"openvino"` request rejects a non-zero `DeviceID` loudly — `0` lets the rung resolve the device itself). `"auto"` walks the ladder CUDA → OpenVINO; when a rung fails at the options stage — or when the winning provider accepts the *options* but the *session* itself cannot be built on it, the remaining rungs are retried at the session stage first — and only when every attempt has failed, a WARN naming each failure is logged and initialization continues on the CPU (the eager session, and, in length-bucket mode, the first lazily created bucket session). `Embedder.ExecutionProvider()` reports which provider inference actually runs on (`cpu`, `cuda`, or `openvino`).
+
+Inside the OpenVINO rung the *device* is resolved the same empirical way, because the plugin applies its own priority to an appended device list but then uses only the first device, and the wrapper exposes no hardware-device class to filter with. The first session attempt appends every device the plugin reports; if that session cannot be created (on Intel Core Ultra hosts the first device is the NPU, whose compiler rejects this model's dynamic shapes), the remaining devices are tried one at a time through the same session creation, and the winner is remembered process-wide (`openVINOPreferredDevice`) so later sessions append only it. See `specs/domains/embedding.md` → *OpenVINO device resolution*.
 
 On any failure the session options are cleaned up before returning the error, but the ONNX Runtime **environment is deliberately NOT destroyed**: `initONNXRuntime` is `sync.Once`-guarded per process, so a destroyed environment could never be reinitialized — not for an `"auto"` CPU-fallback retry, and not for a later `NewEmbedder`. Only `Embedder.Close` performs the full teardown. `sessOpts` is released by `Close()`.
 

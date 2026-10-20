@@ -479,6 +479,17 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 	// sessionStarted is reset by each eager/lazy creation site right before
 	// its newONNXSession call, so observeSession measures that attempt only.
 	var sessionStarted time.Time
+	// replaceOpts swaps the live session options while the OpenVINO device
+	// retry rebuilds them per candidate device; the previous handle is released
+	// on the dedicated ONNX thread, like every other options mutation.
+	replaceOpts := func(opts *ort.SessionOptions) {
+		runOnORTThread(runner, func() {
+			if sessOpts != nil {
+				_ = sessOpts.Destroy()
+			}
+		})
+		sessOpts = opts
+	}
 	// newSess creates the eager batchSize=1 session through the runner (a
 	// no-op indirection for the CPU provider) and observes the session-create
 	// stage in telemetry, mirroring the lazy batch/bucket session paths.
@@ -499,6 +510,23 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 		logger.Info("creating persistent ONNX session", "model", cfg.ModelPath)
 		sessionStarted = time.Now()
 		sess, err = newSess()
+		if err != nil && effective == ExecutionProviderOpenVINO {
+			// The OpenVINO plugin takes the first of the devices it was given;
+			// when that one cannot compile this model (an Intel NPU rejects
+			// its dynamic shapes) try the plugin's other devices before
+			// letting the failure sink the rung. An explicit "openvino"
+			// request stays loud when no device can run the model; an "auto"
+			// request still reaches its ladder below.
+			sess, err = retryOpenVINOSession(buildOpts, replaceOpts, func() (*onnxSession, error) {
+				sessionStarted = time.Now()
+				return newSess()
+			}, func(msg, provider, cause string) {
+				logger.Warn(msg, "provider", provider, "error", cause, "deviceID", cfg.DeviceID)
+			}, &reasons, err)
+			if err == nil {
+				logger.Info("OpenVINO session created on a fallback device", "deviceIndex", openVINOAttemptedDevice())
+			}
+		}
 		if err != nil {
 			if !requestedAuto {
 				cleanup(sessOpts)
@@ -827,6 +855,48 @@ func (e *Embedder) newSession(batchSize, seqLen int) (*onnxSession, error) {
 	return sess, err
 }
 
+// retryOpenVINODeviceSession attempts the OpenVINO plugin's remaining devices
+// when a lazily created session could not be built on the one in use — the
+// lazy counterpart of the eager-session retry in NewEmbedder, and a no-op for
+// every other provider. The caller must hold e.mu.
+func (e *Embedder) retryOpenVINODeviceSession(batchSize, seqLen int) (*onnxSession, bool) {
+	if e.executionProvider != ExecutionProviderOpenVINO {
+		return nil, false
+	}
+	deviceCount, err := openVINODeviceCount()
+	if err != nil || deviceCount <= 1 {
+		return nil, false
+	}
+	buildOpts := func(provider string) (*ort.SessionOptions, error) {
+		var (
+			opts    *ort.SessionOptions
+			optsErr error
+		)
+		e.onORTThread(func() {
+			opts, optsErr = buildSessionOptions(provider, e.libraryPath, e.deviceID, e.intraOpThreads)
+		})
+		return opts, optsErr
+	}
+	replaceOpts := func(opts *ort.SessionOptions) {
+		e.onORTThread(func() {
+			if e.sessOpts != nil {
+				_ = e.sessOpts.Destroy()
+			}
+		})
+		e.sessOpts = opts
+	}
+	warn := func(msg, provider, cause string) {
+		e.logger.Warn(msg, "provider", provider, "error", cause, "deviceID", e.deviceID)
+	}
+	var reasons []string
+	sess, ok := retryOpenVINODevices(deviceCount, openVINOAttemptedDevice(), buildOpts, replaceOpts,
+		func() (*onnxSession, error) { return e.newSession(batchSize, seqLen) }, warn, &reasons)
+	if ok {
+		e.logger.Info("OpenVINO session created on a fallback device", "deviceIndex", openVINOAttemptedDevice())
+	}
+	return sess, ok
+}
+
 // newSessionWithFallback builds a persistent ONNX session, honouring the "auto"
 // contract for the lazily created sessions (length buckets and the batch
 // session), not just the eager one: when the session cannot be built on the
@@ -838,7 +908,13 @@ func (e *Embedder) newSession(batchSize, seqLen int) (*onnxSession, error) {
 // for it). The caller must hold e.mu.
 func (e *Embedder) newSessionWithFallback(batchSize, seqLen int) (*onnxSession, error) {
 	sess, err := e.newSession(batchSize, seqLen)
-	if err == nil || !e.canDegradeToCPU() {
+	if err == nil {
+		return sess, nil
+	}
+	if s, ok := e.retryOpenVINODeviceSession(batchSize, seqLen); ok {
+		return s, nil
+	}
+	if !e.canDegradeToCPU() {
 		return sess, err
 	}
 	hardwareProvider := e.executionProvider
