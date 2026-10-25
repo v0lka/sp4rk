@@ -13,11 +13,11 @@ import (
 )
 
 const toolEditFileDescription = `Purpose: find-and-replace exactly one occurrence of a substring in an existing file — the surgical alternative to rewriting the whole file.
-Use when: modifying a specific fragment of an existing file. The old_string must match exactly (whitespace and indentation included) and occur exactly once — include surrounding lines for uniqueness. The call fails loudly on zero or multiple matches instead of guessing.
-Inputs: path; old_string (the exact text to replace, with enough context to be unique); new_string (the replacement — empty string deletes the matched text).
+Use when: modifying a specific fragment of an existing file — read (or re-read) the file immediately before editing and copy old_string verbatim (whitespace, tabs) from that read. old_string must occur exactly once — include surrounding lines for uniqueness; zero or multiple matches fail loudly instead of guessing.
+Inputs: path — required; old_string — required (the exact text to replace, with enough context to be unique); new_string — required (the replacement; empty string deletes the matched text).
 Outputs: confirmation of the edit, or an error stating the match was not found / matched more than once.
 Example: to rename a function, put its signature plus one neighboring line into old_string and the renamed signature into new_string.
-Anti-example: not for creating files or full rewrites (write_file); one call fixes one occurrence — for bulk renames across many files ask the user or use a scripted change via the shell tool.`
+Anti-example: not for creating files or full rewrites (write_file); one call fixes one occurrence — for bulk renames across many files ask the user or use a scripted change via the shell tool; on a "file changed since read" conflict error, re-read the file and rebuild old_string before retrying.`
 
 // EditFileTool performs find-and-replace edits on files.
 type EditFileTool struct {

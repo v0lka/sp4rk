@@ -20,10 +20,10 @@ import (
 
 const toolRipgrepDescription = `Purpose: fast regex/literal content search across files, returning matches as "file:line: content" with optional context lines. Respects .gitignore and skips binary files.
 Use when: you need lines and locations matching known text — identifiers, error messages, config keys, function definitions. For finding files by name use glob; for meaning-based discovery ("retry logic", "auth middleware") use semantic_search; to read a match use read_file.
-Inputs: pattern (regex or literal); optional context_lines (lines around each match); optional file_pattern (glob filter like *.go); ignore_case; include_hidden; optional path (scope the search to a directory).
+Inputs: pattern (regex or literal) — required; optional context_lines (lines around each match); optional file_pattern (glob filter like *.go); ignore_case; include_hidden; optional path (scope the search to a directory).
 Outputs: matched lines with file and line number, plus context when requested; empty output means no matches.
 Example: pattern "func TestOrchestrator" with file_pattern "*_test.go" locates orchestrator tests.
-Anti-example: not for file discovery by name (glob); matching is case-sensitive unless ignore_case=true; regex metacharacters in a literal string must be escaped.`
+Anti-example: there is no transpose or output_mode parameter — inputs are exactly pattern, path, file_pattern, ignore_case, context_lines, include_hidden; not for file discovery by name (glob); matching is case-sensitive unless ignore_case=true; regex metacharacters in a literal string must be escaped.`
 
 // maxRipgrepResultBytes caps how much formatted match output the ripgrep tool
 // accumulates in memory. The scanner buffer bounds a single line only; the

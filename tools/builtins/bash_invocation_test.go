@@ -58,7 +58,7 @@ func TestBashExecTool_OverrideDescriptionNamesInvocationAndShell(t *testing.T) {
 	if !strings.Contains(desc, "the fallback for what no dedicated tool covers") {
 		t.Errorf("description must keep the legacy guidance tail, got: %s", desc)
 	}
-	if !strings.Contains(desc, `Example: "go test ./core/... 2>&1 | tail -30"`) {
+	if !strings.Contains(desc, `Example: {"command": "go test ./core/... 2>&1 | tail -30", "timeout": "120s"}`) {
 		t.Errorf("description must keep the usage examples, got: %s", desc)
 	}
 	if tool.DeclaredShellKind() != tools.ShellKindZsh {

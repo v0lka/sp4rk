@@ -17,10 +17,10 @@ import (
 
 const toolBashDescription = `Purpose: execute a shell command via bash -c — the fallback for what no dedicated tool covers: builds, test runs, package managers, git operations, system tasks.
 Use when: reading (read_file), editing (edit_file), listing (list_directory) and searching (ripgrep, glob) all have dedicated tools — reach for bash only when they cannot do the job.
-Inputs: command (pipes, redirects, chained commands OK); optional working_directory (absolute path for the command's execution context; defaults to workspace root); optional timeout, a JSON string with a unit suffix, e.g. "30s" or "2m" (default "60s", capped at the configured max). The timeout value MUST be quoted in the tool call - write "timeout": "30s"; an unquoted bare token like 30s is invalid JSON and the call is rejected.
+Inputs: timeout is a quoted JSON string with a unit suffix — write "timeout": "120s"; a bare token like 30s is invalid JSON and the call is rejected (default "60s", capped at the max). command (pipes, redirects, chained commands OK); optional working_directory (absolute path for the execution context; defaults to workspace root).
 Outputs: combined stdout and stderr; failing exit codes surface as errors carrying the output. Keep output minimal (e.g. pipe through tail) to avoid flooding context.
-Example: "go test ./core/... 2>&1 | tail -30".
-Anti-example: do not "cat src/app.go" (read_file), "find . -name '*.ts'" (glob) or "grep -rn TODO ." (ripgrep) — dedicated tools respect path policy and return structured results.`
+Example: {"command": "go test ./core/... 2>&1 | tail -30", "timeout": "120s"}.
+Anti-example: do not "cat src/app.go" (read_file), "find . -name '*.ts'" (glob) or "grep -rn TODO ." (ripgrep) — dedicated tools respect path policy and return structured results. Also invalid: the bare token 30s (unquoted) and the empty call {} (command is required).`
 
 // BashExecTool executes bash commands in a shell.
 type BashExecTool struct {
@@ -76,7 +76,7 @@ func NewBashExecToolWithInvocation(blacklist []string, timeouts BashTimeouts, in
 			ToolName:        "bash_exec",
 			ToolGroup:       tools.GroupExecute,
 			ToolDescription: composeShellDescription(toolBashDescription, invocation, tools.DefaultBashInvocation()),
-			Schema:          json.RawMessage(`{"type": "object", "properties": {"command": {"type": "string", "description": "The bash command to execute. Supports pipes, redirects, and chained commands."}, "timeout": {"type": "string", "description": "Optional timeout as a quoted JSON string with a unit suffix, e.g. \"30s\" or \"2m\". The value MUST be a string in double quotes: write \"timeout\": \"30s\" - an unquoted bare token like 30s is invalid JSON and the call is rejected. Default: \"60s\"; maximum: \"120s\"."}, "working_directory": {"type": "string", "description": "Absolute path to use as the working directory for command execution. If omitted, defaults to the workspace root when available."}}, "required": ["command"]}`),
+			Schema:          json.RawMessage(`{"type": "object", "properties": {"command": {"type": "string", "description": "The bash command to execute. Supports pipes, redirects, and chained commands."}, "timeout": {"type": "string", "description": "Optional timeout: a quoted JSON string with a unit suffix — write \"timeout\": \"120s\"; a bare token like 30s is invalid JSON and the call is rejected. E.g. \"30s\", \"2m\". Default: \"60s\"; maximum: \"120s\"."}, "working_directory": {"type": "string", "description": "Absolute path to use as the working directory for command execution. If omitted, defaults to the workspace root when available."}}, "required": ["command"]}`),
 			Policy:          tools.PolicyUserConfirm,
 			Untrusted:       true,
 		},

@@ -48,6 +48,30 @@ The SDK ships a catalog of filesystem, search, web, execution, and agent-infrast
 
 `ask_user` is intentionally absent from the SDK. Interactive multi-question prompting requires host UI plumbing, so it lives in the host application; the SDK only supplies the primitives such a tool builds on.
 
+### Tool Descriptions
+
+Every built-in's `Description()` follows one structural rubric — six labelled sections in a fixed order, each label starting its own line:
+
+```text
+Purpose: one sentence — what the tool does.
+Use when: when to reach for it, and which dedicated tool wins instead.
+Inputs: the parameters, critical constraint first.
+Outputs: what comes back, including truncation and error shapes.
+Example: one full valid call.
+Anti-example: the concrete failure shape, and the confusable tool.
+```
+
+The one-label-per-line shape is a rendering contract: a line-based markdown reformatter (and any host UI that renders tool descriptions) splits the description into bold-labelled paragraphs instead of a single unlabelled block. The `Purpose:`/`Anti-example:` pair is what disambiguates conflicting tool pairs (`edit_file` vs `write_file`, `read_step_output` vs `read_final_result`). A description stays within a 1200-character guard — roughly 150–250 tokens; anything beyond means marketing prose crept back in.
+
+Audit-derived authoring rules for the section contents:
+
+- **Critical constraint first in `Inputs:`** — the most common first-call failure leads the parameter prose (in `bash_exec`/`posh_exec`: `timeout` is a quoted JSON string with a unit suffix — a bare token like `30s` is invalid JSON and the call is rejected).
+- **A full valid call in `Example:`** — a complete argument object (e.g. `{"command": "go test ./core/... 2>&1 | tail -30", "timeout": "120s"}`), never a fragment.
+- **The concrete failure shape in `Anti-example:`** — the exact invalid input (`the bare token 30s (unquoted)`, `the empty call {}`), plus the confusable tool named, never a vague warning.
+- **Duplicate the rule in the JSON-schema parameter description** — the model sees both the prose description and the `Schema` property descriptions; when the two channels disagree, a model that follows the prose produces inputs that fail validation on the first call. Every constraint an `Inputs:` line states about a parameter appears in that parameter's schema `description` as well.
+
+The rubric is test-guarded at every declaration site: `tools/builtins/descriptions_guard_test.go` (all `tools/builtins` tools, including the platform shell tool), `tools/builtins/websearch/descriptions_guard_test.go` (`web_search`), and `skills/descriptions_guard_test.go` (`read_skill_resource`); the `agent` package's `finish` follows the same rubric. The shell invocation override preserves the rubric — a same-family override rewrites only the `Purpose:` header line (see [Shell tools](#shell-tools-bash_exec-posh_exec)).
+
 ### Trust classification
 
 A tool's output is **untrusted** when it may carry adversarial content (web, MCP, filesystem reads of external data). Such tools set `Untrusted: true` on their `BaseTool`; their observations are wrapped in `<untrusted-content>` tags before entering the LLM context when injection defense is enabled (see [../memory/README.md](../memory/README.md)). Mutating filesystem tools (`write_file`, `edit_file`, `delete_*`, `create_directory`) are not marked untrusted.

@@ -12,7 +12,7 @@ import (
 
 const toolReadStepOutputDescription = `Purpose: read the complete, untruncated output of one completed plan step by its ID.
 Use when: the step's summary in your task description is insufficient and you need the full result of a dependency step before proceeding.
-Inputs: step_id (e.g. "step_1") of a completed step.
+Inputs: step_id must come from list_step_outputs or a plan event — never invent one; call list_step_outputs FIRST unless you already hold the exact ID.
 Outputs: the step's raw output text exactly as it was produced, or an error if the ID is unknown/incomplete.
 Example: step_id "step_2" after seeing its one-line summary.
 Anti-example: not for the previous task's final answer (read_final_result); summaries usually suffice — pull full outputs only when the summary leaves you unable to act.`
@@ -141,11 +141,11 @@ func (t *ListStepOutputsTool) Execute(ctx context.Context, input json.RawMessage
 // -----------------------------------------------------------------------------
 
 const toolReadFinalResultDescription = `Purpose: read the final answer of the previously completed task on this blackboard.
-Use when: the prior exchange's outcome is not visible in your history — e.g. after a backend restart, or when the result was too large to inject verbatim — and it matters for the current task.
+Use when: only when a prior task on THIS blackboard actually completed — a fresh task has nothing recorded and the call errors — and its outcome is not visible in your history (e.g. after a backend restart, or the result was too large to inject verbatim) and it matters for the current task.
 Inputs: none.
 Outputs: the prior task's raw final answer exactly as produced, or an error if no final result is recorded.
 Example: call right after a restart to recover the prior context before planning.
-Anti-example: not for plan-step outputs (read_step_output or list_step_outputs); not for truncated tool outputs (tool_result_read).`
+Anti-example: not a speculative probe — on error do not retry unchanged; not for plan-step outputs (read_step_output or list_step_outputs); not for truncated tool outputs (tool_result_read).`
 
 // ReadFinalResultTool reads the final result of a previously completed task
 // from FinalResultStore (backed by the blackboard).

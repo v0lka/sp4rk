@@ -13,7 +13,7 @@ import (
 
 const toolUpdateChecklistDescription = `Purpose: maintain the checklist of concrete sub-tasks for the current step so progress stays visible.
 Use when: as your FIRST tool call in a step (initialize with all items unchecked, "- [ ]"), and again immediately after completing each single sub-task — mark exactly one item done ("- [x]") per call. Batch-checking several items at once is discouraged; incremental updates are the point.
-Inputs: todo_list — the full updated checklist, one "- [ ]"/"- [x] " line per item (plain ASCII checkboxes only: no nesting, no Unicode checkboxes); optional step_id to attach the checklist to a specific plan step when executing a declared plan inline — omit it for standalone checklists or as a delegated subagent (inferred from context).
+Inputs: todo_list — the full updated checklist, one "- [ ]"/"- [x] " line per item (plain ASCII checkboxes only: no nesting, no Unicode checkboxes); optional step_id to attach the checklist to a specific plan step — a context ChecklistGuard rejects starting a standalone (empty step_id) checklist once a plan is active in the run: when executing a declared plan inline, ALWAYS pass step_id; standalone checklists are for plan-less tasks only (subagents: step_id is inferred from context).
 Outputs: the updated checklist state.
 Example: "- [x] read config
 - [ ] update schema".

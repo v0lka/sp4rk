@@ -12,10 +12,10 @@ import (
 
 const toolReadSkillResourceDesc = `Purpose: read a resource file bundled with an activated skill — its reference material, scripts, or other supporting files — by skill name and a path relative to that skill's directory.
 Use when: a skill's instructions point you at a bundled file (e.g. "see references/api.md"); the skill must already be active on the current request, otherwise it is not addressable.
-Inputs: skill (name of the active skill that contains the resource); path (relative path within the skill directory, e.g. 'references/api.md', 'scripts/setup.sh').
+Inputs: skill (name of the active skill that contains the resource) — required; path (relative path within the skill directory, e.g. 'references/api.md', 'scripts/setup.sh') — required; neither has a default.
 Outputs: the resource file's raw contents as text.
 Example: skill="pdf-processing", path="references/forms.md".
-Anti-example: not for reading a skill's instruction body (already injected into your prompt) or arbitrary workspace files (use read_file with a path); only active skills resolve, and paths that escape the skill directory are rejected.`
+Anti-example: an empty {} call is invalid — both skill and path are required; not for reading a skill's instruction body (already injected into your prompt) or arbitrary workspace files (use read_file with a path); only active skills resolve, and paths that escape the skill directory are rejected.`
 
 // SkillPathResolver resolves a skill name to its directory path.
 // Returns ("", false) if the skill is not found or not active.

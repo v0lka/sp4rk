@@ -18,10 +18,10 @@ import (
 
 const toolPoshDescription = `Purpose: execute a command via Windows PowerShell (powershell.exe -NoProfile -NonInteractive -Command) — the fallback for what no dedicated tool covers: builds, test runs, package managers, git operations, system tasks.
 Use when: reading (read_file), editing (edit_file), listing (list_directory) and searching (ripgrep, glob) all have dedicated tools — reach for the shell only when they cannot do the job.
-Inputs: command (PowerShell statement; pipelines OK); optional working_directory (absolute path for the execution context); optional timeout, a JSON string with a unit suffix, e.g. "30s" or "2m" (default "60s", capped at the configured max). The timeout value MUST be quoted in the tool call - write "timeout": "30s"; an unquoted bare token like 30s is invalid JSON and the call is rejected.
+Inputs: timeout is a quoted JSON string with a unit suffix — write "timeout": "120s"; a bare token like 30s is invalid JSON and the call is rejected (default "60s", capped at the max). command (PowerShell statement; pipelines OK); optional working_directory (absolute path for the execution context).
 Outputs: combined stdout and stderr; failing exit codes surface as errors carrying the output. Keep output minimal to avoid flooding context.
-Example: "go build ./... ; if ($LASTEXITCODE -ne 0) { exit 1 }".
-Anti-example: do not "Get-Content src/app.go" (read_file) or "Get-ChildItem -Recurse -Filter *.ts" (glob) — dedicated tools respect path policy and return structured results.`
+Example: {"command": "go build ./...; exit $LASTEXITCODE", "timeout": "120s"}.
+Anti-example: do not "Get-Content src/app.go" (read_file) or "Get-ChildItem -Recurse -Filter *.ts" (glob) — dedicated tools respect path policy and return structured results. Also invalid: the bare token 30s (unquoted) and the empty call {} (command is required).`
 
 // PoshExecTool executes PowerShell commands via powershell.exe on Windows.
 // It is the Windows counterpart of BashExecTool: same blacklist/Judge model,
@@ -108,7 +108,7 @@ func NewPoshExecToolWithInvocation(blacklist []string, timeouts BashTimeouts, in
 			ToolName:        "posh_exec",
 			ToolGroup:       tools.GroupExecute,
 			ToolDescription: composeShellDescription(toolPoshDescription, invocation, tools.DefaultPoshInvocation()),
-			Schema:          json.RawMessage(`{"type": "object", "properties": {"command": {"type": "string", "description": "The PowerShell command to execute. Supports pipes, redirects, and chained commands."}, "timeout": {"type": "string", "description": "Optional timeout as a quoted JSON string with a unit suffix, e.g. \"30s\" or \"2m\". The value MUST be a string in double quotes: write \"timeout\": \"30s\" - an unquoted bare token like 30s is invalid JSON and the call is rejected. Default: \"60s\"; maximum: \"120s\"."}, "working_directory": {"type": "string", "description": "Absolute path to use as the working directory for command execution. If omitted, defaults to the workspace root when available."}}, "required": ["command"]}`),
+			Schema:          json.RawMessage(`{"type": "object", "properties": {"command": {"type": "string", "description": "The PowerShell command to execute. Supports pipes, redirects, and chained commands."}, "timeout": {"type": "string", "description": "Optional timeout: a quoted JSON string with a unit suffix — write \"timeout\": \"120s\"; a bare token like 30s is invalid JSON and the call is rejected. E.g. \"30s\", \"2m\". Default: \"60s\"; maximum: \"120s\"."}, "working_directory": {"type": "string", "description": "Absolute path to use as the working directory for command execution. If omitted, defaults to the workspace root when available."}}, "required": ["command"]}`),
 			Policy:          tools.PolicyUserConfirm,
 			Untrusted:       true,
 		},

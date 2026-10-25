@@ -13,14 +13,14 @@ import (
 
 const toolStoreFactDescription = `Purpose: store a durable fact for later retrieval by yourself or other agents.
 Use when: immediately after learning cross-step information — API signatures, architectural decisions, file locations, error patterns, intermediate results — before context grows large and earlier tool outputs become unavailable. Retrieve later with search_facts; facts persist across steps and execution cycles.
-Inputs: content (the fact itself, self-contained); keywords (3-10 retrieval keywords).
+Inputs: a single JSON object {content, keywords} — not an array, not a bare string; keywords max 10 items.
 Outputs: confirmation of storage.
 Example: content "auth middleware lives in core/middleware.go, enforced via applySecurityPolicies" with keywords ["auth", "middleware", "policy", "security"].
 Anti-example: not for ephemeral scratch that dies with the current turn; do not defer storing to the end of a long investigation — store early, store often.`
 
 const toolSearchFactsDescription = `Purpose: search previously stored facts by keywords.
 Use when: at the start of a new step or subtask — recover prior decisions and discoveries before re-reading sources. Results rank by relevance (most keyword matches first).
-Inputs: keywords (1-5 search terms).
+Inputs: keywords (required: 1-5 search terms; no list-all mode — an empty {} call is rejected).
 Outputs: the matching stored facts, best match first; empty when nothing matches.
 Example: keywords ["auth", "config"] to recall where auth settings live.
 Anti-example: not for discovering new information (search the codebase: ripgrep/semantic_search); if nothing matches, do not reconstruct from memory — re-read the source.`
