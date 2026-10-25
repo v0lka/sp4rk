@@ -21,7 +21,7 @@ Use when: reading (read_file), editing (edit_file), listing (list_directory) and
 Inputs: timeout is a quoted JSON string with a unit suffix — write "timeout": "120s"; a bare token like 30s is invalid JSON and the call is rejected (default "60s", capped at the max). command (PowerShell statement; pipelines OK); optional working_directory (absolute path for the execution context).
 Outputs: combined stdout and stderr; failing exit codes surface as errors carrying the output. Keep output minimal to avoid flooding context.
 Example: {"command": "go build ./...; exit $LASTEXITCODE", "timeout": "120s"}.
-Anti-example: do not "Get-Content src/app.go" (read_file) or "Get-ChildItem -Recurse -Filter *.ts" (glob) — dedicated tools respect path policy and return structured results. Also invalid: the bare token 30s (unquoted) and the empty call {} (command is required).`
+Anti-example: do not "Get-Content src/app.go" (read_file) or "Get-ChildItem -Recurse -Filter *.ts" (glob) — dedicated tools respect path policy and return structured results. Also invalid: the empty call {} (command is required).`
 
 // PoshExecTool executes PowerShell commands via powershell.exe on Windows.
 // It is the Windows counterpart of BashExecTool: same blacklist/Judge model,
