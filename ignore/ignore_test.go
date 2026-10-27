@@ -345,6 +345,289 @@ func TestResolver_MatchRootEscapeGuard(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Options: NewResolverWithOptions — ignore-file subsets, extra patterns
+// ---------------------------------------------------------------------------
+
+// TestResolverWithOptions_NilIgnoreFilesMeansBoth verifies the zero Options is
+// exactly NewResolver: both ignore files are honoured.
+func TestResolverWithOptions_NilIgnoreFilesMeansBoth(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, ".gitignore", "*.log\n")
+	writeFile(t, root, ".aiignore", "*.secret\n")
+	touchFile(t, root, "app.log")
+	touchFile(t, root, "creds.secret")
+
+	r, err := NewResolverWithOptions(root, Options{})
+	if err != nil {
+		t.Fatalf("NewResolverWithOptions: %v", err)
+	}
+
+	assertIgnored(t, r, joinRel(root, "app.log"), false)      // .gitignore
+	assertIgnored(t, r, joinRel(root, "creds.secret"), false) // .aiignore
+
+	// An explicitly listed pair behaves the same as nil.
+	rb, err := NewResolverWithOptions(root, Options{IgnoreFiles: []string{".gitignore", ".aiignore"}})
+	if err != nil {
+		t.Fatalf("NewResolverWithOptions (explicit both): %v", err)
+	}
+	assertIgnored(t, rb, joinRel(root, "app.log"), false)
+	assertIgnored(t, rb, joinRel(root, "creds.secret"), false)
+}
+
+// TestResolverWithOptions_OnlyGitignore verifies a narrowed set honours
+// .gitignore (root and nested) while .aiignore files contribute nothing.
+func TestResolverWithOptions_OnlyGitignore(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, ".gitignore", "*.log\n")
+	writeFile(t, root, ".aiignore", "*.secret\n")
+	writeFile(t, root, "pkg/.aiignore", "*.draft\n")
+	touchFile(t, root, "app.log")
+	touchFile(t, root, "creds.secret")
+	touchFile(t, root, "pkg/notes.draft")
+
+	r, err := NewResolverWithOptions(root, Options{IgnoreFiles: []string{".gitignore"}})
+	if err != nil {
+		t.Fatalf("NewResolverWithOptions: %v", err)
+	}
+
+	assertIgnored(t, r, joinRel(root, "app.log"), false)            // .gitignore honoured
+	assertNotIgnored(t, r, joinRel(root, "creds.secret"), false)    // .aiignore not honoured
+	assertNotIgnored(t, r, joinRel(root, "pkg/notes.draft"), false) // nested .aiignore not honoured
+}
+
+// TestResolverWithOptions_OnlyAiignore verifies the mirrored narrowing: only
+// .aiignore files (root and nested) contribute rules.
+func TestResolverWithOptions_OnlyAiignore(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, ".gitignore", "*.log\n")
+	writeFile(t, root, ".aiignore", "*.secret\n")
+	writeFile(t, root, "pkg/.gitignore", "*.gen.go\n")
+	touchFile(t, root, "app.log")
+	touchFile(t, root, "creds.secret")
+	touchFile(t, root, "pkg/thing.gen.go")
+
+	r, err := NewResolverWithOptions(root, Options{IgnoreFiles: []string{".aiignore"}})
+	if err != nil {
+		t.Fatalf("NewResolverWithOptions: %v", err)
+	}
+
+	assertNotIgnored(t, r, joinRel(root, "app.log"), false)          // .gitignore not honoured
+	assertIgnored(t, r, joinRel(root, "creds.secret"), false)        // .aiignore honoured
+	assertNotIgnored(t, r, joinRel(root, "pkg/thing.gen.go"), false) // nested .gitignore not honoured
+}
+
+// TestResolverWithOptions_NoIgnoreFilesOnlyExtraPatterns verifies an empty
+// non-nil IgnoreFiles honours no ignore file at all, leaving only
+// ExtraPatterns in effect (on-disk .gitignore/.aiignore are ignored as sources).
+func TestResolverWithOptions_NoIgnoreFilesOnlyExtraPatterns(t *testing.T) {
+	root := t.TempDir()
+	// Both ignore files exist on disk but must not be read.
+	writeFile(t, root, ".gitignore", "*.log\n")
+	writeFile(t, root, ".aiignore", "*.secret\n")
+	touchFile(t, root, "app.log")
+	touchFile(t, root, "creds.secret")
+	touchFile(t, root, "cache/blob.bin")
+
+	r, err := NewResolverWithOptions(root, Options{
+		IgnoreFiles:   []string{},
+		ExtraPatterns: []string{"cache/"},
+	})
+	if err != nil {
+		t.Fatalf("NewResolverWithOptions: %v", err)
+	}
+
+	assertNotIgnored(t, r, joinRel(root, "app.log"), false)      // .gitignore not honoured
+	assertNotIgnored(t, r, joinRel(root, "creds.secret"), false) // .aiignore not honoured
+	assertIgnored(t, r, joinRel(root, "cache"), true)            // extra pattern honoured
+	assertIgnored(t, r, joinRel(root, "cache/blob.bin"), false)  // contents via ignored ancestor
+}
+
+// TestResolverWithOptions_ExtraPatternsDirOnly verifies a trailing-slash
+// extra pattern matches directories (and their contents) but not a plain file
+// with the same name.
+func TestResolverWithOptions_ExtraPatternsDirOnly(t *testing.T) {
+	root := t.TempDir()
+	touchFile(t, root, "build/out.txt")
+	touchFile(t, root, "src/build/inner.txt")
+
+	r, err := NewResolverWithOptions(root, Options{ExtraPatterns: []string{"build/"}})
+	if err != nil {
+		t.Fatalf("NewResolverWithOptions: %v", err)
+	}
+
+	assertIgnored(t, r, joinRel(root, "build"), true)          // dir matched (any depth)
+	assertIgnored(t, r, joinRel(root, "build/out.txt"), false) // contents via ancestor
+	assertIgnored(t, r, joinRel(root, "src/build"), true)      // bare name: any depth
+	assertIgnored(t, r, joinRel(root, "src/build/inner.txt"), false)
+
+	// A plain FILE named build is not matched by the dir-only rule.
+	fileRoot := t.TempDir()
+	writeFile(t, fileRoot, "build", "not a dir")
+	fr, err := NewResolverWithOptions(fileRoot, Options{ExtraPatterns: []string{"build/"}})
+	if err != nil {
+		t.Fatalf("NewResolverWithOptions (file named build): %v", err)
+	}
+	assertNotIgnored(t, fr, joinRel(fileRoot, "build"), false)
+}
+
+// TestResolverWithOptions_ExtraPatternsAnchoring verifies a leading-slash
+// extra pattern is anchored to the root and does not match nested namesakes.
+func TestResolverWithOptions_ExtraPatternsAnchoring(t *testing.T) {
+	root := t.TempDir()
+	touchFile(t, root, "dist/bundle.js")
+	touchFile(t, root, "pkg/dist/other.js")
+
+	r, err := NewResolverWithOptions(root, Options{ExtraPatterns: []string{"/dist"}})
+	if err != nil {
+		t.Fatalf("NewResolverWithOptions: %v", err)
+	}
+
+	assertIgnored(t, r, joinRel(root, "dist"), true)            // anchored: root-level dir
+	assertIgnored(t, r, joinRel(root, "dist/bundle.js"), false) // contents via ancestor
+	assertNotIgnored(t, r, joinRel(root, "pkg/dist"), true)     // anchored: nested namesake NOT matched
+	assertNotIgnored(t, r, joinRel(root, "pkg/dist/other.js"), false)
+}
+
+// TestResolverWithOptions_ExtraPatternsAnyDepth verifies a bare-name extra
+// pattern matches at the root and at any depth beneath it.
+func TestResolverWithOptions_ExtraPatternsAnyDepth(t *testing.T) {
+	root := t.TempDir()
+	touchFile(t, root, "app.log")
+	touchFile(t, root, "deep/nested/b.log")
+
+	r, err := NewResolverWithOptions(root, Options{ExtraPatterns: []string{"*.log"}})
+	if err != nil {
+		t.Fatalf("NewResolverWithOptions: %v", err)
+	}
+
+	assertIgnored(t, r, joinRel(root, "app.log"), false)
+	assertIgnored(t, r, joinRel(root, "deep/nested/b.log"), false)
+}
+
+// TestResolverWithOptions_ExtraPatternsLayerOnTopOfFiles verifies extra
+// patterns apply in addition to (not instead of) the ignore files' rules.
+func TestResolverWithOptions_ExtraPatternsLayerOnTopOfFiles(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, ".gitignore", "*.log\n")
+	touchFile(t, root, "app.log")
+	touchFile(t, root, "vendor/lib.a")
+	touchFile(t, root, "keep.txt")
+
+	r, err := NewResolverWithOptions(root, Options{ExtraPatterns: []string{"vendor/"}})
+	if err != nil {
+		t.Fatalf("NewResolverWithOptions: %v", err)
+	}
+
+	assertIgnored(t, r, joinRel(root, "app.log"), false) // from .gitignore
+	assertIgnored(t, r, joinRel(root, "vendor"), true)   // from extra patterns
+	assertIgnored(t, r, joinRel(root, "vendor/lib.a"), false)
+	assertNotIgnored(t, r, joinRel(root, "keep.txt"), false)
+}
+
+// TestResolverWithOptions_ExtraPatternsPruneWalk verifies extra patterns
+// participate in load-time directory pruning: a nested ignore file beneath a
+// directory ignored only by an extra pattern is never collected, exactly as
+// for root-file rules (TestResolver_PrunesIgnoredSubtreeDuringLoad).
+func TestResolverWithOptions_ExtraPatternsPruneWalk(t *testing.T) {
+	root := t.TempDir()
+	// vendored/ is ignored only by the extra pattern, not by any ignore file.
+	writeFile(t, root, "vendored/.gitignore", "*.txt\n")
+	writeFile(t, root, "vendored/.aiignore", "*.md\n")
+	touchFile(t, root, "notes.txt")
+	touchFile(t, root, "readme.md")
+	touchFile(t, root, "vendored/doc.md")
+
+	r, err := NewResolverWithOptions(root, Options{ExtraPatterns: []string{"vendored/"}})
+	if err != nil {
+		t.Fatalf("NewResolverWithOptions: %v", err)
+	}
+
+	// Only the extra pattern may be compiled: with pruning the two nested
+	// ignore files are never read. Collecting them would yield 3 patterns
+	// (the extra pattern plus the two directory-scoped rules), so this count
+	// is the direct pruning probe.
+	if len(r.patterns) != 1 {
+		t.Fatalf("compiled %d patterns, want 1 (nested ignore files beneath an extra-pattern dir are pruned): %+v", len(r.patterns), r.patterns)
+	}
+
+	// The vendored/ dir and its contents are ignored by the extra pattern...
+	assertIgnored(t, r, joinRel(root, "vendored"), true)
+	assertIgnored(t, r, joinRel(root, "vendored/doc.md"), false)
+	// ...but its nested ignore files were pruned, so their patterns do not
+	// leak into the rest of the tree.
+	assertNotIgnored(t, r, joinRel(root, "notes.txt"), false)
+	assertNotIgnored(t, r, joinRel(root, "readme.md"), false)
+	// The pruning probe that flips on regression: were vendored/.aiignore
+	// collected, its directory-scoped "vendored/**/*.md" rule would make the
+	// origin-scoped query true; pruned, no .aiignore rule exists at all.
+	if r.IgnoredByAIIgnore(joinRel(root, "vendored/doc.md"), false) {
+		t.Errorf("IgnoredByAIIgnore(vendored/doc.md) = true, want false (nested .aiignore beneath an extra-pattern dir is pruned)")
+	}
+}
+
+// TestResolverWithOptions_ExtraPatternsExcludedFromAIQuery verifies extra
+// patterns carry the "config" origin and are therefore excluded from the
+// .aiignore-scoped query, like .gitignore-sourced rules.
+func TestResolverWithOptions_ExtraPatternsExcludedFromAIQuery(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, ".aiignore", "*.secret\n")
+	touchFile(t, root, "creds.secret")
+	touchFile(t, root, "app.log")
+
+	r, err := NewResolverWithOptions(root, Options{ExtraPatterns: []string{"*.log"}})
+	if err != nil {
+		t.Fatalf("NewResolverWithOptions: %v", err)
+	}
+
+	assertIgnored(t, r, joinRel(root, "app.log"), false)      // full query sees the config rule
+	assertIgnored(t, r, joinRel(root, "creds.secret"), false) // .aiignore rule still works
+	if r.IgnoredByAIIgnore(joinRel(root, "app.log"), false) {
+		t.Errorf("IgnoredByAIIgnore(app.log) = true, want false (rule has origin %q)", configOrigin)
+	}
+	if !r.IgnoredByAIIgnore(joinRel(root, "creds.secret"), false) {
+		t.Errorf("IgnoredByAIIgnore(creds.secret) = false, want true (rule is from .aiignore)")
+	}
+}
+
+// TestResolverWithOptions_ExtraPatternLineNormalization verifies extra
+// patterns go through the same line normalization as ignore files: comments,
+// blank lines, and negation lines are skipped.
+func TestResolverWithOptions_ExtraPatternLineNormalization(t *testing.T) {
+	root := t.TempDir()
+	touchFile(t, root, "app.log")
+	touchFile(t, root, "keep.txt")
+
+	r, err := NewResolverWithOptions(root, Options{ExtraPatterns: []string{
+		"# comment line",
+		"",
+		"!*.txt",      // negation: unsupported, skipped
+		"   *.log   ", // surrounding whitespace trimmed
+	}})
+	if err != nil {
+		t.Fatalf("NewResolverWithOptions: %v", err)
+	}
+
+	assertIgnored(t, r, joinRel(root, "app.log"), false) // real pattern honoured
+	assertNotIgnored(t, r, joinRel(root, "keep.txt"), false)
+	if len(r.patterns) != 1 {
+		t.Fatalf("compiled %d patterns, want 1 (comments/blanks/negation skipped): %+v", len(r.patterns), r.patterns)
+	}
+}
+
+// TestResolverWithOptions_UnknownIgnoreFileRejected verifies an unrecognized
+// IgnoreFiles entry fails the build instead of silently honouring nothing.
+func TestResolverWithOptions_UnknownIgnoreFileRejected(t *testing.T) {
+	root := t.TempDir()
+	_, err := NewResolverWithOptions(root, Options{IgnoreFiles: []string{".gitignore", ".ignore"}})
+	if err == nil {
+		t.Fatalf("NewResolverWithOptions with unknown ignore file: want error, got nil")
+	}
+	if _, err := NewResolverWithOptionsContext(context.Background(), root, Options{IgnoreFiles: []string{".hgignore"}}); err == nil {
+		t.Fatalf("NewResolverWithOptionsContext with unknown ignore file: want error, got nil")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Multi: root selection, containment, IgnoreChecker
 // ---------------------------------------------------------------------------
 
