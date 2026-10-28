@@ -9,6 +9,11 @@
 //
 // Negation patterns (lines beginning with '!') are intentionally unsupported —
 // they are silently skipped, matching the behaviour this resolver replaces.
+//
+// NewResolver honours both ignore files by default. NewResolverWithOptions
+// narrows the honoured file set to a subset of the two and/or layers extra
+// gitignore-style patterns (origin "config", scoped as if written in a root
+// ignore file) on top of whatever the honoured files contribute.
 package ignore
 
 import (
@@ -27,24 +32,35 @@ import (
 	"github.com/v0lka/sp4rk/safeio"
 )
 
-// ignoreFileNames is the set of files, in any directory, whose patterns are
-// honoured. A directory's ignore file applies to that directory and below.
-var ignoreFileNames = map[string]bool{
-	".gitignore": true,
-	".aiignore":  true,
-}
-
-// aiIgnoreFile is the ignore file that augments .gitignore with project-specific
-// AI exclusions. Patterns sourced from it are tracked so callers can query
+// gitIgnoreFile and aiIgnoreFile are the two ignore file names the resolver
+// knows. aiIgnoreFile augments .gitignore with project-specific AI
+// exclusions; patterns sourced from it are tracked so callers can query
 // .aiignore-only verdicts separately from .gitignore ones (git itself honours
 // .gitignore, including negation, that the resolver does not).
-const aiIgnoreFile = ".aiignore"
+const (
+	gitIgnoreFile = ".gitignore"
+	aiIgnoreFile  = ".aiignore"
+)
+
+// configOrigin stamps patterns compiled from Options.ExtraPatterns. Like
+// .gitignore-sourced rules, they are excluded from the .aiignore-scoped query
+// (IgnoredByAIIgnore): neither originates from .aiignore.
+const configOrigin = "config"
+
+// ignoreFileNames is the set of files, in any directory, whose patterns are
+// honoured. A directory's ignore file applies to that directory and below.
+// It is both the default honoured set (Options.IgnoreFiles == nil) and the
+// universe of names Options.IgnoreFiles may restrict it to.
+var ignoreFileNames = map[string]bool{
+	gitIgnoreFile: true,
+	aiIgnoreFile:  true,
+}
 
 // pattern is a single compiled ignore rule. glob is a doublestar-compatible
 // pattern expressed relative to the resolver root. dirOnly marks rules that
 // originated from a trailing-slash form and therefore match directories only.
-// origin records which ignore file the rule came from (".gitignore" or
-// ".aiignore"), enabling .aiignore-only queries.
+// origin records the rule's source (".gitignore", ".aiignore", or "config"
+// for Options.ExtraPatterns), enabling .aiignore-only queries.
 type pattern struct {
 	glob    string
 	dirOnly bool
@@ -68,6 +84,10 @@ type Resolver struct {
 	root            string
 	patterns        []pattern
 	caseInsensitive bool
+	// ignoreFiles is the honoured ignore-file name set for this resolver
+	// (the package default unless Options.IgnoreFiles narrows it). load
+	// consults it instead of the package map.
+	ignoreFiles map[string]bool
 }
 
 // NewResolver walks root once, collecting and compiling every ignore file
@@ -99,6 +119,53 @@ func NewResolver(root string) (*Resolver, error) {
 // next entry. The partial result is discarded — a cancelled build never
 // publishes a half-collected resolver.
 func NewResolverContext(ctx context.Context, root string) (*Resolver, error) {
+	return NewResolverWithOptionsContext(ctx, root, Options{})
+}
+
+// Options configures a Resolver beyond the NewResolver defaults. The zero
+// Options is exactly NewResolver: both ignore files honoured, no extra
+// patterns.
+type Options struct {
+	// IgnoreFiles restricts which ignore file names the load walk honours.
+	// nil (the zero value) means both .gitignore and .aiignore, matching
+	// NewResolver. A non-nil slice is the exact honoured set: each entry must
+	// be ".gitignore" or ".aiignore" (anything else fails the build with an
+	// error, so a typo cannot silently disable an ignore file), and an empty
+	// non-nil slice honours no ignore file at all, leaving only
+	// ExtraPatterns in effect.
+	IgnoreFiles []string
+
+	// ExtraPatterns are gitignore-style lines compiled on top of whatever the
+	// honoured ignore files contribute. They are scoped as if written in a
+	// root ignore file: a leading slash (or an internal slash) anchors the
+	// pattern to the root, a bare name matches at any depth, and a trailing
+	// slash marks it directory-only. Blank lines, comments, and negation
+	// lines are skipped exactly as in an ignore file. Compiled patterns carry
+	// the origin "config", so they are excluded from the .aiignore-scoped
+	// query (IgnoredByAIIgnore) like .gitignore-sourced rules.
+	ExtraPatterns []string
+}
+
+// NewResolverWithOptions is NewResolver honouring opts: a narrowed ignore-file
+// set (Options.IgnoreFiles) and/or extra root-scoped patterns
+// (Options.ExtraPatterns) layered on top of the honoured files. It is the
+// context.Background form, like NewResolver; callers that build resolvers on
+// goroutines a shutdown must join should prefer NewResolverWithOptionsContext.
+func NewResolverWithOptions(root string, opts Options) (*Resolver, error) {
+	return NewResolverWithOptionsContext(context.Background(), root, opts)
+}
+
+// NewResolverWithOptionsContext is NewResolverWithOptions with cooperative
+// cancellation, mirroring NewResolverContext: once ctx is done the walk
+// abandons the rest of the tree and returns a nil Resolver with an error
+// wrapping ctx's error (detect via errors.Is(err, context.Canceled)). A nil
+// ctx means context.Background. Options are validated before any filesystem
+// access, so an invalid Options fails fast without touching the root.
+func NewResolverWithOptionsContext(ctx context.Context, root string, opts Options) (*Resolver, error) {
+	files, err := resolveIgnoreFiles(opts.IgnoreFiles)
+	if err != nil {
+		return nil, fmt.Errorf("ignore: options for root %q: %w", root, err)
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -117,11 +184,36 @@ func NewResolverContext(ctx context.Context, root string) (*Resolver, error) {
 	r := &Resolver{
 		root:            absRoot,
 		caseInsensitive: pathutil.DetectCaseInsensitive(absRoot),
+		ignoreFiles:     files,
 	}
+	// Extra patterns are compiled before the walk begins so that load-time
+	// directory pruning sees them: a directory matched by an extra pattern
+	// is pruned exactly like one matched by a root ignore-file rule, and
+	// nested ignore files beneath it contribute nothing.
+	r.patterns = append(r.patterns, parsePatternLines(opts.ExtraPatterns, "", configOrigin)...)
 	if err := r.load(ctx); err != nil {
 		return nil, fmt.Errorf("ignore: load root %q: %w", absRoot, err)
 	}
 	return r, nil
+}
+
+// resolveIgnoreFiles maps Options.IgnoreFiles to the honoured set of ignore
+// file names. nil selects the default both-files set; a non-nil slice (an
+// empty one included) is the exact honoured set, and every entry must be a
+// known ignore file name — anything else is an error rather than a silent
+// skip, so a typo cannot quietly disable an entire ignore file.
+func resolveIgnoreFiles(names []string) (map[string]bool, error) {
+	if names == nil {
+		return ignoreFileNames, nil
+	}
+	files := make(map[string]bool, len(names))
+	for _, name := range names {
+		if !ignoreFileNames[name] {
+			return nil, fmt.Errorf("ignore: IgnoreFiles entry %q must be %q or %q", name, gitIgnoreFile, aiIgnoreFile)
+		}
+		files[name] = true
+	}
+	return files, nil
 }
 
 // Root returns the cleaned absolute root this resolver was built for.
@@ -185,8 +277,9 @@ func (r *Resolver) Ignored(absPath string, isDir bool) bool {
 }
 
 // IgnoredByAIIgnore reports whether absPath is ignored by rules sourced
-// exclusively from .aiignore files. Rules originating from .gitignore are
-// excluded from this query. It is intended for callers that already obtain a
+// exclusively from .aiignore files. Rules originating from .gitignore or from
+// Options.ExtraPatterns (origin "config") are excluded from this query. It is
+// intended for callers that already obtain a
 // .gitignore verdict from git itself (which honours negation and the global
 // gitignore that the resolver does not): layering only .aiignore rules on top
 // preserves git's un-ignore semantics instead of overriding them.
@@ -229,7 +322,8 @@ func (r *Resolver) matchOne(path string, isDir bool, origin string) bool {
 	return false
 }
 
-// load walks the root collecting patterns from every ignore file. It prunes
+// load walks the root collecting patterns from every ignore file in the
+// resolver's honoured set (r.ignoreFiles; see Options.IgnoreFiles). It prunes
 // the walk for efficiency: the .git directory is always skipped (it is never
 // source we want to honour ignore files for, and it can be enormous), and any
 // directory that is itself ignored by the patterns collected so far is pruned
@@ -253,7 +347,7 @@ func (r *Resolver) load(ctx context.Context) error {
 			return err
 		}
 		if !d.IsDir() {
-			if !ignoreFileNames[d.Name()] {
+			if !r.ignoreFiles[d.Name()] {
 				return nil
 			}
 			// Only regular files are read. A read-open (O_RDONLY) of a FIFO
@@ -327,12 +421,28 @@ func readIgnoreFile(absPath, relDir, source string) ([]pattern, error) {
 	}
 	defer func() { _ = f.Close() }()
 
-	var pats []pattern
+	var lines []string
 	sc := bufio.NewScanner(f)
 	// Allow generously long lines (gitignore patterns can be wide globs).
 	sc.Buffer(make([]byte, 64*1024), 1024*1024)
 	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
+		lines = append(lines, sc.Text())
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	return parsePatternLines(lines, relDir, source), nil
+}
+
+// parsePatternLines normalizes gitignore-style lines and compiles the
+// non-empty, non-comment, non-negation ones into patterns scoped to relDir
+// with the given origin. readIgnoreFile feeds it ignore-file contents;
+// NewResolverWithOptionsContext feeds it Options.ExtraPatterns with relDir ""
+// (root scoping) and origin "config".
+func parsePatternLines(lines []string, relDir, origin string) []pattern {
+	var pats []pattern
+	for _, raw := range lines {
+		line := strings.TrimSpace(raw)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
@@ -348,11 +458,11 @@ func readIgnoreFile(absPath, relDir, source string) ([]pattern, error) {
 		}
 		p := compile(relDir, line)
 		if p.glob != "" {
-			p.origin = source
+			p.origin = origin
 			pats = append(pats, p)
 		}
 	}
-	return pats, sc.Err()
+	return pats
 }
 
 // compile converts a raw gitignore-style pattern line into a doublestar glob
