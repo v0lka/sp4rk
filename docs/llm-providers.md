@@ -465,6 +465,35 @@ router, err := llm.NewRouter(ctx, llm.RouterConfig{
 }, registry)
 ```
 
+## Async 202 Accepted endpoints
+
+Some endpoints answer a long request with the HTTP async request-reply idiom (RFC 9110) instead of holding the connection: `202 Accepted` + a `Location` header pointing at a status monitor (optionally `Retry-After` pacing the polls). The monitor answers `202` while the task runs and the real response once done. sp4rk supports this **at the transport level**, so it works for every protocol and changes no `Provider` contract — callers still see one blocking call:
+
+```go
+// Declaratively, per provider entry:
+entry := llm.ProviderEntry{
+    Name: "my-gateway", ProviderType: "openai", BaseURL: "...",
+    FollowAsyncAccepted: true,
+}
+
+// Or imperatively, for any *http.Client handed to a provider:
+client := llm.WrapHTTPClientAsyncAccepted(baseClient, llm.AsyncAcceptedConfig{})
+
+// Or at the lowest level, for any RoundTripper:
+rt := llm.NewAsyncAcceptedTransport(baseTransport, llm.AsyncAcceptedConfig{})
+```
+
+Behaviour of the wrapped transport:
+
+- **Trigger.** Only a `202` **with** a `Location` header engages the loop; a `202` without one, and every other status, passes through untouched. Endpoints that never answer 202 are unaffected.
+- **Pacing.** Server-owned when the server speaks: `Retry-After` (delta-seconds or HTTP-date) and the millisecond extension `Retry-After-Ms` (which wins when both are present) are honored on 202s *and* on transient poll failures, capped by `MaxInterval` (default 5m) so a hostile header cannot stall a call. When the server is silent, a client-side fallback starts at `DefaultInterval` (default 2s) and doubles per poll up to 8×.
+- **Polling.** `GET` on the monitor, carrying the original request's headers minus body-describing ones. Sensitive headers (`Authorization`, cookies, API-key spellings) are forwarded **only** when the monitor is the same host as — or a subdomain of — the original request's host (net/http's redirect rule); a foreign-host monitor is polled unauthenticated rather than leaking credentials. A `202` poll may carry a new `Location`, which is adopted (the monitor can relocate mid-task).
+- **Failure tolerance.** Transient poll failures (network errors, HTTP 408/429/5xx from the monitor) are tolerated up to `MaxConsecutiveErrs` in a row (default 5) — a blip must not abandon the running task — after which the last failing response (or error) surfaces and is classified upstream like any other provider failure.
+- **Terminal.** The first non-202 monitor answer — the result, a `303` redirect to it (followed by the `http.Client` layer above, as usual), or a definitive 4xx — is returned as the response to the *original* request.
+- **Cancellation.** The original request's context governs the entire loop. Note `http.Client.Timeout` also spans the whole loop; prefer per-request contexts over an aggressive client-wide timeout when wrapping.
+
+Two caveats inherent to the idiom: the initial POST remains non-idempotent (a network failure *before* the 202 arrives may leave an unobserved task server-side — pair the endpoint with `Idempotency-Key` support if it can fail that way), and the upper retry layers (SDK-internal and router) treat a surfaced poll failure like any call failure, so a retry submits a **new** task.
+
 ## ChatRequest / ChatResponse
 
 ```go

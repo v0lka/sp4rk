@@ -146,6 +146,18 @@ type ProviderEntry struct {
 	// It is threaded through to OpenAIProviderConfig.OmitReasoningHistory
 	// for the request-building seam to act on.
 	OmitReasoningHistory bool
+	// FollowAsyncAccepted enables the HTTP 202 async request-reply idiom for
+	// this provider's endpoint: a response of 202 Accepted carrying a
+	// Location header is transparently resolved by polling that status
+	// monitor with GET — honoring Retry-After / Retry-After-Ms, falling back
+	// to a doubling client-side cadence — until it answers non-202, which is
+	// then returned as the response to the original call. Implemented by
+	// wrapping this entry's HTTP client in NewAsyncAcceptedTransport, so it
+	// applies to every protocol the provider speaks and changes no Provider
+	// contract; endpoints that never answer 202 are unaffected. See
+	// NewAsyncAcceptedTransport for the full contract (credential scoping,
+	// cadence, failure tolerance).
+	FollowAsyncAccepted bool
 }
 
 // Router routes LLM calls to the active provider.
@@ -197,6 +209,12 @@ func NewRouter(ctx context.Context, cfg RouterConfig, registry *ModelRegistry) (
 		providerClient := entry.HTTPClient
 		if providerClient == nil {
 			providerClient = cfg.HTTPClient
+		}
+		// The 202-polling idiom is transport-level, so it is applied here —
+		// on the client every protocol of this provider will ride — rather
+		// than threaded through the provider constructors.
+		if entry.FollowAsyncAccepted {
+			providerClient = WrapHTTPClientAsyncAccepted(providerClient, AsyncAcceptedConfig{Logger: cfg.Logger})
 		}
 		provider, err := createProviderFromConfig(ctx, entry.Name, entry.ProviderType, entry.APIKey, entry.BaseURL, providerClient, cfg.Logger, entry.ReasoningWire, entry.TokenSource, entry.RequireStreaming, entry.OmitReasoningHistory)
 		if err != nil {
