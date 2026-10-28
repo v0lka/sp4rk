@@ -29,8 +29,9 @@ import (
 //
 // NewAsyncAcceptedTransport builds that RoundTripper;
 // WrapHTTPClientAsyncAccepted applies it to an *http.Client suitable for
-// ProviderEntry.HTTPClient / OpenAIProviderConfig.HTTPClient; and
-// ProviderEntry.FollowAsyncAccepted enables it declaratively per provider.
+// ProviderEntry.HTTPClient / OpenAIProviderConfig.HTTPClient. Router-built
+// providers get it BY DEFAULT (tuned via ProviderEntry.AsyncAccepted, opted
+// out via ProviderEntry.DisableAsyncAccepted).
 //
 // Poll cadence is SERVER-OWNED when the server speaks: Retry-After (seconds
 // or HTTP-date) and the millisecond extensions Retry-After-Ms (OpenAI) /

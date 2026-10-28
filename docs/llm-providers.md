@@ -467,14 +467,15 @@ router, err := llm.NewRouter(ctx, llm.RouterConfig{
 
 ## Async 202 Accepted endpoints
 
-Some endpoints answer a long request with the HTTP async request-reply idiom (RFC 9110) instead of holding the connection: `202 Accepted` + a `Location` header pointing at a status monitor (optionally `Retry-After` pacing the polls). The monitor answers `202` while the task runs and the real response once done. sp4rk supports this **at the transport level**, so it works for every protocol and changes no `Provider` contract — callers still see one blocking call:
+Some endpoints answer a long request with the HTTP async request-reply idiom (RFC 9110) instead of holding the connection: `202 Accepted` + a `Location` header pointing at a status monitor (optionally `Retry-After` pacing the polls). The monitor answers `202` while the task runs and the real response once done. sp4rk supports this **at the transport level**, so it works for every protocol and changes no `Provider` contract — callers still see one blocking call.
+
+**It is on by default** for every router-built provider — an endpoint that never answers 202 never engages it — and opted out per entry:
 
 ```go
-// Declaratively, per provider entry (zero-value AsyncAccepted = defaults):
+// Default: nothing to configure. Optional tuning per provider entry:
 entry := llm.ProviderEntry{
     Name: "my-gateway", ProviderType: "openai", BaseURL: "...",
-    FollowAsyncAccepted: true,
-    AsyncAccepted: llm.AsyncAcceptedConfig{ // optional tuning
+    AsyncAccepted: llm.AsyncAcceptedConfig{ // zero value = defaults
         MaxPolls:        200,              // count budget (0 = 120, negative = unlimited)
         MaxElapsed:      time.Hour,        // duration budget (0 = 30m, negative = unlimited)
         MinInterval:     time.Second,      // cadence floor (0 = 100ms)
@@ -482,12 +483,17 @@ entry := llm.ProviderEntry{
     },
 }
 
-// Or imperatively, for any *http.Client handed to a provider:
+// Opt out (raw 202s surface to the SDK; openai-go internal retries return):
+entry := llm.ProviderEntry{Name: "n", ProviderType: "openai", DisableAsyncAccepted: true}
+
+// Imperatively, for any *http.Client handed to a provider directly:
 client := llm.WrapHTTPClientAsyncAccepted(baseClient, llm.AsyncAcceptedConfig{MaxPolls: 200})
 
 // Or at the lowest level, for any RoundTripper:
 rt := llm.NewAsyncAcceptedTransport(baseTransport, llm.AsyncAcceptedConfig{})
 ```
+
+One default-on consequence to know: because budget errors must not be retried beneath the router (see below), the OpenAI SDK clients run with their internal retry loop disabled whenever the wrapped client is in place — **the router owns all retries** (its exponential backoff replaces openai-go's own `Retry-After`-honoring in-SDK retries for final 429/5xx responses). `DisableAsyncAccepted` restores the unwrapped client and the SDK retries with it.
 
 Behaviour of the wrapped transport:
 

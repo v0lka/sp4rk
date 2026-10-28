@@ -434,11 +434,12 @@ func TestAsyncAcceptedTransport_MinIntervalFloor(t *testing.T) {
 	}
 }
 
-// TestNewRouter_FollowAsyncAccepted_EntryConfig verifies the declarative
-// wiring: ProviderEntry.AsyncAccepted reaches the transport, so a router
-// consumer can bound polling (here MaxPolls: 2) without building a client —
-// a 202-forever endpoint exhausts the entry's budget instead of the default.
-func TestNewRouter_FollowAsyncAccepted_EntryConfig(t *testing.T) {
+// TestNewRouter_AsyncAccepted_EntryConfig verifies the declarative wiring:
+// the 202-polling transport is on BY DEFAULT (no opt-in flag on the entry)
+// and ProviderEntry.AsyncAccepted reaches it, so a router consumer can bound
+// polling (here MaxPolls: 2) without building a client — a 202-forever
+// endpoint exhausts the entry's budget instead of the default.
+func TestNewRouter_AsyncAccepted_EntryConfig(t *testing.T) {
 	var polls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
@@ -454,12 +455,11 @@ func TestNewRouter_FollowAsyncAccepted_EntryConfig(t *testing.T) {
 
 	router, err := NewRouter(context.Background(), RouterConfig{
 		Providers: []ProviderEntry{{
-			Name:                "p",
-			ProviderType:        "openai",
-			APIKey:              "k",
-			BaseURL:             srv.URL,
-			Models:              []string{"test-model"},
-			FollowAsyncAccepted: true,
+			Name:         "p",
+			ProviderType: "openai",
+			APIKey:       "k",
+			BaseURL:      srv.URL,
+			Models:       []string{"test-model"},
 			AsyncAccepted: AsyncAcceptedConfig{
 				DefaultInterval: 2 * time.Millisecond,
 				MinInterval:     -1,
@@ -481,6 +481,48 @@ func TestNewRouter_FollowAsyncAccepted_EntryConfig(t *testing.T) {
 	}
 	if got := polls.Load(); got != 2 {
 		t.Errorf("polls = %d, want exactly the entry-configured MaxPolls (2)", got)
+	}
+}
+
+// TestNewRouter_DisableAsyncAccepted_OptOut verifies the opt-out: with
+// DisableAsyncAccepted the client stays unwrapped, so a 202 surfaces raw to
+// the SDK (a degenerate success → error) and the monitor is never polled.
+func TestNewRouter_DisableAsyncAccepted_OptOut(t *testing.T) {
+	var polls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			w.Header().Set("Location", "/jobs/1")
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		polls.Add(1)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	t.Cleanup(srv.Close)
+
+	router, err := NewRouter(context.Background(), RouterConfig{
+		Providers: []ProviderEntry{{
+			Name:                 "p",
+			ProviderType:         "openai",
+			APIKey:               "k",
+			BaseURL:              srv.URL,
+			Models:               []string{"test-model"},
+			DisableAsyncAccepted: true,
+		}},
+		MaxRetries: -1,
+	}, nil)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
+
+	if _, err = router.Call(context.Background(), ChatRequest{
+		Model:    "test-model",
+		Messages: []Message{{Role: "user", Content: "hi"}},
+	}); err == nil {
+		t.Fatal("expected an error: a raw 202 is a degenerate success for the SDK")
+	}
+	if got := polls.Load(); got != 0 {
+		t.Errorf("polls = %d, want 0 (opt-out must not poll the monitor)", got)
 	}
 }
 

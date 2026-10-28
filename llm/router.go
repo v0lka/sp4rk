@@ -146,25 +146,28 @@ type ProviderEntry struct {
 	// It is threaded through to OpenAIProviderConfig.OmitReasoningHistory
 	// for the request-building seam to act on.
 	OmitReasoningHistory bool
-	// FollowAsyncAccepted enables the HTTP 202 async request-reply idiom for
-	// this provider's endpoint: a response of 202 Accepted carrying a
-	// Location header is transparently resolved by polling that status
-	// monitor with GET — honoring Retry-After / Retry-After-Ms, falling back
-	// to a doubling client-side cadence — until it answers non-202, which is
-	// then returned as the response to the original call. Implemented by
-	// wrapping this entry's HTTP client in NewAsyncAcceptedTransport, so it
-	// applies to every protocol the provider speaks and changes no Provider
-	// contract; endpoints that never answer 202 are unaffected. See
-	// NewAsyncAcceptedTransport for the full contract (credential scoping,
-	// cadence, failure tolerance).
-	FollowAsyncAccepted bool
-	// AsyncAccepted tunes the 202-polling transport enabled by
-	// FollowAsyncAccepted: poll budgets (MaxPolls, MaxElapsed), cadence
-	// bounds (DefaultInterval, MinInterval, MaxInterval), failure tolerance
-	// and the opt-in abandonment cancel (CancelOnAbandon). The zero value
-	// selects the documented defaults — setting FollowAsyncAccepted alone is
-	// enough. Ignored unless FollowAsyncAccepted is set. A nil Logger
-	// inherits RouterConfig.Logger.
+	// DisableAsyncAccepted opts this provider OUT of the HTTP 202 async
+	// request-reply idiom, which is enabled by default: a response of 202
+	// Accepted carrying a Location header is transparently resolved by
+	// polling that status monitor with GET — honoring Retry-After /
+	// Retry-After-Ms, falling back to a doubling client-side cadence — until
+	// it answers non-202, which is then returned as the response to the
+	// original call. Implemented by wrapping this entry's HTTP client in
+	// NewAsyncAcceptedTransport, so it applies to every protocol the
+	// provider speaks and changes no Provider contract; endpoints that never
+	// answer 202 are unaffected by the wrapping, EXCEPT that the OpenAI SDK
+	// clients run with their internal retry loop disabled — the router owns
+	// the retry policy (see isAsyncAcceptedHTTPClient). Set this to restore
+	// the unwrapped client (202s then surface raw, and openai-go's internal
+	// retries come back). See NewAsyncAcceptedTransport for the full
+	// contract (credential scoping, cadence, budgets, failure tolerance).
+	DisableAsyncAccepted bool
+	// AsyncAccepted tunes the default-on 202-polling transport: poll budgets
+	// (MaxPolls, MaxElapsed), cadence bounds (DefaultInterval, MinInterval,
+	// MaxInterval), failure tolerance and the opt-in abandonment cancel
+	// (CancelOnAbandon). The zero value selects the documented defaults.
+	// Ignored when DisableAsyncAccepted is set. A nil Logger inherits
+	// RouterConfig.Logger.
 	AsyncAccepted AsyncAcceptedConfig
 }
 
@@ -220,8 +223,10 @@ func NewRouter(ctx context.Context, cfg RouterConfig, registry *ModelRegistry) (
 		}
 		// The 202-polling idiom is transport-level, so it is applied here —
 		// on the client every protocol of this provider will ride — rather
-		// than threaded through the provider constructors.
-		if entry.FollowAsyncAccepted {
+		// than threaded through the provider constructors. It is ON by
+		// default (a 202-less endpoint never engages it) and opted out per
+		// entry via DisableAsyncAccepted.
+		if !entry.DisableAsyncAccepted {
 			acfg := entry.AsyncAccepted
 			if acfg.Logger == nil {
 				acfg.Logger = cfg.Logger
