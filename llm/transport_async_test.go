@@ -14,10 +14,14 @@ import (
 )
 
 // asyncTestClient builds an *http.Client wrapped with the 202-polling
-// transport at a fast cadence for tests.
+// transport at a fast cadence for tests: a tiny fallback interval and no
+// MinInterval floor (the floor gets its own dedicated test).
 func asyncTestClient(cfg AsyncAcceptedConfig) *http.Client {
 	if cfg.DefaultInterval == 0 {
 		cfg.DefaultInterval = 2 * time.Millisecond
+	}
+	if cfg.MinInterval == 0 {
+		cfg.MinInterval = -1
 	}
 	return WrapHTTPClientAsyncAccepted(nil, cfg)
 }
@@ -316,6 +320,117 @@ func TestParseRetryAfter(t *testing.T) {
 	hdr.Set("Retry-After-Ms", "100")
 	if d, ok := parseRetryAfter(hdr); !ok || d != 100*time.Millisecond {
 		t.Errorf("precedence = %v %v, want Retry-After-Ms (100ms) to win", d, ok)
+	}
+}
+
+// TestAsyncAcceptedTransport_MaxPollsExhausted verifies the count budget: a
+// monitor answering 202 forever is abandoned after exactly MaxPolls polls,
+// the error names the spent budget (and is shaped non-retryable so upper
+// layers do not resubmit), and CancelOnAbandon sends the best-effort DELETE —
+// carrying auth on the same host.
+func TestAsyncAcceptedTransport_MaxPollsExhausted(t *testing.T) {
+	var polls atomic.Int32
+	var deleteAuth atomic.Value
+	deleted := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost:
+			w.Header().Set("Location", "/jobs/1")
+			w.WriteHeader(http.StatusAccepted)
+		case r.Method == http.MethodGet:
+			polls.Add(1)
+			w.Header().Set("Retry-After-Ms", "1")
+			w.WriteHeader(http.StatusAccepted)
+		case r.Method == http.MethodDelete && r.URL.Path == "/jobs/1":
+			deleteAuth.Store(r.Header.Get("Authorization"))
+			close(deleted)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	client := asyncTestClient(AsyncAcceptedConfig{MaxPolls: 3, CancelOnAbandon: true})
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/submit", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer k")
+	_, err := client.Do(req)
+	if err == nil || !strings.Contains(err.Error(), "poll budget") {
+		t.Fatalf("error = %v, want a poll-budget exhaustion error", err)
+	}
+	if got := polls.Load(); got != 3 {
+		t.Errorf("polls = %d, want exactly MaxPolls (3)", got)
+	}
+	select {
+	case <-deleted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("abandon-cancel DELETE never reached the monitor")
+	}
+	if got, _ := deleteAuth.Load().(string); got != "Bearer k" {
+		t.Errorf("DELETE Authorization = %q, want it forwarded on the same host", got)
+	}
+}
+
+// TestAsyncAcceptedTransport_MaxElapsedExhausted verifies the duration
+// budget: a wait that would overshoot MaxElapsed is never served — the call
+// gives up before sleeping, with zero polls issued.
+func TestAsyncAcceptedTransport_MaxElapsedExhausted(t *testing.T) {
+	var polls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			w.Header().Set("Location", "/jobs/1")
+			w.Header().Set("Retry-After-Ms", "500")
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		polls.Add(1)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	t.Cleanup(srv.Close)
+
+	client := asyncTestClient(AsyncAcceptedConfig{MaxElapsed: 20 * time.Millisecond})
+	_, err := client.Post(srv.URL+"/submit", "application/json", strings.NewReader(`{}`))
+	if err == nil || !strings.Contains(err.Error(), "polling budget") {
+		t.Fatalf("error = %v, want a polling-budget exhaustion error", err)
+	}
+	if got := polls.Load(); got != 0 {
+		t.Errorf("polls = %d, want 0 (the 500ms wait overshoots the 20ms budget up front)", got)
+	}
+}
+
+// TestAsyncAcceptedTransport_MinIntervalFloor verifies a zero Retry-After
+// cannot hot-loop the monitor: every wait is floored by MinInterval.
+func TestAsyncAcceptedTransport_MinIntervalFloor(t *testing.T) {
+	var polls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			w.Header().Set("Location", "/jobs/1")
+			w.Header().Set("Retry-After-Ms", "0")
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		if polls.Add(1) == 1 {
+			w.Header().Set("Retry-After-Ms", "0")
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		fmt.Fprint(w, `ok`)
+	}))
+	t.Cleanup(srv.Close)
+
+	client := asyncTestClient(AsyncAcceptedConfig{MinInterval: 60 * time.Millisecond})
+	start := time.Now()
+	resp, err := client.Post(srv.URL+"/submit", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	resp.Body.Close()
+	// Two waits (before each poll), both floored: >= ~120ms total.
+	if elapsed := time.Since(start); elapsed < 100*time.Millisecond {
+		t.Errorf("elapsed = %v, want >= ~120ms (Retry-After-Ms: 0 must be floored by MinInterval)", elapsed)
+	}
+	if got := polls.Load(); got != 2 {
+		t.Errorf("polls = %d, want 2", got)
 	}
 }
 
