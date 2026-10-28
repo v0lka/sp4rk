@@ -120,6 +120,16 @@ func NewOpenAIProvider(cfg OpenAIProviderConfig) (*OpenAIProvider, error) {
 	if cfg.HTTPClient != nil {
 		opts = append(opts, option.WithHTTPClient(cfg.HTTPClient))
 	}
+	if isAsyncAcceptedHTTPClient(cfg.HTTPClient) {
+		// An async-accepted (202-polling) client implies router-owned
+		// retries: the transport's poll-budget exhaustion surfaces as a
+		// transport error, which the SDK-internal retry loop would retry
+		// BENEATH the router's policy — each hidden attempt resubmitting the
+		// request and starting a NEW server-side task. See
+		// isAsyncAcceptedHTTPClient; same rationale as the TokenSource
+		// branch below.
+		opts = append(opts, option.WithMaxRetries(0))
+	}
 	if cfg.TokenSource != nil {
 		// The SDK's internal retry loop retries a request whose middleware
 		// returned (nil, error) — shouldRetry(req, nil) is true for a nil

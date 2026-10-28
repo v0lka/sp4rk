@@ -216,6 +216,23 @@ func WrapHTTPClientAsyncAccepted(client *http.Client, cfg AsyncAcceptedConfig) *
 	return wrapped
 }
 
+// isAsyncAcceptedHTTPClient reports whether the client's transport is (an
+// unwrapped) asyncAcceptedTransport. The OpenAI provider constructors consult
+// it to disable the SDK-internal retry loop for such clients: a poll-budget
+// exhaustion (or give-up) surfaces as a transport error, which the SDK would
+// otherwise retry BENEATH the router's policy — resubmitting the request and
+// starting a NEW server-side task per hidden attempt. With SDK retries off,
+// the router alone decides (and correctly refuses, since budget errors
+// classify non-retryable) — the same router-owns-retries rationale as the
+// TokenSource clients.
+func isAsyncAcceptedHTTPClient(client *http.Client) bool {
+	if client == nil {
+		return false
+	}
+	_, ok := client.Transport.(*asyncAcceptedTransport)
+	return ok
+}
+
 // RoundTrip implements http.RoundTripper.
 func (t *asyncAcceptedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	resp, err := t.base.RoundTrip(req)

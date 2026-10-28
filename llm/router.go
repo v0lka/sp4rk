@@ -158,6 +158,14 @@ type ProviderEntry struct {
 	// NewAsyncAcceptedTransport for the full contract (credential scoping,
 	// cadence, failure tolerance).
 	FollowAsyncAccepted bool
+	// AsyncAccepted tunes the 202-polling transport enabled by
+	// FollowAsyncAccepted: poll budgets (MaxPolls, MaxElapsed), cadence
+	// bounds (DefaultInterval, MinInterval, MaxInterval), failure tolerance
+	// and the opt-in abandonment cancel (CancelOnAbandon). The zero value
+	// selects the documented defaults — setting FollowAsyncAccepted alone is
+	// enough. Ignored unless FollowAsyncAccepted is set. A nil Logger
+	// inherits RouterConfig.Logger.
+	AsyncAccepted AsyncAcceptedConfig
 }
 
 // Router routes LLM calls to the active provider.
@@ -214,7 +222,11 @@ func NewRouter(ctx context.Context, cfg RouterConfig, registry *ModelRegistry) (
 		// on the client every protocol of this provider will ride — rather
 		// than threaded through the provider constructors.
 		if entry.FollowAsyncAccepted {
-			providerClient = WrapHTTPClientAsyncAccepted(providerClient, AsyncAcceptedConfig{Logger: cfg.Logger})
+			acfg := entry.AsyncAccepted
+			if acfg.Logger == nil {
+				acfg.Logger = cfg.Logger
+			}
+			providerClient = WrapHTTPClientAsyncAccepted(providerClient, acfg)
 		}
 		provider, err := createProviderFromConfig(ctx, entry.Name, entry.ProviderType, entry.APIKey, entry.BaseURL, providerClient, cfg.Logger, entry.ReasoningWire, entry.TokenSource, entry.RequireStreaming, entry.OmitReasoningHistory)
 		if err != nil {

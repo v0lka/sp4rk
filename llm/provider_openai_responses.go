@@ -88,6 +88,13 @@ func newResponsesClient(apiKey, baseURL string, httpClient *http.Client, tokenSo
 	if httpClient != nil {
 		opts = append(opts, option.WithHTTPClient(httpClient))
 	}
+	if isAsyncAcceptedHTTPClient(httpClient) {
+		// Router-owned retries for 202-polling clients — a poll-budget
+		// exhaustion must not be retried in-SDK, resubmitting the request
+		// and starting a new server-side task (see isAsyncAcceptedHTTPClient
+		// and the same branch in NewOpenAIProvider).
+		opts = append(opts, option.WithMaxRetries(0))
+	}
 	if tokenSource != nil {
 		// Same rationale as the Chat Completions client: a TokenSource
 		// failure must abort the call, not be retried inside the SDK before

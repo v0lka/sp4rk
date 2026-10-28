@@ -470,14 +470,20 @@ router, err := llm.NewRouter(ctx, llm.RouterConfig{
 Some endpoints answer a long request with the HTTP async request-reply idiom (RFC 9110) instead of holding the connection: `202 Accepted` + a `Location` header pointing at a status monitor (optionally `Retry-After` pacing the polls). The monitor answers `202` while the task runs and the real response once done. sp4rk supports this **at the transport level**, so it works for every protocol and changes no `Provider` contract — callers still see one blocking call:
 
 ```go
-// Declaratively, per provider entry:
+// Declaratively, per provider entry (zero-value AsyncAccepted = defaults):
 entry := llm.ProviderEntry{
     Name: "my-gateway", ProviderType: "openai", BaseURL: "...",
     FollowAsyncAccepted: true,
+    AsyncAccepted: llm.AsyncAcceptedConfig{ // optional tuning
+        MaxPolls:        200,              // count budget (0 = 120, negative = unlimited)
+        MaxElapsed:      time.Hour,        // duration budget (0 = 30m, negative = unlimited)
+        MinInterval:     time.Second,      // cadence floor (0 = 100ms)
+        CancelOnAbandon: true,             // DELETE the monitor on give-up
+    },
 }
 
 // Or imperatively, for any *http.Client handed to a provider:
-client := llm.WrapHTTPClientAsyncAccepted(baseClient, llm.AsyncAcceptedConfig{})
+client := llm.WrapHTTPClientAsyncAccepted(baseClient, llm.AsyncAcceptedConfig{MaxPolls: 200})
 
 // Or at the lowest level, for any RoundTripper:
 rt := llm.NewAsyncAcceptedTransport(baseTransport, llm.AsyncAcceptedConfig{})
@@ -487,7 +493,7 @@ Behaviour of the wrapped transport:
 
 - **Trigger.** Only a `202` **with** a `Location` header engages the loop; a `202` without one, and every other status, passes through untouched. Endpoints that never answer 202 are unaffected.
 - **Pacing.** Server-owned when the server speaks: `Retry-After` (delta-seconds or HTTP-date) and the millisecond extensions `Retry-After-Ms` (OpenAI) and `x-ms-retry-after-ms` (Azure) — most precise spelling wins — are honored on 202s *and* on transient poll failures, floored by `MinInterval` (default 100ms — a `Retry-After: 0` must not hot-loop the monitor) and capped by `MaxInterval` (default 5m) so a hostile header cannot stall a call. When the server is silent, a client-side fallback starts at `DefaultInterval` (default 2s) and doubles per poll up to 8×.
-- **Budget.** Polling is bounded by default: `MaxElapsed` (default 30m) and `MaxPolls` (default 120) cap each request's status polling — the client-side defense against a monitor that answers 202 forever (a well-behaved server bounds polling itself by expiring the task: `410`/`404` past its TTL, which the transport treats as terminal). Negative values disable a limit; the caller's context remains an overall bound either way. Budget exhaustion surfaces as a non-retryable-shaped error so upper retry layers do not resubmit, and the task may still be running server-side — which is what `CancelOnAbandon` is for.
+- **Budget.** Polling is bounded by default: `MaxElapsed` (default 30m) and `MaxPolls` (default 120) cap each request's status polling — the client-side defense against a monitor that answers 202 forever (a well-behaved server bounds polling itself by expiring the task: `410`/`404` past its TTL, which the transport treats as terminal). Negative values disable a limit; the caller's context remains an overall bound either way. Budget exhaustion surfaces as a non-retryable-shaped error so upper retry layers do not resubmit, and the task may still be running server-side — which is what `CancelOnAbandon` is for. The OpenAI provider constructors additionally detect an async-accepted-wrapped client and disable the openai-go SDK-internal retry loop (`WithMaxRetries(0)`, same rationale as TokenSource clients): without that, the SDK would retry a budget error *beneath* the router's policy and resubmit a new server-side task per hidden attempt.
 - **Abandonment cancel (opt-in).** With `CancelOnAbandon`, whenever the transport abandons a task — budget exhaustion, poll-failure give-up, or the caller's context ending mid-wait — it best-effort sends `DELETE` to the status monitor (REST's cancel-and-discard idiom; the endpoint must treat it as idempotent) on a detached, time-bounded context, with the same credential scoping as polls. `404`/`409`/`410` answers count as success (the task is not running). Leave it unset for endpoints without a cancel contract.
 - **Polling.** `GET` on the monitor, carrying the original request's headers minus body-describing ones. Sensitive headers (`Authorization`, cookies, API-key spellings) are forwarded **only** when the monitor is the same host as — or a subdomain of — the original request's host (net/http's redirect rule); a foreign-host monitor is polled unauthenticated rather than leaking credentials. A `202` poll may carry a new `Location`, which is adopted (the monitor can relocate mid-task).
 - **Failure tolerance.** Transient poll failures (network errors, HTTP 408/429/5xx from the monitor) are tolerated up to `MaxConsecutiveErrs` in a row (default 5) — a blip must not abandon the running task — after which the last failing response (or error) surfaces and is classified upstream like any other provider failure.

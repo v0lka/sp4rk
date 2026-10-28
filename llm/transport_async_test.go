@@ -434,6 +434,56 @@ func TestAsyncAcceptedTransport_MinIntervalFloor(t *testing.T) {
 	}
 }
 
+// TestNewRouter_FollowAsyncAccepted_EntryConfig verifies the declarative
+// wiring: ProviderEntry.AsyncAccepted reaches the transport, so a router
+// consumer can bound polling (here MaxPolls: 2) without building a client —
+// a 202-forever endpoint exhausts the entry's budget instead of the default.
+func TestNewRouter_FollowAsyncAccepted_EntryConfig(t *testing.T) {
+	var polls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			w.Header().Set("Location", "/jobs/1")
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		polls.Add(1)
+		w.Header().Set("Retry-After-Ms", "1")
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	t.Cleanup(srv.Close)
+
+	router, err := NewRouter(context.Background(), RouterConfig{
+		Providers: []ProviderEntry{{
+			Name:                "p",
+			ProviderType:        "openai",
+			APIKey:              "k",
+			BaseURL:             srv.URL,
+			Models:              []string{"test-model"},
+			FollowAsyncAccepted: true,
+			AsyncAccepted: AsyncAcceptedConfig{
+				DefaultInterval: 2 * time.Millisecond,
+				MinInterval:     -1,
+				MaxPolls:        2,
+			},
+		}},
+		MaxRetries: -1, // single attempt: a budget error must not resubmit
+	}, nil)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
+
+	_, err = router.Call(context.Background(), ChatRequest{
+		Model:    "test-model",
+		Messages: []Message{{Role: "user", Content: "hi"}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "poll budget") {
+		t.Fatalf("error = %v, want the entry-configured poll-budget exhaustion", err)
+	}
+	if got := polls.Load(); got != 2 {
+		t.Errorf("polls = %d, want exactly the entry-configured MaxPolls (2)", got)
+	}
+}
+
 // TestOpenAIProvider_FollowAsyncAccepted_ChatCompletions drives the idiom end
 // to end through the provider stack: a /chat/completions endpoint answering
 // 202+Location, resolved by the wrapped client, assembled into the ordinary
