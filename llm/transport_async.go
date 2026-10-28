@@ -38,9 +38,8 @@ import (
 // x-ms-retry-after-ms (Azure) are honored on the 202s and on transient poll
 // failures, floored by MinInterval and clamped to MaxInterval. When the
 // server is silent, the client falls back to DefaultInterval doubling per
-// poll up to asyncAcceptedBackoffCap× — the same cadence shape as the
-// background-mode poll loop, for the same reason: gentle on rate limits for
-// long tasks, snappy for short ones.
+// poll up to asyncAcceptedBackoffCap× — gentle on rate limits for long
+// tasks, snappy for short ones.
 //
 // Polling is BUDGETED by default: MaxPolls and MaxElapsed bound every
 // request's status polling (standards bound polling by TIME — Retry-After
@@ -292,8 +291,7 @@ func (t *asyncAcceptedTransport) RoundTrip(req *http.Request) (*http.Response, e
 		polls++
 		pollResp, perr := t.base.RoundTrip(newMonitorRequest(ctx, http.MethodGet, monitor, req))
 		if perr != nil {
-			// Same tolerance rationale as the poll loops elsewhere in this
-			// package: a transient GET failure must not abandon the running
+			// A transient GET failure must not abandon the running
 			// server-side task the 202 acknowledged.
 			consecutiveErrs++
 			if consecutiveErrs >= t.maxConsecErr {
