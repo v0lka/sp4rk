@@ -304,9 +304,15 @@ func TestParseRetryAfter(t *testing.T) {
 	if _, ok := parseRetryAfter(http.Header{}); ok {
 		t.Error("absent Retry-After must report ok=false")
 	}
-	// Precedence: the millisecond extension wins over the coarser header.
+	// Azure's millisecond spelling is honored too.
+	if d, ok := parseRetryAfter(h("x-ms-retry-after-ms", "80")); !ok || d != 80*time.Millisecond {
+		t.Errorf("x-ms-retry-after-ms 80 = %v %v, want 80ms true", d, ok)
+	}
+	// Precedence: the millisecond extensions win over the coarser header,
+	// and the OpenAI spelling wins over the Azure one.
 	hdr := http.Header{}
 	hdr.Set("Retry-After", "60")
+	hdr.Set("x-ms-retry-after-ms", "200")
 	hdr.Set("Retry-After-Ms", "100")
 	if d, ok := parseRetryAfter(hdr); !ok || d != 100*time.Millisecond {
 		t.Errorf("precedence = %v %v, want Retry-After-Ms (100ms) to win", d, ok)

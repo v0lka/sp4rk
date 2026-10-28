@@ -297,14 +297,17 @@ func isTransientAsyncPollStatus(code int) bool {
 }
 
 // parseRetryAfter extracts the server-requested wait from a response's
-// headers: Retry-After-Ms (the OpenAI millisecond extension, checked first as
-// the higher-precision value) or Retry-After as delta-seconds or an
-// HTTP-date (RFC 9110 §10.2.3; a past date means poll now). Returns ok=false
-// when neither header parses, leaving cadence to the client-side fallback.
+// headers, most precise spelling first: the millisecond extensions
+// Retry-After-Ms (OpenAI) and x-ms-retry-after-ms (Azure), then Retry-After
+// as delta-seconds or an HTTP-date (RFC 9110 §10.2.3; a past date means poll
+// now). Returns ok=false when no header parses, leaving cadence to the
+// client-side fallback.
 func parseRetryAfter(h http.Header) (time.Duration, bool) {
-	if v := strings.TrimSpace(h.Get("Retry-After-Ms")); v != "" {
-		if ms, err := strconv.ParseInt(v, 10, 64); err == nil && ms >= 0 {
-			return time.Duration(ms) * time.Millisecond, true
+	for _, name := range []string{"Retry-After-Ms", "X-Ms-Retry-After-Ms"} {
+		if v := strings.TrimSpace(h.Get(name)); v != "" {
+			if ms, err := strconv.ParseInt(v, 10, 64); err == nil && ms >= 0 {
+				return time.Duration(ms) * time.Millisecond, true
+			}
 		}
 	}
 	v := strings.TrimSpace(h.Get("Retry-After"))
