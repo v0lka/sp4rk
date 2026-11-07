@@ -80,8 +80,8 @@ The host wires the orchestration cycle by registering **meta-tools** into the sp
 | `delegate` | Launch subagents with a task, acceptance criteria, tool set, DAG dependencies, blocking or async mode | `agent.RunSubAgent` / `RunSubAgentsParallel` |
 | `declare_plan` | Publish a roadmap to the blackboard / host UI; optionally block for approval | `orchestration.Plan` serialization + the `PlanGenerated` event |
 | `reflect` | Invoke the Reflector on the current or a sub-task trajectory | `agent/reflector.Reflect` |
-| `store_fact` / `search_facts` | Memory across delegations | `orchestration.Blackboard` |
-| `read_step_output` | Read results of completed delegations | `orchestration.Blackboard` step outputs |
+| `store_fact` / `search_facts` | Memory across delegations | `orchestration.Blackboard` — later moved into the SDK as `tools/builtins` builtins (capability group `system`), registered via the fluent builder's `MemoryTools()` / `AllBuiltinTools()` bundles |
+| `read_step_output` | Read results of completed delegations | `orchestration.Blackboard` step outputs — later moved into the SDK as a `tools/builtins` builtin (capability group `system`), registered via the fluent builder's `AllBuiltinTools()` bundle |
 
 ### Delegation model
 
@@ -97,7 +97,7 @@ Subagents are **flat by default** — they do not have the `delegate` tool. `del
 
 - `planner.Plan` / `Replan` / continuation as **pipeline phases**. The DAG data structures are retained as a library used by `delegate` and `declare_plan`.
 - The plan-execute-reflect **outer loop**. There is no structural "plan_execute vs react" branch, no plan-review toggle stage, no system-owned clarification gate, and no "normal vs advanced" execution-mode toggle. The Conductor handles both simple and complex tasks in one loop; "simple" is a Conductor that never calls `delegate`.
-- The Router's `routing.mode`. The Router retains only domain, complexity, matched skills, and model selection.
+- The Router's `routing.mode`. The Router retains domain, complexity, matched skills, and model selection as its classification outputs (today's `RoutingDecision` additionally carries `needs_clarification` — router output data no framework gate consumes — and `matched_tools`, the optional `SetToolMatching` feature).
 - The Reflector as an external phase. It remains a library invoked through the `reflect` tool.
 
 ### Skill enforcement, resolved structurally

@@ -78,12 +78,12 @@ When a system prompt contains a `CacheBreakMarker`, downstream consumers split i
 | `glm` | Temperature 1.0, TopP 0.95, TopK 40 |
 | default | Temperature 0.5, TopP 0.95 |
 
-`DefaultSampling` is the vendor preset for executor/default calls. The root wiring converts its five generation knobs (`Temperature`, `TopP`, `TopK`, `RepetitionPenalty`, `PresencePenalty`) into `llm.SamplingDefaults`; `MaxTokens` remains a prompt-level advisory field rather than part of `llm.SamplingDefaults`. The LLM Router applies that preset only for `CallPurposeExecutor` and the backward-compatible zero purpose. Routing, compaction, and summarization calls bypass it and use `llm.DeterministicTemperature` with family-safe floors (Google 1.0, Kimi 1.0, Qwen 0.6, otherwise 0.0).
+`DefaultSampling` is the vendor preset for executor/default calls. The host application converts its five generation knobs (`Temperature`, `TopP`, `TopK`, `RepetitionPenalty`, `PresencePenalty`) into `llm.SamplingDefaults` — the shape is duplicated across the boundary by design (the `llm` package cannot import `prompt`; no conversion exists inside the module, see the `llm.SamplingDefaults` doc); `MaxTokens` remains a prompt-level advisory field rather than part of `llm.SamplingDefaults`. The LLM Router applies that preset only for `CallPurposeExecutor` and the backward-compatible zero purpose. Routing, compaction, and summarization calls bypass it and use `llm.DeterministicTemperature` with family-safe floors (Google 1.0, Kimi 1.0, Qwen 0.6, otherwise 0.0).
 
 ## Invariants
 
 - Trusted substitutions run iteratively (up to 5 passes); untrusted substitutions run once and never expand placeholders inside the value.
-- `Build()` with a `CacheBreak` always embeds `CacheBreakMarker` between stable and dynamic parts.
+- `Build()` with a `CacheBreak` embeds `CacheBreakMarker` between stable and dynamic parts whenever both parts are non-empty (an empty dynamic part yields the bare stable part).
 - `SplitCacheBreak` omits empty parts (returns one part when no marker, two when present).
 - `DefaultSampling` returns `nil` fields (no override) for families with provider-managed defaults, and the Router applies the preset only to executor/default purposes.
 

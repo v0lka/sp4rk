@@ -20,6 +20,10 @@ A Conductor is reusable across steps: the system-prompt factory receives the ste
 
 `NewConductor(cfg ConductorConfig) *Conductor` creates a Conductor. If `MaxSteps` is zero it defaults to `80`. `ContextFactory` and `SystemPrompt` are required (see [README.md](README.md#configuration) for the full config). When `ResumeSteps` is non-empty, `Run` resumes from a checkpoint (see [Resume from a checkpoint](#resume-from-a-checkpoint)).
 
+`SetModel(model string)` overrides `ConductorConfig.Model` after construction. It is concurrency-safe: the value is snapshotted under the same `mu` as `SetReasoningEffort`, and `Run` reads it under `RLock` when resolving model metadata for the system prompt and the context window — so a model chosen (or switched) after construction still sizes the per-run context budget correctly.
+
+`Cleanup()` releases conductor resources; currently a no-op.
+
 ### Lifecycle
 
 ```
@@ -56,9 +60,13 @@ conductor.Run(ctx, message, bb, availableTools, events, compactionStrategy)
 │      │  ctx.Err() set)
 │      └─ Executor returned any other error         → ExecutionStatusFailed
 │
-└─ 6. Return *ExecutionResult (always non-nil, even alongside a non-nil error,
-         which carries best-effort output). The returned Blackboard is the same
-         instance passed in, now populated with any reflections recorded.
+└─ 6. Return *ExecutionResult (non-nil once the executor has launched, even
+         alongside a non-nil error, which carries best-effort output). The
+         configuration fail-fast paths — missing `ContextFactory`, missing
+         `SystemPrompt`, `ResumeSteps` set without a `StepSeedable`
+         `ContextManager` — return a nil result with a non-nil error. The
+         returned Blackboard is the same instance passed in, now populated with
+         any reflections recorded.
 ```
 
 ### Finish-join guard
@@ -71,7 +79,7 @@ type PendingDelegations interface {
 }
 ```
 
-`Run` returns an error only when the context factory or system-prompt factory is missing, or when the underlying executor returns an error. A non-nil error is still accompanied by a non-nil `*ExecutionResult` carrying best-effort output.
+`Run` returns an error when the context factory or system-prompt factory is missing, when `ResumeSteps` is set but the `ContextManager` produced by the factory does not implement `StepSeedable`, or when the underlying executor returns an error. Only executor-loop errors are accompanied by a non-nil `*ExecutionResult` carrying best-effort output; the configuration fail-fast paths return a nil result with the error.
 
 ### Step-boundary signals (PauseChecker, UserMessageSource, ToolCallTimeout)
 
@@ -126,7 +134,7 @@ The pass covers only the start of the run: the Executor's threshold-driven react
 
 ## Error Handling
 
-- **LLM/tool fatal error**: the executor returns a non-nil error; `Run` wraps it and still returns a non-nil `*ExecutionResult` with best-effort output and `Status == ExecutionStatusFailed`.
+- **LLM/tool fatal error**: the executor returns a non-nil error; `Run` returns it unchanged alongside a non-nil `*ExecutionResult` with best-effort output and `Status == ExecutionStatusFailed`.
 - **Budget exhausted / circuit-breaker abort** (no error, `Finished == false`): mapped to `Status == ExecutionStatusPartial` (resumable).
 - **Context cancelled**: mapped to `ExecutionStatusCancelled` and propagated as an executor error.
 - **Cooperative pause**: `agent.ErrPaused` is returned for `errors.Is` inspection, while the non-nil `ExecutionResult` has `Status == ExecutionStatusPaused`, empty `Output`, and the resumable trajectory in `Steps`.
@@ -138,7 +146,7 @@ The pass covers only the start of the run: the Executor's threshold-driven react
 
 - Exactly one `Executor.Run` instance is active per Conductor run.
 - `Conductor.Run` injects the four blackboard-backed store adapters into `ctx` before launching the executor.
-- The returned `*ExecutionResult` is always non-nil (even when the error is non-nil).
+- The returned `*ExecutionResult` is always non-nil once the executor has launched (even when the error is non-nil); the configuration fail-fast paths (missing `ContextFactory`, missing `SystemPrompt`, `ResumeSteps` without a `StepSeedable` `ContextManager`) return a nil result with a non-nil error.
 - The returned `Blackboard` is the same instance passed in.
 - When a `PendingDelegations` registry is in `ctx`, `finish` is rejected while it reports pending async work.
 - When `ResumeSteps` is set, `Run` fails fast unless the `ContextManager` implements `StepSeedable`; on success it seeds both the `ContextManager` and the `Executor` with the same defensive copy of the steps.

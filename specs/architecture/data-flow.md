@@ -9,15 +9,19 @@ Understanding how data moves through sp4rk is essential for safely modifying any
 A task enters the engine and flows downward through the layers:
 
 ```
-host application: calls Framework.Execute / RunF / TaskF(ctx, systemPrompt, events, userMessage)
+host application: calls Framework.Execute(ctx, systemPrompt, events, userMessage) / RunF(ctx)… / TaskF(ctx, task)…
          │
          ▼
 sp4rk root orchestration layer (TaskBuilder, in the root package)
   │  composes the Plan&Execute pipeline and drives it end-to-end:
   │
-  ├─ 1. (optional) CLASSIFY: agent/router.Router.Route(ctx, msg, tools, history, skills)
-  │      → RoutingDecision {Domain, Complexity, MatchedSkills, NeedsClarification, MatchedTools*}
-  │      → drives compaction-strategy and planner-mode selection
+  ├─ 1. (optional) CLASSIFY — host-side composition: the host itself calls
+  │      agent/router.Router.Route(ctx, msg, tools, history, skills); the
+  │      root TaskBuilder never calls Route, and root never imports
+  │      agent/router. The host threads the RoutingDecision
+  │      {Domain, Complexity, MatchedSkills, NeedsClarification, MatchedTools*}
+  │      into the pipeline: planner mode via planner.Config.DomainFromContext /
+  │      ComplexityFromContext, compaction strategy via TaskBuilder .Compaction
   │        (code → sliding_window, research → summarization,
   │         general/mixed <4 → sliding_window, ≥4 → hierarchical)
   │      (* MatchedTools is populated only when semantic tool selection is enabled.)
@@ -54,10 +58,10 @@ The six `ExecutionStatus` values are: `success` (loop finished), `partial` (step
 
 There are two ways to run a task:
 
-- **`Framework.Execute`** — the convenience path. The `Framework` creates a `Conductor` and a `MapBlackboard`, runs the task, and returns an `ExecutionResult`. Best for one-off tasks.
+- **`Framework.Execute`** — the convenience path. The `Framework` creates a `Conductor` and a per-task blackboard (a `CheckpointedBlackboard` when a `Checkpointer` is configured, else a `MapBlackboard`), runs the task, and returns an `ExecutionResult`. Best for one-off tasks.
 - **`Framework.NewConductor`** — returns a reusable `Conductor` already wired with the framework's shared infrastructure (LLM router, tool registry, tool cache). The host then calls `Conductor.Run` directly with its own `Blackboard`. Best for repeated or session-scoped use.
 
-`RunF` provides a lower-level run helper for cases that compose the engine primitives more directly.
+`RunF` is the fluent counterpart of `Framework.Execute` — a single ReAct loop configured declaratively through `RunBuilder`; `TaskF` drives the Plan&Execute pipeline through `TaskBuilder`.
 
 ## The ReAct Loop
 
@@ -80,7 +84,7 @@ The `Executor` (in `github.com/v0lka/sp4rk/agent`) runs a Reason → Act → Obs
 │  7. After a dirty response group, run one        │
 │     configured verify-on-edit command            │
 │  8. Record Observation in the Step               │
-│     └─ trust flag + optional [verify_on_edit] note│
+│     └─ trust flag + [verify_on_edit] note        │
 │  9. ContextManager.AddStep()                     │
 │ 10. CheckFill() → maybe Compact()                │
 │ 11. Check circuit breakers → maybe nudge/abort   │
@@ -188,9 +192,9 @@ The `Events` interface (in `github.com/v0lka/sp4rk/agent`) is the engine's only 
 ```
 Executor / Conductor / SubAgent (via Events interface)
          │  agent.Events: StepStart, Thought, ToolCall, ToolResult,
-         │    StepComplete, SubAgentLaunch, SubAgentComplete, AssistantChunk,
-         │    AssistantDone, ContextFill, ContextCompaction, Finishing,
-         │    ExecutorDiagnostic
+         │    StepComplete, SubAgentLaunch, SubAgentComplete, SubAgentPaused,
+         │    AssistantChunk, AssistantDone, ContextFill, ContextCompaction,
+         │    Finishing, ExecutorDiagnostic
          ▼
 host-supplied Events implementation
          │
@@ -198,9 +202,11 @@ host-supplied Events implementation
 host decides what to do: persist to storage, push to a UI, log, drop, ...
 ```
 
+`SubAgentPaused(stepID, duration)` fires instead of `SubAgentComplete` when a subagent stops at a cooperative pause — a recoverable checkpoint, not a termination.
+
 Plan/reflection lifecycle events — `OnPlanGenerated`, `OnStepStarted`, `OnStepCompleted`, `OnReflected`, `OnRetry`, `OnReplanFailed`, and the rest — are **not** on `agent.Events`. They are emitted through the separate `orchestration.Events` interface (in `github.com/v0lka/sp4rk/orchestration`), which **embeds** `agent.Events`. A host that participates in Plan&Execute implements `orchestration.Events`; the ReAct loop alone needs only `agent.Events`.
 
-Event emission is **decoupled from persistence**. The engine emits events; it does not write task state to a database. If the host needs durable state, it persists on the `OnBlackboardChanged` callback (fired after every successful blackboard write) or by reading the `ExecutionResult` / using a `Checkpointer`. This keeps sp4rk free of storage assumptions.
+Event emission is **decoupled from persistence**. The engine emits events; it does not write task state to a database. If the host needs durable state, it persists on the `OnBlackboardChanged` callback (fired after every successful blackboard write — only when a `Checkpointer` is configured: the hook rides `CheckpointedBlackboard.SetOnChanged`, and an in-memory `MapBlackboard` emits no change notifications) or by reading the `ExecutionResult` / using a `Checkpointer`. This keeps sp4rk free of storage assumptions.
 
 ## Tool Execution Flow
 
@@ -214,10 +220,15 @@ ToolExecutor.Execute(ctx, name, input)
 tools.ToolRegistry.Execute(ctx, name, input)
   │
   ├─ 1. Lookup tool by name
-  ├─ 2. (host-level gates — symlink gate, auto-approval, etc. — run HERE
-  │       when the host has wired them; sp4rk provides the primitives)
-  ├─ 3. Resolve effective policy (per-tool override > tool default)
-  ├─ 4. Apply policy:
+  ├─ 2. Pre-dispatch input validation (ValidateToolInput, fail-open):
+  │       structurally invalid input is rejected before any policy or
+  │       override is consulted; built-in schemas are closed sets,
+  │       MCP-proxied schemas open
+  ├─ 3. (host-side enforcement — symlink gate, auto-approval — rides the
+  │       ToolJudger/ConfirmFunc at policy-application time (step 5); a
+  │       host may also wrap registry.Execute around the pipeline)
+  ├─ 4. Resolve effective policy (per-tool override > tool default)
+  ├─ 5. Apply policy:
   │      ├─ PolicyAlwaysAllow → execute (unless ToolJudger flags the call)
   │      ├─ PolicyAlwaysDeny  → return error ToolResult
   │      └─ PolicyUserConfirm → ConfirmFunc(ctx, ConfirmationRequest) blocks
@@ -231,7 +242,10 @@ tools.ToolRegistry.Execute(ctx, name, input)
          ▼ (back in Executor)
 cache + two-stage truncation
   │
-  ├─ Skip if tool is non-cacheable
+  ├─ Non-cacheable tools skip only the eager caching of small,
+  │  untruncated results; any truncated result (cacheable or not)
+  │  is cached on demand, its hash embedded in the truncation notice
+  │  for tool_result_read recovery
   ├─ Store full result in ToolResultCache (key = shortest unique SHA256 prefix)
   ├─ Stage 1: per-tool line/byte truncation (fragmentation nudge with hash)
   └─ Stage 2: token-based ToolResultBudget hard cap
@@ -260,10 +274,11 @@ root TaskBuilder — a Plan&Execute run
   ├─ Reflector reads: bb.GetAllStepResults(), bb.GetReflections()
   │
   └─ Final: bb.SetFinalResult(output)
-       → OnBlackboardChanged callback notifies the host after every write
+       → OnBlackboardChanged notifies the host (fires only on a
+         CheckpointedBlackboard — a Checkpointer must be configured)
 ```
 
-Steps communicate through the blackboard: one step can `StoreFact` with keywords, and a later step can `SearchFacts` to retrieve it. The `OnBlackboardChanged` callback on `Config` fires after every successful write, enabling the host to react (live UI updates, persistence).
+Steps communicate through the blackboard: one step can `StoreFact` with keywords, and a later step can `SearchFacts` to retrieve it. The `OnBlackboardChanged` callback on `Config` fires after every successful write — but only when a `Checkpointer` is configured: the hook rides `CheckpointedBlackboard.SetOnChanged`, and an in-memory `MapBlackboard` emits no change notifications — enabling the host to react (live UI updates, persistence).
 
 ## Invariants
 

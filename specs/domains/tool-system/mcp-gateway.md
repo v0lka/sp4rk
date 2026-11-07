@@ -7,6 +7,7 @@ Manages connections to external MCP (Model Context Protocol) servers, discovers 
 ## Key Files
 
 - `github.com/v0lka/sp4rk/tools/mcp` — `Gateway`, `GatewayConfig`, `ServerEntry` (`Timeout`, `CallTimeout`), `StartGateway`, `Server`, `ServerConfig` (`Timeout`, `CallTimeout`), `Server.ToolGroup`, `Tool`, `SchemaSanitizer`, `ServerStatus` (`Unhealthy`), the timeout bounds (`defaultMCPTimeout` = 60s, `unhealthyTimeoutThreshold` = 3), error types (`StartError`/`StopError`/`ReconfigureError`, `TimeoutError`)
+- `github.com/v0lka/sp4rk/tools/mcp/redirect.go` — the origin-pinned HTTP redirect policy (`originPinnedClient`, `maxHTTPRedirects` = 10) both HTTP transport legs run on
 - `github.com/v0lka/sp4rk/tools` — `ToolRegistry`, `RegisterWithSource`, `RegisterWithSourceCategory`, `UnregisterBySource`, `StripParamsFromSchema`
 - `github.com/v0lka/sp4rk/sysproc` — `HideConsole` (applied to the stdio subprocess so a GUI-subsystem host spawns no console window)
 
@@ -30,7 +31,7 @@ StartGateway(ctx, cfg, registry, expandEnv, logger)
 │      for each discovered tool:
 │        ├─ resolve the server group (valid override, else transport default)
 │        ├─ wrap as tools.Tool via NewTool
-│        └─ registry.RegisterWithSource(tool, serverName)
+│        └─ registry.RegisterWithSourceCategory(tool, serverName, SourceCategoryMCP)
 └─ returns (nil, nil) when no servers are configured — safe to call unconditionally
 ```
 
@@ -45,6 +46,8 @@ StartGateway(ctx, cfg, registry, expandEnv, logger)
 
 For HTTP, the client first tries the **Streamable HTTP** transport and falls back to **SSE** (Server-Sent Events) if initialization fails — compatible with both modern and legacy MCP HTTP servers.
 
+Both HTTP transport legs run on a client copy whose redirect policy is pinned to the configured endpoint's origin (`originPinnedClient` in `redirect.go`): a redirect is followed only when it stays on the same scheme, host, and effective port — an http→https upgrade on the same host is the single exception — while cross-host redirects, port changes, https→http downgrades, and non-HTTP schemes are refused, under a 10-hop cap (`maxHTTPRedirects`). The host-supplied client is shallow-copied and never mutated; a cross-origin redirect surfaces as a connection error for the server entry.
+
 ### Per-server timeouts
 
 Each server carries two optional bounds, resolved once at connect time and applied via `context.WithTimeoutCause` (never zero at any use site):
@@ -54,7 +57,7 @@ Each server carries two optional bounds, resolved once at connect time and appli
 
 Because `CallTimeout` inherits `Timeout`, a server that sets **neither** field now caps every `tools/call` at **60s**. This is a behavior change for a host that previously ran long-running calls (browser automation, builds, batch jobs) unbounded on the default configuration; such a host must raise `CallTimeout` (or `Timeout`) per server entry. There is no way to disable the per-call bound — the always-bounded guarantee is intentional. The two defaults and the unhealthy threshold are fixed SDK policy, not per-host knobs.
 
-`Server.Connect` resolves both bounds via `resolveTimeoutBounds` into the unexported `timeout` / `callTimeout`, which then become the single source of truth the gateway diffs against: `configChanged` compares the **resolved** bounds — the same normalization `effectiveToolGroup` applies to a group override — and treats any effective change as reconnect-worthy so a new bound re-applies immediately, while an edit that leaves the effective bounds unchanged (e.g. `Timeout: 0` vs `-1`, or a `CallTimeout` equal to `Timeout`) does not churn the connection (the bounds are captured at connect time and never re-read). The `initialize` and `tools/list` exchanges are bounded by the handshake timeout; `tools/call` by the per-call timeout. `client.Start` is **deliberately never wrapped** — for stdio the child process is spawned with `context.Background()` and `Start` only attaches to it, so coupling its context to the handshake deadline would kill a merely-slow server's process instead of aborting and retrying the handshake; `Start` also returns as soon as the transport is up, so it is not the blocking step a timeout needs to bound.
+`Server.Connect` resolves both bounds via `resolveTimeoutBounds` into the unexported `timeout` / `callTimeout`, which then become the single source of truth the gateway diffs against: `configChanged` compares the **resolved** bounds — the same normalization `effectiveToolGroup` applies to a group override — and treats any effective change as reconnect-worthy so a new bound re-applies immediately, while an edit that leaves the effective bounds unchanged (e.g. `Timeout: 0` vs `-1`, or a `CallTimeout` equal to `Timeout`) does not churn the connection (the bounds are captured at connect time and never re-read). The `initialize` and `tools/list` exchanges are bounded by the handshake timeout; `tools/call` by the per-call timeout. `client.Start`'s **context** is deliberately never derived from the handshake deadline — for stdio the child process is spawned with `context.Background()` and `Start` only attaches to it, so coupling its context to the handshake deadline would kill a merely-slow server's process; a slow handshake aborts the attempt, never the stdio child. The blocking `Start` call itself — the SSE transport's wait for the endpoint event — **is** raced against the resolved handshake bound via a timer: when the bound fires, the race context is cancelled and the `Start` goroutine reaped within the bound, and `Connect` fails with a `TimeoutError`.
 
 A bounded operation that exceeds its bound returns a typed `*TimeoutError` (server / `Op` / tool attribution; unwraps to `context.DeadlineExceeded`). Only **our** timer firing counts toward unhealthiness — `timeoutErrorFor` reports `isTimeout=false` for a caller cancellation, which surfaces the parent context's error and is never blamed on the server. After `unhealthyTimeoutThreshold` (**3**) consecutive genuine `tools/call` timeouts the server is marked `Unhealthy` (with a streak description recorded as its last error); only a successful call resets the streak and clears the mark (a failure that is not a timeout neither extends nor clears it), and `Connect` / `Close` clear it too. A timeout never closes the connection or kills the process — `Unhealthy` is an advisory status flag.
 
@@ -121,7 +124,7 @@ MCP failures are **non-fatal** — a single broken server never prevents the age
 - `Reconfigure` is additive/preserving: unchanged servers are not reconnected.
 - `Stop` always attempts graceful close.
 - Every server has a non-zero resolved handshake bound (`defaultMCPTimeout` = 60s when `Timeout` is unset) and a non-zero per-call bound (inherits the handshake bound when `CallTimeout` is unset) — no MCP operation runs unbounded.
-- `client.Start` is never bounded by the handshake timeout (a slow handshake must not kill the stdio child process).
+- `client.Start`'s context is never derived from the handshake deadline (a slow handshake aborts the attempt, never kills the stdio child); the blocking `Start` call (the SSE endpoint wait) is raced against the resolved handshake bound, and `Connect` fails with a `TimeoutError` when it fires.
 - 3 consecutive genuine `tools/call` timeouts set `ServerStatus.Unhealthy`; a successful call (or `Connect`) clears it, and `Close` clears it too (a disconnected server never reports `Unhealthy: true`); a timeout **marks**, never kills — the connection stays open.
 
 ## Related Specs

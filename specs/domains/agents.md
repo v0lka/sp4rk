@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Discovery, parsing, and management of **Subagent Profiles** — `AGENT.md` documents that declare specialized subagent personas and tool budgets. A Subagent Profile is to a delegated subagent what a [Skill](skills.md) is to an activated skill: a named, directory-scoped declaration whose YAML frontmatter carries metadata and whose markdown body is the agent's core directive (the system prompt applied when a subagent is launched under that profile). `AgentManager` discovers profiles from configured directories, parses them, and serves their metadata/bodies. The package is intentionally self-contained and mirrors the `skills` package's Manager/Parser design.
+Discovery, parsing, and management of **Subagent Profiles** — `AGENT.md` documents that declare specialized subagent personas and tool budgets. A Subagent Profile is to a delegated subagent what a [Skill](skills.md) is to an activated skill: a named, directory-scoped declaration whose YAML frontmatter carries metadata and whose markdown body is the agent's core directive (the system prompt applied when a subagent is launched under that profile). `AgentManager` discovers profiles from configured directories, parses them, and serves their metadata/bodies. The package is intentionally self-contained — stdlib + `yaml.v3` + `log/slog` plus the leaf `sp4rk/safeio` read-hardening helper, with no engine imports beyond that leaf — and mirrors the `skills` package's Manager/Parser design.
 
 ## Key Files
 
@@ -49,8 +49,10 @@ NewAgentManager(dirs []string, logger)        // dirs in priority order, highest
   │
   ├─ Scan()                                   // clears catalog, then walks dirs in reverse
   │      priority order so higher-priority entries overwrite lower ones of the same
-  │      name; an existing invalid AGENT.md is logged at Warn and skipped,
-  │      while a directory with no AGENT.md is logged at Debug
+  │      name; an oversized AGENT.md (safeio.ErrTooLarge) is skipped at Warn
+  │      ("skipped oversized agent"), an invalid AGENT.md (*ParseError) at Warn
+  │      ("skipped invalid agent"), and a directory with no/unreadable AGENT.md
+  │      at Debug
   │        ├─ follows directory symlinks (resolved via os.Stat)
   │        └─ ParseAgent each AGENT.md → validate → catalog (keyed by name)
   │
@@ -62,7 +64,7 @@ NewAgentManager(dirs []string, logger)        // dirs in priority order, highest
 
 ## AGENT.md format & validation
 
-A profile lives at `<agents-dir>/<name>/AGENT.md`. The file is YAML frontmatter (delimited by `---`) followed by a markdown body. `ParseAgent(agentMDPath, dirPath)` reads, splits, and validates it, returning a `*Agent` or a `*ParseError`.
+A profile lives at `<agents-dir>/<name>/AGENT.md`. The file is YAML frontmatter (delimited by `---`) followed by a markdown body. `ParseAgent(agentMDPath, dirPath)` reads, splits, and validates it, returning a `*Agent` or a `*ParseError`. The file is read via `safeio.ReadFile` (regular files only — FIFOs/devices are refused without blocking; 10 MiB `safeio.DefaultMaxFileSize` cap): a read failure returns a wrapped error, not a `*ParseError`, while frontmatter/validation failures return `*ParseError`.
 
 | Field | Rule |
 | ----- | ---- |
@@ -127,7 +129,7 @@ A plan step targets a profile via the `PlanStep.Agent` field (see [orchestration
 
 - Directories are scanned in **reverse priority order** so higher-priority entries win on name collision (first occurrence / highest priority wins).
 - `Scan` is idempotent (clears the catalog first); safe to call repeatedly.
-- An existing `AGENT.md` that fails parsing or validation is skipped with a Warn record; a directory without `AGENT.md` is a non-agent and is skipped at Debug.
+- An existing `AGENT.md` that is oversized (`safeio.ErrTooLarge`) or fails parsing/validation is skipped with a Warn record; a directory without a readable `AGENT.md` is a non-agent and is skipped at Debug.
 - Tool-group preferences are canonicalized and validated fail-closed by `ToolPreferenceWithError`; unknown, empty, duplicate, and mixed-preset lists return an error.
 - Skill requirements are validated fail-closed by `RequiredSkills`/`validateSkillsField`; empty-item, duplicate, and invalid-name lists return an error.
 - `Scan` follows directory symlinks.
@@ -148,6 +150,7 @@ A plan step targets a profile via the `PlanStep.Agent` field (see [orchestration
 ## Related Specs
 
 - [skills.md](skills.md) — the sibling package whose Manager/Parser design this mirrors
+- [safeio.md](safeio.md) — read hardening behind AGENT.md reads
 - [orchestration/subagents.md](orchestration/subagents.md) — the delegated-execution primitive a profile configures
 - [orchestration/planner.md](orchestration/planner.md) — `PlanStep.Agent` targets a profile
 - [../contracts/llm-providers.md](../contracts/llm-providers.md) — the model-override router contract `NewModelOverrideCaller` relies on

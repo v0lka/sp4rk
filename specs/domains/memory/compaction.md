@@ -48,7 +48,7 @@ Ratios are normalized to sum to `1.0`. For very small step counts (≤ 5), all s
 func NewCompactionStrategy(name string, cfg CompactionConfig, deps CompactionDeps) agent.CompactionStrategy
 ```
 
-Recognized names: `"sliding_window"`, `"summarization"`, `"hierarchical"`; any other name falls back to `SlidingWindowStrategy`. `CompactionConfig` holds fields for all three strategies (only the relevant ones are used); `CompactionDeps` carries the `TokenCounter`, the `Summarize` callback, and `MaxSummarizeTokens` (default `16000`) required by the LLM-based strategies. Zero fields are defaulted: `sliding_window` applies `KeepFirst`→`3` and `KeepLast`→`10` (the unrecognized-name fallback strategy inherits these same defaults, so a zero-valued config always preserves a head and a tail of the step history rather than erasing it); `BlockSize`→`10`, `KeepLast`→`5`, `ObservationTruncate`→`500` for the LLM-based strategies; hierarchical ratios→`0.4/0.3/0.3`.
+Recognized names: `"sliding_window"`, `"summarization"`, `"hierarchical"`; any other name falls back to `SlidingWindowStrategy`. `CompactionConfig` holds fields for all three strategies (only the relevant ones are used); `CompactionDeps` carries the `TokenCounter`, the `Summarize` callback, and `MaxSummarizeTokens` (default `16000`) required by the LLM-based strategies. Zero fields are defaulted: `sliding_window` applies `KeepFirst`→`3` and `KeepLast`→`10` (the unrecognized-name fallback strategy inherits these same defaults, so a zero-valued config always preserves a head and a tail of the step history rather than erasing it); `BlockSize`→`10`, `KeepLast`→`5`, `ObservationTruncate`→`500` for the LLM-based strategies; hierarchical ratios→`0.4/0.3/0.3`. With `deps.Summarize == nil`, the factory falls back to `SlidingWindowStrategy(keepFirst, keepLast)` for both `"summarization"` and `"hierarchical"`. A strategy constructed directly (`NewSummarizationStrategy`/`NewHierarchicalStrategy`) with a nil summarizer fails closed instead: `Compact` keeps the whole history verbatim, warns once, and the window stops shrinking until a summarizer is wired.
 
 ### CompactConversationHistory (manual, message-level)
 
@@ -129,12 +129,12 @@ A step may override pruning config via `PruningOverride{KeepLastN, ProtectedTool
 
 ## Invariants
 
-- Compaction never removes the system prompt or the last message (current LLM turn).
+- Compaction never removes the system prompt or the last message (current LLM turn) for factory-configured strategies (a directly constructed `SlidingWindowStrategy` with `KeepLast` 0 may drop the tail — a configuration its constructor documents as degenerate).
 - Compaction preserves the untrusted-content boundary: after compaction, verbatim tool messages retained in the frozen prefix whose source step was flagged `IsUntrusted` are re-wrapped via `security.WrapUntrustedContent` (`memory.ContextWindow.wrapUntrustedInFrozenPrefix`). The summarization strategy likewise wraps untrusted observations. Untrusted content never re-enters LLM context raw after compaction.
 - Tool-output pruning runs before strategy compaction.
 - Protected tools are never pruned regardless of `KeepLastN`.
 - Mutation runs before pruning; cache-reference placeholders are not overwritten.
-- After compaction, fill percentage is below the warning threshold.
+- `Compact` recomputes fill from the compacted prefix (tracker synced via `Correct`) and returns the before/after percentages; the executor re-evaluates `CheckFill` on the next iteration and can still report `warning`/`emergency`/`reject` — the `reject` gate aborts the run instead of sending an over-limit request.
 
 ## Related Specs
 

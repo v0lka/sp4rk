@@ -8,7 +8,7 @@ The SDK ships a catalog of filesystem, search, web, execution, and agent-infrast
 
 - `github.com/v0lka/sp4rk/tools/builtins` — built-in tool implementations, `file_reader.go` (`ReadFileRange`, streaming O(1)-memory line reader), `limits.go` (per-tool truncation limit types)
 - `github.com/v0lka/sp4rk/tools` (names) — `ToolReadFile`/`ToolWriteFile`/`ToolBashExec`/… name constants mirroring registration names, and `IsShellExecTool` (classifies the shell-executing tools `bash_exec`/`posh_exec`)
-- `github.com/v0lka/sp4rk/tools/builtins` (web search) — `web_search/` provider abstraction (brave, duckduckgo, exa, tavily)
+- `github.com/v0lka/sp4rk/tools/builtins` (web search) — `web_search/` provider abstraction (brave, duckduckgo, exa, searxng, tavily)
 - `github.com/v0lka/sp4rk/tools/builtins` (blackboard-backed) — `read_step_output`, `list_step_outputs`, `read_final_result`, `read_attachment`, `tool_result_read`, `update_checklist`
 - `github.com/v0lka/sp4rk/agent` — `FinishTool`
 - `github.com/v0lka/sp4rk/skills` — `ReadSkillResourceTool`
@@ -20,8 +20,8 @@ The SDK ships a catalog of filesystem, search, web, execution, and agent-infrast
 
 | Tool | Category | Default Policy | Untrusted | Description |
 | ---- | -------- | -------------- | --------- | ----------- |
-| `bash_exec` | Execution | `user_confirm` | yes | Shell command execution with timeout, the host-supplied blocklist (no patterns ship), and the deterministic flowsh criteria C1–C10. |
-| `posh_exec` | Execution | `user_confirm` | yes | Windows PowerShell command execution with timeout, the host-supplied blocklist (no patterns ship), and the deterministic flowsh criteria C1–C10. |
+| `bash_exec` | Execution | `user_confirm` | yes | Shell command execution with timeout, the host-supplied blocklist (no patterns ship), and the deterministic flowsh criteria C1–C10. Compiles only off-Windows (`//go:build !windows`). |
+| `posh_exec` | Execution | `user_confirm` | yes | Windows PowerShell command execution with timeout, the host-supplied blocklist (no patterns ship), and the deterministic flowsh criteria C1–C10. Compiles only on Windows (`//go:build windows`). |
 | `read_file` | File | `always_allow` | yes | Read file contents (streaming, O(1) memory, default 2000-line window). |
 | `write_file` | File | `user_confirm` | no | Create/overwrite a file. |
 | `edit_file` | File | `user_confirm` | no | Apply targeted find-and-replace edits. |
@@ -34,7 +34,7 @@ The SDK ships a catalog of filesystem, search, web, execution, and agent-infrast
 | `semantic_search` | Search | `always_allow` | yes | Vector similarity search (optional; see [../embedding.md](../embedding.md)). |
 | `web_fetch` | Web | `always_allow` | yes | Fetch URL content as markdown. |
 | `web_search` | Web | `always_allow` | yes | Search the web (optional; needs a search-provider config). |
-| `finish` | Agent | internal | no | Signal task/step completion (auto-appended to every run). |
+| `finish` | Agent | `always_allow` | no | Signal task/step completion (auto-appended to every run). |
 | `batch` | Agent | `always_allow` | no | Dispatch multiple tool calls in one turn (intercepted at the executor level). |
 | `read_step_output` | Agent | `always_allow` | no | Read a specific completed step's output (blackboard-backed). |
 | `list_step_outputs` | Agent | `always_allow` | no | List completed step outputs. |
@@ -43,8 +43,10 @@ The SDK ships a catalog of filesystem, search, web, execution, and agent-infrast
 | `update_checklist` | Agent | `always_allow` | no | Update a step/sub-task checklist; validates Markdown checkboxes. |
 | `store_fact` | Agent | `always_allow` | no | Store a keyword-tagged fact to the blackboard. |
 | `search_facts` | Agent | `always_allow` | no | Search blackboard facts by keyword. |
-| `tool_result_read` | Agent | internal | yes | Read cached tool-result fragments by hash (streaming, O(1) memory for file-backed entries). |
+| `tool_result_read` | Agent | `always_allow` | yes | Read cached tool-result fragments by hash (streaming, O(1) memory for file-backed entries). |
 | `read_skill_resource` | Agent | `always_allow` | no | Read a resource file from an activated skill directory (path-traversal safe). |
+
+`finish` and `tool_result_read` are executor-managed meta-tools rather than ordinary host-policy tools: `finish` is auto-registered by the fluent builders, and both are non-cacheable at the executor. Their `DefaultPolicy()` is `PolicyAlwaysAllow`.
 
 `ask_user` is intentionally absent from the SDK. Interactive multi-question prompting requires host UI plumbing, so it lives in the host application; the SDK only supplies the primitives such a tool builds on.
 
@@ -78,13 +80,13 @@ A tool's output is **untrusted** when it may carry adversarial content (web, MCP
 
 ### File tools
 
-File tools resolve paths via context helpers (`WorkspacePathFrom`/`TempDirFrom`). Relative paths are joined with the workspace root and must stay within it; absolute paths are symlink-resolved and returned regardless of containment (containment is a policy concern, not a parse failure). Containment checks consult `SessionRoots(ctx)` — the union of workspace, temp directory, and any additional roots attached via `WithAllowedRoots` — so all roots are equal peers for path-locality auto-approval, judge fast-paths, symlink classification, and shell working-directory validation (`AllPathsInSessionRoots`, `isPathInSessionRoots`, `validateWorkDir`). `read_file` uses `ReadFileRange` for O(1)-memory streaming of line ranges and is file-backed by default in the `ToolResultCache` (zero content bytes stored; fragments streamed from disk on demand); a read wrapper that implements `ContentBackedReader` opts into content-backed caching for transformed views. Binary files (null bytes in the leading window) are detected and rejected.
+File tools resolve paths via context helpers (`WorkspacePathFrom`/`TempDirFrom`). Relative paths are joined with the workspace root and must stay within it; absolute paths are symlink-resolved and returned regardless of containment (containment is a policy concern, not a parse failure). Containment checks consult `SessionRoots(ctx)` — the union of workspace, temp directory, and any additional roots attached via `WithAllowedRoots` — so all roots are equal peers for path-locality auto-approval, judge fast-paths, symlink classification, and shell working-directory validation (`AllPathsInSessionRoots`, `isPathInSessionRoots`, `validateWorkDir`). `read_file` uses `ReadFileRange` for O(1)-memory streaming of line ranges and is file-backed by default in the `ToolResultCache` (zero content bytes stored; fragments streamed from disk on demand); a read wrapper that implements `ContentBackedReader` opts into content-backed caching for transformed views. Binary and document formats (e.g. pdf, docx) are returned as-is, not converted.
 
-**Git-internal guard (mutating tools).** `write_file`, `edit_file`, `delete_file`, `create_directory`, and `delete_directory` share one judge (`judgeWriteInSessionRoots`) that first checks the symlink-resolved target for a ".git" path component at or below the workspace root. A match escalates as a fired security control (`git_internal_path`, hard) **before** the soft containment check: writing the object database, refs, config, or hooks can rewrite history or plant executable code, so the confirmation must never be auto-resolved. Scope is decided by the canonical `tools.IsWithinRoot` containment check (case-folding exactly when locality auto-approval folds), so a case-mismatched spelling of a workspace prefix cannot slip the guard into auto-approval on case-insensitive filesystems; the temp directory and other session roots are outside the guard (their writes are governed by ordinary containment), and regular dotfiles (`.gitignore`, `.github`) are not matched — only the exact ".git" component is.
+**Git-internal guard (mutating tools).** `write_file`, `edit_file`, and `create_directory` share one judge (`judgeWriteInSessionRoots`) that first checks the fully symlink-resolved target for a ".git" path component at or below the workspace root or an additional allowed root; the destructive pair (`delete_file`, `delete_directory`) routes through `judgeWriteInSessionRootsUnresolved`, which judges the path as spelled (only the parent directory is symlink-resolved), mirroring POSIX `rm` link semantics. A match escalates as a fired security control (`git_internal_path`, hard) **before** the soft containment check: writing the object database, refs, config, or hooks can rewrite history or plant executable code, so the confirmation must never be auto-resolved. Scope is decided by the canonical `tools.IsWithinRoot` containment check (case-folding exactly when locality auto-approval folds), so a case-mismatched spelling of a workspace prefix cannot slip the guard into auto-approval on case-insensitive filesystems; the session temp directory is the only exempt root (host-managed scratch — additional allowed roots attached via `WithAllowedRoots` ARE guarded), and regular dotfiles (`.gitignore`, `.github`) are not matched — only the exact ".git" component is.
 
 ### Shell tools (`bash_exec`, `posh_exec`)
 
-Both shell tools share one safety model, evaluated by their `ToolJudger.Judge` before execution. Every escalation carries a typed `tools.JudgeReasonCode` — the machine-checkable classification delivered to the host as `ConfirmationRequest.JudgeReasonCode` — alongside its prose reason and severity (see [Judge reason codes](#judge-reason-codes)):
+The two tools are platform-gated — `bash_exec` compiles only off-Windows (`//go:build !windows`) and `posh_exec` only on Windows (`//go:build windows`). Both shell tools share one safety model, evaluated by their `ToolJudger.Judge` before execution. Every escalation carries a typed `tools.JudgeReasonCode` — the machine-checkable classification delivered to the host as `ConfirmationRequest.JudgeReasonCode` — alongside its prose reason and severity (see [Judge reason codes](#judge-reason-codes)):
 
 1. **Blocklist** — the raw command string is matched against the constructor-supplied regex list (an invalid pattern fails construction). The list is **host policy**: the engine ships no patterns, and the host decides whether it is empty (an empty list is a valid host choice). A match returns `allow=false` with the blocklist reason (`command_blacklist`, hard), which **takes precedence** over every criterion.
 2. **Flowsh criteria C1–C10** — the host pre-computes the deterministic analysis once per call (`tools.AnalyzeShellCommandForJudge`) and attaches it to the context (`tools.WithShellAnalysis`); the Judge returns the winning criterion's outcome verbatim via `tools.ShellJudgeOutcome` — hard canonical C1–C5, hard non-canonical C6/C7/C10, soft C8/C9. The Judge never runs the analysis engine itself. When no analysis is attached, the Judge returns an empty outcome and defers to the LLM judges; when the attached one carries an **error** (a failed analyzer/KB load — sticky), it **fails closed** with the hard canonical `command_analysis_unavailable` reason.
@@ -124,6 +126,7 @@ Every built-in `ToolJudger` escalation classifies its reason with a typed `tools
 | `unresolvable_path_token` | hard | retained for contract stability — no built-in judge fires it since the static unresolvable-token stage was removed (flowsh C6 supersedes it) |
 | `symlink_suspicious` | — | retained for contract stability — no built-in path fires it since the expansion-suspicion checks were removed from the symlink walk (decision 006); was host-set alongside `symlink_escape` |
 | `outside_session_roots` | soft | `bash_exec`, `posh_exec` (flowsh C9: direct FS effect outside the session roots — writes/metadata on a non-system path, and reads even of a system path), file tools — a fully assessed path resolved outside the session roots |
+| `command_exec_outside_roots` | hard | `bash_exec`, `posh_exec` — flowsh C10: a direct code-execution/process-spawn effect whose path-shaped target resolves outside every session root; **non-canonical** — a judgment shape a strict judge may clear |
 | `unassessable_path` | hard | file tools — the target path could not be determined at all |
 | `git_internal_path` | hard | file tools — the mutating target contains a ".git" path component at or below the workspace root (repository object database, refs, config, hooks; nested repos and worktrees included) |
 | `unassessable_url` | hard | `web_fetch` — the target URL could not be determined at all |
@@ -147,7 +150,7 @@ The DuckDuckGo provider is a best-effort HTML scraper (no official API): it POST
 
 ### Glob walk bounds and symlinks
 
-A single `glob` walk is bounded so a filesystem runaway (a symlink loop or an enormous directory tree) can neither hang the tool nor exhaust memory. Three limits (`builtins.GlobLimits`) apply: `MaxResults` caps the matching paths collected, `MaxEntries` caps the filesystem entries visited, and `Timeout` caps the wall-clock duration. `NewGlobToolWithLimits` replaces a **completely zero** `GlobLimits` with `DefaultGlobLimits()` (500 000 entries / 10 000 results / 30 s), so a zero-value struct (e.g. from an unpopulated config) cannot register an unbounded walk — the protection is a property of the tool. An individual zero field on an otherwise-populated struct is honored as "disabled" (the documented config contract: `0` = no entry budget / unlimited results / no timeout), which is why the fallback is all-or-nothing rather than per-field.
+A single `glob` walk is bounded so a filesystem runaway (a symlink loop or an enormous directory tree) can neither hang the tool nor exhaust memory. Three limits (`builtins.GlobLimits`) apply: `MaxResults` caps the matching paths collected, `MaxEntries` caps the filesystem entries visited, and `Timeout` caps the wall-clock duration. `NewGlobToolWithLimits` replaces a **completely zero** `GlobLimits` with `DefaultGlobLimits()` (500 000 entries / 10 000 results / 30 s), so a zero-value struct (e.g. from an unpopulated config) cannot register an unbounded walk — the protection is a property of the tool. An individual zero field on an otherwise-populated struct is honored as "disabled" (the documented config contract: `0` = no entry budget / unlimited results / no timeout), which is why the fallback is all-or-nothing rather than per-field. Hosts that can distinguish a deliberately all-zero `GlobLimits` from an unpopulated one register via `NewGlobToolWithLimitsOverride`, which stores the values verbatim — all-zero means every bound disabled.
 
 The walk runs with `doublestar.WithNoFollow()`, so **symlinked directories are not traversed**: a self-referential or escaping symlink is never followed, which closes the classic symlink-loop hang. The behaviour is documented to the model in the tool description, because it is a deliberate trade-off — a workspace that relies on symlinked directories (shared/monorepo layouts, linked sub-projects) will not see matches under them. A symlink reference inside the *literal prefix* of the pattern (e.g. `path/to/symlink/*`) is still followed; only traversal of symlinked directories encountered during the walk is suppressed.
 
@@ -187,16 +190,18 @@ To add a new built-in tool:
 
 1. Define a struct embedding `*tools.BaseTool`.
 2. In the constructor, set `ToolName`, `ToolDescription`, `Schema` (JSON Schema), and `Policy` (`PolicyAlwaysAllow` / `PolicyUserConfirm`).
-3. Implement `Execute(ctx, input)` — use `ParseInputError` for JSON parse failures and `ErrorResult` for logical errors.
-4. Set `Untrusted: true` if the tool returns external data (web, MCP, filesystem reads of external content).
-5. Optionally implement `ToolJudger` for tool-specific safety escalation on `PolicyAlwaysAllow` tools; classify each denied branch with a `tools.JudgeReasonCode` (reuse a published code where the semantics match, add a new one otherwise).
-6. For a read tool that returns a transformed/decoded view of a file (not raw bytes), implement `tools.ContentBackedReader` (`IsContentBacked`) so the executor caches the result in memory while keeping file coherence metadata; leave it unimplemented to keep the default file-backed behavior.
-7. Register the tool in the `ToolRegistry` alongside the `finish` tool.
+3. Set `ToolGroup` on the embedded `BaseTool` to a declared `tools.ToolGroup` value — an undeclared (zero) group matches no group allow-list, leaving the tool invisible to group-scoped consumers (fail-closed).
+4. Implement `Execute(ctx, input)` — use `ParseInputError` for JSON parse failures and `ErrorResult` for logical errors.
+5. Set `Untrusted: true` if the tool returns external data (web, MCP, filesystem reads of external content).
+6. Optionally implement `ToolJudger` for tool-specific safety escalation on `PolicyAlwaysAllow` tools; classify each denied branch with a `tools.JudgeReasonCode` (reuse a published code where the semantics match, add a new one otherwise).
+7. For a read tool that returns a transformed/decoded view of a file (not raw bytes), implement `tools.ContentBackedReader` (`IsContentBacked`) so the executor caches the result in memory while keeping file coherence metadata; leave it unimplemented to keep the default file-backed behavior.
+8. Register the tool in the `ToolRegistry` alongside the `finish` tool.
 
 ## Related Specs
 
 - [README.md](README.md) — tool system overview and execution pipeline
 - [mcp-gateway.md](mcp-gateway.md) — dynamic MCP tool discovery
+- [websearch.md](websearch.md) — `web_search` provider abstraction
 - [../../contracts/tools.md](../../contracts/tools.md) — `Tool`/`BaseTool`/`ToolJudger`/`IgnoreChecker` interfaces and the host-to-registry data flow
 - [../orchestration/executor.md](../orchestration/executor.md) — `batch` interception, two-stage truncation, `ToolResultCache`
 - [../memory/blackboard.md](../memory/blackboard.md) — store adapters backing the blackboard tools

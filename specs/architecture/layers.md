@@ -8,50 +8,53 @@ sp4rk is a reusable agent-execution engine. It is organized as a single Go modul
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│  github.com/v0lka/sp4rk   (root)                                      │
-│    Framework, Config, Execute, NewConductor, RunF                     │
-│    Entry point; owns shared infrastructure (LLM router, tool          │
-│    registry, MCP gateway, tool cache); creates per-task conductors    │
+│  github.com/v0lka/sp4rk   (root)                                     │
+│    Framework, Config, Execute, NewConductor, RunF/TaskF              │
+│    Entry point; owns shared infrastructure (LLM router, tool         │
+│    registry, MCP gateway, tool cache); creates per-task conductors   │
 └──────────────────────────────────┬───────────────────────────────────┘
                                    │ Go imports
                                    ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│  orchestration   orchestration.Conductor, Blackboard, DAG,            │
-│                   Checkpointer                                        │
-│  planner         planner.Planner (Plan/Replan)                        │
-│  agent/reflector agent/reflector.Reflector (failure analysis)         │
-│  agent/router    agent/router.Router (request classification)         │
+│  orchestration   orchestration.Conductor, Blackboard, DAG,           │
+│                   Checkpointer                                       │
+│  planner         planner.Planner (Plan/Replan)                       │
+│  agent/reflector agent/reflector.Reflector (failure analysis)        │
+│  agent/router    agent/router.Router (request classification)        │
 └──────────────────────────────────┬───────────────────────────────────┘
                                    │ Go imports
                                    ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│  agent           Executor (ReAct loop), RunSubAgent, FinishTool,      │
-│                   Events, HITLHandler, ToolResultCache                │
+│  agent           Executor (ReAct loop), RunSubAgent, FinishTool,     │
+│                   Events, HITLHandler, ToolResultCache               │
 └──────────────────────────────────┬───────────────────────────────────┘
                                    │ Go imports
                                    ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│  llm             Router, providers (OpenAI, Anthropic, Responses API),│
-│                   ModelRegistry, token counting                       │
-│  tools           ToolRegistry, Tool/ToolJudger interfaces, judge,     │
-│                   symlink gate, param manager                          │
-│  tools/builtins  file/shell/search built-in tools                     │
-│  tools/mcp       MCP gateway and dynamic tools                        │
+│  llm             Router, providers (OpenAI Chat Completions,         │
+│                   OpenAI Responses API, Anthropic Messages, Google   │
+│                   GenerateContent), ModelRegistry, token counting    │
+│  tools           ToolRegistry, Tool/ToolJudger interfaces, judge,    │
+│                   symlink gate, pre-dispatch input validation        │
+│  tools/builtins  file/shell/search built-ins + websearch             │
+│  tools/mcp       MCP gateway and dynamic tools                       │
 └──────────────────────────────────┬───────────────────────────────────┘
                                    │ consumed across layers
                                    ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│  memory   ContextWindow, compaction strategies (sliding/summary/      │
-│           hierarchical), Steps                                       │
-│  prompt   PromptBuilder, sampling helpers                            │
+│  memory   ContextWindow, compaction strategies (sliding/summary/     │
+│           hierarchical), step history (SeedSteps)                    │
+│  prompt   Builder, SystemPromptBuilder                               │
 │  skills   SkillManager, parser, resource tool                        │
 │  agents   AgentManager, AGENT.md parser (Subagent Profiles)          │
 │  security untrusted-content wrapping (prompt-injection defense)      │
 │  embedding Embedder, chunker, ONNX runtime, tokenizer                │
 │  pathutil pure path algorithmic primitives                           │
 │  strutil  pure string utilities                                      │
-│  sysproc  child-process console-window suppression (Windows)         │
+│  sysproc  HideConsole, KillTree, process groups, Job Objects         │
 │  ignore   multi-root .gitignore/.aiignore resolver                   │
+│  oneshot  one-shot structured-output LLM client (over llm)           │
+│  safeio   safe file read/write primitives (over pathutil)            │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -60,29 +63,31 @@ sp4rk is a reusable agent-execution engine. It is organized as a single Go modul
 | Package                    | May Import                                                                                  | Must NOT Import                          |
 | -------------------------- | ------------------------------------------------------------------------------------------- | ---------------------------------------- |
 | root `sp4rk`               | `agent`, `agent/reflector`, `llm`, `memory`, `orchestration`, `planner`, `tools`, `tools/builtins`, `tools/mcp`, `skills`, `agents`, `embedding`, `prompt`, `security` | External libs only (no upward cycle)     |
-| `orchestration`            | `agent`, `llm`, `tools`, `skills`                                                           | `planner`, root, `backend`-equivalents   |
-| `planner`                  | `agent`, `llm`, `orchestration`, `prompt`, `skills`, `tools`                                | root                                     |
-| `agent`                    | `llm`, `tools`                                                                              | `orchestration`, `planner`, root         |
-| `agent/reflector`          | `agent`, `llm`, `orchestration`, `prompt`, `tools`                                          | `planner`, root                          |
-| `agent/router`             | `agent`, `llm`, `prompt`, `tools`                                                           | `orchestration`, `planner`, root         |
-| `memory`                   | `agent`, `llm`, `prompt`, `security`, `strutil`                                             | `tools`, `orchestration`, root           |
-| `llm`                      | External libs only                                                                          | Any engine package                       |
-| `tools`                    | `llm`, `pathutil`, `strutil`, `sysproc`, `tools/internal/judge_prompts`                      | `agent`, `memory`, `orchestration`, root |
-| `tools/builtins` | `tools`, `agent`, `pathutil`, `sysproc` | `orchestration`, `planner`, root (intentional `agent` edge — see note) |
+| `orchestration`            | `agent`, `llm`, `safeio`, `skills`, `strutil`, `tools` | `planner`, root, `backend`-equivalents   |
+| `planner`                  | `agent`, `llm`, `oneshot`, `orchestration`, `prompt`, `skills`, `strutil`, `tools` | root                                     |
+| `agent`                    | `llm`, `strutil`, `tools` | `orchestration`, `planner`, root         |
+| `agent/reflector`          | `agent`, `llm`, `oneshot`, `orchestration`, `prompt`, `security`, `tools` | `planner`, root                          |
+| `agent/router`             | `agent`, `llm`, `oneshot`, `prompt`, `tools` | `orchestration`, `planner`, root         |
+| `memory`                   | `agent`, `llm`, `prompt`, `security`, `strutil` | `tools`, `orchestration`, root           |
+| `llm`                      | External libs + `strutil` (pure utility) | `agent`, `memory`, `orchestration`, `planner`, root, `tools` |
+| `tools`                    | `llm`, `oneshot`, `pathutil`, `security`, `strutil`, `sysproc`, `tools/internal/judge_prompts` | `agent`, `memory`, `orchestration`, root |
+| `tools/builtins` | `tools`, `agent`, `pathutil`, `sysproc`, `safeio` | `orchestration`, `planner`, root (intentional `agent` edge — see note) |
+| `tools/builtins/websearch` | `tools`, `tools/builtins` | `agent`, `orchestration`, `planner`, root |
 | `tools/mcp`      | `tools` (and through it, `llm`, `pathutil`), `sysproc`                                  | siblings via the agent/orchestration layer |
-| `prompt`, `skills`, `agents`, `security`, `embedding`, `pathutil`, `strutil`, `sysproc`, `ignore` | leaves / near-leaves only                                       | `tools`, `agent`, `orchestration`, root  |
+| `skills` | `tools`, `pathutil`, `safeio` | `agent`, `orchestration`, root |
+| `prompt`, `agents`, `security`, `embedding`, `oneshot`, `safeio`, `pathutil`, `strutil`, `sysproc`, `ignore` | leaves / near-leaves only (see graph) | `tools`, `agent`, `orchestration`, root  |
 
 > **Module boundary.** sp4rk is a standalone Go module. It cannot import any host-application package — an embedding application imports sp4rk, never the reverse. The import prohibitions on upward engine layers are enforced both by convention and by the import cycles they would otherwise create.
 
-> **Leaf discipline.** `llm` and `tools` are intentionally near-leaf dependencies. They depend on each other (`tools` → `llm`) and on pure utilities only. Keeping them free of orchestration concerns is what lets the `Executor` consume them through small interfaces without dragging in the whole engine.
+> **Leaf discipline.** `llm` and `tools` are intentionally near-leaf dependencies. They depend on each other (`tools` → `llm`), on pure utilities, and on the `oneshot`/`security` leaves. Keeping them free of orchestration concerns is what lets the `Executor` consume them through small interfaces without dragging in the whole engine.
 
-> **Intentional upward edge.** `tools/builtins` imports `agent` (in addition to `tools` and `pathutil`) because its meta-tool builtins — facts, checklist, workspace, and tool-result-read — need agent context types. This is an intentional upward dependency, not a layering mistake: no import cycle arises because core `tools` does not import `tools/builtins` (and `agent` does not import `tools/builtins` either).
+> **Intentional upward edge.** `tools/builtins` imports `agent` (in addition to `tools` and `pathutil`) because its meta-tool builtins — facts, checklist, workspace, tool-result-read, and attachments — need agent context types. This is an intentional upward dependency, not a layering mistake: no import cycle arises because core `tools` does not import `tools/builtins` (and `agent` does not import `tools/builtins` either).
 
 ## Layer Responsibilities
 
 ### Root — Entry Point & Shared Infrastructure
 
-The root package (`github.com/v0lka/sp4rk`) owns the `Framework`: a container that constructs and reuses shared infrastructure (the `llm.Router`, the `tools.ToolRegistry`, the MCP gateway, the tool-result cache) and produces per-task conductors. `Framework.Execute` is the convenience path that spins up a `Conductor` and a `MapBlackboard` for one task; `Framework.NewConductor` builds a reusable conductor for repeated use. `Config` is the single point where a host application wires its callbacks (events emitter, confirm function, HITL handler, model selection). `RunF` provides a lower-level run helper.
+The root package (`github.com/v0lka/sp4rk`) owns the `Framework`: a container that constructs and reuses shared infrastructure (the `llm.Router`, the `tools.ToolRegistry`, the MCP gateway, the tool-result cache) and produces per-task conductors. `Framework.Execute` is the convenience path that spins up a `Conductor` and a per-task blackboard (a `CheckpointedBlackboard` when a `Checkpointer` is configured, else a `MapBlackboard`); `Framework.NewConductor` builds a reusable conductor for repeated use. `Config` is the single point where a host application wires its callbacks (events emitter, confirm function, HITL handler, model selection). `RunF` is the fluent counterpart of `Framework.Execute` — a single ReAct loop configured declaratively through `RunBuilder` — and `TaskF`/`TaskBuilder` drive the Plan&Execute pipeline.
 
 ### Orchestration Layer
 
@@ -99,22 +104,24 @@ Coordinates multi-step tasks across the engine.
 
 ### Primitives Layer
 
-**`llm`** — provider abstraction. The `Router` routes a `ChatRequest` to the active provider/model under a `sync.RLMutex`. Providers implement OpenAI Chat Completions, OpenAI Responses API, and Anthropic Messages. `ModelRegistry` catalogs models with metadata; `tokencount` estimates usage; `reasoning` handles chain-of-thought extraction.
+**`llm`** — provider abstraction. The `Router` routes a `ChatRequest` to the active provider/model under a `sync.RWMutex`. Providers implement OpenAI Chat Completions, OpenAI Responses API, Anthropic Messages, and Google GenerateContent. `ModelRegistry` catalogs models with metadata; `tokencount` estimates usage; `reasoning` handles chain-of-thought extraction.
 
-**`tools`** — the `ToolRegistry` holds and executes tools. Defines the `Tool` interface, the `ToolPolicy` enum, the optional `ToolJudger` interface, `ConfirmFunc`/`ConfirmationRequest`/`ConfirmationResponse` for confirmation flow, the `ToolJudge` (LLM-backed advisory safety evaluation), the symlink gate, and the param manager. `tools/builtins` ships file, shell (`bash_exec`), search (`ripgrep`, `glob`), web, and agent-infrastructure tools. `tools/mcp` proxies external MCP servers and exposes their tools dynamically.
+**`tools`** — the `ToolRegistry` holds and executes tools. Defines the `Tool` interface, the `ToolPolicy` enum, the optional `ToolJudger` interface, `ConfirmFunc`/`ConfirmationRequest`/`ConfirmationResponse` for confirmation flow, the `ToolJudge` (LLM-backed advisory safety evaluation), the symlink gate, and pre-dispatch input validation. `tools/builtins` ships file, shell (`bash_exec`), search (`ripgrep`, `glob`), web, and agent-infrastructure tools. `tools/mcp` proxies external MCP servers and exposes their tools dynamically.
 
 ### Supporting Packages
 
 - **`memory`** — `ContextWindow` manages the LLM context window (`BuildPrompt`, `AddStep`, `Compact`, `CheckFill`). Compaction strategies: sliding window, summarization, hierarchical. Applies the `<untrusted-content>` wrapping at prompt-build time when `InjectionDefenseEnabled` is set.
-- **`prompt`** — `PromptBuilder` composes system prompts from segments; `sampling` helpers. No engine-internal imports.
-- **`skills`** — `SkillManager` scans and activates skills; the resource tool reads skill files. Imports `pathutil` and `tools` only.
-- **`agents`** — `AgentManager` discovers and parses **Subagent Profiles** (`AGENT.md` files declaring specialized subagent personas and tool budgets). Mirrors the `skills` Manager/Parser design but is fully self-contained: imports only the Go standard library plus `gopkg.in/yaml.v3` and `log/slog` (no engine packages). A profile's body is the core directive applied when a subagent is launched under it; `PlanStep.Agent` targets a profile by name, resolved by the execution layer.
+- **`prompt`** — `Builder` and `SystemPromptBuilder` compose system prompts from segments; sampling helpers. No engine-internal imports.
+- **`skills`** — `SkillManager` scans and activates skills; the resource tool reads skill files. Imports `tools`, `pathutil`, and `safeio` only.
+- **`agents`** — `AgentManager` discovers and parses **Subagent Profiles** (`AGENT.md` files declaring specialized subagent personas and tool budgets). Mirrors the `skills` Manager/Parser design but is self-contained: the Go standard library plus `gopkg.in/yaml.v3`, `log/slog`, and the engine's own `safeio` file-read primitive — no coupling to `tools`/`agent`/`orchestration`. A profile's body is the core directive applied when a subagent is launched under it; `PlanStep.Agent` targets a profile by name, resolved by the execution layer.
 - **`security`** — prompt-injection defense primitives: `UntrustedTag`, `WrapUntrustedContent`, `StripUntrustedTags`.
 - **`embedding`** — `Embedder` over ONNX Runtime; `chunker` for text segmentation; tokenizer. Thread-safe. Inference runs on the CPU execution provider by default, or on a GPU via the CUDA or OpenVINO execution provider (`ExecutionProvider` = `cpu`/`cuda`/`openvino`/`auto`; the last walks the ladder CUDA → OpenVINO and only then falls back to the CPU with a WARN); GPU paths funnel every ONNX call through one locked OS thread, and bounded `nvidia-smi` probes (`GPUInUse`, `ListGPUDevices`) provide driver-side GPU diagnostics.
 - **`pathutil`** — pure path algorithmic primitives (containment checks, component splitting, prefix resolution). Zero engine-specific knowledge; usable from any layer.
 - **`strutil`** — pure string utilities.
-- **`sysproc`** — child-process console-window suppression (`HideConsole`) and process-tree containment (`AssignKillOnCloseJob`) for the SDK's spawned helper processes. On Windows `HideConsole` OR-edits `CREATE_NO_WINDOW` (0x08000000) into the child's `SysProcAttr.CreationFlags`, preventing a console window from flashing or staying open when a GUI-subsystem host spawns `posh_exec`/`ripgrep`, version probes (`envinfo`), the embedding package's `nvidia-smi` probes, or stdio MCP servers; on other platforms it is a no-op so callers apply it unconditionally without their own build tags. `AssignKillOnCloseJob` places a started process — and its descendant tree — into a kill-on-close Windows Job Object so that orphaned grandchildren (e.g. a browser and its console window launched by `posh_exec`'s PowerShell) cannot outlive the host; it requires Windows 8+ and is the complement to `HideConsole` (hide the window AND guarantee cleanup). `HideConsole` imports only the Go standard library (`os/exec`, `syscall` under the `windows` build tag); `AssignKillOnCloseJob` additionally requires `golang.org/x/sys/windows`, confined to a `//go:build windows` file.
-- **`ignore`** — multi-root `.gitignore`/`.aiignore` resolver. `Resolver` (single root) and `Multi` (multi-root) walk a root once, collecting ignore files from the root and every nested directory, and answer whether an absolute path is ignored. Each compiled pattern records its source ignore file (`.gitignore` or `.aiignore`), so `IgnoredByAIIgnore` — on both `Resolver` and `Multi` — reports verdicts sourced exclusively from `.aiignore` rules, excluding `.gitignore` rules. This serves a caller that already obtains a `.gitignore` verdict from git itself, which honours negation and the global gitignore the resolver does not: layering only `.aiignore` rules on top preserves git's un-ignore semantics (an OR-merge). `IgnoredByAIIgnore` is a separate capability, not part of the `IgnoreChecker` interface. Both `Resolver` and `Multi` satisfy `IgnoreChecker`, which the `tools` package defines itself (so `tools` never imports `ignore`); the host wires `ignore.Multi` into tool context via `tools.WithIgnoreChecker`, and `glob`/`ripgrep` consult it. `NewMulti` builds a `Multi` from roots and fails the whole workspace on any load error; `NewMultiFromResolvers` wraps pre-built resolvers without re-walking, for per-root error handling (skip a vanished or unreadable root instead of failing), and references the input slice without copying. `load()` prunes any ignored directory, so a nested `.aiignore` beneath a directory ignored only by `.gitignore` is never collected — a safe false negative for the OR-merge consumer, since git covers those paths. Negation patterns are unsupported (silently skipped). Imports `pathutil` and an external glob library only.
+- **`sysproc`** — child-process console-window suppression (`HideConsole`) and process-tree containment (`AssignKillOnCloseJob`) for the SDK's spawned helper processes. On Windows `HideConsole` OR-edits `CREATE_NO_WINDOW` (0x08000000) into the child's `SysProcAttr.CreationFlags`, preventing a console window from flashing or staying open when a GUI-subsystem host spawns `posh_exec`/`ripgrep`, version probes (`envinfo`), the embedding package's `nvidia-smi` probes, or stdio MCP servers; on other platforms it is a no-op so callers apply it unconditionally without their own build tags. `AssignKillOnCloseJob` places a started process — and its descendant tree — into a kill-on-close Windows Job Object so that orphaned grandchildren (e.g. a browser and its console window launched by `posh_exec`'s PowerShell) cannot outlive the host; it requires Windows 8+ and is the complement to `HideConsole` (hide the window AND guarantee cleanup). On Unix-likes, `SetProcessGroup` (places a spawned child in its own process group at creation; no-op on Windows) plus `KillTree` (force-kills the child and its whole process group — the last-resort reaper for a child that ignores graceful shutdown) provide the analogous containment; `tools/mcp` applies both to stdio MCP server children so a launcher (`npx`, `pnpm dlx`, …) and the server it spawns die together. `HideConsole` imports only the Go standard library (`os/exec`, `syscall` under the `windows` build tag); `AssignKillOnCloseJob` additionally requires `golang.org/x/sys/windows`, confined to a `//go:build windows` file.
+- **`ignore`** — multi-root `.gitignore`/`.aiignore` resolver. `Resolver` (single root) and `Multi` (multi-root) walk a root once, collecting ignore files from the root and every nested directory, and answer whether an absolute path is ignored. Each compiled pattern records its source ignore file (`.gitignore` or `.aiignore`), so `IgnoredByAIIgnore` — on both `Resolver` and `Multi` — reports verdicts sourced exclusively from `.aiignore` rules, excluding `.gitignore` rules. This serves a caller that already obtains a `.gitignore` verdict from git itself, which honours negation and the global gitignore the resolver does not: layering only `.aiignore` rules on top preserves git's un-ignore semantics (an OR-merge). `IgnoredByAIIgnore` is a separate capability, not part of the `IgnoreChecker` interface. Both `Resolver` and `Multi` satisfy `IgnoreChecker`, which the `tools` package defines itself (so `tools` never imports `ignore`); the host wires `ignore.Multi` into tool context via `tools.WithIgnoreChecker`, and `glob`/`ripgrep` consult it. `NewMulti` builds a `Multi` from roots and fails the whole workspace on any load error; `NewMultiFromResolvers` wraps pre-built resolvers without re-walking, for per-root error handling (skip a vanished or unreadable root instead of failing), and references the input slice without copying. `load()` prunes any ignored directory, so a nested `.aiignore` beneath a directory ignored only by `.gitignore` is never collected — a safe false negative for the OR-merge consumer, since git covers those paths. Negation patterns are unsupported (silently skipped). Imports `pathutil`, `safeio`, and an external glob library only.
+- **`oneshot`** — the engine's single client for one-shot, structured-output LLM calls: send a request, parse the response into a typed value, and when the response is unparseable re-ask the model with a corrective nudge (exactly two nudges; the third consecutive failure is a final refusal resolved by `Options.OnFailure`). Imports only `llm` and the standard library, so any layer can use it. See [oneshot.md](../domains/oneshot.md).
+- **`safeio`** — hardened, non-blocking filesystem opens and safe writes: a path is opened only after (or while) confirming it is a regular file, so a FIFO, socket, or device planted at an open path can never block the caller. Builds on `pathutil`. See [safeio.md](../domains/safeio.md).
 
 ## Key Boundary Packages
 

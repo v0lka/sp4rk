@@ -55,25 +55,27 @@ The goroutine respects context cancellation. Because the executor's LLM calls an
 
 ```go
 type SubAgentResult struct {
-    StepID string
-    Output string
-    Error  error
-    Steps  []Step
+    StepID  string
+    Output  string
+    Error   error
+    Steps   []Step
+    Summary string // model's final text on stop-tool termination (mirrors ExecutorResult.Summary)
 }
 ```
 
 A subagent is **successful** only when `executor.Run` returns no error *and* `result.Finished == true`. Two failure cases produce an `Error`:
 
 - **Executor error** — the LLM call or a tool returned a fatal error, or the context was cancelled. `Steps` is populated from the partial result when available.
-- **Did not finish** — the step budget was exhausted or a circuit breaker aborted. The executor's `Output` (carrying the specific abort reason, e.g. "circuit breaker", "fruitless abort", "max steps") is wrapped into the error message.
+- **Did not finish** — the step budget was exhausted or a circuit breaker aborted. The failure reason prefers the executor's structured `AbortReason`, then falls back to `Output` (a short `Aborted: …` message for the circuit-breaker / fruitless / max-steps branches), then to the generic `step execution did not complete within max steps` — a mutation-gate prose answer is never surfaced as the failure cause.
 
 ### RunSubAgentsParallel
 
 ```go
-func RunSubAgentsParallel(ctx context.Context, agents []SubAgentTask) []SubAgentResult
+func RunSubAgentsParallel(ctx context.Context, agents []SubAgentTask,
+    opts ...RunSubAgentsParallelOption) []SubAgentResult
 ```
 
-Runs multiple `SubAgentTask`s concurrently and collects all results. Results are collected in **input order** (not completion order); a slow agent blocks subsequent results from being returned. Blocks until all subagents have reported. Returns `nil` for an empty slice. For finer control (streaming results, concurrency limits) launch subagents individually and select on their channels.
+Runs multiple `SubAgentTask`s concurrently and collects all results. Results are collected in **input order** (not completion order); a slow agent blocks subsequent results from being returned. Blocks until all subagents have reported. Returns `nil` for an empty slice. By default every subagent launches at once (unbounded fan-out). `WithMaxParallelSubagents(n)` caps how many run concurrently within a single invocation: subagents beyond the cap are queued and started as running slots free up, while the result set and its input order stay unchanged (`n <= 0` keeps the unbounded default). The cap is per-invocation, not process-wide — a host firing several `RunSubAgentsParallel` calls (or nesting a delegation) enforces any global limit itself. For streaming results as they arrive, launch subagents individually and select on their channels.
 
 ### Defense-in-depth
 
@@ -110,6 +112,7 @@ Profile application is an execution-layer concern: `RunSubAgent`/`RunSubAgentsPa
 - **Executor fatal error**: `Error` is set; `Steps` carries the partial trajectory when available.
 - **Budget exhausted / circuit-breaker abort**: `Finished == false`; the abort reason is wrapped into `Error`.
 - **Context cancelled** (parent cancellation or explicit cancel): the goroutine returns promptly; `Error` reflects the cancellation.
+- **Subagent panic**: contained by the launch goroutine's `recover`, logged with the stack, emitted as `SubAgentComplete(stepID, false, duration, panicMsg)`, and delivered as an `Error` result — the step fails in isolation and execution continues.
 
 ## Invariants
 

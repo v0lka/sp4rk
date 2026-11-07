@@ -48,19 +48,19 @@ The placeholder system substitutes keys iteratively (up to a pass cap) so nested
 
 ### AgentProfile
 
-`AgentProfile` is the step-level configuration carried in `PlanStep.Profile` (typed as `any` on the plan, deserialized by consumers). It selects a system-prompt variant, pruning defaults, allowed tools, and reasoning behavior per step (e.g. `coder`, `researcher`, `tester`, `executor`).
+`AgentProfile` is the step-level configuration carried in `PlanStep.Profile` (typed as `any` on the plan). Its fields are `Role`, `SystemPrompt`, `AllowedTools`, `Skills`, `MaxSteps`, `Domain`, `KeepLastN`, and `ProtectedTools` — it selects a system-prompt variant, pruning defaults, allowed tools, and per-step budgets (e.g. `coder`, `researcher`, `tester`, `executor`); there is no reasoning field (reasoning/model overrides belong to the separate `PlanStep.Agent` Subagent-Profile path). During parsing, step profiles are converted to `*planner.AgentProfile`, with unknown skill names dropped (a profile naming a skill outside the task's pool loses it).
 
 `PlanStep.Agent` (`json:"agent,omitempty"`) optionally names a **Subagent Profile** (an `AGENT.md`-declared persona — see [../agents.md](../agents.md)) that should execute this step. When non-empty, the step runs with that profile's system prompt, tools, max-steps, and model instead of the generic orchestrator defaults. The name is resolved by the execution layer (e.g. the Conductor's agent resolver). `Agent` and `Profile` are independent: `Agent` targets a named, externally-declared profile by directory name, while `Profile` carries inline step-level configuration on the plan object itself. `Agent` round-trips through JSON so a declared plan survives blackboard persistence and task continuation (the blackboard's plan deep-copy propagates it).
 
 ### Methods
 
 - **`Plan(ctx, task, availableTools, reflections, availableSkills, singleStep, conversationHistory)`** — generate a DAG for a new task. Sets `Plan.ExplorationContext` to a summary of any exploration performed.
-- **`Replan(ctx, originalPlan, completed, failedStep, reflection, sessionReflections, availableSkills)`** — regenerate the plan after a step failure, preserving successfully completed work where possible (see `orchestration.BuildCarryForward`).
-- **`PlanContinuation(ctx, originalRequest, existingPlan, completedSteps, newMessage, …, taskComplete)`** — produce a continuation plan for a follow-up message that reuses completed steps.
+- **`Replan(ctx, originalPlan, completed, failedStep, reflection, sessionReflections, availableSkills)`** — regenerate the plan after a step failure. The replan prompt presents the original plan, the completed steps, the failed step, and the reflections; preservation of completed work is applied afterwards by the execution layer via `orchestration.BuildCarryForward` (see [../memory/blackboard.md](../memory/blackboard.md)).
+- **`PlanContinuation(ctx, originalRequest, existingPlan, completedSteps, newMessage, …, taskComplete)`** — produce a continuation plan for a follow-up message that reuses completed steps. A continuation step's `depends_on` may reference steps of the new plan or completed steps of the previous plan; DAG validation runs against the union of the new plan's IDs and the prior plan's IDs (`knownPriorIDs`). The prompt injects the prior plan's terminal step IDs via the `TERMINAL-STEPS` slot.
 
 ### Exploration vs direct planning
 
-Direct planning is used when `domain == general` with `complexity < 4`, or when `PlannerToolNames` is empty (no exploration tools configured). Otherwise exploration runs — for `code`, `research`, and `mixed` domains, and for `general` with `complexity >= 4`, whenever planner tools exist. Exploration itself falls back to direct planning when `ContextFactory` is nil. The exploration executor is a normal `agent.Executor` limited to the read-only `PlannerToolNames`; its findings seed the plan's `ExplorationContext`.
+Direct planning is used when `domain == general` with `complexity < 4`, or when `PlannerToolNames` is empty (no exploration tools configured). Otherwise exploration runs — for `code`, `research`, and `mixed` domains, and for `general` with `complexity >= 4`, whenever planner tools exist. Exploration falls back to direct planning when: `ContextFactory` is nil; the exploration executor fails with a non-context error (a cancelled context is returned as the error instead); the exploration output is empty; or the exploration output fails to parse as a plan. The exploration executor is a normal `agent.Executor` limited to the read-only `PlannerToolNames`; its findings seed the plan's `ExplorationContext`. Every plan path (direct, exploration, continuation) truncates to a single step when `singleStep` is set and the model returned multiple.
 
 ### Single-step vs multi-step mode
 
@@ -69,8 +69,8 @@ Direct planning is used when `domain == general` with `complexity < 4`, or when 
 ## Error Handling
 
 - **`NewPlanner` with a nil caller**: returns an error (caller is required).
-- **LLM call failure**: `Plan`/`Replan`/`PlanContinuation` return an error; the orchestrator may retry or surface the failure. Transport errors are never retried here — provider-level retry is the Router's.
-- **Unparseable plan JSON**: retried by the one-shot client (see [../oneshot.md](../oneshot.md)) with corrective nudges — exactly two, each pairing an assistant echo of the failed output with a `[System]` user message whose hint comes from `RetryHintFn`: invalid JSON / DAG-validation failures get the schema-restating feedback, zero-step plans get the "at least one step" feedback, both quoting the underlying error verbatim. After the two nudges the final refusal returns the parse error.
+- **LLM call failure**: `Plan`/`Replan`/`PlanContinuation` return an error; the orchestrator may retry or surface the failure. Transport errors are never retried here — transport retry (same active provider, jittered exponential backoff) is owned by the `llm.Router` (the LLM router), not by the planner; switching providers is an explicit `SetModel` operation, not automatic failover.
+- **Unparseable plan JSON**: retried by the one-shot client (see [../oneshot.md](../oneshot.md)) with corrective nudges — exactly two, each pairing an assistant echo of the failed output with a `[System]` user message whose hint comes from `RetryHintFn`. Three distinct feedback texts, each quoting the underlying error verbatim: invalid JSON, zero-step plans (`errPlanZeroSteps`), and DAG-validation failures (`errPlanInvalidDAG`). After the two nudges the final refusal returns the parse error.
 - **No exploration tools**: silently falls back to direct planning (not an error).
 
 ## Invariants
@@ -78,7 +78,7 @@ Direct planning is used when `domain == general` with `complexity < 4`, or when 
 - `planner.Planner` satisfies `orchestration.Planner` (compile-time check `var _ orchestration.Planner = (*Planner)(nil)`).
 - When `PlannerToolNames` is empty, no exploration runs regardless of other config.
 - `MaxExploreSteps` defaults to `7` when unset or non-positive; positive values are used as-is (not clamped).
-- `Replan` preserves successfully completed steps that still appear in the new plan and whose dependencies are all carried forward.
+- The replan flow preserves successfully completed steps that still appear in the new plan and whose dependencies are all carried forward — `Replan` presents the completed steps in the replan prompt; the execution layer applies the preservation via `orchestration.BuildCarryForward`.
 - `PlanStep.Profile` is `any` on the wire; consumers convert it to a domain profile (e.g. `*planner.AgentProfile`).
 - `PlanStep.Agent` names a Subagent Profile resolved by the execution layer; it is orthogonal to `Profile` and round-trips through JSON persistence.
 

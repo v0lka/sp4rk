@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The orchestration domain turns a single ReAct agent loop into a multi-step, self-correcting execution engine. It provides the shared state container (the **Blackboard**), the plan data model (a DAG of steps), the single-loop task owner (the **Conductor**), request classification (the **Router**), plan generation (the **Planner**), failure analysis (the **Reflector**), and delegated parallel execution (**subagents**). The Conductor is an agent-driven loop: planning, decomposition, interaction, and reflection are tool calls driven by the host application, not pipeline phases baked into the engine.
+The orchestration domain turns a single ReAct agent loop into a multi-step, self-correcting execution engine. It provides the shared state container (the **Blackboard**), the plan data model (a DAG of steps), the single-loop task owner (the **Conductor**), request classification (the **Router**), plan generation (the **Planner**), failure analysis (the **Reflector**), and delegated parallel execution (**subagents**). Inside the Conductor, planning, decomposition, interaction, and reflection ride as tool calls (meta-tools) rather than structural pipeline phases; the SDK's root `TaskF`/`TaskBuilder` composes the plan-and-execute outer loop — planner, a Conductor per step, reflector — on top of these primitives for hosts that want an engine-provided pipeline (see [architecture/data-flow.md](../../architecture/data-flow.md)).
 
 ## Key Files
 
@@ -23,7 +23,7 @@ The orchestration domain turns a single ReAct agent loop into a multi-step, self
 // blackboard-backed stores so context-aware tools see shared state.
 type Conductor struct {
     cfg ConductorConfig
-    mu  sync.RWMutex // unexported; guards SetReasoningEffort for concurrent use
+    mu  sync.RWMutex // unexported; guards SetReasoningEffort and SetModel for concurrent use
 }
 
 // Every dependency a Conductor needs, populated by the caller before Run.
@@ -46,12 +46,15 @@ type ConductorConfig struct {
     PreWarningPercent   int
     Streaming           bool
     NonCacheableTools   []string
+    StopTools           []string
     ConversationHistory       []llm.Message
+    ContentBlocks             []llm.ContentBlock
     ResumeSteps               []agent.Step
     PendingUserInterjection   string
     PauseChecker              func(context.Context) bool
     UserMessageSource         func(context.Context) string
     ToolCallTimeout           time.Duration
+    ToolCallTimeoutExemptTools []string
     CompactOnStart            bool
     VerifyOnEdit              agent.EditVerifyRunner
     VerifyOnEditMaxOutputChars int
@@ -99,13 +102,16 @@ type ExecutionResult struct {
     Status       ExecutionStatus
     FailedSteps  int
     Summary      string
+    Steps        []agent.Step // `json:"-"`; resumable trajectory returned on pause and terminal paths
 }
 ```
 
 ## Flow
 
+The pipeline below is a **host-side integration example**: the SDK ships the classification primitive (`agent/router`'s `Route`) and the `Conductor`; the host application composes classify → domain→strategy mapping → `Conductor.Run`. Neither `HandleRequest` nor a domain→strategy table exists in the SDK.
+
 ```
-HandleRequest(ctx, message, bb, availableTools)
+Host application: HandleRequest(ctx, message, bb, availableTools)
 │
 ├─ 1. Classify: router.Route(ctx, message, tools, history, skills)
 │      → RoutingDecision { Domain, Complexity, MatchedSkills }
@@ -142,7 +148,7 @@ The Conductor is the only top-level execution entry point this domain exposes. D
 - Complexity is always clamped to `[1, 5]`.
 - `ExecutionResult.Status` is the typed success contract: callers consult it instead of parsing `Output`.
 - The Conductor's `finish`-join guard rejects `finish` while a `PendingDelegations` registry (injected via `WithDelegationRegistry`) reports pending async work.
-- The blackboard is created once per first request and restored for continuations via a `Checkpointer`.
+- In host integrations, the blackboard is created once per first request and restored for continuations via a `Checkpointer` (the SDK's `TaskF` creates a fresh blackboard per `Execute`).
 - The `finish` tool is always available in every run (appended automatically if absent).
 - A `ContextManager` returned by the factory that implements `TaskAware`/`BlockTaskAware`/`ConversationAware`/`TrackerProvider`/`StepSeedable`/`InterjectionAware` gets the corresponding capabilities wired; otherwise they are safely skipped, except `StepSeedable` which is required when `ResumeSteps` is set (else `Run` fails fast). The executor consumes a pending interjection through `agent.InterjectionConsumer` only after a successful LLM response.
 
@@ -155,11 +161,13 @@ The Conductor is the only top-level execution entry point this domain exposes. D
 | `MaxSteps` | `80` (when zero) | Per-run ReAct step budget. |
 | `ReasoningEffort` | `""` | Reasoning effort passed to reasoning-capable models. |
 | `PreWarningPercent` | `0` (disabled) | Context-fill percentage that triggers a pre-compaction `store_fact` nudge. |
-| `CircuitBreaker` | `DefaultCircuitBreakerConfig()` | Loop-protection thresholds (see [executor.md](executor.md)). |
+| `CircuitBreaker` | `DefaultCircuitBreakerConfig()` — applied by the root `Framework`'s config normalization; a hand-built `ConductorConfig` zero value passes through to the executor and disables loop protection (every threshold is `> 0`-guarded) | Loop-protection thresholds (see [executor.md](executor.md)). |
 | `ResumeSteps` | `nil` | Prior ReAct steps to resume from a checkpoint. When non-empty, `Run` seeds the `ContextManager` (via `StepSeedable`) and the `Executor` (via `WithResumeSteps`); the steps count against `MaxSteps`. Requires a `StepSeedable` `ContextManager` (see [conductor.md](conductor.md)). |
 | `PendingUserInterjection` | `""` | One-shot resume nudge appended after seeded history; retained through reactive-compaction retries and consumed after the first successful LLM response. |
 | `PauseChecker` / `UserMessageSource` | `nil` | Optional step-boundary callbacks. Pause is checked first; one live message is polled only when the run continues. The pause checker is additionally polled mid-tool-call on the executor's `toolWatchdogInterval` ticker. |
 | `ToolCallTimeout` | `0` (disabled) | Per-tool-call ceiling installed via `SetToolCallTimeout`: a single tool call whose wait exceeds it is abandoned and the run returns an error wrapping `agent.ErrToolTimeout` (naming the tool). Interactive/long-running tools can be exempted via `SetToolCallTimeoutExempt` (see [executor.md](executor.md#per-tool-call-ceiling-and-watchdog)). |
+| `StopTools` | `nil` | Ordinary (host-provided) tools wired to the executor via `SetStopTools` as turn terminators: a successful call to a listed tool ends the run with `Finished == true`; a failed call does not (see [executor.md](executor.md#finish-guard)). |
+| `ToolCallTimeoutExemptTools` | `nil` | Tool names exempt from the `ToolCallTimeout` ceiling. `nil` keeps `agent.DefaultToolCallTimeoutExemptTools`; a non-nil slice (even empty) replaces the default set wholesale. |
 | `CompactOnStart` | `false` | Forces one compaction pass on the `ContextManager` right after resume/nudge seeding, before the first LLM call, regardless of fill thresholds — manual compaction of a paused task (see [conductor.md](conductor.md#compact-on-start)). Emits `ContextCompaction` only when the pass reports a result; reactive executor compaction is unaffected. |
 | `VerifyOnEdit` | `nil` | User-configured verifier run once per response group containing a successful `write_file`/`edit_file`; nil disables it. |
 | `VerifyOnEditMaxOutputChars` | `<= 0` → `4000` | Unicode-safe cap for the injected verification output. |
