@@ -31,12 +31,29 @@ type ServerEntry struct {
     URL       string            // http: server URL (may contain ${VAR})
     Headers   map[string]string // http: custom headers (values may contain ${VAR})
     WorkDir   string            // stdio: working directory for the server process
+
+    // ToolGroupOverride tags every tool served by this server with an explicit
+    // capability group instead of the transport-derived default. Same semantics
+    // as ServerConfig.ToolGroupOverride (see Capability groups below).
+    ToolGroupOverride tools.ToolGroup
+
+    // Timeout bounds the initialization handshake (initialize + tools/list).
+    // Zero or negative selects the package default (60s). On the HTTP transport
+    // it applies to EACH attempt (Streamable HTTP, then the SSE fallback), so an
+    // unresponsive server can spend up to twice the bound before Connect fails.
+    Timeout time.Duration
+
+    // CallTimeout bounds a single tools/call invocation. Zero or negative
+    // inherits Timeout (which itself defaults to 60s), so leaving BOTH unset
+    // caps every call at 60s. There is no way to disable the per-call bound.
+    CallTimeout time.Duration
 }
 ```
 
 - **`Transport`** — selects the connection mechanism. `"stdio"` (the default when empty) launches a local subprocess; `"http"` connects to a remote server over HTTP.
 - **`Command` / `Args` / `Env` / `WorkDir`** — stdio-only fields describing the subprocess to launch.
 - **`URL` / `Headers`** — http-only fields describing the remote endpoint.
+- **`ToolGroupOverride` / `Timeout` / `CallTimeout`** — forwarded verbatim into the runtime `ServerConfig`, so the gateway-level configuration path can express them too (not only direct `mcp.Server` construction).
 - Environment variable references (`${VAR}`) may appear in `Env` values, `URL`, and `Headers` values. They are expanded before the server is started (see [Environment variable expansion](#environment-variable-expansion)).
 
 ## GatewayConfig
@@ -104,7 +121,7 @@ if err != nil {
 
 ### RegisterTools
 
-`Gateway.RegisterTools(registry)` wraps every discovered tool as a `Tool` (via `NewTool`) and registers it with `registry.RegisterWithSource(mcpTool, name)`, tagging it with the server name as its source. This source tag is what enables `UnregisterBySource` to cleanly remove a server's tools later.
+`Gateway.RegisterTools(registry)` wraps every discovered tool as a `Tool` (via `NewTool`) and registers it with `registry.RegisterWithSourceCategory(mcpTool, name, tools.SourceCategoryMCP)`, tagging it with the server name as its source and its category explicitly as MCP (so the category does not depend on the server name). A rejected registration — an MCP tool that would shadow a non-MCP tool of the same name — is logged as a warning and skipped. This source tag is what enables `UnregisterBySource` to cleanly remove a server's tools later.
 
 ### Stop
 
@@ -120,7 +137,7 @@ When `Transport` is `"stdio"` (the default), the gateway launches a local subpro
 
 - **`Command`** is the executable to run (e.g. `"npx"`, `"node"`, `"python"`).
 - **`Args`** are the command-line arguments passed to it.
-- **`Env`** is applied on top of an **allowlisted** subset of the host environment, not the full process environment. stdio servers run arbitrary third-party commands, so they inherit only `PATH`, `HOME`, `USER`, `SHELL`, `LANG`, `TERM`, `TMPDIR`, `TEMP`, `TMP`, and any `LC_*` locale variables — host secrets (LLM API keys, proxy credentials, etc.) are **not** forwarded implicitly. Explicit `Env` entries are applied on top and always win, so anything else a server needs must be declared there.
+- **`Env`** is applied on top of an **allowlisted** subset of the host environment, not the full process environment. stdio servers run arbitrary third-party commands, so they inherit only: executable/identity resolution (`PATH`, `HOME`, `USER`, `SHELL`, `USERPROFILE`); locale and terminal (`LANG`, `TERM`, and any `LC_*` variable); temp directories (`TMPDIR`, `TEMP`, `TMP`); Windows essentials (`APPDATA`, `LOCALAPPDATA`, `SYSTEMROOT`, `COMSPEC`, `PATHEXT`); network proxy configuration (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `ALL_PROXY`, plus their lowercase spellings — embedded `user:password@` credentials are stripped from the proxy URLs before forwarding); CA trust anchors (`SSL_CERT_FILE`, `SSL_CERT_DIR`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`); and virtualenv activation (`VIRTUAL_ENV`, plus the exact conda keys `CONDA_PREFIX`, `CONDA_DEFAULT_ENV`, `CONDA_SHLVL`, `CONDA_PREFIX_1`, `CONDA_PROMPT_MODIFIER`, `CONDA_EXE`, `CONDA_PYTHON_EXE`). Only the `LC_` prefix is wildcard-matched; every other entry is an exact name match, compared case-insensitively on Windows and case-sensitively elsewhere. Host secrets (LLM API keys, application credentials, etc.) are **not** forwarded implicitly. Explicit `Env` entries are applied on top and always win, so anything else a server needs must be declared there.
 - **`WorkDir`** sets the subprocess's working directory (falls back to `DefaultWorkDir`).
 
 The subprocess is spawned with `exec.CommandContext`, inheriting the allowlisted environment (plus explicit `Env` entries) and the configured working directory. Communication happens over the process's stdin/stdout pipes via the MCP client library.
@@ -252,7 +269,6 @@ func (g *Gateway) Reconfigure(
     newConfig GatewayConfig,
     registry *tools.ToolRegistry,
     expandEnv func(string) string,
-    logger *slog.Logger,
 ) error
 ```
 
@@ -268,13 +284,13 @@ Config comparison uses the *expanded* config (see [Environment variable expansio
 ### Status and introspection
 
 ```go
-g.Status()      // []ServerStatus — per-server name, transport, connected, starting, tool count, tools, error
+g.Status()      // []ServerStatus — per-server name, transport, connected, unhealthy, starting, tool count, tools, error
 g.ServerNames() // []string — all connected server names
-g.ToolCount()   // int — total tools across all servers
+g.ToolCount()   // int — total tools across all CONNECTED servers (failed servers excluded; see Status())
 g.GetServer(n)  // *Server — a specific server by name, or nil
 ```
 
-`ServerStatus` is sorted by server name for deterministic output.
+`ServerStatus` is sorted by server name for deterministic output. `Unhealthy` is an advisory flag: it is set once a server hits three consecutive `tools/call` timeouts (`unhealthyTimeoutThreshold`, fixed SDK policy — not per-server configurable) and cleared by a subsequent successful call, by `Connect`, and by `Close`.
 
 ## Complete example: stdio filesystem server
 

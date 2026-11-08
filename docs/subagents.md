@@ -36,7 +36,7 @@ type SubAgentTask struct {
 | `StepID` | The plan-step identifier. Injected into the context so context-aware tools know the current step. |
 | `Executor` | A fresh `Executor` for this step. Must not be shared across concurrent subagents. |
 | `CM` | The `ContextManager` owning this step's prompt history and compaction. |
-| `TaskTools` | The tools available to this step. The `finish` tool is appended automatically. |
+| `TaskTools` | The tools available to this step. A registered `finish` tool is not required: the executor appends the `finish` definition to every LLM request at call time, so completion works even when `TaskTools` has no `finish` entry (registering it only makes it visible in registry listings and group-filtered toolsets). |
 | `TaskDesc` | A human-readable task description, emitted in the `SubAgentLaunch` event. |
 | `Emitter` | The `Events` sink for this subagent. `nil` is replaced with `NoopEvents`. |
 | `TodoUpdateFunc` | Optional callback invoked when the step's checklist is updated. Wired into the context for the `update_checklist` tool. |
@@ -66,8 +66,9 @@ The returned channel is buffered (capacity 1) and closed when the goroutine fini
 2. **Injects context** — the task description, step ID, and (if provided) the checklist callback are attached to the context (see [Context injection](#context-injection)).
 3. **Runs the executor** — `executor.Run(ctx, taskTools, cm)` is called inside the goroutine.
 4. **Defense-in-depth check** — even if the executor reports `Finished: true`, the output is scanned for printed tool-call syntax (a failure mode where the model writes a fenced code block with a tool-name tag instead of emitting a `tool_use` block). If detected, the result is treated as a failure.
-5. **Emits `SubAgentComplete`** — `emitter.SubAgentComplete(stepID, success, duration, errMsg)` fires with the outcome, wall-clock duration, and the failure reason (`""` on success).
+5. **Emits `SubAgentComplete`** — `emitter.SubAgentComplete(stepID, success, duration, errMsg)` fires with the outcome, wall-clock duration, and the failure reason (`""` on success). A cooperative pause (`agent.ErrPaused`) emits `SubAgentPaused(stepID, duration)` **instead**.
 6. **Sends the result** — a `SubAgentResult` is sent on the channel.
+7. **Recovers panics** — the goroutine body is wrapped in a deferred `recover()` registered *before* `SubAgentLaunch` fires, so a panic anywhere in subagent execution cannot tear down the host process (execution runs on this goroutine, which the host cannot wrap with its own `recover`). The panic is logged as `"subagent execution panicked"` with `step_id`, `panic`, and a `stack` from `debug.Stack()`, through the **executor's** logger (a discard handler when `executor` is nil, so the handler cannot itself panic), then reported as a failure: `emitter.SubAgentComplete(stepID, false, time.Since(startTime), panicErr.Error())` fires and the channel receives `SubAgentResult{StepID: stepID, Error: panicErr}`, where `panicErr` is `fmt.Errorf("subagent %s panicked: %v", stepID, r)`. `Output` and `Steps` are empty on this path, and the remaining steps above are skipped — the recovered send is the only value the channel carries before it is closed.
 
 ### Context cancellation
 
@@ -82,7 +83,7 @@ resultCh := agent.RunSubAgent(ctx, "step_2", exec, cm, taskTools, "Refactor auth
 // Later, if you need to abort:
 cancel()
 
-result := <-resultCh // always returns, even after cancellation
+_ = <-resultCh // always returns, even after cancellation
 ```
 
 ## SubAgentResult
@@ -95,22 +96,29 @@ type SubAgentResult struct {
     Output string
     Error  error
     Steps  []Step // actual executor steps (tool calls + observations)
+    // Summary carries the model's own final text when the subagent terminated
+    // on a host-designated stop tool (see Executor.SetStopTools) rather than the
+    // inline finish tool. Mirrors ExecutorResult.Summary; empty otherwise.
+    Summary string
 }
 ```
 
 | Field | Description |
 |-------|-------------|
 | `StepID` | The plan-step identifier this result corresponds to. |
-| `Output` | The finish answer on success, or the abort reason on failure. |
-| `Error` | Non-nil if the executor errored, was cancelled, or did not finish. |
+| `Output` | Depends on the outcome. **Success** — the `finish` answer (or, when the run ended on a host-designated stop tool, that tool's short confirmation, with the model's prose in `Summary`). **Hard error** (executor errored / cancelled, or the tool-call-syntax guard fired) — **empty**; the result carries only `StepID`, `Steps` and `Error`. **Did not finish** — the executor's own partial output, while the abort reason goes into `Error`. |
+| `Error` | Non-nil if the executor errored, was cancelled, did not finish, leaked tool-call syntax, or panicked. |
 | `Steps` | The full sequence of executor steps (tool calls + observations). Empty when the executor returned no result. |
+| `Summary` | The model's own final text when the subagent terminated on a host-designated stop tool (`Executor.SetStopTools`) rather than the inline `finish` tool — `Output` then holds only the stop tool's short confirmation. Empty for runs that did not end on a stop tool. |
 
 ### Success vs. failure semantics
 
-A subagent is considered **successful** only when `executor.Run` returns no error *and* `result.Finished == true`. Two failure cases produce an `Error`:
+A subagent is considered **successful** only when `executor.Run` returns no error *and* `result.Finished == true`. Four failure cases produce an `Error`:
 
-- **Executor error** — the LLM call or a tool returned a fatal error, or the context was cancelled. `Steps` is populated from the partial result when available.
-- **Did not finish** — the step budget was exhausted or a circuit breaker aborted. The executor's `Output` (which contains the specific abort reason, e.g. "circuit breaker", "fruitless abort", "max steps") is wrapped into the error message.
+- **Executor error** — the LLM call or a tool returned a fatal error, or the context was cancelled. `Output` is empty; `Steps` is populated from the partial result when available.
+- **Did not finish** — the step budget was exhausted or a circuit breaker aborted. The error message is the executor's structured `AbortReason` when set, otherwise its `Output` (a short `"Aborted: …"` message for the circuit-breaker / fruitless branches), otherwise a generic `"step execution did not complete within max steps"`. `Output` itself still carries the executor's partial output.
+- **Leaked tool-call syntax** — the [defense-in-depth guard](#defense-in-depth-detecttoolcallsyntaxincontent) turned an otherwise-successful run into an error. Like the executor-error case it takes the `err != nil` return path, so the result carries only `StepID`, `Steps` and `Error` — `Output` and `Summary` are **empty** even though the executor did finish.
+- **Panic** — the [panic-recovery guard](#what-runsubagent-does) caught a panic inside subagent execution. `Error` is `"subagent <stepID> panicked: <value>"` and both `Output` and `Steps` are empty.
 
 ```go
 result := <-resultCh
@@ -138,8 +146,10 @@ These are the same helpers used in standalone executor runs (see [Agent Executor
 Subagents emit sub-agent lifecycle events through the provided `Events` sink:
 
 - **`SubAgentLaunch(stepID, description)`** — fired when the goroutine starts, before the executor runs.
-- **`SubAgentComplete(stepID, success, duration, errMsg)`** — fired when the goroutine finishes, with the success flag, wall-clock duration, and the failure reason (`""` on success).
-- **`SubAgentPaused(stepID, duration)`** — fired instead of `SubAgentComplete` when the subagent stopped at a cooperative pause checkpoint (`executor.ErrPaused`). A pause is a recoverable checkpoint, not a failure: the trajectory is preserved in the `SubAgentResult` for a later resume. So `SubAgentComplete` does **not** always fire — do not pair launch/complete counters without accounting for paused runs. The `SubAgentResult` also carries `Summary` (the model's final text when the run ended on a host-designated stop tool).
+- **`SubAgentComplete(stepID, success, duration, errMsg)`** — fired when the goroutine finishes, with the success flag, wall-clock duration, and the failure reason (`""` on success). On the non-error paths the `SubAgentResult` also carries `Summary` (the model's final text when the run ended on a host-designated stop tool); it is empty when the run returned an error.
+- **`SubAgentPaused(stepID, duration)`** — fired instead of `SubAgentComplete` when the subagent stopped at a cooperative pause checkpoint (`agent.ErrPaused`). A pause is a recoverable checkpoint, not a failure: the trajectory is preserved in the `SubAgentResult` for a later resume. So `SubAgentComplete` does **not** always fire — do not pair launch/complete counters without accounting for paused runs. On a paused run the result carries `StepID`, `Steps` (the resumable trajectory) and `Error` = `agent.ErrPaused`; `Output` and `Summary` are empty. Detect the pause with `errors.Is(result.Error, agent.ErrPaused)`.
+
+`SubAgentComplete` with `success == false` has **four** distinct trigger paths, not one: a hard executor error (an LLM call or tool failed, or the context was cancelled); a run that never finished (step budget exhausted, circuit-breaker abort, mutation gate); the [tool-call-syntax defense guard](#defense-in-depth-detecttoolcallsyntaxincontent) — an otherwise-successful run whose `Output`/`Summary` leaks tool-call syntax is forced to `success = false` and gets `errMsg` `"model printed tool-call syntax as text instead of using tool_use blocks"`; and the [panic-recovery guard](#what-runsubagent-does) — a panic inside subagent execution is recovered, logged with a stack trace, and surfaced as `SubAgentComplete(stepID, false, …)` whose `errMsg` is `"subagent <stepID> panicked: <value>"`. On the normal completion path only a cooperative pause diverts to `SubAgentPaused`; the panic guard always reports a failure.
 
 If `emitter` is `nil`, `RunSubAgent` substitutes `NoopEvents`, so the events are silently dropped. See [Events](events.md#sub-agent-events) for the full method signatures.
 
@@ -150,7 +160,9 @@ A known LLM failure mode is *printing* a tool invocation as prose — writing a 
 ```go
 if success && (DetectToolCallSyntaxInContent(result.Output) || DetectToolCallSyntaxInContent(result.Summary)) {
     success = false
-    err = errors.New("model printed tool-call syntax as text instead of using tool_use blocks")
+    if err == nil {
+        err = errors.New("model printed tool-call syntax as text instead of using tool_use blocks")
+    }
 }
 ```
 
@@ -239,10 +251,11 @@ store := &trajStore{}
 ctx = agent.WithTrajectoryStore(ctx, store)
 
 resultCh := agent.RunSubAgent(ctx, "step_2", exec, cm, taskTools, "Investigate bug", events, nil)
-result := <-resultCh
+<-resultCh
 
 // The store now holds the full trajectory, synced at each iteration.
 trajectory := store.Steps()
+log.Printf("captured %d steps", len(trajectory))
 ```
 
 Retrieve the store from inside a tool via the context:
@@ -255,7 +268,7 @@ if ts := agent.TrajectoryStoreFromContext(ctx); ts != nil {
 }
 ```
 
-`TrajectoryStore` is particularly useful in plan-and-reflect orchestration: the reflector reads the trajectory to analyze why a step failed and produce corrective insights. See [Events](events.md#orchestrationevents) for the `OnReflected` hook.
+`TrajectoryStore` is particularly useful in plan-and-reflect orchestration: the orchestrator hands the captured trajectory (`store.Steps()`) to `Reflector.Reflect` as an explicit argument — the reflector analyzes the trajectory it is given and does not fetch the store from the context itself. See [Events](events.md#orchestrationevents) for the `OnReflected` hook.
 
 ## Subagent Profiles
 
@@ -263,55 +276,51 @@ A subagent may be launched under a named **Subagent Profile** (an `AGENT.md`-dec
 
 | Profile field | Applied to the subagent as |
 | --- | --- |
-| `Body` | the core directive / system prompt (replaces the generic orchestrator default) |
-| `Tools` (`ToolPreference`) | the tool budget (`nil`=all, `"read-only"`, or a comma-list of tool-group tokens). Resolve it with `ToolPreferenceWithError()`, which returns an error for an invalid field; the legacy `ToolPreference() any` silently maps an invalid field to `nil` (the full toolset) and must not be used for security-sensitive resolution |
-| `MaxSteps` | the ReAct iteration cap (0/absent → derived from task complexity) |
-| `Model` | forced per-call via `NewModelOverrideCaller` |
-| `AllowRedelegate` | whether the subagent may launch further subagents |
-| `Hidden` | discovery visibility only (never blocks invocation) |
+| `Agent.Body` | the core directive / system prompt (replaces the generic orchestrator default) |
+| `Agent.Metadata.Tools` (`ToolPreference`) | the tool budget (`nil`=all, `"read-only"`, or a comma-list of tool-group tokens). Resolve it with `ToolPreferenceWithError()`, which returns an error for an invalid field; the legacy `ToolPreference() any` silently maps an invalid field to `nil` (the full toolset) and must not be used for security-sensitive resolution |
+| `Agent.Metadata.MaxSteps` | the ReAct iteration cap (0/absent → derived from task complexity) |
+| `Agent.Metadata.Model` | forced per-call via `NewModelOverrideCaller` |
+| `Agent.Metadata.AllowRedelegate` | whether the subagent may launch further subagents |
+| `Agent.Metadata.Hidden` | discovery visibility only (never blocks invocation) |
+
+Only `Body` (alongside `DirPath`) is a field of `agents.Agent` itself — the frontmatter fields (`Tools`, `MaxSteps`, `Model`, `AllowRedelegate`, `Hidden`, …) live on `agents.AgentMetadata`, reached through `Agent.Metadata`.
 
 `agent.NewModelOverrideCaller(inner LLMCaller, model string)` wraps an `LLMCaller` so every `Call` sets `req.Model` before delegating to `inner`. It returns `inner` unchanged when `model` is empty, so the override applies conditionally without callers branching. It relies on the [LLM router contract](llm-providers.md) that `req.Model` is filled with the active model only when empty — setting it beforehand bypasses the router's active-model selection for that caller while still routing to the active provider.
 
-Profile application is an execution-layer concern: `RunSubAgent`/`RunSubAgentsParallel` themselves are profile-agnostic primitives. The host or Conductor resolves the profile and constructs the `Executor`, `ContextManager`, `TaskTools`, and caller before handing them to `RunSubAgent` as a `SubAgentTask`.
+Profile application is an execution-layer concern: `RunSubAgent`/`RunSubAgentsParallel` themselves are profile-agnostic primitives. The **host's** execution layer resolves the profile and constructs the `Executor`, `ContextManager`, `TaskTools`, and caller before handing them to `RunSubAgent` as a `SubAgentTask` — the SDK ships no resolver, and `orchestration.Conductor` passes `PlanStep.Agent` through untouched.
 
 ## Putting it together
 
-A complete parallel execution with trajectory capture:
+A complete parallel execution with **per-step** trajectory capture.
+
+`RunSubAgentsParallel` takes a single `ctx`, and `SubAgentTask` has no per-task context field — so every subagent it launches sees the *same* `TrajectoryStore`. Because the executor replaces the store's whole contents on each sync (`ts.Sync(state.allSteps)`), concurrent subagents sharing one store clobber each other. **Per-step trajectory capture is therefore not achievable through the parallel helper.** To capture each step's trajectory separately, launch the subagents manually with a per-task context:
 
 ```go
-// One trajectory store per step (each subagent has its own executor).
+// One trajectory store per step, attached to that step's own context.
 storeA, storeB := &trajStore{}, &trajStore{}
 ctxA := agent.WithTrajectoryStore(ctx, storeA)
 ctxB := agent.WithTrajectoryStore(ctx, storeB)
 
-tasks := []agent.SubAgentTask{
-    {
-        StepID:    "step_2",
-        Executor:  newExecutorForStep("step_2"),
-        CM:        newContextManagerForStep("step_2"),
-        TaskTools: taskTools,
-        TaskDesc:  "Implement feature A",
-        Emitter:   events,
-    },
-    {
-        StepID:    "step_3",
-        Executor:  newExecutorForStep("step_3"),
-        CM:        newContextManagerForStep("step_3"),
-        TaskTools: taskTools,
-        TaskDesc:  "Implement feature B",
-        Emitter:   events,
-    },
-}
+chA := agent.RunSubAgent(ctxA, "step_2", newExecutorForStep("step_2"),
+    newContextManagerForStep("step_2"), taskTools, "Implement feature A", events, nil)
+chB := agent.RunSubAgent(ctxB, "step_3", newExecutorForStep("step_3"),
+    newContextManagerForStep("step_3"), taskTools, "Implement feature B", events, nil)
 
-results := agent.RunSubAgentsParallel(ctx, tasks)
-for _, r := range results {
+// Collect in launch order; select on the channels instead to stream arrivals.
+for _, r := range []agent.SubAgentResult{<-chA, <-chB} {
     if r.Error != nil {
         log.Printf("step %s failed: %v (output: %s)", r.StepID, r.Error, r.Output)
         continue
     }
     log.Printf("step %s succeeded: %s", r.StepID, r.Output)
 }
+
+// Each store holds only its own step's trajectory.
+log.Printf("step_2 trajectory: %d steps\n", len(storeA.Steps()))
+log.Printf("step_3 trajectory: %d steps\n", len(storeB.Steps()))
 ```
+
+> **Note:** `RunSubAgentsParallel(ctx, tasks, opts...)` is still the right choice when you do *not* need per-step trajectories — a single shared store then simply holds whichever subagent synced last. It also offers `agent.WithMaxParallelSubagents(n)` to bound fan-out; the manual loop above launches every subagent at once and has no such cap.
 
 ## See also
 

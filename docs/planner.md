@@ -22,6 +22,7 @@ import "github.com/v0lka/sp4rk/planner"
 - [PromptSet](#promptset)
   - [Placeholder system](#placeholder-system)
 - [AgentProfile](#agentprofile)
+  - [Subagent Profiles (`PlanStep.Agent`)](#subagent-profiles-planstepagent)
 - [Methods](#methods)
   - [Plan](#plan)
   - [Replan](#replan)
@@ -29,6 +30,10 @@ import "github.com/v0lka/sp4rk/planner"
 - [Exploration vs direct planning](#exploration-vs-direct-planning)
 - [Single-step vs multi-step mode](#single-step-vs-multi-step-mode)
 - [Supporting types](#supporting-types)
+  - [ToolLister](#toollister)
+  - [Events (planner)](#events-planner)
+  - [ToolRegistry (planner)](#toolregistry-planner)
+  - [ContextManagerFactory (planner)](#contextmanagerfactory-planner)
 - [Examples](#examples)
   - [Standalone planner](#standalone-planner)
   - [Full-power planner with skills and exploration](#full-power-planner-with-skills-and-exploration)
@@ -185,9 +190,9 @@ type PromptSet struct {
 | `ContinuationPreamble` | Preamble for follow-up plans after a completed task. |
 | `ContinuationIncompletePreamble` | Preamble used when the prior task was **not** fully completed — instructs the planner to finish only remaining work and not re-execute completed steps. |
 | `ContinuationSingleStep` | Preamble for single-step continuations. |
-| `DomainAssignment` | Section assigning domains to steps (substituted as `DOMAIN-ASSIGNMENT`). |
-| `AgentProfiles` | Section describing available agent profiles (substituted as `AGENT-PROFILES`). |
-| `ExtraSections` | Additional sections appended to every mode (substituted as `MODE-EXTRA-SECTIONS`). |
+| `DomainAssignment` | Section assigning domains to steps (substituted as `DOMAIN-ASSIGNMENT`). Applied to every mode, including replan. |
+| `AgentProfiles` | Section describing available agent profiles (substituted as `AGENT-PROFILES`). Applied to every mode, including replan. |
+| `ExtraSections` | Additional sections appended to the two plan modes and the two continuation modes (substituted as `MODE-EXTRA-SECTIONS`). The replan mode leaves this slot — and `MODE-TOT`/`MODE-GUIDANCE`/`MODE-TAIL` — empty. |
 | `FamilyPrompt` | Function returning a family-specific prompt adapter for a given agent role and model family. Returns `""` when no adaptation exists. |
 | `VerificationMandate` | Appended to all planner prompts. |
 
@@ -206,12 +211,14 @@ Prompt templates use uppercase placeholders that the planner substitutes at call
 | `MODE-TOT` | The active mode's tree-of-thought section. |
 | `MODE-GUIDANCE` | The active mode's guidance section. |
 | `MODE-EXTRA-SECTIONS` | Extra sections for the active mode. |
-| `MODE-TAIL` | The mode tail (multi-step includes formatted reflections). |
+| `MODE-TAIL` | The mode tail: the `REFLECTIONS` slot for both plan modes (`planModeTail`), or the continuation-chaining instruction for the two continuation modes (`continuationModeTail`). See the `REFLECTIONS` note below. |
 | `MODE-JSON-EXAMPLE` | The JSON example for the active mode. |
 | `DOMAIN-ASSIGNMENT` | Domain assignment section. |
 | `AGENT-PROFILES` | Agent profiles section. |
 | `WORKSPACE-PATH` | Workspace instruction block. |
 | `RECENT-CONVERSATION` | Formatted prior conversation (for first-message plans). |
+
+> **Note — `REFLECTIONS`:** the plan-mode templates carry one more real substitution that is deliberately *not* a host-facing `PromptSet` slot. The package-internal `planModeTail` constant — the `MODE-TAIL` value for both plan modes (`multiStepMode()` and `singleStepMode()`) — is literally `"REFLECTIONS\n"`, so the trusted substitution pass first expands `MODE-TAIL` into text containing the `REFLECTIONS` token, and the later untrusted-data pass in `buildSystemPromptFromMode` then expands it to `formatPlanReflections(reflections)`. (The two continuation modes use `continuationModeTail`, which carries no `REFLECTIONS` token.) You never write `REFLECTIONS` yourself; it reaches the prompt through `MODE-TAIL`. Because the data pass runs once over the whole assembled text, a `REFLECTIONS` token in your own template would also be expanded.
 
 **Replan placeholders** (used by `ReplanPrompt`):
 
@@ -222,6 +229,7 @@ Prompt templates use uppercase placeholders that the planner substitutes at call
 | `FAILED-STEP` | The failed step ID, error, and output. |
 | `CURRENT-REFLECTION` | The reflection on the failure. |
 | `PREVIOUS-SESSION-REFLECTIONS` | Earlier reflections from the session. |
+| `AVAILABLE-TOOLS` | Formatted tool list (from the tool registry). |
 | `AVAILABLE-SKILLS` | Formatted skill list (via `FormatSkillList`). |
 | `WORKSPACE-PATH` | Workspace instruction block. |
 
@@ -291,7 +299,7 @@ The planner emits profiles in the JSON example so the LLM can attach them to ste
 
 ### Subagent Profiles (`PlanStep.Agent`)
 
-In addition to the inline `Profile`, a step may carry an `Agent` field (`json:"agent,omitempty"`) that optionally names a **Subagent Profile** — an `AGENT.md`-declared persona (see [Subagent Profiles](agents.md)). When non-empty, the step runs with that profile's system prompt, tools, max-steps, and model instead of the generic orchestrator defaults. The name is resolved by the execution layer (e.g. the Conductor's agent resolver).
+In addition to the inline `Profile`, a step may carry an `Agent` field (`json:"agent,omitempty"`) that optionally names a **Subagent Profile** — an `AGENT.md`-declared persona (see [Subagent Profiles](agents.md)). When non-empty, the step runs with that profile's system prompt, tools, max-steps, and model instead of the generic orchestrator defaults. The name is resolved by the **host's** execution layer — the SDK ships no resolver, and `orchestration.Conductor` passes `PlanStep.Agent` through untouched.
 
 `Agent` and `Profile` are independent: `Agent` targets a named, externally-declared profile by directory name, while `Profile` carries inline step-level configuration on the plan object itself. `Agent` round-trips through JSON so a declared plan survives blackboard persistence and task continuation (the blackboard's plan deep-copy propagates it).
 
@@ -438,7 +446,7 @@ otherwise                               →  exploration planning
 - **Direct planning** makes a single LLM call with the `BasePrompt` and parses the JSON plan. Fast and sufficient for simple or general-domain tasks.
 - **Exploration planning** runs a short ReAct loop (bounded by `MaxExploreSteps`) using the tools named in `PlannerToolNames` — typically read-only tools like `read_file`, `list_directory`, `ripgrep`, `glob`. The exploration output is then parsed into a plan, and `Plan.ExplorationContext` is populated with a summary of what was explored.
 
-If the exploration executor fails, produces no output, or returns unparseable JSON, the planner **falls back to direct planning** automatically. If `ContextFactory` is nil, exploration is skipped and direct planning is used.
+If the exploration executor fails, produces no output, or returns unparseable JSON, the planner **falls back to direct planning** automatically (except when the context was cancelled — that error is returned to the caller). If `ContextFactory` is nil, exploration is skipped and direct planning is used.
 
 To enable exploration, configure:
 
@@ -592,7 +600,7 @@ MODE-JSON-EXAMPLE`,
 
 ### Full-power planner with skills and exploration
 
-This example (adapted from the SDK's example 07) shows a planner configured with skills discovery, exploration tools, and a custom event sink. It is the "kitchen sink" configuration exercising the planner at maximum capacity.
+This example (adapted from the SDK's examples 06 and 11 — the explicit `planner.NewPlanner` wiring from `06-plan-and-reflect`, the skills discovery from `11-full-power`) shows a planner configured with skills discovery, exploration tools, and a custom event sink. It is the "kitchen sink" configuration exercising the planner at maximum capacity.
 
 ```go
 package main
@@ -649,9 +657,12 @@ func main() {
 	workspaceDir, _ := os.MkdirTemp("", "example-*")
 	defer func() { _ = os.RemoveAll(workspaceDir) }()
 
-	// Seed a skills directory.
+	// Seed a skills directory. Scan only visits SUBDIRECTORIES of each
+	// discovery dir and parses <dir>/<name>/SKILL.md, so the skill's own
+	// directory must exist before SKILL.md is written into it.
 	skillsDir := filepath.Join(workspaceDir, ".agents", "skills")
 	_ = os.MkdirAll(skillsDir, 0o755)
+	_ = os.MkdirAll(filepath.Join(skillsDir, "go-testing"), 0o755)
 	_ = os.WriteFile(filepath.Join(skillsDir, "go-testing", "SKILL.md"),
 		[]byte("---\nname: go-testing\ndescription: Use when writing Go tests.\n---\n# Go Testing\n"),
 		0o644)
@@ -696,6 +707,15 @@ func main() {
 	cfg.ToolRegistry = registry
 	cfg.PlannerToolNames = map[string]bool{
 		"read_file": true, "list_directory": true, "glob": true,
+	}
+	// Exploration needs a ContextManager factory. fw.ContextFactory() returns
+	// the VARIADIC orchestration.ContextManagerFactory, which is not assignable
+	// to the non-variadic planner.ContextManagerFactory — adapt it with a
+	// closure. Without this the planner logs a warning and falls back to
+	// direct planning, leaving plan.ExplorationContext empty.
+	orchContextFactory := fw.ContextFactory()
+	cfg.ContextFactory = func(systemPrompt string, modelMeta llm.ModelMetadata, compactionStrategy string) agent.ContextManager {
+		return orchContextFactory(systemPrompt, modelMeta, compactionStrategy)
 	}
 	cfg.DomainFromContext = func(context.Context) string { return "code" }
 	cfg.ComplexityFromContext = func(context.Context) int { return 5 }

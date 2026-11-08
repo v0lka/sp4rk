@@ -9,7 +9,7 @@ This example is a **fluent-first hybrid**: the Framework is assembled with `sp4r
 | Framework assembly     | **Fluent**| `sp4rk.NewF` + `.Providers`/`.MCPStdio`/`.Tools`/`.HITL` |
 | Plan → Execute → Reflect | **Fluent**| `fw.TaskF(...).Plan().Reflect().Models(...).Execute()` |
 | Compaction / execution tuning | **Classic**| `.Config(base sp4rk.Config)` escape hatch |
-| `OnBlackboardChanged`  | **Classic**| rides in the `WithConfig` base (no dedicated fluent option) |
+| `OnBlackboardChanged`  | **Classic**| rides in the `.Config(base)` base (no dedicated fluent option) |
 | Skills discovery       | **Classic**| `skills.SkillManager` → passed to the fluent `.Skills` builder method |
 | Agent profile discovery | **Classic**| `agents.AgentManager` + strict `ToolPreferenceWithError` validation |
 | Custom events sink     | **Classic**| `consoleEvents` (embeds `orchestration.NoopEvents`) → the fluent `.Events` builder method |
@@ -33,9 +33,9 @@ This example is a **fluent-first hybrid**: the Framework is assembled with `sp4r
 | MCP integration    | Fluent            | `.MCPStdio(...)`              |
 | Event streaming    | Classic escape    | `consoleEvents` (embeds `orchestration.NoopEvents`) → the fluent `.Events` builder method |
 | Human-in-the-loop  | Fluent            | `.HITL(autoApproveHITL)` (blocks `delete_directory`) |
-| Planner            | Fluent            | `.Plan()` with `sp4rk.DefaultPromptSet`         |
+| Planner            | Fluent            | `.Plan()` with `sp4rk.DefaultPromptSet()`       |
 | Conductor          | Fluent            | created internally by `fw.TaskF`              |
-| Reflector          | Fluent            | `.Reflect()` with `sp4rk.DefaultReflectorPrompt`|
+| Reflector          | Fluent            | `.Reflect()` with `sp4rk.DefaultReflectorPrompt()`|
 | Skills             | Classic escape    | `skills.SkillManager` → `.Skills(discovered)`    |
 | Subagent Profiles  | Classic escape    | `agents.AgentManager` + `ToolPreferenceWithError()` |
 | Fact memory        | Fluent            | `MemoryTools()` bundle + blackboard              |
@@ -53,7 +53,7 @@ sp4rk.NewF().
     HITL(autoApproveHITL).AutoApprove().
     Build()
     │
-    ├─ ToolRegistry: [custom] timestamp + [core] file/memory tools + [mcp] filesystem tools
+    ├─ ToolRegistry: [core] timestamp + [core] file/memory tools + [filesystem] MCP tools
     ├─ SkillManager: discovers go-testing skill   (classic — pre-execution)
     │
     └─ fw.TaskF(...).Workspace(...).Skills(...).Events(consoleEvents)
@@ -86,29 +86,43 @@ The Framework is built with `sp4rk.NewF`, but fields that have no dedicated flue
 base := sp4rk.Config{
     Execution:  sp4rk.ExecutionConfig{ /* tuning */ },
     Compaction: sp4rk.CompactionConfig{ /* thresholds */ },
-    OnBlackboardChanged: func(ct string) { fmt.Println("blackboard:", ct) },
+    OnBlackboardChanged: func(ct string) { fmt.Printf("  📝 blackboard: %s\n", ct) },
 }
 fw, _ := sp4rk.NewF().
     Config(base).             // escape hatch: advanced tuning
     Providers(providers...).
+    DefaultModel(plannerModel).
     MCPStdio("filesystem", "npx", "-y", "@modelcontextprotocol/server-filesystem", workspaceDir).
+    MCPWorkDir(workspaceDir).
     FileTools().MemoryTools().
-    Tools(allTools...).
+    Tools(newTimestampTool()). // custom timestamp tool
     HITL(&autoApproveHITL{...}).
     AutoApprove().
+    MaxSteps(20).
     Build()
 ```
 
 The orchestration cycle is one `fw.TaskF` chain (replacing the ~80-line hand-rolled loop of example 06):
 
 ```go
-result, err := fw.TaskF(ctx, task).
+events := &consoleEvents{}
+tb := fw.TaskF(context.Background(), task).
+    System(fmt.Sprintf(`You are a task execution agent working in %s.
+Complete the assigned step using the available tools.
+Use store_fact to record important findings for other steps.
+Call finish with a summary when done.`, workspaceDir)).
     Workspace(workspaceDir).
     Skills(discoveredSkills).
-    Events(&consoleEvents{}).
-    Plan().Reflect().MaxRetries(2).
-    Models(plannerModel, executorModel). // runtime switching
-    Execute()
+    Events(events).
+    Plan().
+    Reflect().
+    MaxRetries(2)
+if openaiAvailable {
+    // Runtime model switching: plan/reflect on Claude, execute on GPT-4o.
+    tb = tb.Models(plannerModel, executorModel)
+}
+
+result, err := tb.Execute()
 ```
 
 #### Runtime model switching
@@ -165,12 +179,12 @@ base := sp4rk.Config{
     // …execution tuning, compaction…
     Checkpointer: newMemoryCheckpointer(), // required for the callback below
     OnBlackboardChanged: func(changeType string) {
-        fmt.Printf("blackboard: %s\n", changeType)
+        fmt.Printf("  📝 blackboard: %s\n", changeType)
     },
 }
 ```
 
-Fires after every successful blackboard write (`plan`, `step_result`, `fact`, `attachment`, `reflection`). The notification hook lives on `CheckpointedBlackboard`, so it only runs when a `Checkpointer` is present — a plain blackboard never invokes it. The example's `newMemoryCheckpointer()` (an in-memory `orchestration.Checkpointer` at the bottom of `main.go`) exists solely to satisfy that requirement; a production deployment would back it with durable storage (file, DB, …). Useful for UI integration or audit logging.
+Fires after every successful blackboard write (`original_request`, `plan`, `step_result`, `reflection`, `fact`, `attachment`, `final_result`). The notification hook lives on `CheckpointedBlackboard`, so it only runs when a `Checkpointer` is present — a plain blackboard never invokes it. The example's `newMemoryCheckpointer()` (an in-memory `orchestration.Checkpointer` at the bottom of `main.go`) exists solely to satisfy that requirement; a production deployment would back it with durable storage (file, DB, …). Useful for UI integration or audit logging.
 
 #### Compaction configuration
 
@@ -201,14 +215,14 @@ This example is a single fluent-first hybrid `main.go` (no build tag). Its
 profile-discovery contract test is local and needs no provider or MCP server:
 
 ```bash
-cd sdk/examples
+cd examples
 GOWORK=off go test ./11-full-power
 ```
 
 The live capstone needs the prerequisites above:
 
 ```bash
-cd sdk/examples
+cd examples
 go mod tidy          # first time only
 cd 11-full-power
 go run .
@@ -216,12 +230,11 @@ go run .
 
 ## Expected output
 
+The `Available tools:` listing comes from `ToolRegistry.List()` (which delegates to `ListFiltered`) and ranges over the registry's internal map — so the order of the entries may vary between runs. The block below is the both-API-keys case and omits the two `slog` INFO lines the discovery managers emit on stderr (`skill scan complete`, `agent scan complete`). Without `OPENAI_API_KEY` the run instead prints `Runtime model switching disabled (set OPENAI_API_KEY to enable a second provider)` and `Models: planning=claude-sonnet-4-5 | execution=same as planning (single provider)`. The `  📝 blackboard: …` notification is shown only once, for `step_1`; `OnBlackboardChanged` actually fires after *every* successful write (e.g. `plan`, one `step_result` per step, `fact`, `final_result` — the seven change types are listed above), so the remaining notification lines are elided here to keep the step trace readable.
+
 ```
 Workspace: /tmp/sp4rk-example-11-123456
 Skills dir: /tmp/sp4rk-example-11-123456/.agents/skills
-
-Active LLM: anthropic/claude-sonnet-4-5 (provider: anthropic)
-Runtime model switching enabled: claude-sonnet-4-5 → openai/gpt-4o for execution
 
 Available tools:
   [core] timestamp
@@ -238,24 +251,25 @@ Available tools:
   [filesystem] get_file_info
   …
 
+Active LLM: anthropic/claude-sonnet-4-5 (provider: anthropic)
+Runtime model switching enabled: claude-sonnet-4-5 → openai/gpt-4o for execution (handled by TaskBuilder.Models)
+
 Discovered skills: 1
   • go-testing: Use when writing Go tests with the standard testing package.
+Discovered agent profile: code-researcher (tool groups: [local-read execute])
 
-📋 Planning...
-Plan: 4 steps
+📋 Plan: 4 steps
    • step_1: Create project directory
    • step_2: Write main.go with timestamp
    • step_3: Verify file contents
    • step_4: Store summary fact
-
-🔄 Switched executor to openai/gpt-4o (provider: openai)
 
 ▶ step_1: Create project directory
   ▶ step 1
     🔧 create_directory(…) [core]
     ✅ result (28 chars)
   📝 blackboard: step_result
-  ✅ step_1 done
+  ✅ step_1 done (1.2s)
 
 ▶ step_2: Write main.go with timestamp
   ▶ step 1
@@ -265,12 +279,12 @@ Plan: 4 steps
     🔧 write_file(…) [core]
     ✅ result (18 chars)
   🏁 finish @3: Wrote main.go…
-  ✅ step_2 done
+  ✅ step_2 done (2.4s)
 
 …
 
 ═══════════════════════════════════════════
-Steps: 4/4 | Reflections: 0 | Facts: 1
+Steps: 4 total, 0 failed | Reflections: 0 | Facts: 1
 Models: planning=claude-sonnet-4-5 | execution=openai/gpt-4o
 
 Final output:

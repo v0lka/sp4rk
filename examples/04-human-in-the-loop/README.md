@@ -65,7 +65,7 @@ Two hooks, both called synchronously from the executor loop:
 
 | Method       | When it's called                          | What you control                     |
 |--------------|--------------------------------------------|--------------------------------------|
-| `OnToolCall` | Before **every** tool execution            | Allow / deny / modify the input      |
+| `OnToolCall` | Before **every** call sent to the registry | Allow / deny / modify the input      |
 | `OnStepLimit`| When the step budget is exhausted          | Grant more steps or stop             |
 
 ### 2. OnToolCall — allow, deny, or modify
@@ -77,13 +77,15 @@ func (h *ConfirmingHITL) OnToolCall(_ context.Context, toolName string, input js
     }
 
     // Prompt the user for dangerous tools
-    fmt.Printf("⚠️  APPROVAL REQUIRED: %s(%s)\n", toolName, input)
-    // read y/n from stdin…
+    fmt.Printf("\n⚠️  APPROVAL REQUIRED\n")
+    fmt.Printf("   Tool: %s\n", toolName)
+    fmt.Printf("   Input: %s\n", formatJSON(input))
+    // …then "   Allow? [y/N]: " and read y/n from stdin
 
     if approved {
         return &agent.HITLToolDecision{Allow: true, Reason: "user approved"}, nil
     }
-    return &agent.HITLToolDecision{Allow: false, Reason: "user denied"}, nil
+    return &agent.HITLToolDecision{Allow: false, Reason: "user denied this tool call"}, nil
 }
 ```
 
@@ -132,7 +134,7 @@ The `reason` parameter is non-empty when a circuit breaker triggered the pause (
 fw, err := sp4rk.New(sp4rk.Config{
     LLM:       llmConfig,
     Execution: sp4rk.ExecutionConfig{ MaxSteps: 10 },
-    HITL:      NewConfirmingHITL([]string{"write_file", "delete_file", "bash_exec"}),
+    HITL:      NewConfirmingHITL([]string{"write_file", "delete_file", "create_directory", "bash_exec"}),
 })
 ```
 
@@ -143,7 +145,7 @@ fw, err := sp4rk.New(sp4rk.Config{
 Tool policies (`Tool.DefaultPolicy()`) and the HITL handler are two separate gates:
 
 - **Tool policy** — enforced by the tool registry inside `Execute()`. `PolicyUserConfirm` tools require the registry's `ConfirmFunc`; with none configured they are **denied** (fail-closed).
-- **HITL handler** — dynamic, called by the executor for **every** tool call before it reaches the registry. Can make per-call decisions based on the actual input.
+- **HITL handler** — dynamic, called by the executor for **every** tool call that is dispatched to the registry — the `finish` and outer `batch` meta-tools are intercepted first (each `batch` sub-call is gated individually). Can make per-call decisions based on the actual input.
 
 Because this example does its confirmation in the HITL handler, it explicitly relaxes the registry-level policy for the gated tools (`registry.SetPolicyOverride(name, tools.PolicyAlwaysAllow)`) so the user is not asked twice. If you prefer registry-level confirmation instead, drop the overrides and pass a `ConfirmFunc` in `sp4rk.Config`.
 
@@ -158,14 +160,14 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 ### Fluent (recommended)
 
 ```bash
-cd sdk/examples/04-human-in-the-loop
+cd examples/04-human-in-the-loop
 go run -tags fluent .
 ```
 
 ### Classic API (advanced control)
 
 ```bash
-cd sdk/examples/04-human-in-the-loop
+cd examples/04-human-in-the-loop
 go run .
 ```
 
@@ -175,6 +177,7 @@ go run .
 Workspace: /tmp/sp4rk-example-04-123456
 This example is INTERACTIVE — you will be asked to approve tool calls.
 Press y + Enter to allow, or just Enter to deny.
+
 
 ⚠️  APPROVAL REQUIRED
    Tool: write_file
@@ -204,11 +207,15 @@ If you deny a tool call, the agent receives the denial reason and can adapt:
 ```
 ⚠️  APPROVAL REQUIRED
    Tool: write_file
+   Input: {
+     "path": "notes.txt",
+     "content": "Hello HITL!"
+   }
    Allow? [y/N]: n
    ❌ Denied
 ```
 
-The agent then sees: `Tool result: user denied this tool call` and can try a different approach or call `finish`.
+The agent then sees: `[Tool call rejected: user denied this tool call]` and can try a different approach or call `finish`.
 
 ## Next
 

@@ -12,17 +12,19 @@ go get github.com/v0lka/sp4rk@latest
 
 ### Go version
 
-Go **1.26+** is required. The SDK's `go.mod` declares this version; older toolchains will fail to build.
+Go **1.27.3+** is required. The SDK's `go.mod` declares this version (`go 1.27.3`); older toolchains will fail to build.
 
 ### API keys
 
-You need at least one LLM provider API key. Export it before running your program:
+You need at least one LLM provider configured. A hosted provider requires an API key — export it before running your program:
 
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
 # or
 export OPENAI_API_KEY="sk-..."
 ```
+
+A keyless local OpenAI-compatible endpoint (LM Studio, vLLM, a proxy) needs no key: set `ProviderType: "openai"`, point `BaseURL` at it, and leave `APIKey` empty. See [llm-providers.md](llm-providers.md).
 
 ## Configuration
 
@@ -39,7 +41,7 @@ Everything starts with [`sp4rk.Config`](../framework.go), passed to [`sp4rk.New`
 | `HITL` | `agent.HITLHandler` | Optional human-in-the-loop hooks. `nil` uses defaults: allow all tool calls, deny step extensions. |
 | `ConfirmFunc` | `tools.ConfirmFunc` | Confirmation callback for tools whose effective policy is `PolicyUserConfirm` (file writers, `bash_exec`, MCP tools). **The registry is fail-closed:** with no `ConfirmFunc`, such tools are denied instead of executing silently. See [tools.md](tools.md#policy-enforcement-in-execute-fail-closed). |
 | `Checkpointer` | `orchestration.Checkpointer` | Optional blackboard state persistence. `nil` means no checkpointing. |
-| `OnBlackboardChanged` | `func(changeType string)` | Optional callback invoked after every successful blackboard write (plan, step result, fact, attachment, reflection). The notification hook lives on `CheckpointedBlackboard`, so it fires only when a `Checkpointer` is configured; with no `Checkpointer` the callback is never invoked. `nil` means no notifications. |
+| `OnBlackboardChanged` | `func(changeType string)` | Optional callback invoked after every successful blackboard write. `changeType` is one of the seven values `"original_request"`, `"plan"`, `"step_result"`, `"reflection"`, `"fact"`, `"attachment"` (add and remove), and `"final_result"`. The notification hook lives on `CheckpointedBlackboard`, so it fires only when a `Checkpointer` is configured; with no `Checkpointer` the callback is never invoked. `nil` means no notifications. |
 | `Logger` | `*slog.Logger` | Optional structured logger. Uses `slog.Default()` if `nil`. |
 
 ### LLMConfig
@@ -65,6 +67,7 @@ Everything starts with [`sp4rk.Config`](../framework.go), passed to [`sp4rk.New`
 | `PreWarningPercent` | `int` | `0` (disabled) | Context fill percentage that triggers a pre-compaction warning listing vulnerable tool outputs. |
 | `ToolCacheTTLSeconds` | `int` | `300` | TTL for cached tool results, enabling `tool_result_read` fragmentation for truncated outputs. Negative disables the cache. |
 | `MaxDependencyContextChars` | `int` | `8000` | Character limit for step dependency summaries passed to dependent steps. |
+| `Streaming` | `bool` | `false` | Streams the LLM's text output live: the executor forwards deltas as `agent.Events.AssistantChunk` as they arrive from the provider, instead of a single chunk at finalization. Opt-in. |
 
 ### CompactionConfig
 
@@ -112,7 +115,7 @@ registry.Register(builtins.NewReadFileTool())
 registry.Register(builtins.NewWriteFileTool())
 registry.Register(builtins.NewListDirectoryTool())
 
-// The finish tool — required for task completion
+// The finish tool — auto-appended by the executor, but register it so it shows up in the registry
 registry.Register(agent.NewFinishTool())
 
 // A custom tool
@@ -134,7 +137,7 @@ registry.Register(NewCalculatorTool())
 
 The `FinishTool` is a special tool that signals task completion. The agent calls it with its final answer, and the executor stops the ReAct loop.
 
-**Why it is required:** the ReAct loop has no other way to know the task is done. Without a finish tool, the loop runs until the step budget (`ExecutionConfig.MaxSteps`) is exhausted and returns an `ExecutionResult` with `Status == "partial"` — the agent never cleanly signals completion.
+**Why registering it is recommended, not required:** `Executor.buildToolDefinitions` appends the `finish` definition to every LLM request when it is not already among the run's task tools, and the executor intercepts a `finish` call by name before dispatching to the registry — so completion works even when you never register it. Registering `agent.NewFinishTool()` on the classic `sp4rk.New` path is still recommended so the tool shows up in `fw.ToolRegistry().List()` for host enumeration and in group-filtered subagent toolsets. The fluent builders (`sp4rk.NewF()`) register it for you; opt out with `NoAutoFinish()`.
 
 Register it once after creating the framework:
 
@@ -352,6 +355,8 @@ When you have completed the task, call the finish tool with a summary.`, workspa
 	}
 }
 ```
+
+> **Reserved `system` group:** `system` is the reserved group for host-trusted orchestration/state builtins that bypass policy gates (see [`tools/group.go`](../tools/group.go)). A custom tool should only claim it when it genuinely has no filesystem or network effect of its own — a pure-compute tool like this calculator. Anything touching external input must use a real capability group (`execute`, `local_read`, `local_write`, `remote_read`, `remote_write`, `local_mcp`, `remote_mcp`).
 
 ## Next steps
 

@@ -31,7 +31,7 @@ func NewContextWindow(cfg ContextWindowConfig) *ContextWindow
 
 #### Fallback behavior
 
-If `ModelMeta.ContextWindow` is `0` (unknown model), a fallback of **128000** is used. A zero context window would otherwise disable compaction entirely (`EffectiveMax` returns `0`, `CheckFill` returns `"ok"`), causing unbounded conversation growth until the API rejects the request. Likewise, a zero `OutputLimit` falls back to **4096**.
+If `ModelMeta.ContextWindow` is `0` (unknown model), a fallback of **128000** is used. A zero context window would otherwise leave the budget degenerate: `EffectiveMax` collapses to `0` or less, and `CheckFill` then reports every prompt as `"reject"` at 100% fill regardless of its real size, so fill accounting — and with it compaction and pruning — cannot track actual conversation growth. Likewise, a zero `OutputLimit` falls back to **4096**.
 
 ```go
 cw := memory.NewContextWindow(memory.ContextWindowConfig{
@@ -57,18 +57,22 @@ cw := memory.NewContextWindow(memory.ContextWindowConfig{
 | `ConsumePendingUserInterjection()` | Retires the pending nudge after successful delivery. The executor calls it through `agent.InterjectionConsumer`; it is not consumed while merely building a prompt. |
 | `Compact(ctx) *CompactionResult` | Compresses the step history using the configured strategy. Returns before/after fill percentages, or `nil` if no compaction occurred. |
 | `SetStrategy(s)` | Changes the compaction strategy. |
-| `CheckFill() FillCheck` | Returns the current fill status: `"ok"`, `"compact"`, `"warning"`, `"emergency"`, or `"reject"`. |
+| `CheckFill() agent.FillCheck` | Returns the current fill status: `"ok"`, `"compact"`, `"warning"`, `"emergency"`, or `"reject"`. |
 | `CorrectTokenCount(apiInputTokens)` | Updates the tracker with the actual API-reported input token count so estimates converge over time. |
 | `FillPercent() float64` | Current fill percentage of the effective context window. |
 | `AvailableTokens() int` | Tokens remaining in the context window (never negative). |
 | `OutputLimit() int` | The model's maximum output token limit. |
-| `VulnerableOutputs() []VulnerableOutput` | Tool outputs that will be pruned on the next pruning cycle. Returns `nil` when pruning is inactive. |
-| `SetTask(task)` | Sets the formatted task content (the user message). |
+| `VulnerableOutputs() []agent.VulnerableOutput` | Tool outputs that will be pruned on the next pruning cycle. Returns `nil` when pruning is inactive. |
+| `SetTask(task)` | Sets the formatted task content (the user message). Reverts to the text-only prompt path: content blocks set by a prior `SetTaskWithBlocks` are cleared. |
+| `SetTaskWithBlocks(task, blocks)` | Sets the task content along with structured `llm.ContentBlock`s (text/image). Satisfies `orchestration.BlockTaskAware`, which the Conductor type-asserts and calls when `ConductorConfig.ContentBlocks` is non-empty (blocks take precedence over the plain text). |
 | `SetPlan(planText)` | Sets the formatted plan content (a system message). |
 | `SetPriorConversation(msgs)` | Sets messages from previous exchanges that appear between the system message(s) and the current task, giving the agent dialogue context for follow-ups. |
 | `SetHistoryMutation(m)` | Configures regular history mutation. Must be called before the first `BuildPrompt`. |
-| `EffectiveMax() int` | Effective maximum token count: `ContextWindow - OutputLimit - safetyMargin`. |
+| `EffectiveMax() int` | Effective maximum token count: `ContextWindow - OutputLimit - safetyMargin - toolOverhead` (the last term is the tool-definition overhead set via `SetToolOverhead`). |
+| `SetToolOverhead(tokens int)` | Reserves a fixed token allowance out of the context budget for the per-request tool schemas the executor attaches to every LLM call; the reserve is subtracted from `EffectiveMax`. Clamped to `toolOverheadMaxReservePercent` (80%) of the usable window so `EffectiveMax` stays positive; a negative input clears a previous reserve. Implements `agent.ToolOverheadAware`. |
+| `ContextWindowSize() int` | Returns the model's advertised context-window size — the raw window, before the safety-margin, output-limit and tool-overhead deductions `EffectiveMax` applies. Implements `agent.ContextWindowSizeProvider`. |
 | `Tracker() *llm.ContextTokenTracker` | Returns the underlying token tracker. |
+| `ContextTracker() *llm.ContextTokenTracker` | Returns the same underlying token tracker as `Tracker()` (identical value) under the name required by the `orchestration.TrackerProvider` capability interface, which `*ContextWindow` therefore satisfies structurally. |
 
 `BuildPrompt` splits the system prompt on `CacheBreakMarker` into multiple system messages so that providers can apply prompt caching to the stable parts (see [Prompt Building](prompt-building.md)). When a pending interjection is set, it is appended after the step history as the final user message. `BuildPrompt` deliberately does not clear it: the executor calls `ConsumePendingUserInterjection` only after a successful LLM response, so a context-overflow call followed by reactive compaction and a second `BuildPrompt` does not lose the user's nudge.
 
@@ -118,17 +122,17 @@ Three strategies implement the `agent.CompactionStrategy` interface. Each transf
 
 ### 1. Sliding Window
 
-`SlidingWindowStrategy` keeps the first `KeepFirst` and last `KeepLast` steps, dropping the middle. A system message `[... N steps omitted ...]` marks the gap. This is the simplest and fastest strategy — no LLM calls are required.
+`SlidingWindowStrategy` keeps the first `keepFirst` and last `keepLast` steps, dropping the middle. A system message `[... N steps omitted ...]` marks the gap. This is the simplest and fastest strategy — no LLM calls are required.
 
 ```go
 strategy := memory.NewSlidingWindowStrategy(keepFirst, keepLast)
 ```
 
-If the total step count does not exceed `KeepFirst + KeepLast`, all steps are kept verbatim.
+If the total step count does not exceed `keepFirst + keepLast`, all steps are kept verbatim.
 
 ### 2. Summarization
 
-`SummarizationStrategy` groups the oldest steps into blocks and uses an LLM (via a `Summarize` callback) to summarize each block into a compact system message. The most recent `KeepLast` steps are preserved verbatim.
+`SummarizationStrategy` groups the oldest steps into blocks and uses an LLM (via a `Summarize` callback) to summarize each block into a compact system message. The most recent `keepLast` steps are preserved verbatim.
 
 ```go
 strategy := memory.NewSummarizationStrategy(
@@ -141,7 +145,7 @@ strategy := memory.NewSummarizationStrategy(
 )
 ```
 
-Each block's text is truncated to `maxSummarizeTokens` before being sent to the summarizer. If summarization fails, a fallback indicator message is emitted instead. If no summarizer is provided, a placeholder is used.
+Each block's text is truncated to `maxSummarizeTokens` before being sent to the summarizer. If summarization fails, a fallback indicator message (`[Summary of steps i-j failed: …]`) is emitted instead. With a **nil summarizer** the strategy fails closed: it keeps the whole history verbatim (logging a one-shot warning) instead of replacing the summarized steps with a bare placeholder — the output is frozen as the prompt prefix, so a placeholder would permanently discard those steps' thought/action/observation. The window simply stops shrinking until a summarizer is wired.
 
 ### 3. Hierarchical
 
@@ -165,7 +169,7 @@ strategy := memory.NewHierarchicalStrategy(
 )
 ```
 
-Ratios are normalized to sum to `1.0` if they do not already. For very small step counts (≤ 5), all steps are returned verbatim.
+Ratios are normalized to sum to `1.0` if they do not already; a set containing a non-positive or non-finite ratio is rejected in favour of the `0.4`/`0.3`/`0.3` defaults. For very small step counts (≤ 5), all steps are returned verbatim, and a nil summarizer fails closed exactly like `SummarizationStrategy` (the whole history is kept verbatim rather than replaced by placeholders).
 
 ### NewCompactionStrategy
 
@@ -183,6 +187,8 @@ Recognized names:
 | `"summarization"` | `SummarizationStrategy` |
 | `"hierarchical"` | `HierarchicalStrategy` |
 | any other | Falls back to `SlidingWindowStrategy` |
+
+`"summarization"` and `"hierarchical"` additionally require `deps.Summarize`: with a nil summarizer the factory returns a `SlidingWindowStrategy` instead (`memory/compaction.go`), because an LLM-backed strategy without an LLM would freeze placeholder text over the whole step history.
 
 ```go
 strategy := memory.NewCompactionStrategy(
@@ -239,8 +245,23 @@ type CompactionDeps struct {
     // MaxSummarizeTokens is the maximum token count for text sent to summarization.
     // Defaults to 16000 if zero.
     MaxSummarizeTokens int
+    // Forecast supplies the compression-ratio forecasts used by PredictCompaction
+    // to estimate the post-summary token count of the LLM-backed strategies.
+    // It is ignored by CompactConversationHistory and the step-based strategies.
+    Forecast CompactionForecast
 }
 ```
+
+### See also: message-level compaction and prediction
+
+The strategies above are step-based: they operate on the step history held by a `ContextWindow`. `memory` also exports a message-level counterpart for callers that hold a raw conversation history, plus a prediction API:
+
+- `CompactConversationHistory(ctx, msgs, strategy, cfg, deps)` — compacts a plain conversation history (`[]llm.Message` of user/assistant exchanges) using the named strategy. A purely structural operation: each strategy applies its configured message-count window exactly, with no token-budget sizing and no token trim, so a history too short for the window is returned verbatim. Serves callers such as a session orchestrator compacting cross-task dialogue context on demand.
+- `ConversationHierarchicalZones(n, cfg)` — returns the distant/middle zone sizes for an `n`-message history under the hierarchical strategy, using the same normalized cumulative zone math as `CompactConversationHistory` and `PredictCompaction`, so callers that attribute a compaction's output to its zones need not duplicate that math.
+- `PredictCompaction(msgs, strategy, cfg, deps)` — computes the expected effect of compacting `msgs` with the named strategy without running it. A pure function safe to call from any goroutine; an unknown strategy fails closed with the same error as `CompactConversationHistory`, and an empty history yields a zero prediction with `WillCompact=false`.
+- `CompactionPrediction` — the prediction result: `Strategy`, `WillCompact` (the exact "would this strategy shrink the history right now" verdict), `BeforeTokens`/`AfterTokens` (an exact dry-run for `sliding_window`, a forecast for the LLM-backed strategies), `VerbatimTokens` (the compression-ratio EWMA calibration anchor), `Reclaim`, and `Exact`.
+
+`CompactConversationHistory`, `PredictCompaction` and `CompactionPrediction` are specified in [specs/domains/memory/compaction.md](../specs/domains/memory/compaction.md).
 
 ## ToolOutputPruning
 
@@ -326,6 +347,8 @@ cw.SetHistoryMutation(memory.HistoryMutation{
 ## Prompt Injection Defense Integration
 
 When `InjectionDefenseEnabled` is `true`, tool outputs from tools that return external data (marked via the step's `IsUntrusted` flag) are wrapped in `<untrusted-content>` tags before being added to the prompt. This defends against indirect prompt injection. See [Security](security.md) for details on the wrapping and stripping functions.
+
+The flag is a `ContextWindow`-level opt-in: `sp4rk.Framework` constructs its `ContextWindow` internally and never sets it (`sp4rk.Config` has no corresponding field), so the automatic wrap is off on the Framework path. Enable it by constructing the `ContextWindow` yourself, or wrap untrusted output inside the tool's `Execute`.
 
 The boundary **survives compaction**: the compaction strategies build verbatim tool messages without the defense wrap, so the `ContextWindow` re-wraps any tool message in the frozen compacted prefix whose source step was flagged `IsUntrusted` after compaction. Untrusted output never re-enters LLM context without the boundary.
 

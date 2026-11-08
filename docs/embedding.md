@@ -1,6 +1,6 @@
 # Embedding & Vector Search
 
-The `embedding` package provides ONNX-based text embedding for local semantic search, plus a document chunker and a built-in vector search tool. Everything runs in-process — no external API calls are required for embedding.
+The `embedding` package provides ONNX-based text embedding for local semantic search, plus a document chunker. Everything runs in-process — no external API calls are required for embedding. The built-in vector search tool that consumes these embeddings lives in `tools/builtins`, not in `embedding` — see [VectorSearchTool](#vectorsearchtool).
 
 ```go
 import "github.com/v0lka/sp4rk/embedding"
@@ -25,15 +25,6 @@ type EmbedderConfig struct {
     MaxSeqLength int
     // HiddenDim is the embedding dimension of the model. Defaults to 512.
     HiddenDim int
-    // IntraOpThreads limits ONNX Runtime intra-op threads during inference.
-    // 0 (the default) preserves legacy behavior: the session is created with a
-    // nil *SessionOptions, letting ONNX Runtime choose the thread count. A
-    // positive value N constrains intra-op parallelism to N threads, bounding
-    // CPU usage in resource-constrained environments. Negative values are
-    // treated as 0.
-    IntraOpThreads int
-    // Logger for structured logging. If nil, a no-op logger is used.
-    Logger *slog.Logger
     // BatchSize is the fixed row capacity of the persistent batch ONNX
     // session used when EmbedDocuments receives more than one text.
     // Multi-text batches are processed in chunks of at most BatchSize rows
@@ -49,6 +40,13 @@ type EmbedderConfig struct {
     // fitting fixed sequence length (64, 128, 256, or MaxSeqLength) and
     // lazily creates one persistent ONNX session per used bucket. Opt-in.
     EnableLengthBuckets bool
+    // IntraOpThreads limits ONNX Runtime intra-op threads during inference.
+    // 0 (the default) preserves legacy behavior: the session is created with a
+    // nil *SessionOptions, letting ONNX Runtime choose the thread count. A
+    // positive value N constrains intra-op parallelism to N threads, bounding
+    // CPU usage in resource-constrained environments. Negative values are
+    // treated as 0.
+    IntraOpThreads int
     // ExecutionProvider selects the ONNX Runtime execution provider:
     // "cpu" (also the empty-string default), "cuda", "openvino", or "auto"
     // (the ladder CUDA → OpenVINO → CPU with a WARN naming each failure).
@@ -61,9 +59,16 @@ type EmbedderConfig struct {
     // explicit "openvino" request a non-zero value is a hard configuration
     // error, while 0 lets the OpenVINO rung resolve the device itself (the
     // plugin's first device, then the remaining ones when it cannot compile
-    // the model). Ignored by the CPU provider; negative values are rejected
+    // the model). Under "auto" a non-zero DeviceID fails the OpenVINO rung
+    // the same way — but only as one rung of the ladder, so NewEmbedder logs
+    // a WARN naming the failure and continues, degrading to the CPU provider
+    // when no hardware rung succeeds, instead of failing.
+    // Ignored by the CPU provider; negative values are rejected
     // for every provider.
     DeviceID int
+    // Logger for structured logging. If nil, a discard logger is used
+    // (slog.New(slog.DiscardHandler)).
+    Logger *slog.Logger
     // Telemetry optionally collects bounded, content-free stage aggregates.
     // Nil disables collection.
     Telemetry *Telemetry
@@ -168,6 +173,90 @@ For `jina-embeddings-v2-small-en`:
 - **Output:** `last_hidden_state` (`float32`, shape `[batch, seq, hiddenDim]`).
 - **Post-processing:** mean pooling with the attention mask, then L2 normalization.
 
+## GPU diagnostics
+
+Three helpers answer "what GPUs exist", "is this process actually on the GPU" and "did OpenVINO really run on the Intel GPU" from *outside* the process, rather than trusting ONNX Runtime to self-report which execution provider it picked.
+
+```go
+func ListGPUDevices(ctx context.Context) ([]GPUDevice, error)
+func GPUInUse(ctx context.Context) (bool, error)
+func VerifyOpenVINOExecution(ctx context.Context, emb *Embedder) (bool, error)
+
+type GPUDevice struct {
+    Index    int    // driver-assigned ordinal, as used by CUDA_VISIBLE_DEVICES ("0" = primary GPU)
+    Name     string // product name as reported by the driver; informational only
+    Provider string // ExecutionProviderCUDA or ExecutionProviderOpenVINO
+}
+```
+
+Every probe takes a caller-supplied `context.Context` first and derives its working context with `context.WithTimeout`, so the effective budget is **min(caller deadline, internal cap)** — an earlier caller deadline always wins, and the cap is the upper bound for callers without one. The cap is 2 s (`gpuProbeTimeout`) for `GPUInUse` and `ListGPUDevices`, and 30 s for `VerifyOpenVINOExecution`. A wedged driver therefore never stalls the caller.
+
+The result semantics are shared, per probe source:
+
+- Probe tool **absent from `PATH`** → a no-error, no-signal result (`false, nil` or an empty list). Absence of a vendor's userspace means "no GPUs from that vendor", not a failure, and that fast path returns without consulting `ctx`.
+- Probe tool **present but the invocation fails** (driver down, non-zero exit, timeout, or a cancelled/expired `ctx` once the probe is actually running) → an error.
+- Callers **must treat any error as "unverified", never as "not on GPU"**, and must not turn it into a startup failure.
+
+`GPUInUse` runs `nvidia-smi --query-compute-apps=pid --format=csv,noheader`, parses the listed compute-application PIDs and compares them with `os.Getpid()`. An empty list means no process on the machine is using the GPU; a non-empty list without our PID means some *other* process is. A CUDA context is created lazily — on the first inference on the CUDA provider — and lives until the ONNX Runtime environment is destroyed, so the correct moment to probe is *after* at least one real inference, not immediately after session creation. Known limitation: in PID-namespaced environments (containers, WSL) NVML may report host-namespace PIDs that never match the in-namespace `os.Getpid()`.
+
+`ListGPUDevices` enumerates two sources, each following the semantics above independently: NVIDIA GPUs via `nvidia-smi --query-gpu=index,name --format=csv,noheader` (tagged `Provider: "cuda"`) and Intel GPUs via `vulkaninfo --summary` filtered to the Intel PCI vendor (tagged `Provider: "openvino"`) — the hardware the OpenVINO provider runs on. Devices are concatenated NVIDIA-first. **Partial answers win**: the merged list is returned with a `nil` error as long as at least one source produced a device, so one broken driver stack cannot hide the GPUs another still reports; only when *no* source produced a device **and** at least one present source failed does the call fail, with the errors joined — the caller then sees "hardware present, probe failed" instead of a bare "no GPUs". For `cuda` entries, `Index` is the driver ordinal that matches `EmbedderConfig.DeviceID` and `CUDA_VISIBLE_DEVICES`; the ordinal is only meaningful within its `Provider`, so a caller selects a (provider, index) pair, never a bare index. Intel entries always carry `0`, because the plugin-based OpenVINO surface exposes no per-device selection.
+
+`VerifyOpenVINOExecution` is the OpenVINO counterpart of `GPUInUse`: it drives sustained inference on `emb` while sampling `xpu-smi`'s device-level compute-utilization counter, and reports whether any sample reached the 25 % threshold — external proof that the OpenVINO provider really executes on the Intel GPU rather than sliding to a CPU device inside the plugin. At most 12 samples are taken and sampling stops early once the threshold is crossed; the cadence comes from the spawns themselves, so there is deliberately no sleep between samples. A sample reaching the threshold yields `(true, nil)`; sampling concluding without ever reaching it yields `(false, nil)` — inference demonstrably never drove the GPU's compute engine. The verdict is **device-level by nature**: `xpu-smi` exposes no per-process attribution on integrated Intel GPUs, so unlike `GPUInUse` this probe cannot name the owning PID, and callers must present the result as device-level rather than process-level. It is diagnostics-only by contract — it never blocks or fails embedder startup, and callers run it in a background/diagnostic context.
+
+The output parsers are deliberately forgiving: prose placeholders (`No running processes found`, `[N/A]`), CRLF endings and extra comma-separated columns degrade to "no GPUs / no PIDs" instead of an error.
+
+## Telemetry
+
+`Telemetry` aggregates low-cardinality, **content-free** embedding metrics — a snapshot contains no text, no model paths and no caller-provided labels. It is safe for concurrent use, and a nil `*Telemetry` is intentionally a no-op, which is why leaving `EmbedderConfig.Telemetry` unset disables collection with no background goroutines or exporters.
+
+```go
+type Telemetry struct { /* ... */ }
+
+type TelemetryStage string // a bounded label for an embedding pipeline stage
+
+const (
+    StageTokenization  TelemetryStage = "tokenization"   // tokenizer encoding work
+    StageONNXInference TelemetryStage = "onnx_inference" // blocking ONNX session runs
+    StageSessionCreate TelemetryStage = "session_create" // successful ONNX session construction
+)
+
+type StageMetrics struct {
+    Calls    int64
+    Duration time.Duration
+}
+
+type TelemetrySnapshot struct {
+    Stages    map[TelemetryStage]StageMetrics
+    Texts     int64
+    Tokens    int64
+    MinTokens int
+    MaxTokens int
+    // InferenceCount counts ONNX inference ATTEMPTS, including ones that
+    // failed — it always equals Stages[StageONNXInference].Calls.
+    InferenceCount int64
+    SessionCount   int64
+    BatchRows      int64
+    BatchCapacity  int64
+}
+
+func (t *Telemetry) Snapshot() TelemetrySnapshot // a stable copy of the current aggregates
+func (t *Telemetry) Reset()                      // clears all aggregates, keeps the collector instance
+
+func (s TelemetrySnapshot) AverageTokens() float64 // mean non-padding tokens per text
+func (s TelemetrySnapshot) BatchFill() float64     // fraction of batch capacity holding real rows
+```
+
+`TelemetryStage` is a **bounded** vocabulary — the three constants above are the whole set — so metric cardinality cannot grow with the workload. `AverageTokens()` is `Tokens / Texts`, and `0` when no text has been embedded; `BatchFill()` is `BatchRows / BatchCapacity`, and `0` when nothing has been batched yet.
+
+The stages and counters map directly onto the pipeline features described above:
+
+- `StageTokenization` times the tokenizer encoding step that `EnableBatchPipeline` overlaps with inference, while `StageONNXInference` times the blocking session runs that overlap hides — comparing the two `Duration` totals is how you tell whether the pipeline is actually buying overlap.
+- `StageSessionCreate` counts successful ONNX session construction. In fixed mode that is the persistent batch session plus the dedicated `batchSize=1` fast-path session; under `EnableLengthBuckets` a session is created lazily per *used* bucket, so `SessionCount` reveals how many of the 64/128/256/`MaxSeqLength` buckets the corpus actually populated.
+- `Texts`/`Tokens` count embedded texts and their **non-padding** tokens (derived from the attention mask), with `MinTokens`/`MaxTokens` tracking the spread. Together with `AverageTokens()` this is the signal for sizing `MaxSeqLength` and for judging whether the length buckets are well placed.
+- `BatchFill()` is the direct read on how much of the ONNX batch capacity is padding waste — and therefore on whether a smaller `BatchSize`, or bucket mode, would pay off.
+
+`InferenceCount` counts inference **attempts**, including ones that failed, and always equals `Stages[StageONNXInference].Calls`, so a derived average inference latency (`Duration / InferenceCount`) stays meaningful after transient failures.
+
 ## Tokenizer
 
 `Tokenizer` wraps a HuggingFace-compatible WordPiece tokenizer loaded from a `tokenizer.json` file. It produces `input_ids`, `attention_mask`, and `token_type_ids` suitable for BERT-family models like `jina-embeddings-v2-small-en`.
@@ -177,10 +266,14 @@ type Tokenizer struct { /* ... */ }
 
 func NewTokenizer(path string) (*Tokenizer, error)
 func (t *Tokenizer) Encode(text string, maxLen int) (inputIDs, attentionMask, tokenTypeIDs []int64, err error)
+func (t *Tokenizer) EncodeWithLength(text string, maxLen int) (inputIDs, attentionMask, tokenTypeIDs []int64, actualLen int, err error)
 func (t *Tokenizer) EncodeBatch(texts []string, maxLen int) (inputIDs, attentionMask, tokenTypeIDs []int64, err error)
+func (t *Tokenizer) EncodeBatchWithLengths(texts []string, maxLen int) (inputIDs, attentionMask, tokenTypeIDs []int64, lengths []int, err error)
 ```
 
 `Encode` tokenizes a single text and returns padded/truncated tensors ready for ONNX inference. `maxLen` controls the maximum sequence length (including the `[CLS]` and `[SEP]` special tokens). `EncodeBatch` tokenizes multiple texts and returns flattened, row-major tensors of shape `[batch_size * maxLen]`.
+
+`EncodeWithLength` is `Encode` plus `actualLen`, the actual non-padding sequence length after truncation; `EncodeBatchWithLengths` is `EncodeBatch` plus one such length per input text. The lengths let a caller select a smaller fixed-shape ONNX session without rescanning the attention mask — which is exactly what the length-bucket mode does. `Encode` and `EncodeBatch` are thin wrappers: they call the `…WithLength`/`…WithLengths` variant and discard the length result. Both variants reject a `maxLen` below 2 with an error rather than panicking on an out-of-range index — the guard lives in `EncodeWithLength`, which the batch path calls per text, so there it surfaces wrapped as `batch encode text N: …`.
 
 ## Chunker
 
@@ -298,6 +391,10 @@ The embedding subsystem requires three external assets, fetched separately:
 1. **ONNX Runtime shared library** — the platform-specific shared library (`libonnxruntime.dylib` / `.so` / `.dll`). Its path is passed as `EmbedderConfig.LibraryPath`.
 2. **Embedding model** — the quantized `jina-embeddings-v2-small-en` ONNX model file. Its path is passed as `EmbedderConfig.ModelPath`.
 3. **Tokenizer** — the HuggingFace `tokenizer.json` file. Its path is passed as `EmbedderConfig.TokenizerPath`.
+
+**ONNX Runtime is optional for the framework.** It is required only by the `embedding` subsystem: the `onnxruntime_go` bindings are imported by the `embedding` package alone, so no other package in the module has ONNX Runtime anywhere in its dependency graph. Every other sp4rk package — the executor, planner, tool registry, LLM providers, MCP gateway — builds and runs with no ONNX Runtime present, so the dependency is opt-in.
+
+Nothing is loaded eagerly either. The shared library is opened by `initONNXRuntime(LibraryPath)`, whose only production caller is `NewEmbedder`; the `embedding` package has no `init` that touches ONNX Runtime. A host that never constructs an `Embedder` therefore never needs `LibraryPath`, `ModelPath` or `TokenizerPath`, and never loads the library. The [GPU diagnostics](#gpu-diagnostics), the chunker and the tokenizer are the parts of `embedding` usable without it — `GPUInUse` and `ListGPUDevices` shell out to driver tooling and take no embedder, though `VerifyOpenVINOExecution` does need one to drive inference; `ChunkFile` and `ComputeFileHash` (`embedding/chunker.go`) are pure stdlib; and `NewTokenizer` (`embedding/tokenizer.go`) needs only `sugarme/tokenizer`, never an `Embedder`.
 
 ## Complete Example
 

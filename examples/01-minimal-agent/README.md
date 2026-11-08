@@ -14,7 +14,7 @@ Both build the identical `*sp4rk.Framework` and produce the same result. The flu
 ## What you will learn
 
 - How to create a `sp4rk.Framework` (via `sp4rk.NewF` or classic `sp4rk.New`)
-- Why the `finish` tool must be registered
+- Why the `finish` tool is registered — and why completion does not depend on it
 - How to define a system prompt factory
 - How to call `Framework.Execute` and read the result
 
@@ -76,7 +76,7 @@ fw, err := sp4rk.New(sp4rk.Config{
 fw.ToolRegistry().Register(agent.NewFinishTool())
 ```
 
-The `finish` tool is the agent's way of saying "I'm done." The executor handles `finish` inline — it does not call `ToolRegistry.Execute` for it — but the tool **must** be in the registry so its descriptor is sent to the LLM as an available tool. Without it, the LLM has no way to signal completion.
+The `finish` tool is the agent's way of saying "I'm done." The executor handles `finish` inline — it does not call `ToolRegistry.Execute` for it. Registering it is what makes `finish` appear in the registry's own listings and descriptors, and the fluent builders do that for you; on the classic path you register it explicitly. Completion does not hinge on the registration, though: `Executor.buildToolDefinitions` appends the `finish` definition to every LLM request when it is not already among the run's task tools, so the model always has a way to signal completion.
 
 ### 3. System prompt factory
 
@@ -95,7 +95,7 @@ func(ctx context.Context, stepDescription string, modelMeta llm.ModelMetadata) s
 - `stepDescription` — the task the agent is working on
 - `modelMeta` — the active model's capabilities (context window, family, …)
 
-For a minimal agent, a static string is fine. Later examples use `prompt.NewSystemPromptBuilder()` for structured prompts with cache-break support.
+For a minimal agent, a static string is fine — none of the examples in this directory need more. For structured prompts with cache-break support the SDK's `prompt` package offers `prompt.NewBuilder()` and `prompt.NewSystemPromptBuilder()`; see [`docs/prompt-building.md`](../../docs/prompt-building.md).
 
 ### 4. Execute
 
@@ -123,6 +123,7 @@ fmt.Println("Output:", result.Output)
 | `failed`    | An error occurred during execution                   |
 | `aborted`   | The reflector recommended aborting after step failures |
 | `cancelled` | The context was cancelled mid-execution              |
+| `paused`    | A cooperative pause signal tripped — the trajectory is preserved and the run may be resumed |
 
 ## Prerequisites
 
@@ -135,7 +136,7 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 ### Fluent (recommended)
 
 ```bash
-cd sdk/examples
+cd examples
 go mod tidy          # first time only
 cd 01-minimal-agent
 go run -tags fluent .
@@ -144,7 +145,7 @@ go run -tags fluent .
 ### Classic API (advanced control)
 
 ```bash
-cd sdk/examples/01-minimal-agent
+cd examples/01-minimal-agent
 go run .
 ```
 

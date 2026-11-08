@@ -54,13 +54,13 @@ Available options:
 | `WithEvents(e Events)` | Lifecycle events (nil → `NoopEvents`). |
 | `WithSuppressAssistantEvents(bool)` | Hide `AssistantChunk`/`AssistantDone` (for sub-steps). |
 | `WithStreaming(bool)` | Stream LLM text deltas live as `AssistantChunk` events as they arrive (opt-in; off by default). |
-| `WithToolResultBudget(b ToolResultBudget)` | Stage 2 token-based truncation. Defaults to `DefaultToolResultBudget()` when unset. |
+| `WithToolResultBudget(b ToolResultBudget)` | Stage 2 token-based truncation. The zero value leaves the budget **disabled** (`HardCapTokens <= 0`) — pass `DefaultToolResultBudget()` explicitly for the SDK defaults (`sp4rk.New` does this for you via `ExecutionConfig.ToolResultBudget`). |
 | `WithCircuitBreaker(c CircuitBreakerConfig)` | Loop-protection thresholds. Defaults to `DefaultCircuitBreakerConfig()` when unset. |
 | `WithHITL(h HITLHandler)` | Human-in-the-loop hooks (nil → `NoopHITLHandler`). |
 | `WithResumeSteps(steps []Step)` | Seeds prior ReAct steps so `Run` resumes from a checkpoint instead of starting fresh. The step counter starts at `len(steps)+1` and the full trajectory (seeded plus new steps) syncs to the `TrajectoryStore`. The resumed steps count against `maxSteps`; the caller must seed the `ContextManager` with the same steps (e.g. via `memory.ContextWindow.SeedSteps`). Nil/empty (or omitted) is the default fresh-start behavior. |
 | `WithPauseChecker(func(context.Context) bool)` | Installs a cooperative pause signal checked once per step boundary, after cancellation and before live-message polling — and, since the tool-call watchdog, also polled on the executor's `toolWatchdogInterval` ticker while a tool call is in flight (so a long tool pauses without waiting for the boundary). A true return yields `ErrPaused`, `Finished: false`, and the resumable trajectory. |
 | `WithUserMessageSource(func(context.Context) string)` | Polls a host-owned live-message queue once per step boundary. A non-empty return becomes the final user message in the next LLM request; at most one message is drained per boundary. |
-| `WithToolCallTimeout(time.Duration)` | Per-tool-call ceiling: a single tool call whose wait exceeds the duration is abandoned and the tool's context is cancelled (a cooperative request — an uninterruptible tool may still finish) and `Run` returns an error wrapping `ErrToolTimeout`, named with the tool. Zero (default) disables it. `SetToolCallTimeout` mirrors it at runtime; `SetToolCallTimeoutExempt(names...)` exempts interactive/long-running tools (e.g. `ask_user`, `declare_plan`, `delegate`, `execute_plan`). |
+| `WithToolCallTimeout(time.Duration)` | Per-tool-call ceiling: a single tool call whose wait exceeds the duration is abandoned and the tool's context is cancelled (a cooperative request — an uninterruptible tool may still finish) and `Run` returns an error wrapping `ErrToolTimeout`, named with the tool. Zero (default) disables it; `DefaultToolCallTimeout` (`5 * time.Minute`) is the recommended non-zero ceiling. `SetToolCallTimeout` mirrors it at runtime; `SetToolCallTimeoutExempt(names...)` replaces the set of interactive/long-running tools exempt from it, whose documented default is returned by `DefaultToolCallTimeoutExemptTools()`: `ask_user`, `declare_plan`, `delegate`, `execute_plan`, `propose_goal`. |
 
 A minimal construction using the SDK defaults:
 
@@ -118,14 +118,22 @@ Each iteration of `Run` proceeds as follows:
 4. **Cooperative pause** — a configured pause checker runs. A true result returns `ErrPaused` with the trajectory collected so far; no live message is drained on that boundary. The checker is also polled *while a tool call is in flight* (on the executor's `toolWatchdogInterval` ticker, see [Per-tool-call ceiling](#per-tool-call-ceiling)), so a long tool reaches its checkpoint without waiting for the boundary.
 5. **Live user message** — a configured source is polled. One non-empty message is recorded as a nudge-only step and becomes the final user message in this iteration's LLM request.
 6. **LLM call** — the prompt is built from the context manager and sent to the LLM. If the provider reports a context-window-exceeded error, a reactive compaction is triggered and the call is retried. A pending resume interjection is consumed only after a successful response, so it remains present on the retry.
-7. **Thought event** — `emitter.Thought(stepNum, content, reasoning)` fires with the model's reasoning and content.
+7. **Thought event** — `emitter.Thought(stepNum, content, reasoning)` fires with the model's reasoning and content, but only when at least one of them is non-empty.
 8. **Implicit finish check** — if the model returns no tool calls, the executor checks whether this is a legitimate finish or a failure mode (e.g. printed tool-call syntax as text). A nudge may be injected to force an explicit `finish` call.
 9. **Truncation detection** — if the stop reason is `max_tokens` and tool calls were present, the call was truncated; a nudge is injected and the truncation counter is checked against the circuit breaker.
 10. **Tool execution** — each tool call is executed (after HITL approval). Results are truncated in two stages, cached if applicable, and recorded as observations. `ToolCall` and `ToolResult` events fire per call. If verify-on-edit is enabled, successful `write_file`/`edit_file` calls schedule one verification run at the end of the response group.
 11. **StepComplete event** — `emitter.StepComplete(stepNum, duration)` fires.
-12. **Compaction** — the context fill is checked; if it crosses a threshold, compaction runs and `ContextFill` / `ContextCompaction` events fire.
+12. **Compaction** — the context fill is checked and a `ContextFill` event fires on every completed step; if the reported status crosses a threshold, compaction runs and a `ContextCompaction` event fires.
 
-The loop terminates when the `finish` tool is called (`Finished: true`) or the budget is exhausted (`Finished: false`).
+The loop terminates on any of these paths:
+
+- **Explicit `finish` tool call** — `Finished: true`, `Output` = the `answer` argument (subject to the finish guard and the mutation/checklist gates).
+- **Host-designated stop tool** — a successful call to a `SetStopTools` tool ends the run with `Finished: true`, the tool's observation as `Output`, and the model's final text as `Summary`.
+- **Implicit text-only finish** — no tool calls and the model stopped on its own: `Finished: true`, `Output` = the model's text (see [FinishTool](#finishtool)).
+- **Cooperative pause** — the pause checker trips: `Run` returns `ErrPaused` alongside a result with `Finished: false` and the resumable trajectory.
+- **Budget exhaustion** — `stepNum` exceeds the step limit and `OnStepLimit` grants no more steps: `Finished: false`, `Output` empty.
+- **Circuit-breaker / syntax abort** — a breaker threshold is crossed, or the model repeatedly prints tool-call syntax as text: `Finished: false` with a short `Aborted: …` message in `Output`.
+- **Fatal error** — LLM failure, cancellation, or a tool-call timeout: `Run` returns a `nil` result and a non-nil error.
 
 ## Pause, live steering, and resume interjections
 
@@ -155,7 +163,7 @@ The callbacks must be cheap and safe to invoke from the `Run` goroutine. Queue p
 
 ## Per-tool-call ceiling
 
-`WithToolCallTimeout` / `SetToolCallTimeout` bound a single tool call. The executor runs the call on a detached, panic-recovering goroutine and abandons the **wait** — cancelling the tool's derived call context (a cooperative request, so an uninterruptible tool may still finish) — when the ceiling fires, returning an error wrapping `agent.ErrToolTimeout` named with the tool (`tool "name": tool call timed out`). Treat the abandoned tool's side effects as having possibly occurred. Zero (the default) disables the ceiling. Interactive/long-running orchestration tools that block on a human or sub-work by design (`ask_user`, `declare_plan`, `propose_goal`, `delegate`, `execute_plan`) are exempt by default; `SetToolCallTimeoutExempt(names...)` replaces that set. Resume a run that returned `ErrToolTimeout` only after reconciling the possibly-applied tool.
+`WithToolCallTimeout` / `SetToolCallTimeout` bound a single tool call. The executor runs the call on a detached, panic-recovering goroutine and abandons the **wait** — cancelling the tool's derived call context (a cooperative request, so an uninterruptible tool may still finish) — when the ceiling fires, returning an error wrapping `agent.ErrToolTimeout` named with the tool (`tool "name": tool call timed out`). Treat the abandoned tool's side effects as having possibly occurred. Zero (the default) disables the ceiling; `agent.DefaultToolCallTimeout` (`5 * time.Minute`) is the recommended ceiling for callers that want the class-wide "no single tool call may block the loop indefinitely" guarantee. Interactive/long-running orchestration tools that block on a human or sub-work by design are exempt by default — `agent.DefaultToolCallTimeoutExemptTools()` returns that built-in set (`ask_user`, `declare_plan`, `delegate`, `execute_plan`, `propose_goal`) — and `SetToolCallTimeoutExempt(names...)` replaces it. Resume a run that returned `ErrToolTimeout` only after reconciling the possibly-applied tool.
 
 ## Verify-on-edit
 
@@ -213,7 +221,7 @@ type Step struct {
 | `UserNudge` | An optional user message injected after the step's normal messages (e.g. step-limit nudges, circuit-breaker warnings). |
 | `ResponseGroup` | Links steps that came from a single LLM response containing multiple tool calls. Steps sharing a non-zero value are rendered as one assistant message with multiple tool calls. Zero means a standalone step. |
 | `IsUntrusted` | `true` when the observation came from an untrusted external source (web, MCP, filesystem). Such observations are wrapped in `<untrusted-content>` tags before entering the LLM context as a prompt-injection defense. |
-| `CacheHash` | SHA-256 hash of the full (pre-truncation) tool result, stored in the `ToolResultCache`. Empty for non-cacheable tools whose result is **not** truncated, or when caching is disabled. A non-cacheable tool that *is* truncated is cached on demand (cache-on-truncate) and gets a hash, so the full result stays recoverable via `tool_result_read`. Used to replace old tool results with a cache reference, reducing replay cost. |
+| `CacheHash` | Abbreviated (git-style prefix) SHA-256 hash of the full (pre-truncation) tool result, stored in the `ToolResultCache`; unique within the session. Empty for non-cacheable tools whose result is **not** truncated, or when caching is disabled. A non-cacheable tool that *is* truncated is cached on demand (cache-on-truncate) and gets a hash, so the full result stays recoverable via `tool_result_read`. Used to replace old tool results with a cache reference, reducing replay cost. |
 
 ## ExecutorResult
 
@@ -231,7 +239,7 @@ type ExecutorResult struct {
 
 - `Output` — the final answer (from the `finish` tool, or a stop tool's observation), or a short abort message when the run did not finish.
 - `Steps` — the full sequence of executed steps.
-- `Finished` — `true` if the agent terminated on `finish` or a host-designated stop tool; `false` if the budget was exhausted or a circuit breaker aborted.
+- `Finished` — `true` if the agent terminated on `finish`, a host-designated stop tool, or an implicit text-only finish; `false` on a cooperative pause, budget exhaustion, a circuit-breaker abort, or when the mutation gate let a `finish` through without a successful mutation.
 - `AbortReason` — a short, structured cause when `Finished` is `false` but `Output` holds a meaningful answer rather than an abort message (e.g. the mutation gate rejecting a finish). Empty when `Output` already carries the abort reason, or when the run finished.
 - `Summary` — the model's own final text when the run terminated on a host-designated stop tool (see `SetStopTools`) rather than the inline `finish` tool; `Output` alone is then just the tool's short confirmation. Always empty for runs that do not end on a stop tool.
 
@@ -252,7 +260,7 @@ type FillCheck struct {
 |--------|---------|
 | `ok` | Context is comfortably within limits. |
 | `compact` | Compaction should run to free space. |
-| `warning` | Context is filling up; a pre-compaction nudge may be emitted. |
+| `warning` | Context is filling up; the executor compacts, same as for `compact`. |
 | `emergency` | Context is nearly full; aggressive compaction is required. |
 | `reject` | Context is too full to proceed even after compaction. |
 
@@ -275,7 +283,9 @@ var params struct {
 }
 ```
 
-**Why it is required:** an LLM that simply stops emitting tool calls has not necessarily completed the task — it may have hit a failure mode (e.g. printing tool-call syntax as text). The executor treats a text-only response as an *implicit finish* and injects a nudge demanding an explicit `finish` call. Only an actual `finish` tool call is accepted as completion (subject to the finish guard and mutation/checklist gates).
+**Why it is required:** an LLM that simply stops emitting tool calls has not necessarily completed the task — it may have hit a failure mode (e.g. printing tool-call syntax as text). That failure mode is caught on its own path: when tools are available and the response text contains tool-call syntax, the executor nudges up to three times (`tool_call_syntax_nudge`) and then aborts with `Finished: false` (`tool_call_syntax_abort`).
+
+A genuine text-only response (no tool calls, `end_turn`) **is** accepted as an *implicit finish*: `Run` returns `Finished: true` with `Output` set to the model's text — plus any pending verify-on-edit note appended. The nudge demanding an explicit `finish` call (`executorFinishNudge`, reported as an `ExecutorDiagnostic` named `executor_finish_nudge`) fires **only** when the executor suppresses assistant events (`suppressAssistantEvents`, i.e. a plan step whose output needs structured capture) and **only once** per run; after that retry the text-only response is accepted regardless. A `finish` call that does arrive is still subject to the finish guard and the mutation/checklist gates.
 
 ## Checklist gate
 
@@ -399,11 +409,11 @@ exec.SetToolCache(cache)
 
 Key behaviors:
 
-- **Hashing** — `ComputeToolResultHash(toolName, content)` returns the same hash `Store` would produce. Identical content from different tools gets different hashes.
+- **Hashing** — `ComputeToolResultHash(toolName, content)` returns the full hex SHA-256 built from the same formula `Store` uses internally; note that `Store` returns the **abbreviated** short hash (a session-unique prefix), not this full value. File-backed entries hash from metadata instead of content (`ComputeFileBackedHash`). Identical content from different tools gets different hashes.
 - **Deduplication** — repeated identical calls produce the same hash; no duplicate entries.
-- **File coherence** — for file-based tools (`read_file`, `write_file`, `edit_file`), the cache records the file path, mtime, and size. `CheckCoherence(hash)` returns `false` if the file has changed since caching.
+- **File coherence** — for file-based tools (`read_file`, `write_file`, `edit_file`), the cache records the file path, mtime, and size. The check is `CheckCoherence(hash string) (valid bool, reason string)` — note the **two** return values: alongside `valid` you get a human-readable `reason`. It returns `false` in four cases: the hash resolves to no entry (`"cache entry not found"`), an MCP entry's TTL has elapsed (`"cache entry expired"`), the recorded file can no longer be stat'ed (`"file '<path>' no longer accessible: <err>"`), or the file's mtime or size differs from what was cached (`"file '<path>' has been modified since the result was cached"`). An entry with no recorded file path needs no coherence check and always returns `true, ""`.
 - **MCP TTL** — MCP-sourced entries expire after the configured TTL. Non-MCP entries never expire. Expired entries are swept periodically.
-- **Non-cacheable tools** — internal meta-tools (`finish`, `tool_result_read`, `store_fact`, etc.) are excluded from caching by default. Add your own meta-tools via `AddNonCacheableTools`.
+- **Non-cacheable tools** — `defaultNonCacheableTools` excludes exactly ten SDK-provided meta-tools from **eager** caching, in declaration order: `tool_result_read`, `finish`, `read_step_output`, `list_step_outputs`, `read_final_result`, `read_attachment`, `store_fact`, `search_facts`, `update_checklist`, and `batch` (spelled `tools.ToolBatch`). A non-cacheable result that *is* truncated is still cached on demand — see [`Step.CacheHash`](#step). Add your own meta-tools via `AddNonCacheableTools`.
 
 ```go
 // Exclude an application-layer meta-tool from caching.
@@ -536,13 +546,14 @@ These setters configure optional behavior. Call them **before** `Run`.
 |--------|-------------|
 | `SetLogger(l *slog.Logger)` | Sets the structured logger. Defaults to a discard handler. |
 | `SetReasoningEffort(effort string)` | Sets the reasoning effort passed to LLM calls (empty = no reasoning control). |
+| `SetStreaming(stream bool)` | Stream LLM text deltas live as `AssistantChunk` events as they arrive — the runtime twin of [`WithStreaming(bool)`](#newexecutor) (opt-in; off by default). |
 | `SetToolCache(cache *ToolResultCache)` | Sets the shared tool-result cache. All tool results are stored before truncation. |
 | `SetPerToolTruncation(cfg map[string]ToolTruncationConfig)` | Sets per-tool Stage 1 truncation defaults. The provided map is deep-copied, so the caller may mutate it after the call. |
 | `SetPreWarningPercent(percent int)` | Sets the context-fill percentage that triggers the pre-compaction `store_fact` warning nudge (0 = disabled). |
 | `SetFinishGuard(fn func(ctx) error)` | Sets a callback invoked before finish is accepted. A non-nil error rejects finish with a nudge. Used to prevent abandoning pending async work. |
 | `SetStopTools(names ...string)` | Registers ordinary tools as **turn terminators**: a successful call to a listed tool ends the run (`Finished=true`, the call's observation as the output) instead of continuing to the next step. A failed call never terminates the run. The terminator fires inside `batch` sub-calls too. It honours `SetFinishGuard` (a rejecting guard nudges and retries instead of terminating), and it records the model's final assistant text in `ExecutorResult.Summary` (a stop tool has no `answer` argument, so `Output` alone is just the tool's confirmation). Passing no names clears the set. Used by the c0wrk goal loop to end a working turn on `declare_goal_status`. |
 | `AddNonCacheableTools(names ...string)` | Adds tool names to the non-cacheable set (extends SDK defaults). |
-| `SetMutationRequired(required bool)` | When `true`, finish is rejected unless a mutating tool ran successfully. |
+| `SetMutationRequired(required bool)` | When `true`, a `finish` with no successful mutating tool call is gated. Like the checklist gate this is a **soft** two-stage gate, not a permanent rejection: the first attempt injects a nudge (`executorMutationNudge`, diagnostic `mutation_gate_nudge`) and retries; on the second attempt the finish **is** accepted, but reported as `Finished: false` with `AbortReason` set to `"finish rejected: required mutation was not performed"` (diagnostic `mutation_gate_rejected`) so the orchestrator reflects/replans instead of recording success. |
 | `SetChecklistGateEnabled(enabled bool)` | Enables/disables the checklist gate (default: enabled). |
 | `SetPlanContext(stepID string, index, total int)` | Sets plan-step metadata for structured logging. |
 | `SetHITLHandler(h HITLHandler)` | Sets the human-in-the-loop handler (nil-safe). |
@@ -560,7 +571,7 @@ exec.SetFinishGuard(func(ctx context.Context) error {
 })
 ```
 
-If the guard returns an error, finish is rejected and a nudge containing the error message is injected. On the second attempt, finish is accepted regardless (soft gate).
+If the guard returns an error, finish is rejected and a nudge containing the error message is injected. Unlike the checklist gate, this is **not** a soft gate: the guard is consulted again on every subsequent `finish` attempt, so it keeps rejecting for as long as it returns an error.
 
 ## Context helpers
 
@@ -573,6 +584,7 @@ The executor reads several optional values from the context. These are injected 
 | `WithToolResultCache(ctx, cache)` / `ToolResultCacheFromContext(ctx)` | Makes the cache available to the `tool_result_read` tool. |
 | `WithPerToolTruncation(ctx, cfg)` / `PerToolTruncationFromContext(ctx)` | Shares truncation config with `tool_result_read` for `num_lines` enforcement. |
 | `WithStepTodoUpdateFunc(ctx, fn)` / `StepTodoUpdateFuncFromContext(ctx)` | Callback for checklist/to-do updates. |
+| `WithChecklistGuard(ctx, fn)` / `ChecklistGuardFromContext(ctx)` | Injects a `ChecklistGuardFunc(stepID string) string` consulted by the `update_checklist` tool after parsing succeeds and before the update callback runs. A non-empty return rejects the call with that message as an error result; an empty return allows it. Enforces invariants such as "no standalone checklist once a plan is declared" (`stepID` is empty for a plan-less checklist). |
 | `WithDumpWriter(ctx, w)` / `DumpWriterFromContext(ctx)` | Injects an `io.Writer` for LLM request/response dumps. |
 
 Additional stores for inter-step communication and user-provided context live in the `agent` package: `StepOutputStore`, `FactStore`, `AttachmentStore`, and `FinalResultStore`, each with a `With*`/`*FromContext` pair. `AttachmentStore` is read-only access to user-attached files (converted to markdown). See [Subagents](subagents.md) for how these are wired during parallel plan execution.
@@ -591,7 +603,7 @@ import "github.com/v0lka/sp4rk/agent"
 func NewDumpCaller(inner agent.LLMCaller, w io.Writer, logger *slog.Logger) agent.LLMCaller
 ```
 
-Wraps `inner` so that every `Call` writes the **full, untruncated** `ChatRequest` and `ChatResponse` as JSONL records to `w`. Each record carries a UTC timestamp, a `direction` (`request`/`response`), the payload, and (for responses) an `error` field. Pass `nil` for `w` (or `logger`) to no-op. This is the mechanism behind `WithDumpWriter` above — but `NewDumpCaller` lets you attach a dump writer to the caller directly, independent of context plumbing (e.g. when wiring an executor that runs many steps into one shared file).
+Wraps `inner` so that every `Call` writes the **full, untruncated** `ChatRequest` and `ChatResponse` as JSONL records to `w`. Each record carries a UTC timestamp, a `direction` (`request`/`response`), the payload, and (for responses) an `error` field. Pass `nil` for `w` to no-op — `NewDumpCaller` returns `inner` unchanged, unwrapped. A `nil` `logger` is **not** a no-op: it is replaced with `slog.New(slog.DiscardHandler)` and JSONL dumping still happens; only the decorator's own diagnostic log lines are silenced. This decorator is independent of `WithDumpWriter` above: that helper only injects an `io.Writer` into the context, and the SDK executor itself never reads it back — `DumpWriterFromContext` is a seam for *your* call sites (cross-cutting calls that don't pass through the per-step caller pipeline). `NewDumpCaller` is what actually writes dumps, attaching the writer to the caller directly, with no context plumbing (e.g. when wiring an executor that runs many steps into one shared file).
 
 ### NewLoggingLLMCaller — structured token-usage logs
 
@@ -599,7 +611,7 @@ Wraps `inner` so that every `Call` writes the **full, untruncated** `ChatRequest
 func NewLoggingLLMCaller(inner agent.LLMCaller, provider string, logger *slog.Logger) agent.LLMCaller
 ```
 
-Logs, at **DEBUG** level, the outgoing request (provider, model, message/tool counts) and the response token usage (input/output/total tokens, stop reason, tool-call count). `provider` is a logical label (e.g. `"anthropic"`) used only for log attribution; a `nil` logger returns `inner` unchanged. Because logging is DEBUG-level, it is toggled purely by the logger's level — no code changes needed to enable it in production.
+Logs, at **DEBUG** level, the outgoing request (provider, model, message/tool counts) and the response token usage (input/output/total tokens, stop reason, tool-call count). A **failed** call is the exception: it is logged at **WARN** level (`"llm: call failed"`, with `provider` and `error`) so it stays visible at the default INFO level instead of being dropped with the DEBUG-only diagnostics. `provider` is a logical label (e.g. `"anthropic"`) used only for log attribution; a `nil` logger returns `inner` unchanged. Because the success-path logging is DEBUG-level, it is toggled purely by the logger's level — no code changes needed to enable it in production.
 
 ### Stacking and combining
 
@@ -614,7 +626,7 @@ caller := agent.NewLoggingLLMCaller(
 exec := agent.NewExecutor(caller, toolRegistry, 25)
 ```
 
-For per-step dumps orchestrated by the conductor (one `step_<id>.jsonl` file per plan step), the orchestration layer uses a [`StepDumpTracker`](orchestration.md) and feeds each step's writer into the context via `WithDumpWriter`.
+For per-step dumps (one `step_<id>.jsonl` file per plan step), `orchestration` ships a [`StepDumpTracker`](orchestration.md) as a **host-side** building block: it opens, de-duplicates, and closes one writer per step ID. The `Conductor` does not open or consume those dumps — its `Cleanup` is a no-op, since per-step dump cleanup is owned by the session layer. Wiring is yours: open a writer per step and hand it to `NewDumpCaller`, typically from the planner's `CallerForStep` hook (or inject it with `WithDumpWriter` for call sites that read it back themselves).
 
 ## Putting it together
 

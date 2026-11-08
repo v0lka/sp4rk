@@ -18,8 +18,18 @@ type Tool interface {
     Execute(ctx context.Context, input json.RawMessage) (ToolResult, error)
     DefaultPolicy() ToolPolicy
     IsUntrusted() bool
+}
+```
+
+`Group()` is deliberately **not** part of `Tool` — capability-group metadata is exposed through the OPTIONAL `GroupProvider` interface, so adding group awareness does not break existing tool implementations:
+
+```go
+type GroupProvider interface {
     Group() ToolGroup
 }
+
+// ToolGroupOf returns t's capability group, or "" when t does not implement GroupProvider.
+func ToolGroupOf(t Tool) ToolGroup
 ```
 
 | Method | Purpose |
@@ -30,11 +40,11 @@ type Tool interface {
 | `Execute(ctx, input)` | Runs the tool with the given JSON input. Returns a `ToolResult` and/or an error. |
 | `DefaultPolicy()` | The tool's default security policy (allow / deny / confirm). |
 | `IsUntrusted()` | Reports whether the tool returns external/untrusted data (web, MCP, filesystem) that should be sanitized before being placed into LLM context. |
-| `Group()` | The tool's capability group (`ToolGroup`) — required, no "unknown" value; an undeclared group matches no group allow-list (fail-closed). |
+| `Group()` (optional, `GroupProvider`) | The tool's capability group (`ToolGroup`) — no "unknown" value; read it via `ToolGroupOf(t)`, which is fail-closed to the undeclared `""` group when the tool does not implement `GroupProvider`. An undeclared group matches no group allow-list (fail-closed). |
 
 ## ToolGroup
 
-Every tool declares exactly one capability group — a coarse, security-relevant taxonomy used for group-based toolset selection (read-only subagent budgets) and host-side policy (per-group allow/confirm/deny). The groups (`tools/group.go`): `execute` (arbitrary shell), `local_read`, `local_write`, `remote_read`, `remote_write`, `system` (orchestration/state, no direct FS or network side effect), `local_mcp` (stdio MCP server), `remote_mcp` (http MCP server). Helpers: `AllToolGroups()`, `IsValidToolGroup(g)`, and `MCPToolGroup(transport)` (stdio → `local_mcp`, http → `remote_mcp`).
+Every tool should declare exactly one capability group — a coarse, security-relevant taxonomy used for group-based toolset selection (read-only subagent budgets) and host-side policy (per-group allow/confirm/deny). Declaration is via the optional `GroupProvider` interface (`BaseTool` supplies it), read back with `ToolGroupOf`; a tool that does not declare one reports `""`, which matches no group allow-list (fail-closed). The groups (`tools/group.go`): `execute` (arbitrary shell), `local_read`, `local_write`, `remote_read`, `remote_write`, `system` (orchestration/state, no direct FS or network side effect), `local_mcp` (stdio MCP server), `remote_mcp` (http MCP server). Helpers: `AllToolGroups()`, `IsValidToolGroup(g)`, and `MCPToolGroup(transport)` (stdio → `local_mcp`, http → `remote_mcp`).
 
 ## BaseTool
 
@@ -111,7 +121,7 @@ type ToolJudger interface {
 }
 ```
 
-`Severity` classifies the escalation for the host: **hard** marks a fired security control (shell blocklist pattern, a canonical/non-canonical flowsh criterion, SSRF) that hosts must treat as never auto-resolvable; **soft** marks a scope question (path containment, credential access) that a strict judge may resolve. `Allow=false` with an empty `Reason` means "no tool-specific concern" and the tool proceeds. The severity reaches the host via `ConfirmationRequest.JudgeSeverity`; `JudgeSeverityHard` is the zero value, so an unclassified escalation is treated as hard.
+`Severity` classifies the escalation for the host: **hard** marks a fired security control (shell blocklist pattern, a flowsh criterion, SSRF); **soft** marks a scope question (path containment, credential access) that a strict judge may resolve. Only the **canonical** hard codes are never auto-resolvable — the three hard-but-non-canonical flowsh codes (`command_unbounded_analysis`, `command_external_content_ingest`, `command_exec_outside_roots`) may be positively cleared by a strict judge (see `tools.IsCanonicalReasonCode`). `Allow=false` with an empty `Reason` means "no tool-specific concern" and the tool proceeds. The severity reaches the host via `ConfirmationRequest.JudgeSeverity`; `JudgeSeverityHard` is the zero value, so an unclassified escalation is treated as hard.
 
 `ReasonCode` is the typed classification of the reason — the machine-checkable counterpart of the human-readable `Reason` prose, delivered to the host as `ConfirmationRequest.JudgeReasonCode`. It is a cross-repository contract: hosts key deterministic policy decisions off the code instead of matching prose, so a published code is never renamed or reused (new classifications add new codes), and the empty value means unclassified — hosts decide unclassified escalations by their own fail-closed policy. The built-in judges publish `command_blacklist`, `outside_session_roots`, `ssrf_private_address`, `ssrf_protection_degraded`, `unassessable_url`, `unassessable_path`, `git_internal_path`, and the flowsh criteria `command_exfil_flow`, `command_privilege_escalation`, `command_system_write`, `command_destructive_outside_roots`, `command_download_cradle`, `command_unbounded_analysis`, `command_external_content_ingest`, `credential_access`, `command_exec_outside_roots`, and `command_analysis_unavailable` (a failed analyzer — the shell Judge fails closed) (see [tool-safety.md](tool-safety.md#shell-command-analysis-flowsh)); `unresolvable_path_token` is retained as a published code for contract stability but is no longer fired by any built-in judge; `symlink_escape` is set by hosts that run symlink detection over tool input; `symlink_suspicious` is likewise retained for contract stability but no longer fired — the expansion-suspicion checks were removed from the symlink walk (see [decision 006](../specs/decisions/006-symlink-walk-literal-paths-only.md)), so dynamic constructs are the flowsh criteria's domain alone.
 
@@ -201,7 +211,7 @@ See [specs/domains/tool-system/README.md](../specs/domains/tool-system/README.md
 
 ### MCP shadowing protection
 
-A tool whose source category is MCP may **not** overwrite an already-registered non-MCP tool of the same name. `RegisterWithSourceCategory` returns an error in that case; the legacy `RegisterWithSource` path logs a warning and skips the registration. A built-in tool can always replace an MCP tool (clearing the stale MCP source), and an MCP server re-registering its own tools (reconnect) is allowed.
+A tool whose source category is MCP may **not** overwrite an already-registered non-MCP tool of the same name. `RegisterWithSourceCategory` returns an error in that case; the legacy `RegisterWithSource` path likewise skips the registration and returns an error. A built-in tool can always replace an MCP tool (clearing the stale MCP source), and an MCP server re-registering its own tools (reconnect) is allowed.
 
 ## Context helpers
 
@@ -250,11 +260,11 @@ readOnly := tools.FilterToolsByProfile(
 
 ## Custom tool implementation
 
-This is a complete, step-by-step guide using a `calculator` tool that evaluates arithmetic expressions. The same pattern applies to any custom tool.
+This is a step-by-step guide using a `calculator` tool that evaluates arithmetic expressions. The same pattern applies to any custom tool.
 
 ### 1. Define the tool struct, embedding `BaseTool`
 
-Embedding `BaseTool` gives you `Name`, `Description`, `InputSchema`, `DefaultPolicy`, and `IsUntrusted` for free — you only implement `Execute`.
+Embedding `BaseTool` gives you `Name`, `Description`, `InputSchema`, `DefaultPolicy`, `IsUntrusted`, and `Group` for free — you only implement `Execute`.
 
 ```go
 package main
@@ -321,6 +331,8 @@ func (t *CalculatorTool) Execute(_ context.Context, input json.RawMessage) (tool
     return tools.ToolResult{Content: fmt.Sprintf("%s = %g", params.Expression, result)}, nil
 }
 ```
+
+> **Note on `evaluate`:** `evaluate` is not a sp4rk symbol — it is the arithmetic evaluator from the examples module ([`examples/02-custom-tools/calculator.go`](../examples/02-custom-tools/calculator.go)). Supply your own implementation for whatever expression syntax your tool accepts; the steps here only compile as a single `package main` once it is defined.
 
 ### 4. Register the tool and run
 
@@ -422,11 +434,16 @@ It is used to hide parameters from the LLM — e.g. a source-specific field an M
 
 ## Built-in tools reference
 
-All built-in tools live in the `builtins` package:
+All tools in the `builtins` package, plus `web_search` from its `builtins/websearch` sub-package:
 
 ```go
-import "github.com/v0lka/sp4rk/tools/builtins"
+import (
+    "github.com/v0lka/sp4rk/tools/builtins"
+    "github.com/v0lka/sp4rk/tools/builtins/websearch"
+)
 ```
+
+Two further engine-shipped tools are registered from their own packages rather than `builtins`: `finish` (from `agent`, via `agent.NewFinishTool()`) and `read_skill_resource` (from `skills`, via `skills.NewReadSkillResourceTool(resolver)`). Both declare the `system` group.
 
 | Tool name | Constructor | Description |
 | --- | --- | --- |
@@ -436,7 +453,7 @@ import "github.com/v0lka/sp4rk/tools/builtins"
 | `delete_file` | `NewDeleteFileTool()` | Deletes a single file at the specified path. Fails if the path points to a directory — use `delete_directory` for directories. |
 | `list_directory` | `NewListDirectoryTool()` | Lists the immediate contents of a directory, returning each entry's name, type (file or dir), and size in bytes. Does not recurse into subdirectories. |
 | `create_directory` | `NewCreateDirectoryTool()` | Creates a directory at the specified path, including any necessary parent directories (like `mkdir -p`). Succeeds silently if the directory already exists. |
-| `delete_directory` | `NewDeleteDirectoryTool()` | Deletes a directory at the specified path. By default only empty directories can be deleted; set `recursive` to `true` to remove the directory and all its contents. |
+| `delete_directory` | `NewDeleteDirectoryTool()` | Deletes a directory at the specified path. `recursive` is a required boolean with no default: `recursive: false` deletes only an empty directory (failing loudly on a non-empty one), `recursive: true` removes the directory and all its contents. |
 | `glob` | `NewGlobTool()` | Find files and directories by name using glob patterns. Supports `**` for recursive directory matching. Honours `.gitignore` and `.aiignore` rules when an `IgnoreChecker` is plumbed through tool context (see [Ignore filtering](#ignore-filtering) below). Symlinked directories are not traversed, and each walk is bounded by a result cap, an entry budget, and a wall-clock timeout (`NewGlobToolWithLimits(GlobLimits)` / `DefaultGlobLimits()`); a bound that fires returns the partial matches with a warning rather than an error. |
 | `ripgrep` | `NewRipgrepTool()` | Search file contents using regex or literal patterns. Returns matches in `file:line: content` format with optional context lines. `rg` honours `.gitignore` natively; `.aiignore` (root and nested) is additionally enforced via the context `IgnoreChecker` when present (see [Ignore filtering](#ignore-filtering) below). Skips binary files. |
 | `batch` | `NewBatchTool()` | Execute multiple tool calls sequentially in one turn. All calls execute in order even if one fails — errors are captured per-call and do not abort the batch. |
@@ -448,7 +465,7 @@ import "github.com/v0lka/sp4rk/tools/builtins"
 | `list_step_outputs` | `NewListStepOutputsTool()` | List all available step outputs with short previews (up to 200 characters each). Use to discover which completed step results are available. |
 | `read_final_result` | `NewReadFinalResultTool()` | Read the final result of the previously completed task on the blackboard. Use to retrieve a prior exchange's outcome when it is not visible in the conversation history. |
 | `read_attachment` | `NewReadAttachmentTool()` | Read the markdown content of a user-attached file by its ID. The attachment IDs are provided in the user message; use this to inspect files the user attached to the conversation (e.g. PDFs, spreadsheets, images). |
-| `web_fetch` | `NewWebFetchTool(limits WebFetchLimits)` | Fetch a web page by URL and convert its HTML content to markdown. Only HTTP/HTTPS URLs are supported. Requests time out after 30 seconds by default; up to 10 redirects are followed. Transient failures (transport errors, 408/429/5xx) are retried `WebFetchLimits.Retries` times (default 0 = disabled), each retry doubling the timeout. Supports paginated reading. |
+| `web_fetch` | `NewWebFetchTool(limits WebFetchLimits)` | Fetch a web page by URL and convert its HTML content to markdown. Only HTTP/HTTPS URLs are supported. Requests time out after 30 seconds by default; up to 10 redirects are followed. Transient failures (transport errors, 408/429/5xx) are retried `WebFetchLimits.Retries` times (default 2; 0 disables retrying), each retry doubling the timeout. Supports paginated reading. |
 | `web_search` | `websearch.NewTool(provider, limits)` | Search the web and return a list of results with titles, URLs, and text snippets. Uses a pluggable `SearchProvider` — see [Web search providers](#web-search-providers) below. |
 | `bash_exec` | `NewBashExecTool(blacklist []string) (*BashExecTool, error)` | Execute shell commands via `bash -c`. Use for build commands, running scripts, installing packages, git operations, and system tasks. Returns combined stdout and stderr. Commands time out after 60 seconds by default (configurable up to 120s). Available on Unix only (`!windows` build tag). The `blacklist` parameter is the **host-supplied** regex list (c0wrk ships it empty and calls it the blocklist — no patterns ship in the engine); deterministic safety comes from the [flowsh criteria](tool-safety.md#shell-command-analysis-flowsh), which the host attaches per call. |
 | `posh_exec` | `NewPoshExecTool(blacklist []string) (*PoshExecTool, error)` | Execute commands via `powershell.exe -NoProfile -NonInteractive -Command`. Windows counterpart of `bash_exec`: same blocklist/Judge model (host-supplied pattern list + flowsh criteria), timeout, and working-directory containment. Returns combined stdout and stderr. Commands time out after 60 seconds by default (configurable up to 120s). Available on Windows only (`windows` build tag). |
@@ -481,7 +498,7 @@ ctx := tools.WithIgnoreChecker(ctx, checker)
 Behaviour to keep in mind:
 
 - **Opt-in, no regression.** `tools.IgnoreCheckerFrom(ctx)` returns `nil` when no checker is attached. Both tools then keep their pre-ignore behaviour (`rg` still honours `.gitignore` natively; `glob` does not filter). Wiring the checker is additive.
-- **glob** resolves each `doublestar.GlobWalk` entry to an absolute path and drops it when `checker.Ignored(absEntry, isDir)` is true. An ignored directory is pruned, and its file children are skipped too (the checker considers ancestor directories when deciding whether a path is ignored).
+- **glob** resolves each `doublestar.GlobWalk` entry to an absolute path and drops it when `checker.Ignored(absEntry, isDir)` is true. An ignored entry returns plain `nil`, not `fs.SkipDir`, so the directory is *not* pruned: the walk still descends into it and each child is dropped individually by the same ancestor-aware checker. Ignored subtrees therefore still consume the `GlobLimits.MaxEntries` budget and the walk timeout.
 - **ripgrep** relies on `rg`'s native `.gitignore` handling and additionally **post-filters** every emitted match *and* context-line path through the same `IgnoreChecker`. This catches `.aiignore` rules (root *and* nested) and any resolver-only rule `rg` cannot see. `rg` still searches the matched files; the tool discards their matches afterwards. For the typical secret-suppression use case (a few `.aiignore` entries) the cost is negligible.
 
 See [Utilities → ignore](utilities.md#ignore) for the resolver's pattern semantics, limitations (negation patterns are unsupported), and its dependency on `pathutil` for symlink-aware path canonicalization.
@@ -502,8 +519,13 @@ const (
     ToolBashExec  = "bash_exec"
     ToolPoshExec  = "posh_exec"
     ToolBatch     = "batch"
+    // ToolResultRead reads fragments of cached tool results by hash; the
+    // executor rewrites its display name to "<original_tool> (cached)".
+    ToolResultRead = "tool_result_read"
 )
 ```
+
+The package also exports `IsShellExecTool(name)`, reporting whether `name` is one of the shell-executing built-ins (`bash_exec`, `posh_exec`).
 
 ### Web search providers
 
@@ -516,7 +538,7 @@ type SearchProvider interface {
 }
 ```
 
-Four providers are included:
+Five providers are included:
 
 | Provider | Constructor | API key required | Notes |
 | --- | --- | --- | --- |
@@ -524,8 +546,9 @@ Four providers are included:
 | **Tavily** | `websearch.NewTavilyProviderWithClient(apiKey, timeout, client)` | Yes (`TAVILY_API_KEY`) | Tavily Search API |
 | **Exa** | `websearch.NewExaProviderWithClient(apiKey, timeout, client)` | Yes (`EXA_API_KEY`) | Exa Search API |
 | **DuckDuckGo** | `websearch.NewDuckDuckGoProviderWithClient(timeout, client)` | No | HTML scraping; no API key needed |
+| **SearXNG** | `websearch.NewSearXNGProviderWithClient(baseURL, timeout, client)` | No | Self-hosted SearXNG instance's JSON API; an empty `baseURL` selects `websearch.DefaultSearxngBaseURL` (`http://127.0.0.1:8888`). The instance must enable JSON output (`settings.yml` → `search.formats: [html, json]`) |
 
-Each constructor accepts a `time.Duration` timeout and an optional `*http.Client` (pass `nil` for the default client). The `SearchResult` struct is provider-agnostic:
+Each constructor accepts a `time.Duration` timeout and an optional `*http.Client` (pass `nil` for the default client); the keyed providers take the API key first and SearXNG takes its instance base URL first. `Name()` returns `"brave"`, `"tavily"`, `"exa"`, `"duckduckgo"`, or `"searxng"`. All five refuse to follow HTTP redirects. The `SearchResult` struct is provider-agnostic:
 
 ```go
 type SearchResult struct {
@@ -561,7 +584,7 @@ type WebSearchLimits struct {
 }
 ```
 
-Use `builtins.DefaultWebSearchLimits()` for sensible defaults, or construct a custom `WebSearchLimits` to override them. The tool is marked `IsUntrusted: true` — its output is automatically wrapped in `<untrusted-content>` tags by the context window's prompt injection defense.
+Use `builtins.DefaultWebSearchLimits()` for sensible defaults, or construct a custom `WebSearchLimits` to override them (`websearch.Limits` is a type alias for it). The tool is constructed with `Untrusted: true` on its embedded `BaseTool`, so `IsUntrusted()` reports true — a `memory.ContextWindow` built with `InjectionDefenseEnabled: true` then wraps its output in `<untrusted-content>` tags as a prompt injection defense. That flag is a `ContextWindow`-level opt-in which `sp4rk.Framework` does not set, so on the Framework path the automatic wrap is off; call `security.WrapUntrustedContent` explicitly inside the tool's own `Execute` instead (see [Security](security.md)).
 
 ## Configurable limits & timeouts
 
@@ -584,24 +607,30 @@ func DefaultBashTimeouts() BashTimeouts
 // Constructors that accept the override:
 func NewBashExecToolWithTimeouts(blacklist []string, timeouts BashTimeouts) (*BashExecTool, error)
 func NewPoshExecToolWithTimeouts(blacklist []string, timeouts BashTimeouts) (*PoshExecTool, error)
+
+// Constructors that also pin the launch wrapper (an operator-supplied tools.ShellInvocation):
+func NewBashExecToolWithInvocation(blacklist []string, timeouts BashTimeouts, invocation tools.ShellInvocation) (*BashExecTool, error)
+func NewPoshExecToolWithInvocation(blacklist []string, timeouts BashTimeouts, invocation tools.ShellInvocation) (*PoshExecTool, error)
 ```
 
 `NewBashExecTool(blacklist)` / `NewPoshExecTool(blacklist)` use `DefaultBashTimeouts()`.
 
-### FileLimits (`read_file`)
+### FileLimits (`read_file` / `edit_file`)
 
 ```go
 type FileLimits struct {
     ReadDefaultLines int // lines returned when no explicit range is given (default: 2000)
     MaxLineBytes     int // per-line byte cap; overlong lines are truncated, 0 = no cap (default: 1 MiB)
     MaxWindowLines   int // hard cap on lines per call, even for explicit ranges, 0 = no cap (default: 50000)
+    MaxEditFileBytes int // size cap on a file edit_file will read and rewrite; 0 falls back to safeio.ReadFile's DefaultMaxFileSize (10 MiB) (default: 64 MiB)
 }
 
 func DefaultFileLimits() FileLimits
 func NewReadFileToolWithLimits(limits FileLimits) *ReadFileTool
+func NewEditFileToolWithLimits(limits FileLimits) *EditFileTool
 ```
 
-`NewReadFileTool()` uses `DefaultFileLimits()`.
+`NewReadFileTool()` and `NewEditFileTool()` use `DefaultFileLimits()`.
 
 ### RipgrepLimits (`ripgrep`)
 
@@ -617,7 +646,38 @@ func NewRipgrepToolWithPath(limits RipgrepLimits, rgPath string) *RipgrepTool //
 
 `NewRipgrepTool()` uses `DefaultRipgrepLimits()` and locates `rg` on `PATH`. `NewRipgrepToolWithPath` pins a specific binary path — useful when `rg` is bundled alongside your app rather than installed system-wide.
 
-> The `WebFetchLimits` and `WebSearchLimits` structs follow the same pattern and are documented with their respective tools above.
+### WebFetchLimits (`web_fetch`)
+
+```go
+type WebFetchLimits struct {
+    Timeout time.Duration // timeout for HTTP requests; doubled on each retry attempt (default: 30s)
+    Retries int           // number of retries after the initial attempt; 0 disables retrying (default: 2)
+}
+
+func DefaultWebFetchLimits() WebFetchLimits
+func NewWebFetchTool(limits WebFetchLimits) *WebFetchTool
+func NewWebFetchToolWithClient(limits WebFetchLimits, client *http.Client) *WebFetchTool
+```
+
+A non-positive `Timeout` is replaced by `DefaultWebFetchLimits().Timeout` — unlike other knobs, "no limit" is never a valid `web_fetch` timeout.
+
+### GlobLimits (`glob`)
+
+```go
+type GlobLimits struct {
+    MaxEntries int           // max filesystem entries visited before the walk is aborted, 0 = no entry budget (default: 500000)
+    MaxResults int           // max matching paths collected before the walk is aborted, 0 = unlimited (default: 10000)
+    Timeout    time.Duration // wall-clock timeout for a single glob walk, 0 = no timeout (default: 30s)
+}
+
+func DefaultGlobLimits() GlobLimits
+func NewGlobToolWithLimits(limits GlobLimits) *GlobTool
+func NewGlobToolWithLimitsOverride(limits GlobLimits) *GlobTool // honours an all-zero struct verbatim (no default substitution)
+```
+
+`NewGlobTool()` uses `DefaultGlobLimits()`. `NewGlobToolWithLimits` replaces a completely zero `GlobLimits` with the defaults; `NewGlobToolWithLimitsOverride` performs no substitution, for a host that distinguishes "unset" from "explicitly zero on every knob".
+
+> The `WebSearchLimits` struct follows the same pattern and is documented with `web_search` above.
 
 ## Related: execution-context intelligence
 

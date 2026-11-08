@@ -36,17 +36,19 @@ Executor.Run()
     ├─ Thought(1, "I should list Go files…")
     ├─ ToolCall(1, 0, "glob", "**/*.go", "core")
     ├─ ToolResult(1, 0, 142, "main.go\ncalculator.go…", false)
-    ├─ ContextFill(12.3%, 15744/128000, "ok")
     ├─ StepComplete(1, 1.2s)
+    ├─ ContextFill(12.3%, 15744/128000, "ok")
     │
     ├─ StepStart(2)
     ├─ Thought(2, "Now I'll read the first file…")
     ├─ ToolCall(2, 0, "read_file", …)
     ├─ ToolResult(2, 0, 890, "package main…", false)
     ├─ StepComplete(2, 0.8s)
+    ├─ ContextFill(15.7%, 20096/128000, "ok")
     │
+    ├─ StepStart(3)
     ├─ Finishing(3, "The file implements…")
-    └─ AssistantDone("The file…", 18200, 45)
+    └─ StepComplete(3, 0.4s)
 ```
 
 ## Code walkthrough
@@ -82,7 +84,7 @@ type PrintingEvents struct {
 }
 
 func (e *PrintingEvents) StepStart(stepNum int) {
-    fmt.Printf("┌─ Step %d ─────────────\n", stepNum)
+    fmt.Printf("\n┌─ Step %d ─────────────────────────────\n", stepNum)
 }
 // override only the methods you care about…
 ```
@@ -98,8 +100,8 @@ This is the **recommended pattern** for custom event sinks. It also future-proof
 | `ToolCall`         | Before a tool is executed                  | `toolName`, `argsPreview`, `source`|
 | `ToolResult`       | After a tool returns                       | `resultLen`, `preview`, `isError`  |
 | `StepComplete`     | End of a ReAct iteration                   | `duration`                         |
-| `AssistantChunk`   | Streaming text chunk from the LLM          | `content`                          |
-| `AssistantDone`    | Final assistant text + token usage         | `inputTokens`, `outputTokens`      |
+| `AssistantChunk`   | A streamed text delta; at an implicit finish without streaming, once with the full text | `content`                          |
+| `AssistantDone`    | Closes the assistant text: at an implicit finish, or at Run exit when a live stream is still open (streaming enabled) | `inputTokens`, `outputTokens`      |
 | `ContextFill`      | After context-window fill check            | `fillPercent`, `status`            |
 | `ContextCompaction`| After context compaction runs              | `beforePercent`, `afterPercent`    |
 | `Finishing`        | When the agent calls `finish`              | `summary`                          |
@@ -135,14 +137,14 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 ### Fluent (recommended)
 
 ```bash
-cd sdk/examples/03-event-streaming
+cd examples/03-event-streaming
 go run -tags fluent .
 ```
 
 ### Classic API (advanced control)
 
 ```bash
-cd sdk/examples/03-event-streaming
+cd examples/03-event-streaming
 go run .
 ```
 
@@ -157,24 +159,31 @@ go run .
 │ 💭 Thought: I'll use the glob tool to find Go files…
 │ 🔧 ToolCall #0: glob({"pattern":"**/*.go"}) [source: core]
 │ ✅ Result #0 (142 chars): main.go…
-│ 📊 Context: 12.3% (15744/128000 tokens) — ok
 └─ Step 1 complete (1.2s) ──────────────
+│ 📊 Context: 12.3% (15744/128000 tokens) — ok
 
 ┌─ Step 2 ─────────────────────────────
 │ 💭 Thought: Now I'll read the first file…
 │ 🔧 ToolCall #0: read_file({"path":"main.go"}) [source: core]
 │ ✅ Result #0 (890 chars): package main…
-│ 📊 Context: 15.7% (20096/128000 tokens) — ok
 └─ Step 2 complete (0.8s) ──────────────
+│ 📊 Context: 15.7% (20096/128000 tokens) — ok
 
+┌─ Step 3 ─────────────────────────────
 │ 🏁 Finishing at step 3: The file main.go implements…
-│ 📝 Assistant done: 18200 input / 45 output tokens
+└─ Step 3 complete (0.4s) ──────────────
 
 ═══════════════════════════════════════════════════════════
 Final Status: success
 Final Output: The file main.go implements a custom event streaming example…
 ═══════════════════════════════════════════════════════════
 ```
+
+> Step 3 gets a full box: `StepStart` fires at the top of every iteration — including the one in which `finish` is called — and the explicit-finish path emits `StepComplete` too. The blank line above each `┌─ Step N` box comes from the leading `\n` in `PrintingEvents.StepStart`'s format string. A `│ 💭 Thought:` line appears inside that box only when the model returns text or reasoning alongside the `finish` call.
+>
+> `📊 Context` lands *after* the step's `Step N complete` closing line, outside the box: `ContextFill` comes from the post-step compaction pass, which the executor runs only after it has emitted `StepComplete`. The iteration that calls `finish` skips that pass — the explicit-finish path returns before reaching it — so Step 3 has no `📊 Context` line.
+>
+> `AssistantDone` never fires in a default run of this example, so neither the diagram above nor the sample output shows it. It fires only when the loop ends on an *implicit* finish (no `finish` tool call — there `AssistantChunk` and `AssistantDone` fire instead of `Finishing`; with streaming off, `AssistantChunk` carries the full text once), or at `Run` exit from the stream finalizer, which has an open stream to close only when live streaming is enabled (the `WithStreaming(true)` option / `Execution.Streaming: true`; off by default, and neither variant here enables it). Enabling streaming would additionally print the `│ 📝 Assistant done: …` line implemented by `PrintingEvents.AssistantDone` in `events.go`.
 
 ## Next
 

@@ -92,7 +92,7 @@ import "github.com/v0lka/sp4rk"  // options live in the root package
 | Option | Category | Effect |
 | --- | --- | --- |
 | `WithProvider(p)` | Providers | Append one LLM provider (repeatable). |
-| `WithProviders(ps…)` | Providers | Append multiple providers at once. |
+| `WithProviders(ps…)` | Providers | Replace the accumulated provider list with `ps…` — unlike the appending `.Providers(ps…)` builder method, providers already added to the chain are discarded. |
 | `WithDefaultModel(model)` | Providers | Override the auto-selected default model; accepts a bare name or composite `provider/model` ID. |
 | `WithTools(ts…)` | Tools | Register tools after the framework is built (spread a bundle: `sp4rk.WithTools(sp4rk.FileTools()...)`). |
 | `WithoutAutoFinish()` | Tools | Skip auto-registering the finish tool (it is registered by default). |
@@ -101,7 +101,7 @@ import "github.com/v0lka/sp4rk"  // options live in the root package
 | `WithConfirmFunc(fn)` | Security | Confirmation callback for `PolicyUserConfirm` tools; without it such tools are denied (fail-closed). |
 | `WithAutoApprove()` | Security | Install an always-approve callback — convenient for sandboxed workspaces. |
 | `WithHITL(h)` | Security | Set the human-in-the-loop handler ([HITL](hitl.md)). |
-| `WithMaxSteps(n)` | Execution | Per-step ReAct loop budget (`0` = sp4rk default 50, negative = disabled). |
+| `WithMaxSteps(n)` | Execution | Per-step ReAct loop budget (`0` = sp4rk default 50, negative = explicitly 0). |
 | `WithStreaming(bool)` | Execution | Stream LLM text deltas live as `AssistantChunk` events (off by default). |
 | `WithLogger(l)` | Misc | Structured logger (defaults to `slog.Default()`). |
 | `WithConfig(cfg)` | Escape hatch | Supply a full `Config` as the base; other options apply on top. |
@@ -111,14 +111,14 @@ package can produce `Option` values (the `apply` method is unexported), so
 options from other packages cannot be applied by accident.
 
 ```go
-fw := sp4rk.NewF().
+fw, err := sp4rk.NewF().
     Anthropic(key, "claude-sonnet-4-5").
     FileTools().
     Options(
         sp4rk.WithMaxSteps(40),
         sp4rk.WithAutoApprove(),
     ).
-    Build(ctx)
+    Build()
 ```
 
 ## RunBuilder surface
@@ -143,6 +143,7 @@ result; with `.Plan()` it builds a DAG and runs it with retry + reflection.
 - `.Plan()` / `.Planner(*planner.Planner)` — enable the default planner or inject one
 - `.Reflect()` / `.Reflector(*reflector.Reflector)` — enable reflection (default prompt) or inject one
 - `.MaxRetries(n)` — per-step retry budget (default 2)
+- `.MaxReplans(n)` — global replan budget: the maximum number of adopted plan regenerations per execution (default 3; `0` disables replanning)
 - `.Models(planModel, execModel)` — separate models for planning/reflection vs. execution (runtime switching)
 - `.Workspace(dir)` — workspace path for tool execution
 - `.Skills([]skills.SkillDescriptor)` — skills made available to the planner
@@ -184,7 +185,7 @@ surfaces once, at `.Build()` (or the pipeline terminal), wrapped as
 
 ## Before / after
 
-Example 05 (MCP integration) — the headline tuple elimination:
+Example 05 (MCP integration) — the headline tuple elimination. Note: example 05's `main.go` inlines the `mcp.ServerEntry` literal and never calls the `sp4rk.MCPStdio` tuple helper — the **Before** block below is the generic classic form a tuple-using caller would write, while `main_fluent.go` is the **After** form.
 
 **Before** (classic `sp4rk.New` constructor — tuple + separate registration)
 ```go
@@ -200,7 +201,9 @@ fw, err := sp4rk.New(sp4rk.Config{
     },
 })
 // built-ins registered separately; MCP tools need a ConfirmFunc/policy override
-fw.ToolRegistry().Register(sp4rk.FileTools()...)
+for _, t := range sp4rk.FileTools() {
+    fw.ToolRegistry().Register(t)
+}
 ```
 
 **After** (fluent builder)

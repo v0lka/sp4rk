@@ -68,7 +68,7 @@ Planner.Plan()  ──────────────►  Plan { step_1, st
     │                    next ready step…
     │
     ▼
-AggregateOutput(completed, plan)  ──►  final result
+AggregateOutput(completed, plan, preCompletedIDs)  ──►  final result
 ```
 
 ## Code walkthrough
@@ -115,7 +115,8 @@ The returned `Plan` is a DAG:
 
 ```go
 type Plan struct {
-    Steps []PlanStep  // each has ID, Summary, Description, DependsOn, …
+    Steps              []PlanStep  // each has ID, Summary, Description, DependsOn, …
+    ExplorationContext string      // populated only by the planner's exploration mode
 }
 ```
 
@@ -169,12 +170,12 @@ The Reflector sends the trajectory, plan, and prior reflections to the LLM and p
 ```go
 type Reflection struct {
     Summary         string    // what happened
-    RootCause       string    // primary reason for failure
-    SuggestedAction string    // "retry" | "replan" | "abort"
-    ActionPlan      string    // concrete steps to fix
     Hypotheses      []string  // possible causes
+    SuggestedAction string    // "retry" | "replan" | "abort"
     Reasoning       string    // analysis reasoning
     FailureAnalysis string    // detailed failure analysis
+    RootCause       string    // primary reason for failure
+    ActionPlan      string    // concrete steps to fix
     Timestamp       time.Time // when the reflection was produced
 }
 ```
@@ -214,7 +215,7 @@ finalOutput := orchestration.AggregateOutput(completed, plan, nil)
 | Conductor  | `orchestration`        | Executes one step as a ReAct loop         |
 | Reflector  | `agent/reflector`      | Analyzes failures, suggests corrections   |
 
-The Framework (`sp4rk.Framework`) wires them together: `fw.NewConductor()` creates a Conductor with the Framework's LLM router, tool registry, and context-window factory. `fw.LLMRouter()` provides the `agent.LLMCaller` needed by the Planner and Reflector. `fw.ContextFactory()` provides the `orchestration.ContextManagerFactory` needed by the Planner for exploration mode.
+The Framework (`sp4rk.Framework`) wires them together: `fw.NewConductor()` creates a Conductor with the Framework's LLM router, tool registry, and context-window factory. `fw.LLMRouter()` provides the `agent.LLMCaller` needed by the Planner and Reflector. `fw.ContextFactory()` provides the `orchestration.ContextManagerFactory` the Conductor builds each step's context window with. The Planner's optional exploration mode takes a *different*, non-variadic `planner.ContextManagerFactory`, so `fw.ContextFactory()` is not directly assignable to `planner.Config.ContextFactory` — wrap it if you enable exploration. This example leaves exploration off (`PlannerToolNames` empty), so it plans directly.
 
 ## Prerequisites
 
@@ -227,18 +228,20 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 ### Fluent (recommended)
 
 ```bash
-cd sdk/examples/06-plan-and-reflect
+cd examples/06-plan-and-reflect
 go run -tags fluent .
 ```
 
 ### Classic API (advanced control)
 
 ```bash
-cd sdk/examples/06-plan-and-reflect
+cd examples/06-plan-and-reflect
 go run .
 ```
 
 ## Expected output
+
+From the **classic** variant (`main.go`). The fluent variant (`main_fluent.go`) emits none of the `📋 Planning...` / `▶ Executing` lines and reports `Steps: %d total, %d failed` instead of `Steps completed: %d/%d`.
 
 ```
 Workspace: /tmp/sp4rk-example-06-123456
@@ -269,11 +272,18 @@ and verified the file contents by reading it back.
 ═══════════════════════════════════════════
 ```
 
+The **classic** variant also prints `  [auto-approving <tool>]` for every
+confirmation-gated write (`create_directory`, `write_file`, and `edit_file` are
+all `PolicyUserConfirm`), so lines such as `  [auto-approving write_file]` are
+interleaved with the step markers — elided here for readability. The **fluent**
+variant's `.AutoApprove()` callback satisfies the same fail-closed registry
+silently.
+
 If a step fails, you'll see the reflection in action:
 
 ```
 ▶ Executing step_2: Write main.go file
-  ❌ step_2 failed (attempt 1): step execution did not complete…
+  ❌ step_2 failed (attempt 1): Aborted: tool 'write_file' called 4 times consecutively with identical arguments
   🔍 Reflecting on failure...
   💡 Reflection: The agent tried to write to a non-existent directory
      Root cause: directory not created before write

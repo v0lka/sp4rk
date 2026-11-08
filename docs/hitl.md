@@ -13,7 +13,7 @@ import (
 
 ## HITLHandler interface
 
-`HITLHandler` provides two hooks: one invoked before every tool execution, and one invoked when the step budget is exhausted or a circuit breaker fires.
+`HITLHandler` provides two hooks: one invoked before every registry-dispatched tool execution, and one invoked when the step budget is exhausted or a circuit breaker fires.
 
 ```go
 type HITLHandler interface {
@@ -30,7 +30,7 @@ type HITLHandler interface {
 
 ### OnToolCall
 
-`OnToolCall` is invoked before **every** tool execution. The handler can:
+`OnToolCall` is invoked before **every registry-dispatched** tool execution — the executor-intercepted meta-tools `finish` and `batch` are the exception (see [Design notes](#design-notes)). The handler can:
 
 - **Allow** the tool call as-is (`Allow: true`, `ModifiedInput: nil`).
 - **Deny** the tool call (`Allow: false`).
@@ -63,7 +63,9 @@ type HITLToolDecision struct {
 |-------|-------------|
 | `Allow` | `true` to execute the tool; `false` to reject the call. |
 | `ModifiedInput` | When non-nil and `Allow` is `true`, this raw JSON replaces the model's original input. Use it to sanitize arguments, enforce constraints, or fix malformed input. |
-| `Reason` | A human-readable explanation shown in the UI. For denied calls, this is surfaced to the user; for allowed calls it is informational. |
+| `Reason` | A human-readable explanation of the decision. For denied calls it is primarily **model-facing**: the executor formats it into the tool observation as `[Tool call rejected: <Reason>]`, feeds that back to the LLM, and emits it as an error `ToolResult` event. For allowed calls it is informational. Write `Reason` for the model, not only for the UI. |
+
+When `Reason` is empty, the executor falls back to `[Tool call rejected: rejected by user]`. Because the observation re-enters the model's context as the rejected step, a specific reason lets the agent correct course (e.g. `writes outside the workspace are blocked — use a path under the session temp dir`) rather than retrying the same call blindly. Hosts that also render the decision in a UI can display the same string.
 
 ### Allow / deny / modify semantics
 
@@ -160,6 +162,7 @@ fw, err := sp4rk.New(sp4rk.Config{
     HITL: NewConfirmingHITL([]string{
         "write_file",
         "delete_file",
+        "create_directory",
         "bash_exec",
     }),
 })
@@ -168,9 +171,11 @@ fw, err := sp4rk.New(sp4rk.Config{
 You can also set the handler directly on an `Executor` via `SetHITLHandler` (nil-safe):
 
 ```go
-exec := agent.NewExecutor(/* ... */, nil)
+exec := agent.NewExecutor(/* ... */, agent.WithHITL(nil)) // nil handler → NoopHITLHandler
 exec.SetHITLHandler(&myHITLHandler{})
 ```
+
+> **`Config.HITL` does not discharge the registry's `PolicyUserConfirm` gate.** HITL runs first, at the executor level, and the registry's own confirmation gate still applies afterwards — so confirmation-gated built-ins (`write_file`, `delete_file`, `create_directory`, `bash_exec`) additionally need a `Config.ConfirmFunc` or a `registry.SetPolicyOverride(name, tools.PolicyAlwaysAllow)`, otherwise the registry denies the call even after the user approved it (see [policy enforcement in Execute](tools.md#policy-enforcement-in-execute-fail-closed)).
 
 ## Complete ConfirmingHITL example
 
@@ -219,7 +224,9 @@ func NewConfirmingHITL(dangerousTools []string) *ConfirmingHITL {
     }
 }
 
-// OnToolCall is invoked before every tool execution. It can:
+// OnToolCall is invoked before every tool call that is dispatched to the
+// registry (the finish and outer batch meta-tools are intercepted first;
+// each batch sub-call is gated individually). It can:
 //   - Allow the call as-is (Allow=true, ModifiedInput=nil)
 //   - Deny the call (Allow=false)
 //   - Modify the input (Allow=true, ModifiedInput=non-nil)
@@ -305,6 +312,7 @@ func run() error {
         HITL: NewConfirmingHITL([]string{
             "write_file",
             "delete_file",
+            "create_directory",
             "bash_exec",
         }),
     })
@@ -321,6 +329,17 @@ func run() error {
     registry.Register(builtins.NewListDirectoryTool())
     registry.Register(builtins.NewCreateDirectoryTool())
     registry.Register(agent.NewFinishTool())
+
+    // Confirmation here is handled by the HITL handler at the executor level
+    // (OnToolCall above). The registry itself is FAIL-CLOSED for
+    // PolicyUserConfirm tools — write_file, delete_file and create_directory
+    // all declare it — so without a ConfirmFunc it would deny them outright.
+    // Relax the registry-level policy for exactly the tools the handler
+    // already gates, so the user is asked once instead of the call being
+    // denied after approval.
+    for _, name := range []string{"write_file", "delete_file", "create_directory"} {
+        registry.SetPolicyOverride(name, tools.PolicyAlwaysAllow)
+    }
 
     // Set up workspace
     workspaceDir, err := os.MkdirTemp("", "sdk-example-hitl-*")
@@ -396,7 +415,7 @@ fw, err := sp4rk.New(sp4rk.Config{
 
 ## Design notes
 
-- **Every tool call is intercepted.** `OnToolCall` fires before *every* tool, including read-only ones. Filter by `toolName` if you only want to confirm destructive operations.
+- **Every registry-dispatched tool call is intercepted.** `OnToolCall` fires before *every* tool the executor dispatches through the registry, including read-only ones. Filter by `toolName` if you only want to confirm destructive operations. The executor-intercepted meta-tools are the exception: `finish` is handled terminally before the hook, and `batch` is expanded first, with each sub-call then intercepted individually — so a gate wired for "all tool calls" never sees `finish`, nor the outer `batch` call itself.
 - **Modification is powerful.** `ModifiedInput` lets you enforce invariants (e.g. clamping line ranges, redirecting paths) without denying the call. The modified input replaces the model's arguments verbatim.
 - **Step-limit reasons.** When `OnStepLimit` fires with a non-empty `reason`, a circuit breaker (not plain budget exhaustion) triggered the pause. You can use this to decide whether more steps are likely to help. See [Agent Executor](agent-executor.md#circuit-breakers) for the breaker thresholds.
 - **Promptness matters.** Because handlers run on the executor loop, a slow handler delays the entire agent. For interactive handlers, read input with a timeout or respect `ctx.Done()`.

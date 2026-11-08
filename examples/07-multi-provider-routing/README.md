@@ -45,24 +45,33 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 # optional second provider:
 export OPENAI_API_KEY="sk-..."
 
-cd sdk/examples/07-multi-provider-routing
+cd examples/07-multi-provider-routing
 go run -tags fluent .   # or: go run .
 ```
 
-Expected output (single provider):
+Expected output (single provider). Both variants print the first four lines —
+line 3 is blank, produced by the leading `\n` in
+`fmt.Println("\n(set OPENAI_API_KEY …)")`. The **classic** `main.go` additionally
+prints the fifth, pointing at the fluent declarative switch:
 
 ```
 initial  : anthropic/claude-sonnet-4-5 (provider: anthropic)
 [default] -> Static typing catches many bugs at compile time...
+
 (set OPENAI_API_KEY to enable a second provider and runtime switching)
+(see main_fluent.go for the declarative phase-based switch via TaskF().Models())   # classic variant only
 ```
 
-With both keys set you additionally see the `switched` / `restored` (and, in the
-fluent variant, `phased`) lines as the router moves between providers.
+With both keys set you additionally see the `switched` lines in both variants,
+the `restored` line in the **classic** variant only (`main_fluent.go` restores
+the router silently), and the `phased` line in the fluent variant only, as the
+router moves between providers.
 
 ## Contrast with the capstone
 
 The full-power example uses phase-based switching as one of ~10 features and
-gates it behind `OPENAI_API_KEY`. This example makes routing the focus, exposes
-the low-level `SetModel`/`ActiveModel`/`ActiveProviderName` surface the capstone
-hides, and degrades gracefully to a single provider.
+gates it behind `OPENAI_API_KEY`. This example makes routing the focus, drives
+the low-level `SetModel`/`ActiveModel`/`ActiveProviderName` surface (the capstone
+only *reads* it — `ActiveModel()`/`ActiveProviderName()` in its final report — and
+never re-points the router with `SetModel`), and degrades gracefully to a single
+provider.

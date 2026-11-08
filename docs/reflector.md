@@ -35,7 +35,7 @@ type Reflector struct {
 }
 ```
 
-`Reflector` analyses an execution trajectory to produce structured self-correction insights. It is a stateless wrapper around an LLM caller: each call to `Reflect` sends the trajectory, the plan, and any prior reflections to the LLM and parses the JSON response into an `orchestration.Reflection`.
+`Reflector` analyses an execution trajectory to produce structured self-correction insights. It is a thin wrapper around an LLM caller — but **not** a stateless one: it holds a mutable `reasoningEffort` that `SetReasoningEffort` can change at runtime, which is why the [concurrency caveat](#setreasoningeffort) below exists. Each call to `Reflect` sends the trajectory, the plan, and any prior reflections to the LLM and parses the JSON response into an `orchestration.Reflection`.
 
 The reflector satisfies `orchestration.Reflector` at compile time:
 
@@ -75,7 +75,11 @@ Return a JSON object with:
 func (r *Reflector) SetReasoningEffort(effort string)
 ```
 
-Sets the reasoning effort for the reflector's LLM calls. Use this with reasoning-capable models to control how much reasoning budget the reflector spends analysing a failure. Common values are `"low"`, `"medium"`, and `"high"`.
+Sets the reasoning effort for the reflector's LLM calls, overriding the default tier-Off resolution for subsequent `Reflect` calls. Use this with reasoning-capable models to control how much reasoning budget the reflector spends analysing a failure. The value is the serving model's native spelling (see `llm.FamilyReasoningOptions`) — `"low"`/`"medium"`/`"high"` for OpenAI-family models, `"On"`/`"Off"` for Anthropic, and so on.
+
+By default reasoning is **off**: when no explicit effort is set, `Reflect` sends `llm.ReasoningForCall(Config.Family, Config.Model, llm.ReasoningTierOff)` — the model's native disable spelling when it has one, otherwise its cheapest effort, and `""` (no reasoning field sent at all) when the family/model are unknown or the built-in catalog declares the model incapable of reasoning.
+
+`SetReasoningEffort` must not be called concurrently with `Reflect`; callers that share a `Reflector` across goroutines should serialize access (e.g. with a mutex).
 
 ```go
 rf.SetReasoningEffort("high")
@@ -91,6 +95,13 @@ type Config struct {
     SystemPrompt string
     // AnalyzeFooter is appended to the user message. Defaults to a standard analysis request.
     AnalyzeFooter string
+    // ReasoningEffort sets the initial LLM reasoning effort for reflection
+    // calls. May be changed at runtime via SetReasoningEffort.
+    ReasoningEffort string
+    // Family and Model identify the model that will serve the reflection call,
+    // for reasoning-tier resolution. Both are optional.
+    Family string
+    Model  string
 }
 ```
 
@@ -98,6 +109,8 @@ type Config struct {
 | --- | --- |
 | `SystemPrompt` | The reflection system prompt. Instructs the LLM on how to analyse failures and what JSON to return. |
 | `AnalyzeFooter` | Text appended to the user message after the trajectory, plan, and prior reflections. When empty, defaults to `"Please analyze this execution and provide a structured reflection."` |
+| `ReasoningEffort` | Initial reasoning effort for reflection calls; overridable at runtime via `SetReasoningEffort`. When empty, the tier-Off policy is resolved from `Family`/`Model` (see below). |
+| `Family` / `Model` | Identify the model that will serve the reflection call, used only for reasoning-tier resolution. When both are empty the tier-Off policy resolves to `""` and no reasoning field is sent. |
 
 The system prompt should instruct the model to return a JSON object matching the `Reflection` schema. The reflector extracts JSON from the response (allowing surrounding prose) and unmarshals it.
 
@@ -123,7 +136,7 @@ Analyses an execution trajectory and returns a structured reflection.
 | `plan` | The plan being executed. Provides step descriptions and dependencies so the reflector understands the broader context. May be `nil`. |
 | `prevReflections` | Reflections from earlier failures in the same task. The reflector learns from these to avoid repeating the same mistakes. |
 
-**Returns** an `*orchestration.Reflection` with `Timestamp` set to the current time. Returns an error if the LLM call fails, returns nil, or produces unparseable JSON.
+**Returns** an `*orchestration.Reflection` with `Timestamp` set to the current time. Returns an error if the LLM call fails, returns a nil response, or yields output that stays unparseable after the one-shot retry loop; it never returns `nil, nil`.
 
 ```go
 reflection, err := rf.Reflect(ctx, trajectory, plan, reflections)
@@ -145,16 +158,16 @@ The reflector constructs a user message that presents the trajectory in a step-b
 **Thought:** I need to read the file first.
 **Action:** read_file
 **Input:** {"path": "main.go"}
-
 **Observation:** Error: file not found
 
 ### Step 2
 **Thought:** The file doesn't exist, so I'll create it.
 **Action:** write_file
 **Input:** {"path": "main.go", "content": "..."}
-
 **Observation:** Error: permission denied
 ```
+
+The `**Action:**`/`**Input:**` lines are emitted only when the step actually carried a tool call, and an observation from a step flagged `IsUntrusted` is wrapped in the `<untrusted-content>` boundary via `security.WrapUntrustedContent` before it enters the reflection prompt — so a malicious tool result cannot inject instructions into the reflection.
 
 When the plan is provided, it is appended as a section listing each step's ID, description, and dependencies:
 
@@ -201,7 +214,7 @@ This gives the LLM memory of past failures so it can identify recurring patterns
 
 ### Response parsing
 
-The reflector extracts JSON from the LLM response (tolerating surrounding prose or markdown fences) and unmarshals it into an `orchestration.Reflection`. It then validates `SuggestedAction`:
+The reflector extracts JSON from the LLM response (tolerating surrounding prose or markdown fences, via `llm.ExtractJSON`) and unmarshals it into an `orchestration.Reflection`. The call runs through the leaf `oneshot` client (`oneshot.Do` with `Kind: "reflection"`), so an unparseable response is re-asked with a corrective nudge restating the JSON contract — exactly two nudges, three attempts in total — before the parse error surfaces; transport errors are never retried there. The request carries `CallPurpose: llm.CallPurposeRouting` for deterministic sampling. It then validates `SuggestedAction`:
 
 - `"retry"`, `"replan"`, and `"abort"` are accepted as-is.
 - An empty or unrecognised value defaults to `"retry"`.
