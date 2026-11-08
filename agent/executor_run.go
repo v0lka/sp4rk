@@ -891,7 +891,7 @@ func (e *Executor) processSingleToolCall(
 	if base, in, ok := e.resolveToolResultReadDisplay(action.Name, action.Input); ok {
 		toolDisplayName, toolDisplayInput = base+" (cached)", in
 	}
-	e.emitter.ToolCall(state.stepNum, callIdx, toolDisplayName, toolDisplayInput, e.tools.GetToolSource(action.Name))
+	toolCallID := emitToolCallWithID(e.emitter, state.stepNum, callIdx, toolDisplayName, toolDisplayInput, e.tools.GetToolSource(action.Name))
 
 	// --- Circuit breaker: detect repeated identical tool calls ---
 	// Placed AFTER batch/finish checks so meta-tools aren't subject to
@@ -948,9 +948,9 @@ func (e *Executor) processSingleToolCall(
 	// Execute the tool (task context should already be set by the caller)
 	// Inject tool result cache into context so tool_result_read can access it.
 	// Also inject per-tool truncation config for num_lines enforcement.
-	execCtx := ctx
+	execCtx := withToolCallID(ctx, toolCallID, action.Name, input)
 	if e.toolCache != nil {
-		execCtx = WithToolResultCache(ctx, e.toolCache)
+		execCtx = WithToolResultCache(execCtx, e.toolCache)
 		execCtx = WithPerToolTruncation(execCtx, e.perToolTruncation)
 	}
 	result, err := e.executeToolCall(execCtx, action.Name, input)
@@ -1567,20 +1567,14 @@ func (e *Executor) processBatchTool(
 		if base, in, ok := e.resolveToolResultReadDisplay(sub.Tool, sub.Input); ok {
 			batchedName, batchedInput = base+" (batched)", in
 		}
-		e.emitter.ToolCall(state.stepNum, effectiveIdx, batchedName, batchedInput, e.tools.GetToolSource(sub.Tool))
+		toolCallID := emitToolCallWithID(e.emitter, state.stepNum, effectiveIdx, batchedName, batchedInput, e.tools.GetToolSource(sub.Tool))
 
 		// Circuit breaker: repeat identical tool call.
 		if loopAct, execResult, err := e.checkRepeatIdenticalTool(ctx, subCall, effectiveIdx, thought, resp, state, cw); loopAct != actionNone || execResult != nil {
 			return execResult, loopAct, err
 		}
 
-		// Execute via full policy pipeline.
 		execCtx := ctx
-		if e.toolCache != nil {
-			execCtx = WithToolResultCache(ctx, e.toolCache)
-			execCtx = WithPerToolTruncation(execCtx, e.perToolTruncation)
-		}
-
 		// --- HITL: allow consumer to intercept/modify batch sub-calls ---
 		var result tools.ToolResult
 		var execErr error
@@ -1638,6 +1632,12 @@ func (e *Executor) processBatchTool(
 			}
 		}
 		if !result.IsError && result.Content == "" {
+			// Bind the emitter's ID to this invocation only after HITL allows it.
+			execCtx = withToolCallID(ctx, toolCallID, subCall.Name, subInput)
+			if e.toolCache != nil {
+				execCtx = WithToolResultCache(execCtx, e.toolCache)
+				execCtx = WithPerToolTruncation(execCtx, e.perToolTruncation)
+			}
 			result, execErr = e.executeToolCall(execCtx, subCall.Name, subInput)
 		}
 		if execErr != nil {
