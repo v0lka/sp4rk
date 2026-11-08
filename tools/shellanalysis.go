@@ -285,8 +285,49 @@ func AnalyzeShellCommandForJudgeWithDialect(ctx context.Context, lang api.Lang, 
 	if err != nil {
 		return nil, fmt.Errorf("shell analysis: flowsh analyzer init: %w", err)
 	}
-	report := analyzer.AnalyzeWith(lang, params.Command, api.Options{Vars: ShellVarBindingsFrom(ctx)})
+	report := analyzer.AnalyzeWith(lang, shellAnalysisSource(ctx, lang, params.WorkingDirectory, params.Command), api.Options{Vars: ShellVarBindingsFrom(ctx)})
 	return evaluateShellReport(ctx, params.WorkingDirectory, params.Command, lang, report), nil
+}
+
+// shellAnalysisSource renders the source handed to the flowsh analyzer for one
+// shell tool input. For the bash dialect it prepends a literal `cd <base> &&`
+// whenever a resolution base is known — the tool's working_directory, else the
+// session workspace, the same base the containment walk resolves against.
+// The bash frontend tracks the working directory only through an in-script
+// `cd`, so without the prefix every relative path is reasoned about against
+// the offline default PWD "/". Since flowsh v0.7.0 the credential-operand
+// heuristic additionally resolves a relative secret-named operand against
+// that PWD and emits the resolved FSRead (always the safe side: it can add a
+// report entry, never remove one); against the default PWD that resolution
+// fabricates a root-level path the command never reads, which the C9
+// containment walk would count as an out-of-root read and the verification
+// marker would refuse — a benign in-workspace read of, say, a source file
+// named secrets.go would escalate. The `cd` builtin is silent about effects
+// and catalogued marker plumbing, so the prefix neither fires a criterion nor
+// breaks the marker for an in-root base; for an out-of-root base the FSMeta it
+// carries is the honest scope signal. The PowerShell frontend has no
+// PWD-dependent heuristic, so posh_exec input is analysed verbatim. The
+// digest, signature and judge echo keep the ORIGINAL command — only the
+// analyzer's view is grounded.
+func shellAnalysisSource(ctx context.Context, lang api.Lang, workDir, command string) string {
+	if lang != api.LangBash {
+		return command
+	}
+	base := workDir
+	if base == "" {
+		base = WorkspacePathFrom(ctx)
+	}
+	if base == "" {
+		return command
+	}
+	return "cd " + shellSingleQuote(base) + " && " + command
+}
+
+// shellSingleQuote renders s as one POSIX single-quoted word: an embedded
+// quote is spelled as quote, backslash, quote, quote, so any
+// working-directory path survives the analyzer's parser verbatim.
+func shellSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // DeclaredShellKinder is implemented by shell-exec tools that carry a

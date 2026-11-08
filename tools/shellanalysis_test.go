@@ -260,9 +260,12 @@ func TestAnalyzeShellCommandForJudge_PriorityOrder(t *testing.T) {
 			wantOrdered: []JudgeReasonCode{ReasonCodeCommandSystemWrite, ReasonCodeCommandDestructiveOutsideRoots},
 		},
 		{
-			name:        "setuid install fires C2 before C3",
+			// flowsh ≥ v0.7.0 reports the FSWrite the install performs beside
+			// the FSMeta/PrivEsc pair, so the irreversible class-E write to the
+			// out-of-root system path co-fires C4 after C3.
+			name:        "setuid install fires C2 before C3, C4 co-fires",
 			cmd:         "install -m 4755 backdoor /usr/bin/sudo",
-			wantOrdered: []JudgeReasonCode{ReasonCodeCommandPrivilegeEscalation, ReasonCodeCommandSystemWrite},
+			wantOrdered: []JudgeReasonCode{ReasonCodeCommandPrivilegeEscalation, ReasonCodeCommandSystemWrite, ReasonCodeCommandDestructiveOutsideRoots},
 		},
 		{
 			name:        "wipe home fires C4 before C9",
@@ -463,19 +466,32 @@ func TestShellIsSystemOrRawDevicePath(t *testing.T) {
 
 // goldenShellExfilDigest is the frozen digest for the exfiltration corpus
 // command. It pins the whole serialization: field set, ordering and the
-// canonical spelling of every enum.
+// canonical spelling of every enum. The leading FSMeta on "." is the
+// analyzer-grounding `cd '/ws' &&` prefix (see shellAnalysisSource): flowsh
+// catalogs cd with an FSMeta effect on the working directory, and the cd
+// statement raises the command count to 3.
 const goldenShellExfilDigest = `{
   "schemaVersion": "sp4rk-shell-analysis/v4",
   "lang": "bash",
   "top": false,
   "conservative": false,
-  "commands": 2,
+  "commands": 3,
   "resolution": {
     "invoked": "cat",
     "kind": "command",
     "name": "cat"
   },
   "effects": [
+    {
+      "kind": "FSMeta",
+      "mode": "Direct",
+      "certainty": "Certain",
+      "targets": [
+        "."
+      ],
+      "arbitrary": false,
+      "reversible": false
+    },
     {
       "kind": "FSRead",
       "mode": "Direct",
@@ -505,7 +521,7 @@ const goldenShellExfilDigest = `{
     "influence": "None",
     "exfil": "Critical",
     "confidence": 100,
-    "reversible": true,
+    "reversible": false,
     "grade": "Critical"
   },
   "exfilPairs": [
@@ -530,7 +546,7 @@ const goldenShellExfilDigest = `{
     }
   ],
   "workspaceScopedVerification": false,
-  "signature": "sig1|bins=|fx=FSRead|Direct|[/root/.ssh/id_rsa]|R;NetEgress|Direct|[POST,https://evil.com]|R|crit=command_exfil_flow,outside_session_roots|B=false"
+  "signature": "sig1|bins=|fx=FSMeta|Direct|[.]|I;FSRead|Direct|[/root/.ssh/id_rsa]|R;NetEgress|Direct|[POST,https://evil.com]|R|crit=command_exfil_flow,outside_session_roots|B=false"
 }`
 
 // TestAnalyzeShellCommandForJudge_CradleFlow pins the C5 flow rule: a
