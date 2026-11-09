@@ -28,9 +28,14 @@ const (
 	MaxWindowLog = 29 // 512 MiB, klauspost/compress zstd MaxWindowSize
 )
 
-// ErrClosed is returned by Write on a writer that has already been Closed.
-// Close itself is idempotent and reports nil after the first call. Test it
-// with errors.Is.
+// ErrClosed is returned by Write on a writer whose underlying stream has
+// been closed. For CodecNone every open is an independent stream, so the
+// error follows that writer's own Close. For the compressed codecs the
+// handles of one path share one stream, and it closes with the LAST handle
+// Close: until then a handle keeps appending through the live encoder —
+// whether or not it has Closed itself — and Write reports no error. Close
+// itself is idempotent and reports nil after the first call. Test it with
+// errors.Is.
 var ErrClosed = errors.New("appendcodec: writer already closed")
 
 // ErrMagicMismatch is returned by OpenAppend when the existing content of the
@@ -263,17 +268,23 @@ func (q *queuedWriter) Close() error {
 	if !q.closed.CompareAndSwap(false, true) {
 		return nil
 	}
+	// The registry lock is held across the whole teardown — entry drop and
+	// descriptor close alike. Dropping the entry first and only then closing
+	// (the footer write is real disk I/O) would leave the descriptor open
+	// and locked but unlisted: a concurrent same-process OpenAppend for the
+	// path would miss the registry, go fresh to the file and hit the
+	// still-held advisory lock as a spurious ErrLocked — an error the
+	// contract reserves for cross-process conflicts. Lock order is
+	// registry.mu -> appendWriter.mu (Write and appendWriter.Close never
+	// take registry.mu), so this cannot deadlock.
 	streamRegistry.mu.Lock()
+	defer streamRegistry.mu.Unlock()
 	q.s.refs--
-	last := q.s.refs <= 0
-	if last {
-		if streamRegistry.m[q.s.key] == q.s {
-			delete(streamRegistry.m, q.s.key)
-		}
-	}
-	streamRegistry.mu.Unlock()
-	if !last {
+	if q.s.refs > 0 {
 		return nil
+	}
+	if streamRegistry.m[q.s.key] == q.s {
+		delete(streamRegistry.m, q.s.key)
 	}
 	return q.s.Close()
 }
