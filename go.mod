@@ -6,6 +6,7 @@ require (
 	codeberg.org/readeck/go-readability/v2 v2.1.2
 	github.com/JohannesKaufmann/html-to-markdown v1.6.0
 	github.com/bmatcuk/doublestar/v4 v4.10.0
+	github.com/klauspost/compress v1.20.3
 	github.com/liushuangls/go-anthropic/v2 v2.17.3
 	github.com/mark3labs/mcp-go v0.45.0
 	github.com/openai/openai-go v1.12.0

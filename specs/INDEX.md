@@ -27,6 +27,7 @@
 | Adding/modifying built-in tools                               | [domains/tool-system/builtins.md](domains/tool-system/builtins.md)              |
 | Web search tool, provider backends (Brave, DuckDuckGo, Exa, SearXNG, Tavily) | [domains/tool-system/websearch.md](domains/tool-system/websearch.md), [domains/tool-system/builtins.md](domains/tool-system/builtins.md) |
 | Safe file reads/writes (regular-files-only, size caps, atomic publish) | [domains/safeio.md](domains/safeio.md)                                          |
+| Append-safe compressed logging (appendcodec: gzip/zstd, xz rejected) | [decisions/010-appendcodec-gzip-zstd-xz-rejected.md](decisions/010-appendcodec-gzip-zstd-xz-rejected.md) |
 | UTF-8 string helpers (truncation, invisible content)           | [domains/strutil.md](domains/strutil.md)                                        |
 | Ignore rules (.gitignore/.aiignore), glob & ripgrep filtering | [architecture/layers.md](architecture/layers.md), [contracts/tools.md](contracts/tools.md), [domains/tool-system/builtins.md](domains/tool-system/builtins.md) |
 | MCP servers, dynamic tools                                    | [domains/tool-system/mcp-gateway.md](domains/tool-system/mcp-gateway.md)        |
@@ -81,6 +82,8 @@ Supporting / leaf packages (no engine imports beyond what is listed):
 
     oneshot   → llm                (one-shot structured-call client; consumed by planner,
                                     agent/router, agent/reflector, and the tools judges)
+    appendcodec → safeio           (stdlib compress/gzip + klauspost/compress zstd otherwise;
+                                    consumed by host rotation wrappers, not by engine layers)
     skills    → pathutil, safeio, tools
     agents    → safeio             (stdlib + yaml.v3 + log/slog otherwise; no coupling to
                                     tools/agent/orchestration)
@@ -94,7 +97,7 @@ Supporting / leaf packages (no engine imports beyond what is listed):
                 a no-op on non-Windows)
 ```
 
-Supporting packages — `prompt`, `oneshot`, `skills`, `agents`, `security`, `embedding`, `pathutil`, `strutil`, `sysproc`, `ignore`, `safeio` — are consumed across layers as needed and have no upward dependencies.
+Supporting packages — `prompt`, `oneshot`, `skills`, `agents`, `security`, `embedding`, `pathutil`, `strutil`, `sysproc`, `ignore`, `safeio`, `appendcodec` — are consumed across layers as needed and have no upward dependencies.
 
 Import rule: every arrow is one-way. `tools` and `llm` are near-leaf dependencies; they never import `agent`, `orchestration`, `planner`, or the root package. This keeps the primitive layers free of higher-level concerns and prevents import cycles.
 
@@ -162,3 +165,4 @@ See [META.md](META.md) for document templates, naming rules, and update protocol
 - [007-c10-exec-scope-criterion.md](decisions/007-c10-exec-scope-criterion.md) - The C10 exec-scope criterion and digest v4
 - [008-unified-oneshot-service-client.md](decisions/008-unified-oneshot-service-client.md) - Unified one-shot service client
 - [009-opt-in-request-scoped-streaming.md](decisions/009-opt-in-request-scoped-streaming.md) - Opt-in request-scoped streaming channel
+- [010-appendcodec-gzip-zstd-xz-rejected.md](decisions/010-appendcodec-gzip-zstd-xz-rejected.md) - Append-safe codec writers: gzip and zstd, xz rejected
