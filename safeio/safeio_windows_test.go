@@ -125,7 +125,7 @@ func TestOpenFileNoFollow_RegularFileUnaffected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create-append open: %v", err)
 	}
-	if _, werr := io.WriteString(f, "data"); werr != nil {
+	if _, werr := f.WriteString("data"); werr != nil {
 		t.Fatalf("write: %v", werr)
 	}
 	if cerr := f.Close(); cerr != nil {
@@ -147,7 +147,7 @@ func TestOpenFileNoFollow_RegularFileUnaffected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("truncate open: %v", err)
 	}
-	if _, werr := io.WriteString(f, "x"); werr != nil {
+	if _, werr := f.WriteString("x"); werr != nil {
 		t.Fatalf("write after truncate: %v", werr)
 	}
 	if cerr := f.Close(); cerr != nil {
