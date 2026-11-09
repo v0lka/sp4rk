@@ -729,6 +729,50 @@ func TestOpenAppendSecondWriterSharesStream(t *testing.T) {
 	}
 }
 
+func TestQueuedWriterCloseIdempotentPerHandle(t *testing.T) {
+	// A double Close of ONE handle retires its reference exactly once: the
+	// sibling handle keeps writing and the shared stream outlives the
+	// misuse. Without the per-handle guard the extra decrement would retire
+	// the sibling's reference and, on the last live one, tear down the
+	// still-shared stream under it. CodecNone has no queued handles — its
+	// *appendWriter is already idempotent — and is included for uniform
+	// coverage.
+	for _, codec := range []Codec{CodecNone, CodecGzip, CodecZstd} {
+		t.Run(codec.String(), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "double-close."+codec.String())
+			w1, err := OpenAppend(path, codec, 10)
+			if err != nil {
+				t.Fatalf("OpenAppend 1: %v", err)
+			}
+			a := "before misuse\n"
+			if _, err := w1.Write([]byte(a)); err != nil {
+				t.Fatalf("write 1: %v", err)
+			}
+			w2, err := OpenAppend(path, codec, 10)
+			if err != nil {
+				t.Fatalf("OpenAppend 2: %v", err)
+			}
+
+			// The misuse: handle one is closed twice; the second Close
+			// reports nil and counts nothing.
+			requireClose(t, w1)
+			requireClose(t, w1)
+
+			// The sibling must be unaffected and keep writing.
+			b := "sibling survives\n"
+			if _, err := w2.Write([]byte(b)); err != nil {
+				t.Fatalf("write after sibling double close: %v", err)
+			}
+			requireClose(t, w2)
+
+			want := a + b
+			if got := decodeFile(t, path, codec); got != want {
+				t.Errorf("decoded = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
 func TestOpenAppendSharedPathCodecConflict(t *testing.T) {
 	// A second open of a LIVE path with a different codec would append into
 	// the wrong container; it fails with ErrMagicMismatch and leaves the

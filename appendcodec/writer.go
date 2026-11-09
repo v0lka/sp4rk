@@ -7,7 +7,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/v0lka/sp4rk/safeio"
@@ -140,6 +143,12 @@ func OpenAppend(path string, codec Codec, windowLog int) (io.WriteCloser, error)
 		return nil, fmt.Errorf("appendcodec: resolve %s: %w", path, err)
 	}
 	key = filepath.Clean(key)
+	if runtime.GOOS == "windows" {
+		// Windows paths are case-insensitive: fold the case so aliases such
+		// as C:\Logs\A and c:\logs\a hit one registry entry instead of
+		// degrading a same-process share to ErrLocked.
+		key = strings.ToLower(key)
+	}
 
 	// CodecNone takes the compatibility path — no lock, no registry. See the
 	// Concurrency section above.
@@ -239,14 +248,21 @@ var streamRegistry = struct {
 // (gzip/zstd). Write queues behind the stream's mutex, so records written
 // through different handles of one path never interleave; Close retires
 // only this handle — the last Close writes the codec footer, closes the
-// descriptor, releases the OS lock and drops the registry entry. CodecNone
-// never produces a queuedWriter: its opens return independent plain
-// handles.
-type queuedWriter struct{ s *sharedStream }
+// descriptor, releases the OS lock and drops the registry entry — and is
+// idempotent per handle, so a double Close never counts a reference twice.
+// CodecNone never produces a queuedWriter: its opens return independent
+// plain handles.
+type queuedWriter struct {
+	s      *sharedStream
+	closed atomic.Bool
+}
 
 func (q *queuedWriter) Write(p []byte) (int, error) { return q.s.Write(p) }
 
 func (q *queuedWriter) Close() error {
+	if !q.closed.CompareAndSwap(false, true) {
+		return nil
+	}
 	streamRegistry.mu.Lock()
 	q.s.refs--
 	last := q.s.refs <= 0
