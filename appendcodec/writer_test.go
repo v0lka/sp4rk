@@ -9,10 +9,12 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -157,6 +159,51 @@ func requireClose(t *testing.T, w io.WriteCloser) {
 	if err := w.Close(); err != nil {
 		t.Errorf("Close: %v", err)
 	}
+}
+
+func TestMain(m *testing.M) {
+	switch os.Getenv("APPENDCODEC_TEST_HELPER") {
+	case "":
+		os.Exit(m.Run())
+	case "hold-open":
+		// Re-executed test binary: hold an OpenAppend writer on the path
+		// from APPENDCODEC_TEST_PATH with the codec from
+		// APPENDCODEC_TEST_CODEC long enough for the parent process to
+		// attempt its own open, then exit.
+		crossProcessHelperMain()
+	}
+	os.Exit(0)
+}
+
+// crossProcessHelperMain is the hold-open helper body: open, write one
+// record, hold the descriptor, write a final record, Close, exit. Any
+// failure is reported on stderr with a non-zero exit code.
+func crossProcessHelperMain() {
+	path := os.Getenv("APPENDCODEC_TEST_PATH")
+	codec, err := ParseCodec(os.Getenv("APPENDCODEC_TEST_CODEC"))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "helper: bad codec: %v\n", err)
+		os.Exit(3)
+	}
+	w, err := OpenAppend(path, codec, 0)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "helper: open: %v\n", err)
+		os.Exit(3)
+	}
+	if _, err := w.Write([]byte("from child\n")); err != nil {
+		fmt.Fprintf(os.Stderr, "helper: write: %v\n", err)
+		os.Exit(3)
+	}
+	time.Sleep(1500 * time.Millisecond)
+	if _, err := w.Write([]byte("child late\n")); err != nil {
+		fmt.Fprintf(os.Stderr, "helper: late write: %v\n", err)
+		os.Exit(3)
+	}
+	if err := w.Close(); err != nil {
+		fmt.Fprintf(os.Stderr, "helper: close: %v\n", err)
+		os.Exit(3)
+	}
+	os.Exit(0)
 }
 
 func TestCodecString(t *testing.T) {
@@ -345,10 +392,11 @@ func TestOpenAppendCrashWithoutClose(t *testing.T) {
 			// without running the encoder's Close, so the codec footer is
 			// never written. Drop the writer WITHOUT Close and release only
 			// the raw fd — exactly the on-disk bytes a crash leaves behind.
-			aw, ok := w.(*appendWriter)
+			qw, ok := w.(*queuedWriter)
 			if !ok {
-				t.Fatalf("OpenAppend returned %T, want *appendWriter", w)
+				t.Fatalf("OpenAppend returned %T, want *queuedWriter", w)
 			}
+			aw := qw.s.appendWriter
 			aw.mu.Lock()
 			aw.closed = true
 			fdErr := aw.f.Close()
@@ -615,52 +663,270 @@ func TestOpenAppendTruncatedMagicRefused(t *testing.T) {
 	}
 }
 
-func TestOpenAppendLocksPathAgainstSecondWriter(t *testing.T) {
-	// The one-writer contract is enforced, not just documented: while one
-	// writer is live, a second OpenAppend on the same path fails with
-	// ErrLocked (cross-platform: flock on unix, a beyond-EOF LockFileEx
-	// range on Windows); after Close the path is open again and the new
-	// writer continues the stream rotation-style.
+func TestOpenAppendSecondWriterSharesStream(t *testing.T) {
+	// The one-encoder contract is invisible within a process: a second
+	// OpenAppend on a live path succeeds and returns an independent handle
+	// that queues its records through the first writer's encoder; handles
+	// are refcounted, so the first Close only retires its handle and the
+	// last Close writes the footer and releases the lock. After the last
+	// Close the path is open again and the new writer continues the stream
+	// rotation-style. Records from both handles stay in write order and
+	// decodable end to end (gzip multi-member / zstd multi-frame).
 	for _, codec := range []Codec{CodecNone, CodecGzip, CodecZstd} {
 		t.Run(codec.String(), func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "locked."+codec.String())
+			path := filepath.Join(t.TempDir(), "shared."+codec.String())
 			w1, err := OpenAppend(path, codec, 10)
 			if err != nil {
 				t.Fatalf("OpenAppend 1: %v", err)
 			}
-			first := "held by writer one\n"
-			if _, err := w1.Write([]byte(first)); err != nil {
+			a := "written by handle one\n"
+			if _, err := w1.Write([]byte(a)); err != nil {
 				t.Fatalf("write 1: %v", err)
 			}
 
 			w2, err := OpenAppend(path, codec, 10)
-			if err == nil {
-				_ = w2.Close()
-				t.Fatal("second OpenAppend on locked path: want ErrLocked, got nil")
+			if err != nil {
+				t.Fatalf("second OpenAppend on live path: %v", err)
 			}
-			if !errors.Is(err, ErrLocked) {
-				t.Fatalf("error = %v, want ErrLocked", err)
+			b := "queued by handle two\n"
+			if _, err := w2.Write([]byte(b)); err != nil {
+				t.Fatalf("write 2: %v", err)
+			}
+			c := "still fine\n"
+			if _, err := w1.Write([]byte(c)); err != nil {
+				t.Fatalf("write after second open: %v", err)
 			}
 
-			// The refused open must not have disturbed the live writer.
-			if _, err := w1.Write([]byte("still fine\n")); err != nil {
-				t.Fatalf("write after refused open: %v", err)
-			}
-
+			// The first Close only retires its handle: handle two keeps
+			// writing through the shared encoder.
 			requireClose(t, w1)
+			d := "after first close\n"
+			if _, err := w2.Write([]byte(d)); err != nil {
+				t.Fatalf("write after first close: %v", err)
+			}
+
+			// The last Close writes the footer and releases the lock.
+			requireClose(t, w2)
+			if _, err := w2.Write([]byte("late\n")); !errors.Is(err, ErrClosed) {
+				t.Fatalf("write after last close: err = %v, want ErrClosed", err)
+			}
+
 			w3, err := OpenAppend(path, codec, 10)
 			if err != nil {
-				t.Fatalf("OpenAppend after Close: %v", err)
+				t.Fatalf("OpenAppend after last Close: %v", err)
 			}
-			second := "generation two\n"
-			if _, err := w3.Write([]byte(second)); err != nil {
+			e := "generation two\n"
+			if _, err := w3.Write([]byte(e)); err != nil {
 				t.Fatalf("write 3: %v", err)
 			}
 			requireClose(t, w3)
 
-			if got := decodeFile(t, path, codec); got != first+"still fine\n"+second {
-				t.Errorf("decoded = %q, want all three records", got)
+			want := a + b + c + d + e
+			if got := decodeFile(t, path, codec); got != want {
+				t.Errorf("decoded = %q, want %q", got, want)
 			}
 		})
+	}
+}
+
+func TestOpenAppendSharedPathCodecConflict(t *testing.T) {
+	// A second open of a LIVE path with a different codec would append into
+	// the wrong container; it fails with ErrMagicMismatch and leaves the
+	// live writer undisturbed.
+	path := filepath.Join(t.TempDir(), "conflict.gz")
+	w, err := OpenAppend(path, CodecGzip, 0)
+	if err != nil {
+		t.Fatalf("OpenAppend gzip: %v", err)
+	}
+	if _, err := w.Write([]byte("kept\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	for _, codec := range []Codec{CodecZstd, CodecNone} {
+		_, err := OpenAppend(path, codec, 0)
+		if !errors.Is(err, ErrMagicMismatch) {
+			_ = w.Close()
+			t.Fatalf("OpenAppend %s on live gzip path: err = %v, want ErrMagicMismatch", codec, err)
+		}
+	}
+	requireClose(t, w)
+	if got := decodeFile(t, path, CodecGzip); got != "kept\n" {
+		t.Errorf("decoded = %q, want untouched stream", got)
+	}
+}
+
+// TestOpenAppendCrossProcess pins the cross-process half of the concurrency
+// contract by re-executing the test binary as a hold-open helper. With
+// CodecNone — the compatibility codec — no advisory lock exists, so the
+// parent's concurrent open succeeds and both writers land their records in
+// the file (the pre-appendcodec behavior). With CodecGzip the helper holds
+// the lock, so the parent's open fails with ErrLocked and leaves the
+// helper's stream untouched.
+func TestOpenAppendCrossProcess(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		codec   Codec
+		wantErr error
+	}{
+		{name: "none-no-lock", codec: CodecNone},
+		{name: "gzip-locked", codec: CodecGzip, wantErr: ErrLocked},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "xproc."+tc.codec.String())
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^$") // re-executes this test binary itself
+			cmd.Env = append(os.Environ(),
+				"APPENDCODEC_TEST_HELPER=hold-open",
+				"APPENDCODEC_TEST_PATH="+path,
+				"APPENDCODEC_TEST_CODEC="+tc.codec.String(),
+			)
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
+			if err := cmd.Start(); err != nil {
+				t.Fatalf("start helper: %v", err)
+			}
+			t.Cleanup(func() {
+				if cmd.Process != nil {
+					_ = cmd.Process.Kill()
+				}
+			})
+
+			// Wait until the helper's first record reaches the file: from
+			// then on its writer is definitely open and holding whatever
+			// lock its codec takes. (Size, not content — a compressed
+			// record does not contain its plaintext.)
+			deadline := time.Now().Add(10 * time.Second)
+			for {
+				info, serr := os.Stat(path)
+				if serr == nil && info.Size() > 0 {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("helper produced no output in time; stderr: %s", stderr.String())
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+
+			w, err := OpenAppend(path, tc.codec, 0)
+			if tc.wantErr != nil {
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("OpenAppend while helper holds path: err = %v, want %v", err, tc.wantErr)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("OpenAppend while helper holds path: %v (compat codec must not lock)", err)
+				}
+				if _, err := w.Write([]byte("from parent\n")); err != nil {
+					t.Fatalf("parent write: %v", err)
+				}
+				if err := w.Close(); err != nil {
+					t.Fatalf("parent close: %v", err)
+				}
+			}
+
+			if err := cmd.Wait(); err != nil {
+				t.Fatalf("helper exited %v; stderr: %s", err, stderr.String())
+			}
+
+			if tc.wantErr != nil {
+				// The refused open must not have disturbed the helper's
+				// stream.
+				if got := decodeFile(t, path, tc.codec); got != "from child\nchild late\n" {
+					t.Errorf("decoded = %q, want only the helper's records", got)
+				}
+				return
+			}
+			data, rerr := os.ReadFile(path)
+			if rerr != nil {
+				t.Fatalf("read: %v", rerr)
+			}
+			// Both records must be present and intact; the order between
+			// the two independent writers is not deterministic.
+			for _, want := range []string{"from child\n", "child late\n", "from parent\n"} {
+				if !bytes.Contains(data, []byte(want)) {
+					t.Errorf("file %q missing record %q", data, want)
+				}
+			}
+		})
+	}
+}
+
+// TestOpenAppendNoneIndependentHandles pins the compatibility behavior of
+// CodecNone: two opens of one path return INDEPENDENT plain handles — not
+// queued through a shared encoder, not refcounted, no registry entry — and
+// concurrent writers through different handles interleave only between
+// write calls, never inside one.
+func TestOpenAppendNoneIndependentHandles(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "independent.log")
+	w1, err := OpenAppend(path, CodecNone, 0)
+	if err != nil {
+		t.Fatalf("OpenAppend 1: %v", err)
+	}
+	w2, err := OpenAppend(path, CodecNone, 0)
+	if err != nil {
+		t.Fatalf("OpenAppend 2 on live path: %v (compat mode must not fail)", err)
+	}
+	if _, ok := w1.(*appendWriter); !ok {
+		t.Errorf("CodecNone open returned %T, want *appendWriter (independent handle)", w1)
+	}
+	if _, ok := w2.(*appendWriter); !ok {
+		t.Errorf("CodecNone second open returned %T, want *appendWriter (independent handle)", w2)
+	}
+	streamRegistry.mu.Lock()
+	_, inRegistry := streamRegistry.m[path]
+	streamRegistry.mu.Unlock()
+	if inRegistry {
+		t.Errorf("CodecNone registered its path in the shared-stream registry, want none (compat mode has no shared encoder)")
+	}
+
+	// Both handles write concurrently; O_APPEND keeps every write(2) intact.
+	const linesEach = 25
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for _, hw := range []struct {
+		handle io.WriteCloser
+		tag    string
+	}{{w1, "h1"}, {w2, "h2"}} {
+		go func(tag string, w io.WriteCloser) {
+			defer wg.Done()
+			for i := 0; i < linesEach; i++ {
+				if _, err := fmt.Fprintf(w, "%s line %d\n", tag, i); err != nil {
+					t.Errorf("write %s: %v", tag, err)
+					return
+				}
+			}
+		}(hw.tag, hw.handle)
+	}
+	wg.Wait()
+
+	// Closing one handle must not affect the other: independent fds, no
+	// shared refcount.
+	requireClose(t, w1)
+	if _, err := w2.Write([]byte("h2 after h1 close\n")); err != nil {
+		t.Fatalf("write after first close: %v", err)
+	}
+	requireClose(t, w2)
+
+	data, rerr := os.ReadFile(path)
+	if rerr != nil {
+		t.Fatalf("read: %v", rerr)
+	}
+	lines := strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
+	if len(lines) != 2*linesEach+1 {
+		t.Fatalf("decoded %d lines, want %d", len(lines), 2*linesEach+1)
+	}
+	counts := map[string]int{"h1": 0, "h2": 0}
+	for _, l := range lines {
+		switch {
+		case strings.HasPrefix(l, "h1 line "):
+			counts["h1"]++
+		case strings.HasPrefix(l, "h2"):
+			counts["h2"]++
+		default:
+			t.Fatalf("corrupted line %q — records were interleaved", l)
+		}
+	}
+	if counts["h1"] != linesEach || counts["h2"] != linesEach+1 {
+		t.Errorf("line counts h1=%d h2=%d, want %d/%d", counts["h1"], counts["h2"], linesEach, linesEach+1)
 	}
 }

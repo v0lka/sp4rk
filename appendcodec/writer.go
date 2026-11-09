@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/klauspost/compress/zstd"
@@ -35,15 +36,20 @@ var ErrClosed = errors.New("appendcodec: writer already closed")
 // errors.Is; the concrete type is *MagicMismatchError.
 var ErrMagicMismatch = errors.New("appendcodec: existing content does not match codec")
 
-// ErrLocked is returned by OpenAppend when the target path is already held
-// by another live writer. OpenAppend takes an exclusive advisory lock on the
-// file for the lifetime of its descriptor — flock(2) on unix, a beyond-EOF
-// LockFileEx range on Windows — so "one path, one writer" is enforced, not
-// just documented: a second OpenAppend on the same path, from this process
-// or another, fails with ErrLocked instead of interleaving its frames into
-// the first writer's stream. The lock is released by Close (closing the
-// descriptor drops it) and by process death. Test it with errors.Is.
-var ErrLocked = errors.New("appendcodec: path already locked by another writer")
+// ErrLocked is returned by OpenAppend when another PROCESS holds the target
+// path. It applies only to the compressed codecs (CodecGzip, CodecZstd),
+// which serialize every writer of a path behind one advisory lock and one
+// encoder; CodecNone is the compatibility codec — it takes no lock at all
+// and never reports this error. Within one process there is no such error
+// for a compressed path either: further OpenAppend calls for the same path
+// share the live writer — each returns an independent handle whose records
+// queue through the one encoder's mutex, so nothing interleaves and the OS
+// lock is taken only once. Across processes the lock cannot be shared or
+// merged, so a conflicting open fails immediately with ErrLocked instead of
+// interleaving its frames into the other process's stream. The lock dies
+// with the descriptor — released by the LAST handle Close, and by process
+// death. Test it with errors.Is.
+var ErrLocked = errors.New("appendcodec: path already locked by another process")
 
 // MagicMismatchError reports the codec requested for OpenAppend and the
 // unrecognised-or-conflicting leading bytes found in the target file. It
@@ -72,11 +78,13 @@ type codecStream interface {
 }
 
 // OpenAppend opens path for codec-compressed appending and returns a writer
-// whose every completed Write is already on disk (the codec's Flush runs
-// after each Write, so a concurrent reader — and a decoder of a file whose
-// writer crashed before Close — always sees every acknowledged record), and
-// whose Close writes the codec footer (gzip member trailer / zstd frame
-// epilogue; nothing for CodecNone) and releases the descriptor.
+// whose every completed Write is decodable by any reader the moment the call
+// returns (the codec's Flush runs after each Write, so a concurrent reader —
+// and a decoder of a file whose writer crashed before Close — always sees
+// every acknowledged record; nothing fsyncs, so power-loss durability is the
+// caller's concern), and whose Close writes the codec footer (gzip member
+// trailer / zstd frame epilogue; nothing for CodecNone) and releases the
+// descriptor.
 //
 // The open is link-safe and TOCTOU-free: safeio.OpenFileNoFollow refuses a
 // symlink at the final path component (ELOOP on unix; Windows parity per
@@ -96,16 +104,170 @@ type codecStream interface {
 // ignored by CodecGzip and CodecNone. The zstd encoder always runs with
 // WithEncoderConcurrency(1); gzip runs at the standard-library default level.
 //
-// The returned writer is safe for concurrent Write calls from multiple
-// goroutines: a mutex serializes each Write together with its Flush, so
-// records never interleave. Write after Close reports ErrClosed; Close is
-// idempotent. One path has exactly one live writer, enforced: OpenAppend
-// holds an exclusive advisory lock on the file for the descriptor's lifetime
-// (flock on unix; a beyond-EOF LockFileEx range on Windows, where region
-// locks are mandatory — the range sits past any reachable file size so
-// content reads and writes stay unblocked), and a second OpenAppend on the
-// same path fails with ErrLocked until the first writer is Closed.
+// Concurrency is scoped by codec:
+//
+//   - CodecGzip and CodecZstd: one path has exactly one live encoder —
+//     OpenAppend holds an exclusive advisory lock on the file for the
+//     descriptor's lifetime (flock on unix; a beyond-EOF LockFileEx range on
+//     Windows, where region locks are mandatory — the range sits past any
+//     reachable file size so content reads and writes stay unblocked) — and
+//     concurrent encoders, whose frame write(2)s would interleave and
+//     corrupt the stream, cannot exist. Within this process that constraint
+//     is invisible: a second OpenAppend for the same path returns an
+//     independent handle that queues its records through the one live
+//     encoder (the mutex under the stream serializes each Write with its
+//     Flush, so records never interleave), and handles are refcounted —
+//     Close retires only its handle; the LAST Close writes the footer,
+//     closes the descriptor and releases the lock. Opening the same live
+//     path with a different codec fails with an error matching
+//     ErrMagicMismatch. From another process the lock cannot be shared, so
+//     the open fails with ErrLocked. Write after the last Close reports
+//     ErrClosed; Close is idempotent.
+//
+//   - CodecNone: the compatibility codec, keeping the semantics this package
+//     replaced — no advisory lock, no sharing registry, no queue. Every open
+//     returns an independent plain O_APPEND handle, and any number of
+//     writers — in this process or others — may hold the path at once; each
+//     write(2) lands atomically at the then-current end of file, so records
+//     of concurrent writers interleave only between write calls, never
+//     inside one. The only retained guard is the magic sniff: plain bytes
+//     are refused on a gzip/zstd file (and compressed codecs refuse plain
+//     files) with ErrMagicMismatch — best-effort, because nothing
+//     serializes the check against concurrent opens.
 func OpenAppend(path string, codec Codec, windowLog int) (io.WriteCloser, error) {
+	key, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("appendcodec: resolve %s: %w", path, err)
+	}
+	key = filepath.Clean(key)
+
+	// CodecNone takes the compatibility path — no lock, no registry. See the
+	// Concurrency section above.
+	if codec == CodecNone {
+		return openAppendNone(path)
+	}
+
+	// The registry lock is held across the whole open: concurrent first
+	// opens of one compressed path serialize here, so the second finds the
+	// entry the first created instead of racing it to the file lock.
+	// OpenAppend runs once per stream, not per record, so the held lock
+	// costs nothing.
+	streamRegistry.mu.Lock()
+	defer streamRegistry.mu.Unlock()
+
+	if s, ok := streamRegistry.m[key]; ok {
+		if s.codec != codec {
+			return nil, fmt.Errorf("%w: %s is already open with codec %s, requested %s",
+				ErrMagicMismatch, path, s.codec, codec)
+		}
+		s.refs++
+		return &queuedWriter{s: s}, nil
+	}
+
+	w, err := openAppendFile(path, codec, windowLog)
+	if err != nil {
+		return nil, err
+	}
+	s := &sharedStream{appendWriter: w, codec: codec, key: key, refs: 1}
+	streamRegistry.m[key] = s
+	return &queuedWriter{s: s}, nil
+}
+
+// openAppendNone is the CodecNone open path: the pre-appendcodec semantics
+// kept for compatibility. It takes no advisory lock and consults no sharing
+// registry — every call returns an independent plain O_APPEND handle, and
+// concurrent writers (in this process or another) append side by side, each
+// write(2) atomic at the end of file. The one retained guard is the magic
+// sniff read from the same descriptor: appending plain bytes onto a
+// gzip/zstd stream would strand the existing members, so that mismatch
+// still fails with ErrMagicMismatch. Without the lock the check is not
+// serialized against concurrent opens, so it is best-effort; mixing codecs
+// on one path is a caller error.
+func openAppendNone(path string) (*appendWriter, error) {
+	f, err := safeio.OpenFileNoFollow(path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	prefix, err := readMagicPrefix(f, path)
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if err := checkAppendMagic(CodecNone, path, prefix); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return &appendWriter{f: f}, nil
+}
+
+// readMagicPrefix reads the leading magicLen bytes of f for the append
+// compatibility check, tolerating a file shorter than the sniff window.
+func readMagicPrefix(f *os.File, path string) ([]byte, error) {
+	prefix := make([]byte, magicLen)
+	n, rerr := f.ReadAt(prefix, 0)
+	if rerr != nil && !errors.Is(rerr, io.EOF) && !errors.Is(rerr, io.ErrUnexpectedEOF) {
+		return nil, &os.PathError{Op: "read", Path: path, Err: rerr}
+	}
+	return prefix[:n], nil
+}
+
+// sharedStream is the registry entry behind every handle OpenAppend hands
+// out for one compressed path (gzip/zstd): the locked descriptor's
+// appendWriter (its mutex is the write queue all handles share), the codec
+// the stream was opened with, the normalized registry key, and the count of
+// live handles.
+type sharedStream struct {
+	*appendWriter
+	codec Codec
+	key   string
+	refs  int
+}
+
+// streamRegistry maps normalized absolute paths to this process's live
+// compressed streams. It turns a same-process second OpenAppend for a
+// gzip/zstd path into a queued handle instead of a lock conflict; paths that
+// normalize differently (a symlinked parent directory aliases the same file
+// under two keys) miss the registry and degrade to the advisory lock's
+// ErrLocked — never to interleaved frames. CodecNone streams never enter
+// the registry: the compatibility codec has no lock and no shared encoder.
+var streamRegistry = struct {
+	mu sync.Mutex
+	m  map[string]*sharedStream
+}{m: make(map[string]*sharedStream)}
+
+// queuedWriter is one independent handle on a compressed sharedStream
+// (gzip/zstd). Write queues behind the stream's mutex, so records written
+// through different handles of one path never interleave; Close retires
+// only this handle — the last Close writes the codec footer, closes the
+// descriptor, releases the OS lock and drops the registry entry. CodecNone
+// never produces a queuedWriter: its opens return independent plain
+// handles.
+type queuedWriter struct{ s *sharedStream }
+
+func (q *queuedWriter) Write(p []byte) (int, error) { return q.s.Write(p) }
+
+func (q *queuedWriter) Close() error {
+	streamRegistry.mu.Lock()
+	q.s.refs--
+	last := q.s.refs <= 0
+	if last {
+		if streamRegistry.m[q.s.key] == q.s {
+			delete(streamRegistry.m, q.s.key)
+		}
+	}
+	streamRegistry.mu.Unlock()
+	if !last {
+		return nil
+	}
+	return q.s.Close()
+}
+
+// openAppendFile is OpenAppend's locked path, used only for the compressed
+// codecs (CodecGzip, CodecZstd — CodecNone takes the lock-free
+// openAppendNone): open through safeio, take the advisory lock, verify the
+// existing magic against the codec and build the encoder. The caller
+// (OpenAppend) owns the registry bookkeeping.
+func openAppendFile(path string, codec Codec, windowLog int) (*appendWriter, error) {
 	if codec == CodecZstd && windowLog > 0 {
 		windowLog = clampWindowLog(windowLog)
 	}
@@ -121,15 +283,16 @@ func OpenAppend(path string, codec Codec, windowLog int) (io.WriteCloser, error)
 		return nil, &os.PathError{Op: "lock", Path: path, Err: err}
 	}
 
-	// The path is locked: no other OpenAppend can write concurrently while
-	// the prefix is inspected, so the content is stable for the check below.
-	prefix := make([]byte, magicLen)
-	n, rerr := f.ReadAt(prefix, 0)
-	if rerr != nil && !errors.Is(rerr, io.EOF) && !errors.Is(rerr, io.ErrUnexpectedEOF) {
+	// The path is locked: no other locked OpenAppend can write concurrently
+	// while the prefix is inspected, so the content is stable for the check
+	// below. (A concurrent CodecNone writer would not be locked out — the
+	// compatibility codec takes no lock — so this check remains best-effort
+	// against mixed-codec misuse.)
+	prefix, rerr := readMagicPrefix(f, path)
+	if rerr != nil {
 		_ = f.Close()
-		return nil, &os.PathError{Op: "read", Path: path, Err: rerr}
+		return nil, rerr
 	}
-	prefix = prefix[:n]
 	if err := checkAppendMagic(codec, path, prefix); err != nil {
 		_ = f.Close()
 		return nil, err
@@ -150,8 +313,6 @@ func OpenAppend(path string, codec Codec, windowLog int) (io.WriteCloser, error)
 			return nil, fmt.Errorf("appendcodec: zstd encoder for %s: %w", path, zerr)
 		}
 		w.cs = enc
-	case CodecNone:
-		// nil codecStream: Write goes straight to f.
 	default:
 		_ = f.Close()
 		return nil, fmt.Errorf("%w: %s", ErrUnknownCodec, codec)

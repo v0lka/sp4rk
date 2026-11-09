@@ -10,13 +10,14 @@ import (
 )
 
 // lockOffsetHigh is the high dword of the lock byte range's start offset:
-// 0x7FFFFFFF_00000000 — 16 EiB into the file, far beyond any reachable size
-// (NTFS caps files at 16 TiB). Windows region locks taken with LockFileEx
-// are mandatory for other handles — a reader touching the locked range would
-// fail with ERROR_LOCK_VIOLATION — so the range must sit where no content
-// byte can ever be: locking byte 0 would block every rotation reader of the
-// live log. A lock beyond EOF is still a valid, conflicting target for a
-// second LockFileEx, which is what makes "one path, one writer" enforceable.
+// 0x7FFFFFFF_00000000 — 2^63, roughly 8 EiB into the file, far beyond any
+// reachable size (NTFS caps files at 256 TB). Windows region locks taken
+// with LockFileEx are mandatory for other handles — a reader touching the
+// locked range would fail with ERROR_LOCK_VIOLATION — so the range must sit
+// where no content byte can ever be: locking byte 0 would block every
+// rotation reader of the live log. A lock beyond EOF is still a valid,
+// conflicting target for a second LockFileEx, which is what makes "one
+// path, one writer" enforceable.
 const lockOffsetHigh = 0x7FFFFFFF
 
 // lockExclusive takes an exclusive byte-range lock (LockFileEx,
