@@ -227,6 +227,38 @@ func TestStepDumpTracker_CodecFilename(t *testing.T) {
 	}
 }
 
+func TestStepDumpTracker_InvalidCodecFallsBack(t *testing.T) {
+	dir := t.TempDir()
+	logger := expectedDiagnostics(t,
+		expectedDiagnostic{message: "step_dump_tracker: unknown codec; falling back to plain JSONL",
+			attrs: map[string]any{"codec": "codec(42)"}},
+	)
+	tracker := NewStepDumpTracker(dir, logger, WithCodec(appendcodec.Codec(42)))
+	// Close tracked files so Windows can remove the temp dir (open files are
+	// locked on Windows, unlike Unix where they can be unlinked while open).
+	t.Cleanup(func() { _ = tracker.CloseAll() })
+
+	w := tracker.OpenStepDump("step-1")
+	if w == nil {
+		t.Fatal("expected non-nil writer")
+	}
+	if _, err := io.WriteString(w, "{\"ok\":true}\n"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := tracker.CloseAll(); err != nil {
+		t.Fatalf("CloseAll: %v", err)
+	}
+
+	// The fallback codec names the file like CodecNone and leaves plain JSONL.
+	raw, err := os.ReadFile(filepath.Join(dir, "step_step-1.jsonl"))
+	if err != nil {
+		t.Fatalf("read plain dump: %v", err)
+	}
+	if got := string(raw); got != "{\"ok\":true}\n" {
+		t.Errorf("dump content = %q, want plain JSONL", got)
+	}
+}
+
 func TestStepDumpTracker_CloseAllWritesFooter(t *testing.T) {
 	// gzip: CloseAll must leave a complete multi-member-decodable stream —
 	// decodeGzip's clean read to EOF fails with ErrUnexpectedEOF on a footer-

@@ -26,7 +26,9 @@ type stepDumpCodecConfig struct {
 // opens: appendcodec.CodecNone (plain JSONL, the default), CodecGzip or
 // CodecZstd. The codec also extends the filename — step_<id>.jsonl,
 // step_<id>.jsonl.gz or step_<id>.jsonl.zst respectively — so different
-// codecs never collide on the same path.
+// codecs never collide on the same path. Any other value is rejected at
+// construction: NewStepDumpTracker logs one warning and falls back to
+// CodecNone.
 func WithCodec(codec appendcodec.Codec) StepDumpOption {
 	return func(c *stepDumpCodecConfig) { c.codec = codec }
 }
@@ -64,6 +66,15 @@ func NewStepDumpTracker(dir string, logger *slog.Logger, opts ...StepDumpOption)
 		if opt != nil {
 			opt(&cfg)
 		}
+	}
+	switch cfg.codec {
+	case appendcodec.CodecNone, appendcodec.CodecGzip, appendcodec.CodecZstd:
+	default:
+		// An invalid codec would fail every OpenAppend with ErrUnknownCodec
+		// after creating an empty dump file; degrade once, here, instead.
+		logger.Warn("step_dump_tracker: unknown codec; falling back to plain JSONL",
+			"codec", cfg.codec.String())
+		cfg.codec = appendcodec.CodecNone
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		logger.Warn("step_dump_tracker: failed to create directory",
