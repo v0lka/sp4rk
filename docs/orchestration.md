@@ -967,30 +967,49 @@ defer bb.Shutdown()
 ### StepDumpTracker
 
 ```go
-func NewStepDumpTracker(dir string, logger *slog.Logger) *StepDumpTracker
+func NewStepDumpTracker(dir string, logger *slog.Logger, opts ...StepDumpOption) *StepDumpTracker
 ```
 
 A best-effort manager for **per-step LLM dump files**, used when the host records each plan step's LLM traffic to its own file for offline debugging. Pass a directory and a logger (`nil` falls back to `slog.Default()`); `NewStepDumpTracker` creates the directory (logging a warning on failure, but not returning an error — dumps are best-effort debugging aids). Pass an empty `dir` to disable the tracker.
 
+Without options the dumps are plain JSONL (`appendcodec.CodecNone`). Two options select compression, via the `github.com/v0lka/sp4rk/appendcodec` package:
+
+```go
+// WithCodec sets the dump codec: appendcodec.CodecNone (plain JSONL, the
+// default), CodecGzip or CodecZstd. The codec extends the filename —
+// step_<id>.jsonl, step_<id>.jsonl.gz or step_<id>.jsonl.zst.
+func WithCodec(codec appendcodec.Codec) StepDumpOption
+
+// WithCodecWindowLog sizes the zstd encoder window (1<<windowLog, clamped
+// by appendcodec; <=0 keeps the encoder default). Ignored by other codecs.
+func WithCodecWindowLog(windowLog int) StepDumpOption
+```
+
 ```go
 type StepDumpTracker struct{ /* unexported */ }
 
-// OpenStepDump returns an io.Writer for the step's dump file, or nil when
-// disabled/closed. The file is created on first call and cached — repeated
-// calls for the same stepID (including retries) append to the same file.
+// OpenStepDump returns an io.Writer for the step's dump file — an
+// appendcodec wrapper that appends codec-framed records (each completed
+// Write is already decodable on disk) — or nil when disabled/closed. The
+// file is created on first call and the wrapper is cached — repeated calls
+// for the same stepID (including retries) append through the same encoder.
 func (t *StepDumpTracker) OpenStepDump(stepID string) io.Writer
 
-// CloseAll closes every tracked file. Idempotent.
+// CloseAll closes every tracked writer: each wrapper's Close writes the
+// codec footer (gzip trailer / zstd frame epilogue; nothing for CodecNone)
+// and then releases the file descriptor. Idempotent.
 func (t *StepDumpTracker) CloseAll() error
 ```
 
 Key properties:
 
-- **Path-traversal safe** — the filename is `step_<filepath.Base(stepID)>.jsonl`, so any directory components in `stepID` are stripped and the file always lands inside `dir`.
-- **Idempotent** — opening a dump for an already-seen step returns the cached `*os.File`, so retries and sub-steps append rather than overwrite.
+- **Path-traversal safe** — the filename is `step_<filepath.Base(stepID)>.jsonl` plus the codec's extension, so any directory components in `stepID` are stripped and the file always lands inside `dir`.
+- **Codec-consistent** — codec-specific filenames mean different codecs never collide on one path, and `appendcodec.OpenAppend` still verifies the existing file's magic before appending, refusing (with a warning, nil writer) foreign content planted at the codec's own path. Under every codec the open itself is hardened too: a symlink at the final path component (refused on unix; Windows parity per safeio), a non-regular pre-existing target, or a dump file without read permission (the magic sniff reads through the same `O_RDWR` descriptor the appends go through) fails the open with the ordinary warning + nil writer path.
+- **Idempotent** — opening a dump for an already-seen step returns the cached wrapper, so retries and sub-steps append rather than overwrite (and a second live encoder — which would interleave compressed frames — is never created). For the compressed codecs, across trackers in one process, `appendcodec` shares the live encoder: a second open of the same dump path returns an independent queued handle whose records serialize on the one encoder, and the codec footer plus file lock are released by the last tracker's `CloseAll`. From another process, the advisory path lock rejects the open with `appendcodec.ErrLocked`, which degrades to the ordinary warning + nil writer path — frames can never interleave. With the default `appendcodec.CodecNone` none of this applies: opens take no lock and return independent plain handles, so parallel runs' JSONL dumps append side by side exactly as before (records interleave between write calls, never inside one).
+- **Crash-truncated dumps stay readable only up to the crash point** — a host crash mid-run leaves the dump decodable through its last flushed record, but the next run appends behind the truncation point and sequential decoders stop there: post-crash records sit in the file, unreachable. Recovery (scan to the last decodable boundary, truncate) is a consumer concern; `appendcodec` ships no helper yet.
 - **Graceful degradation** — every failure (directory creation, file open, write) is swallowed with a warning; dumps are debugging aids and never affect execution.
 
-A host that wants per-step dumps opens each step's writer with `OpenStepDump` and feeds it into the executor context itself via [`agent.WithDumpWriter`](agent-executor.md#llm-debugging-callers) (typically wrapped around a [`NewDumpCaller`](agent-executor.md#newdumpcaller--full-jsonl-requestresponse-dumps) caller through the `CallerForStep` hook), so each step produces a self-contained `step_<id>.jsonl`. The SDK does not wire this for you: the Conductor never opens or consumes these dumps (its `Cleanup` is a no-op) and the executor never reads the context key back.
+A host that wants per-step dumps opens each step's writer with `OpenStepDump` and feeds it into the executor context itself via [`agent.WithDumpWriter`](agent-executor.md#llm-debugging-callers) (typically wrapped around a [`NewDumpCaller`](agent-executor.md#newdumpcaller--full-jsonl-requestresponse-dumps) caller through the `CallerForStep` hook), so each step produces a self-contained `step_<id>.jsonl[.gz|.zst]`. The SDK does not wire this for you: the Conductor never opens or consumes these dumps (its `Cleanup` is a no-op) and the executor never reads the context key back.
 
 ---
 
