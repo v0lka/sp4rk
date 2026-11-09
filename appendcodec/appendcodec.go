@@ -25,9 +25,12 @@
 // Writer concurrency contract: a single writer returned by OpenAppend is safe
 // for concurrent use — a mutex serializes Write (+ the trailing Flush) so
 // concurrent goroutines never interleave each other's records, provided each
-// Write carries one whole record (a line). Opening several writers on the
-// same compressed path is NOT supported: concurrent encoders would interleave
-// their frames' write(2)s and corrupt the stream. One path, one writer.
+// Write carries one whole record (a line). One path, one writer, enforced:
+// OpenAppend holds an exclusive advisory lock on the file for the lifetime of
+// its descriptor (flock on unix, a beyond-EOF LockFileEx range on Windows), so
+// concurrent encoders — which would interleave their frames' write(2)s and
+// corrupt the stream — cannot exist: a second OpenAppend on the same path
+// fails with ErrLocked until the first writer is Closed.
 package appendcodec
 
 import (

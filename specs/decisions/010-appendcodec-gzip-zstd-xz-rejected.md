@@ -16,7 +16,11 @@ the same codec yields one continuous, decodable stream (gzip multi-member /
 zstd multi-frame). Additionally, the open path must be link-safe and
 TOCTOU-free: the existing content is inspected through the same descriptor
 that is later appended through, and symlinks and non-regular files are
-refused (via `safeio.OpenFileNoFollow`).
+refused (via `safeio.OpenFileNoFollow`). The link-safety half — the refusal
+of a final-component symlink (ELOOP) — is a unix guarantee; on Windows,
+`safeio.OpenFileNoFollow` still resolves final-component symlinks (the safeio
+Windows parity note). The TOCTOU closure — inspection through the same
+descriptor that is appended through — holds on both platforms.
 
 Candidate encoder libraries: the standard library's `compress/gzip`,
 `github.com/klauspost/compress/zstd`, and `github.com/ulikunitz/xz`.
@@ -37,10 +41,22 @@ after every `Write` (gzip flushes the pending deflate blocks; klauspost zstd
 dispatches complete non-final blocks — the frame epilogue is written only by
 `Close`, which is where the footer lands), and by serializing `Write`/`Flush`
 and `Close` behind a mutex so concurrent goroutines cannot interleave
-records. `DetectMagic` sniffs the first bytes of a file through
+records. One path has exactly one live writer, enforced: `OpenAppend` takes
+an exclusive advisory lock on the file for the lifetime of its descriptor —
+`flock(2)` on unix; on Windows a beyond-EOF `LockFileEx` range, because
+Windows region locks are mandatory for other handles and the range therefore
+sits 16 EiB into the file, where no content byte can ever land, so rotation
+readers and content writes stay unblocked. A second `OpenAppend` on the same
+path, from this process or another, fails with `ErrLocked` until the first
+writer is Closed (the lock dies with the descriptor — a Close or a crash
+releases it). `DetectMagic` sniffs the first bytes of a file through
 `safeio.OpenFileNoFollow`: gzip magic `1f 8b`, zstd magic `28 b5 2f fd`,
 text content (JSON or otherwise) → `CodecNone`, anything binary and
-unrecognised → `CodecNone` plus one Warn record on the supplied `*slog.Logger`.
+unrecognised → `CodecNone` plus one Warn record on the supplied
+`*slog.Logger`. A file consisting of exactly the magic bytes is not
+recognised as that codec — no sequential decoder can read a magic-only
+head — so appending the codec onto it fails with `*MagicMismatchError`
+instead of writing members no decoder can reach.
 
 **xz is NOT included.** `github.com/ulikunitz/xz` was rejected by the
 operator for the rotation wrapper: its xz writer has no usable `Flush` on the
@@ -61,6 +77,10 @@ is recorded here so the rejection is not re-litigated by accident; the
   `OpenAppend` verifies the existing magic against the requested codec on
   the same descriptor (refuses a mismatch with `*MagicMismatchError`
   matching `ErrMagicMismatch`) instead of producing undecodable files.
+- One path has exactly one live writer, enforced by the advisory `OpenAppend`
+  lock (`ErrLocked`): a second writer cannot interleave frames into the
+  stream — in this process or in another. Sequential reopen-after-Close (the
+  rotation flow) is unaffected.
 - The codec surface is closed: adding a codec means an ADR superseding this
   one. klauspost/compress becomes a pinned direct dependency of the module
   (v1.20.3; upgrades are normal dependency maintenance, the pin records the

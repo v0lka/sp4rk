@@ -565,3 +565,102 @@ func TestAppendWriterClosedSemantics(t *testing.T) {
 		t.Errorf("second Close = %v, want nil (idempotent)", err)
 	}
 }
+
+func TestOpenAppendTruncatedMagicRefused(t *testing.T) {
+	// A file cut off exactly at the container magic bytes is readable by no
+	// sequential decoder, so appending that codec after the magic-only head
+	// would produce members no decoder can reach. The sniff must refuse to
+	// classify the truncated magic as its codec, and OpenAppend must fail
+	// with ErrMagicMismatch instead of writing the unreachable data.
+	dir := t.TempDir()
+	cases := []struct {
+		name  string
+		magic []byte
+		codec Codec
+	}{
+		{name: "gzip", magic: []byte{0x1f, 0x8b}, codec: CodecGzip},
+		{name: "zstd", magic: []byte{0x28, 0xb5, 0x2f, 0xfd}, codec: CodecZstd},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(dir, "truncated-"+tc.name)
+			if err := os.WriteFile(path, tc.magic, 0o644); err != nil {
+				t.Fatalf("write magic-only file: %v", err)
+			}
+
+			got, err := DetectMagic(path, nil)
+			if err != nil {
+				t.Fatalf("DetectMagic: %v", err)
+			}
+			if got == tc.codec {
+				t.Errorf("DetectMagic classified truncated %s magic as %s", tc.name, got)
+			}
+
+			w, err := OpenAppend(path, tc.codec, 0)
+			if err == nil {
+				_ = w.Close()
+				t.Fatal("OpenAppend onto magic-only file: want error, got nil")
+			}
+			if !errors.Is(err, ErrMagicMismatch) {
+				t.Fatalf("error = %v, want ErrMagicMismatch", err)
+			}
+			var mme *MagicMismatchError
+			if !errors.As(err, &mme) {
+				t.Fatalf("error %v is not *MagicMismatchError", err)
+			}
+			if !bytes.Equal(mme.Magic, tc.magic) {
+				t.Errorf("error magic = % x, want % x", mme.Magic, tc.magic)
+			}
+		})
+	}
+}
+
+func TestOpenAppendLocksPathAgainstSecondWriter(t *testing.T) {
+	// The one-writer contract is enforced, not just documented: while one
+	// writer is live, a second OpenAppend on the same path fails with
+	// ErrLocked (cross-platform: flock on unix, a beyond-EOF LockFileEx
+	// range on Windows); after Close the path is open again and the new
+	// writer continues the stream rotation-style.
+	for _, codec := range []Codec{CodecNone, CodecGzip, CodecZstd} {
+		t.Run(codec.String(), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "locked."+codec.String())
+			w1, err := OpenAppend(path, codec, 10)
+			if err != nil {
+				t.Fatalf("OpenAppend 1: %v", err)
+			}
+			first := "held by writer one\n"
+			if _, err := w1.Write([]byte(first)); err != nil {
+				t.Fatalf("write 1: %v", err)
+			}
+
+			w2, err := OpenAppend(path, codec, 10)
+			if err == nil {
+				_ = w2.Close()
+				t.Fatal("second OpenAppend on locked path: want ErrLocked, got nil")
+			}
+			if !errors.Is(err, ErrLocked) {
+				t.Fatalf("error = %v, want ErrLocked", err)
+			}
+
+			// The refused open must not have disturbed the live writer.
+			if _, err := w1.Write([]byte("still fine\n")); err != nil {
+				t.Fatalf("write after refused open: %v", err)
+			}
+
+			requireClose(t, w1)
+			w3, err := OpenAppend(path, codec, 10)
+			if err != nil {
+				t.Fatalf("OpenAppend after Close: %v", err)
+			}
+			second := "generation two\n"
+			if _, err := w3.Write([]byte(second)); err != nil {
+				t.Fatalf("write 3: %v", err)
+			}
+			requireClose(t, w3)
+
+			if got := decodeFile(t, path, codec); got != first+"still fine\n"+second {
+				t.Errorf("decoded = %q, want all three records", got)
+			}
+		})
+	}
+}

@@ -24,8 +24,10 @@ const magicLen = 6
 //
 // Results: an empty file and any file whose leading bytes are text — JSON
 // text ('{' or '[' after an optional BOM and blanks), plain ASCII, or UTF-8
-// — report CodecNone with a nil error. A file whose leading bytes match
-// container magic reports CodecGzip or CodecZstd. Binary content that is
+// — report CodecNone with a nil error. A file whose leading bytes carry a
+// container magic plus at least one byte of stream reports CodecGzip or
+// CodecZstd; a file consisting of exactly the magic bytes is not recognised
+// as that codec (see sniff). Binary content that is
 // neither reports CodecNone with no error but emits a single Warn record
 // ("unknown magic; treating as uncompressed") carrying the path and the hex
 // magic when log is non-nil — a nil log drops the warning. An open failure
@@ -63,9 +65,16 @@ var (
 
 // sniff identifies a codec from a leading prefix of at most magicLen bytes.
 // An empty prefix (missing or zero-length file) is a known CodecNone — there
-// is nothing to be incompatible with. A prefix that matches container magic
-// reports that codec. A prefix that looks like text (JSON or otherwise) is a
-// known CodecNone. Anything else — binary content that is neither container
+// is nothing to be incompatible with. A prefix that carries the COMPLETE
+// container magic plus at least one byte beyond it reports that codec — a
+// real stream member is always longer than the magic alone (a gzip member is
+// a 10-byte header + data + trailer; a zstd frame header alone exceeds the
+// magic) — while a file consisting of exactly the magic bytes is deliberately
+// NOT recognised as that codec: no sequential decoder can read it, so
+// treating it as its codec would let OpenAppend append members that are
+// unreachable (it instead fails with *MagicMismatchError; DetectMagic reports
+// it as unknown-or-text). A prefix that looks like text (JSON or otherwise) is
+// a known CodecNone. Anything else — binary content that is neither container
 // magic nor text — reports (CodecNone, false) so callers can distinguish
 // "plain" from "unknown" (DetectMagic warns; OpenAppend treats unknown
 // content as appendable only for CodecNone).
@@ -73,10 +82,10 @@ func sniff(prefix []byte) (Codec, bool) {
 	if len(prefix) == 0 {
 		return CodecNone, true
 	}
-	if bytes.HasPrefix(prefix, gzipMagic) {
+	if len(prefix) > len(gzipMagic) && bytes.HasPrefix(prefix, gzipMagic) {
 		return CodecGzip, true
 	}
-	if bytes.HasPrefix(prefix, zstdMagic) {
+	if len(prefix) > len(zstdMagic) && bytes.HasPrefix(prefix, zstdMagic) {
 		return CodecZstd, true
 	}
 	if textPrefix(prefix) {

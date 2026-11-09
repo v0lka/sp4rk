@@ -35,6 +35,16 @@ var ErrClosed = errors.New("appendcodec: writer already closed")
 // errors.Is; the concrete type is *MagicMismatchError.
 var ErrMagicMismatch = errors.New("appendcodec: existing content does not match codec")
 
+// ErrLocked is returned by OpenAppend when the target path is already held
+// by another live writer. OpenAppend takes an exclusive advisory lock on the
+// file for the lifetime of its descriptor — flock(2) on unix, a beyond-EOF
+// LockFileEx range on Windows — so "one path, one writer" is enforced, not
+// just documented: a second OpenAppend on the same path, from this process
+// or another, fails with ErrLocked instead of interleaving its frames into
+// the first writer's stream. The lock is released by Close (closing the
+// descriptor drops it) and by process death. Test it with errors.Is.
+var ErrLocked = errors.New("appendcodec: path already locked by another writer")
+
 // MagicMismatchError reports the codec requested for OpenAppend and the
 // unrecognised-or-conflicting leading bytes found in the target file. It
 // matches errors.Is(err, ErrMagicMismatch).
@@ -89,7 +99,12 @@ type codecStream interface {
 // The returned writer is safe for concurrent Write calls from multiple
 // goroutines: a mutex serializes each Write together with its Flush, so
 // records never interleave. Write after Close reports ErrClosed; Close is
-// idempotent. One path should have exactly one live writer.
+// idempotent. One path has exactly one live writer, enforced: OpenAppend
+// holds an exclusive advisory lock on the file for the descriptor's lifetime
+// (flock on unix; a beyond-EOF LockFileEx range on Windows, where region
+// locks are mandatory — the range sits past any reachable file size so
+// content reads and writes stay unblocked), and a second OpenAppend on the
+// same path fails with ErrLocked until the first writer is Closed.
 func OpenAppend(path string, codec Codec, windowLog int) (io.WriteCloser, error) {
 	if codec == CodecZstd && windowLog > 0 {
 		windowLog = clampWindowLog(windowLog)
@@ -98,7 +113,16 @@ func OpenAppend(path string, codec Codec, windowLog int) (io.WriteCloser, error)
 	if err != nil {
 		return nil, err
 	}
+	if err := lockExclusive(f); err != nil {
+		_ = f.Close()
+		if isLockConflict(err) {
+			return nil, fmt.Errorf("%w: %s", ErrLocked, path)
+		}
+		return nil, &os.PathError{Op: "lock", Path: path, Err: err}
+	}
 
+	// The path is locked: no other OpenAppend can write concurrently while
+	// the prefix is inspected, so the content is stable for the check below.
 	prefix := make([]byte, magicLen)
 	n, rerr := f.ReadAt(prefix, 0)
 	if rerr != nil && !errors.Is(rerr, io.EOF) && !errors.Is(rerr, io.ErrUnexpectedEOF) {
