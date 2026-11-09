@@ -232,6 +232,24 @@ func TestParseCodec(t *testing.T) {
 	}
 }
 
+// TestOpenAppendUnknownCodecNoFile pins the pre-flight codec validation:
+// an out-of-enum codec fails before any filesystem side effect — no empty
+// file is left behind.
+func TestOpenAppendUnknownCodecNoFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dump.jsonl")
+
+	w, err := OpenAppend(path, Codec(42), 0)
+	if !errors.Is(err, ErrUnknownCodec) {
+		t.Fatalf("OpenAppend(invalid codec) error = %v, want ErrUnknownCodec", err)
+	}
+	if w != nil {
+		t.Errorf("OpenAppend(invalid codec) writer = %v, want nil", w)
+	}
+	if _, serr := os.Stat(path); !os.IsNotExist(serr) {
+		t.Errorf("OpenAppend(invalid codec) created %s (stat: %v), want no file", path, serr)
+	}
+}
+
 func TestDetectMagic(t *testing.T) {
 	dir := t.TempDir()
 	payload := []byte("hello compressed world\n")

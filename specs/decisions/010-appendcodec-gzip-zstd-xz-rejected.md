@@ -59,7 +59,17 @@ an error matching `ErrMagicMismatch`. `ErrLocked` remains for genuine
 cross-process conflicts (compressed codecs only): another process holding
 the path fails the open instead of queueing, because records cannot be
 merged across process boundaries — and the lock dies with the descriptor (a
-last Close or a crash releases it). `CodecNone` is deliberately outside
+last Close or a crash releases it). On Windows the same-process registry
+keys on the lower-cased path — correct for default (case-insensitive)
+directories, where the fold prevents spurious `ErrLocked` between
+case-variant aliases of one file. The known caveat: on a case-sensitive
+directory (`fsutil file setCaseSensitiveInfo`, WSL interop) two case-variant
+paths are distinct files that share one registry entry, so the second
+`OpenAppend` queues through the first file's encoder instead of erroring —
+rare configuration, accepted for now; keying the registry by file identity
+(volume serial + file index via `GetFileInformationByHandle`) would fix it
+and 8.3-short-name aliases together if it ever matters. `CodecNone` is
+deliberately outside
 this machinery: the compatibility codec takes no lock and consults no
 registry — every open returns an independent plain `O_APPEND` handle, and
 any number of writers, in this process or others, may append side by side

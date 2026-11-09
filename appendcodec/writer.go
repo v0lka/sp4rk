@@ -126,7 +126,9 @@ type codecStream interface {
 //     encoder (the mutex under the stream serializes each Write with its
 //     Flush, so records never interleave), and handles are refcounted —
 //     Close retires only its handle; the LAST Close writes the footer,
-//     closes the descriptor and releases the lock. Opening the same live
+//     closes the descriptor and releases the lock. The joining open's own
+//     parameters — windowLog included — are ignored: the first open's
+//     encoder serves the stream for its lifetime. Opening the same live
 //     path with a different codec fails with an error matching
 //     ErrMagicMismatch. From another process the lock cannot be shared, so
 //     the open fails with ErrLocked. Write after the last Close reports
@@ -143,6 +145,14 @@ type codecStream interface {
 //     files) with ErrMagicMismatch — best-effort, because nothing
 //     serializes the check against concurrent opens.
 func OpenAppend(path string, codec Codec, windowLog int) (io.WriteCloser, error) {
+	// Unknown codec values fail here, before any filesystem side effect —
+	// no file is created, no lock is taken.
+	switch codec {
+	case CodecNone, CodecGzip, CodecZstd:
+	default:
+		return nil, fmt.Errorf("%w: %s", ErrUnknownCodec, codec)
+	}
+
 	key, err := filepath.Abs(path)
 	if err != nil {
 		return nil, fmt.Errorf("appendcodec: resolve %s: %w", path, err)
@@ -151,7 +161,11 @@ func OpenAppend(path string, codec Codec, windowLog int) (io.WriteCloser, error)
 	if runtime.GOOS == "windows" {
 		// Windows paths are case-insensitive: fold the case so aliases such
 		// as C:\Logs\A and c:\logs\a hit one registry entry instead of
-		// degrading a same-process share to ErrLocked.
+		// degrading a same-process share to ErrLocked. Caveat: on a
+		// case-sensitive directory (fsutil file setCaseSensitiveInfo, WSL
+		// interop) two case-variant paths are distinct files that now share
+		// one entry — the second open queues through the first file's
+		// encoder instead of erroring (see ADR-010's Windows notes).
 		key = strings.ToLower(key)
 	}
 
@@ -340,9 +354,6 @@ func openAppendFile(path string, codec Codec, windowLog int) (*appendWriter, err
 			return nil, fmt.Errorf("appendcodec: zstd encoder for %s: %w", path, zerr)
 		}
 		w.cs = enc
-	default:
-		_ = f.Close()
-		return nil, fmt.Errorf("%w: %s", ErrUnknownCodec, codec)
 	}
 	return w, nil
 }

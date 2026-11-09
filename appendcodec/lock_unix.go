@@ -5,7 +5,8 @@ package appendcodec
 import (
 	"errors"
 	"os"
-	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 // lockExclusive takes an exclusive advisory lock (flock(2), non-blocking) on
@@ -14,8 +15,12 @@ import (
 // the same path fails immediately instead of interleaving its frames into
 // the first writer's stream. The lock dies with the descriptor: Close
 // releases it by closing the file, and so does a crash.
+//
+// golang.org/x/sys/unix, not stdlib syscall: syscall.Flock is undefined on
+// solaris/illumos, while x/sys/unix has it (and the LOCK_/E constants) on
+// every GOOS the "unix" build tag covers.
 func lockExclusive(f *os.File) error {
-	return syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	return unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)
 }
 
 // isLockConflict reports whether err from lockExclusive means the file is
@@ -23,5 +28,5 @@ func lockExclusive(f *os.File) error {
 // failure (EWOULDBLOCK and EAGAIN are the same errno almost everywhere; both
 // spellings are checked for portability).
 func isLockConflict(err error) bool {
-	return errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN)
+	return errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN)
 }
