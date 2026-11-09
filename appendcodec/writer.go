@@ -95,8 +95,8 @@ type codecStream interface {
 // descriptor.
 //
 // The open is link-safe and TOCTOU-free: safeio.OpenFileNoFollow refuses a
-// symlink at the final path component (ELOOP on unix; Windows parity per
-// safeio) and any non-regular pre-existing target instead of blocking, and
+// symlink at the final path component (ELOOP, on every platform) and any
+// non-regular pre-existing target instead of blocking, and
 // the existing magic is read from the SAME O_RDWR|O_APPEND|O_CREATE
 // descriptor that is then appended through — there is no window in which the
 // path can be swapped for a differently-compressed file between inspection

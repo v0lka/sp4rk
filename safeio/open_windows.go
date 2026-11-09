@@ -5,6 +5,7 @@ package safeio
 import (
 	"io/fs"
 	"os"
+	"syscall"
 )
 
 // Open opens path for reading and verifies, via the open handle's fstat, that
@@ -66,18 +67,59 @@ func checkRegularHandle(f *os.File, path string) error {
 	return nil
 }
 
-// OpenFileNoFollow is the no-symlink-follow counterpart of OpenFile on unix.
+// OpenFileNoFollow is OpenFile with one extra guard: the open never resolves
+// a symbolic link — or any other reparse point — at the FINAL path
+// component. It is the Windows counterpart of unix O_NOFOLLOW, with the same
+// contract: a link at path makes the open fail with a *fs.PathError wrapping
+// syscall.ELOOP instead of redirecting the caller to the link's target.
 //
-// Windows parity limitation: this implementation delegates to OpenFile and
-// therefore STILL RESOLVES a symbolic link at the final path component —
-// os.OpenFile follows reparse points, and refusing that would require opening
-// with FILE_FLAG_OPEN_REPARSE_POINT via golang.org/x/sys/windows, a new
-// dependency this package avoids. Callers that must never write through a
-// final symlink should use WriteFileAtomic, whose rename replaces the link
-// itself instead of following it, on every platform.
+// The mechanism is the syscall layer's own flag pass-through, not a
+// hand-rolled CreateFile: os.OpenFile maps the caller's flag through
+// syscall.Open, whose high 12 bits (fileFlagsMask) are forwarded to
+// CreateFile as FILE_FLAG_* values when they are in the supported set
+// (validFileFlagsMask) — and FILE_FLAG_OPEN_REPARSE_POINT is in that set.
+// (The pass-through needs the fileFlagsMask-capable syscall.Open; go.mod
+// pins the toolchain that has it, so no version shim is carried here.)
+// With the flag set, CreateFile opens a reparse-point target as the reparse
+// point ITSELF (the link, never its destination), and a non-reparse target
+// behaves exactly as it does without the flag. Every other OpenFile semantic
+// — share modes, the permission security descriptor, append and truncate
+// handling — therefore stays the stdlib's own, on the SAME single open:
+// there is no Stat→Open window for a racing local adversary to slip a link
+// through, matching the unix kernel-level O_NOFOLLOW guarantee.
 //
-// All the OpenFile hardening still applies: the handle-based regularity check
-// refuses a non-regular pre-existing target.
+// The post-open fstat then classifies the handle: fileStat's mode reports
+// fs.ModeSymlink for IO_REPARSE_TAG_SYMLINK and fs.ModeIrregular for every
+// other non-surrogate reparse tag (junctions, app exec links; the DEDUP tag
+// is deliberately reported as a regular file and stays openable). A handle
+// carrying either bit is refused: the descriptor is closed and
+// syscall.ELOOP is returned, so callers can treat both platforms with one
+// errors.Is against syscall.ELOOP. A regular file is returned exactly as
+// OpenFile would return it.
+//
+// All the OpenFile hardening still applies: the handle-based regularity
+// check refuses a non-regular pre-existing target with a *NotRegularError.
+//
+// The guard covers only the final component — intermediate symlinks are
+// still resolved, as with unix O_NOFOLLOW; use MkdirAllReal to build
+// intermediate paths out of real directories only.
 func OpenFileNoFollow(path string, flag int, perm fs.FileMode) (*os.File, error) {
-	return OpenFile(path, flag, perm)
+	f, err := os.OpenFile(path, flag|syscall.FILE_FLAG_OPEN_REPARSE_POINT, perm)
+	if err != nil {
+		return nil, err
+	}
+	st, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, &fs.PathError{Op: "open", Path: path, Err: err}
+	}
+	if mode := st.Mode(); mode&fs.ModeSymlink != 0 || mode&fs.ModeIrregular != 0 {
+		_ = f.Close()
+		return nil, &fs.PathError{Op: "open", Path: path, Err: syscall.ELOOP}
+	}
+	if !st.Mode().IsRegular() {
+		_ = f.Close()
+		return nil, &NotRegularError{Path: path}
+	}
+	return f, nil
 }
