@@ -41,7 +41,7 @@ type Events interface {
 | Method | Description |
 |--------|-------------|
 | `StepStart(stepNum)` | Fired at the beginning of each ReAct iteration, before the LLM call. |
-| `StepComplete(stepNum, duration)` | Fired when an iteration finishes (after tool execution and compaction). `duration` is the wall-clock time for the step. |
+| `StepComplete(stepNum, duration)` | Fired when an iteration's tool execution completes — before the post-step compaction pass (`ContextFill`/`ContextCompaction` fire after it). `duration` is the wall-clock time for the step. An iteration that ends in an accepted implicit finish fires it too, even though no tool executed there. |
 
 #### Reasoning
 
@@ -53,8 +53,8 @@ type Events interface {
 
 | Method | Description |
 |--------|-------------|
-| `ToolCall(stepNum, callIdx, toolName, argsPreview, source)` | Fired before a tool executes. `callIdx` is the index of the call within the step (0-based). `argsPreview` is a truncated string preview of the arguments. `source` identifies where the tool came from (e.g. `"core"`, the MCP server name like `"filesystem"`). |
-| `ToolResult(stepNum, callIdx, resultLen, preview, isError)` | Fired after a tool executes. `resultLen` is the full result length in characters; `preview` is a truncated preview. `isError` is `true` when the tool returned an error result. |
+| `ToolCall(stepNum, callIdx, toolName, argsPreview, source)` | Fired before a tool executes. `callIdx` is the index of the call within the step (0-based). `argsPreview` is the tool call's input JSON as a string; the executor does **not** truncate it, so an arbitrarily large payload (a whole `write_file` body, for example) can arrive here — truncate it yourself for display. `source` identifies where the tool came from (e.g. `"core"`, the MCP server name like `"filesystem"`). |
+| `ToolResult(stepNum, callIdx, resultLen, preview, isError)` | Fired after a tool executes. `resultLen` is the full result length in **bytes** (Go `len()` of the observation string, not a rune/character count); `preview` is the observation string itself — the very same bytes `resultLen` counts. It has already been cut down by the executor's tool-result budget, but it can still be very large, so truncate it in your own implementation for display. `isError` is `true` when the tool returned an error result. The executor also emits `ToolResult` for a `finish` call it intercepts before dispatch (the finish answer becomes the result) and for a user-rejected tool call (the observation is the `[Tool call rejected: …]` notice). |
 
 #### Sub-agent events
 
@@ -69,13 +69,13 @@ type Events interface {
 | Method | Description |
 |--------|-------------|
 | `AssistantChunk(content)` | Assistant output text. With streaming enabled (`agent.WithStreaming(true)`) it carries each incremental text delta as it arrives from the provider, enabling a live-typing effect; otherwise it carries the full text once at finalization. Only emitted when `suppressAssistantEvents` is `false`. |
-| `AssistantDone(content, inputTokens, outputTokens)` | Fired when the assistant response that ends the loop (implicit finish) is finalized — a response that ends in tool calls does not fire it. `inputTokens`/`outputTokens` are the provider-reported token counts for the call. |
+| `AssistantDone(content, inputTokens, outputTokens)` | Fired when the assistant response that ends the loop (implicit finish) is finalized — a response that ends in tool calls does not fire it. It is also fired once at `Run` exit by the stream finalizer when a live stream is still open (an explicit `finish`, or an error/pause/step-limit exit), carrying the text and usage that stream accumulated so the consumer's accumulator is not polluted across runs. `inputTokens`/`outputTokens` are the provider-reported token counts for the call. |
 
 #### Context window
 
 | Method | Description |
 |--------|-------------|
-| `ContextFill(fillPercent, usedTokens, maxTokens, status, stepID)` | Fired to report context-window fill. `status` is one of `ok`, `compact`, `warning`, `emergency`, `reject` (see `FillCheck`). `stepID` is empty for non-plan executions. |
+| `ContextFill(fillPercent, usedTokens, maxTokens, status, stepID)` | Fired to report context-window fill. `status` is one of `ok`, `compact`, `warning`, `emergency`, `reject` (see `FillCheck`). `stepID` is empty for non-plan executions. It fires only for iterations that reach the post-step compaction pass — explicit-`finish` and pause exits leave the terminal iteration before the pass and emit none, as do error exits raised earlier; the exception is a reject-fatal error (window still full after reactive compaction, or a non-positive budget), raised from inside the pass immediately after a final `ContextFill` with status `reject`. |
 | `ContextCompaction(beforePercent, afterPercent, stepID)` | Fired after a compaction runs, reporting the fill percentage before and after. `stepID` names the plan step whose executor iteration compacted; it is empty for a run-level pass such as the Conductor's compact-on-start (`CompactOnStart`). |
 
 #### Completion
@@ -176,11 +176,13 @@ Typical `event` values include:
 - **Compaction errors** — when compaction failed.
 - **Parse errors** — when tool input could not be parsed.
 
+This list is illustrative, not exhaustive: the authoritative set of `event` strings is the `ExecutorDiagnostic` call sites in `agent/`.
+
 The `details` map carries structured, event-specific data (e.g. the tool name, the repeat count, the cache hash).
 
 ## Complete PrintingEvents example
 
-The following is a complete, runnable event sink that prints every lifecycle event to stdout. It embeds `NoopEvents` and overrides each method.
+The following is a complete, runnable event sink that prints every lifecycle event to stdout. It embeds `NoopEvents` and overrides each method. Its `(%d chars)` label is cosmetic — `resultLen` is a byte count, not a rune count (see [`ToolResult`](#method-reference)).
 
 ```go
 package main
@@ -394,11 +396,11 @@ type Events interface {
 
 ### Implementing orchestration.Events
 
-Because `orchestration.Events` embeds `agent.Events`, the embed-and-override pattern works here too — but you need a no-op base for the orchestration methods as well. A common approach is to embed both `agent.NoopEvents` and provide no-op stubs for the orchestration-specific methods, then override what you need:
+Because `orchestration.Events` embeds `agent.Events`, the embed-and-override pattern works here too — and the SDK already provides the no-op base: `orchestration.NoopEvents` embeds `agent.NoopEvents` and no-ops every orchestration-specific hook. Embed it and override what you need:
 
 ```go
 type consoleEvents struct {
-    agent.NoopEvents
+    orchestration.NoopEvents
 }
 
 func (e *consoleEvents) OnPlanGenerated(n int, steps []orchestration.PlanStepEvent) {
@@ -426,11 +428,11 @@ func (e *consoleEvents) OnReflected(r *orchestration.Reflection, attempt, maxAtt
 }
 ```
 
-> The `agent.NoopEvents` embedding covers all `Events` methods. The orchestration-specific methods (`OnPlanGenerated`, `OnStepStarted`, etc.) must be implemented or stubbed by your type to satisfy `orchestration.Events`.
+> `orchestration.NoopEvents` covers every `agent.Events` method (through its embedded `agent.NoopEvents`) plus every orchestration-specific method (`OnPlanGenerated`, `OnStepStarted`, etc.), so your type satisfies `orchestration.Events` with only the overrides you write.
 
 ## Optional interfaces: StepScopable and RetryScopable
 
-Some event sinks want to scope events to a specific plan step or retry attempt. The orchestration layer checks for two optional interfaces and, if present, uses them to produce scoped event emitters.
+Some event sinks want to scope events to a specific plan step or retry attempt. The `orchestration` package declares two optional interfaces for this; a host orchestrator can check for them and, if present, use them to produce scoped event emitters (the SDK does not itself type-assert `Events` against them).
 
 ```go
 // StepScopable lets an Events implementation support scoping to a plan step.
@@ -447,4 +449,4 @@ type RetryScopable interface {
 - `WithStepID(id)` returns a new `Events` instance whose emissions are tagged with the given step ID. This is useful when a single sink handles multiple concurrent steps and needs to route events back to the right step.
 - `WithRetryAttempt(attempt)` returns a new `Events` instance whose emissions are tagged with a retry attempt number, so retries can be distinguished from the original attempt.
 
-These are **optional** — implementations that do not need scoping simply omit them. The orchestration layer falls back to the un-scoped emitter when the interfaces are not implemented.
+These are **optional** — implementations that do not need scoping simply omit them. A host that performs the check falls back to the un-scoped emitter when the interfaces are not implemented.

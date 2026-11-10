@@ -9,7 +9,8 @@ ONNX-based local text embedding for semantic search, plus a document chunker and
 - `github.com/v0lka/sp4rk/embedding` — `Embedder`, `EmbedderConfig`, `NewEmbedder`, `EmbedDocuments`/`EmbedQuery`/`EmbeddingFunc`/`ExecutionProvider`/`Close`
 - `github.com/v0lka/sp4rk/embedding` (runtime) — ONNX Runtime lifecycle (`initONNXRuntime`, `destroyONNXRuntime`, reusable sessions with pre-allocated tensors), execution-provider selection (`ExecutionProviderCPU`/`CUDA`/`Auto`, `buildSessionOptions`), and the single-thread ONNX runner (`ortRunner`); per-shape persistent sessions: the fixed-mode query session (batch 1, eager unless buckets are enabled), the fixed-mode persistent batch session (`[BatchSize, MaxSeqLength]`, lazy), and the opt-in length-bucket sessions (lazy, keyed by `(BatchSize, sequence bucket)`); `onnxSession` teardown is idempotent and safe after close
 - `github.com/v0lka/sp4rk/embedding` (pipeline) — `embedFixedPipeline`, the depth-one tokenization/inference overlap for fixed mode (`EnableBatchPipeline`)
-- `github.com/v0lka/sp4rk/embedding` (GPU probes) — `GPUInUse`, `ListGPUDevices`, `GPUDevice` (bounded `nvidia-smi` diagnostics)
+- `github.com/v0lka/sp4rk/embedding` (GPU probes) — `GPUInUse`, `ListGPUDevices`, `GPUDevice` (bounded `nvidia-smi`/`vulkaninfo` diagnostics)
+- `github.com/v0lka/sp4rk/embedding` (OpenVINO verification) — `VerifyOpenVINOExecution` (sustained-inference probe against `xpu-smi`'s device-level compute-utilization counter)
 - `github.com/v0lka/sp4rk/embedding` (tokenizer) — `Tokenizer`, `NewTokenizer`, `Encode`/`EncodeBatch`, length-aware variants
 - `github.com/v0lka/sp4rk/embedding` (telemetry) — optional bounded aggregates for tokenization, ONNX inference, sessions, token lengths, and batch fill
 - `github.com/v0lka/sp4rk/embedding/onnx_bench_test.go` — fixed/bucketed short/mixed batch matrix plus separate dynamic-shape evaluation
@@ -44,8 +45,9 @@ const (
 )
 
 type GPUDevice struct {
-    Index int    // driver-assigned ordinal ("0" = primary GPU)
-    Name  string // product name, e.g. "NVIDIA GeForce RTX 4070"
+    Index    int    // driver-assigned ordinal ("0" = primary GPU); meaningful only within its Provider
+    Name     string // product name, e.g. "NVIDIA GeForce RTX 4070", "Intel(R) Graphics (ARL)"
+    Provider string // "cuda" (nvidia-smi-enumerated) | "openvino" (Intel devices via vulkaninfo); Intel entries map to device_id 0
 }
 
 type Chunk struct {
@@ -70,11 +72,11 @@ Indexing (host):
   ChunkFile(path, content, cfg) → []Chunk  (with location metadata)
        │
        ├─ ComputeFileHash(content) → SHA-256 (change detection)
-       └─ Embedder.EmbedDocuments(chunks) → [][]float32  (mean-pooled, L2-normalized)
+       └─ Embedder.EmbedDocuments(ctx, texts []string) → [][]float32  (mean-pooled, L2-normalized)
             stored in the host's vector index keyed by file hash
 
 Querying:
-  Embedder.EmbedQuery(text) → []float32
+  Embedder.EmbedQuery(ctx, text string) → []float32
        └─ host index performs hybrid (vector + BM25) search
        └─ VectorSearchTool surfaces results to the agent
 ```
@@ -141,12 +143,14 @@ For `jina-embeddings-v2-small-en`: inputs are `input_ids`/`attention_mask`/`toke
 
 ### GPU diagnostics
 
-Two diagnostic helpers answer "what GPUs exist" and "is this process actually on the GPU" without depending on ONNX Runtime self-reporting. Both shell out to `nvidia-smi` and accept a caller-supplied `context.Context` as their first parameter. Both derive their working context via `context.WithTimeout(ctx, gpuProbeTimeout)`, so the effective budget is **min(caller deadline, 2s)** — an earlier caller deadline always wins, while the shared 2s cap remains the upper bound for callers without one. A wedged driver stalls neither. Both also suppress the Windows console window a GUI-subsystem host would allocate for the probe child process (`sysproc.HideConsole`, a no-op on other platforms). Result semantics mirror each other: a missing `nvidia-smi` yields a no-error empty result (absence of the tool is not an error, and the absent-tool fast path returns without consulting `ctx`), while a failed invocation — including a cancelled or expired context once the probe is actually running — returns an error.
+Two diagnostic helpers answer "what GPUs exist" and "is this process actually on the GPU" without depending on ONNX Runtime self-reporting. Both accept a caller-supplied `context.Context` as their first parameter. Each derives its working context via `context.WithTimeout(ctx, gpuProbeTimeout)`, so the effective budget is **min(caller deadline, 2s)** — an earlier caller deadline always wins, while the shared 2s cap remains the upper bound for callers without one. A wedged driver stalls neither. Both also suppress the Windows console window a GUI-subsystem host would allocate for the probe child process (`sysproc.HideConsole`, a no-op on other platforms). Result semantics mirror each other per source: a missing probe tool yields a no-error no-signal result (absence of the tool is not an error, and the absent-tool fast path returns without consulting `ctx`), while a failed invocation — including a cancelled or expired context once the probe is actually running — returns an error.
 
 - **`GPUInUse(ctx)`** runs `nvidia-smi --query-compute-apps=pid --format=csv,noheader` and reports whether the driver registers *this* process (by PID) as a CUDA compute application. Callers treat an error as "unverified", never as "not on GPU"; a cancelled/expired `ctx` is exactly such an error. A CUDA context materializes lazily (first inference on the CUDA provider) and lives until the ONNX Runtime environment is destroyed, so the correct moment to probe is after at least one real inference. In PID-namespaced environments (containers, WSL) NVML may report host-namespace PIDs that never match `os.Getpid()` — a known limitation.
-- **`ListGPUDevices(ctx)`** runs `nvidia-smi --query-gpu=index,name --format=csv,noheader` and returns one `GPUDevice{Index, Name}` per parseable line; `Index` is the driver-assigned ordinal that matches `EmbedderConfig.DeviceID` and `CUDA_VISIBLE_DEVICES`. Empty or prose-only output yields an empty, non-nil slice. As with `GPUInUse`, a cancelled/expired `ctx` surfaces as an error rather than a silently empty device list.
+- **`ListGPUDevices(ctx)`** is two-source: it runs `nvidia-smi --query-gpu=index,name --format=csv,noheader` (entries tagged `Provider: "cuda"`) plus `vulkaninfo --summary` filtered to the Intel PCI vendor `0x8086` (`gpu_list_vulkan.go`; entries tagged `Provider: "openvino"`), concatenating the results NVIDIA-first. For `cuda` entries, `Index` is the driver-assigned ordinal that matches `EmbedderConfig.DeviceID` and `CUDA_VISIBLE_DEVICES`; Intel entries always carry index `0` (device_id 0). Partial answers win: the merged list is returned with a nil error whenever at least one source produced a device, even when another present source failed; the joined errors are returned only when no source produced a device and at least one present source failed ("hardware present, probe failed"). Each source follows the same result semantics independently — a missing tool is no-signal (`nil`, `nil`, `ctx` not consulted) under the same 2s probe budget, and a cancelled/expired `ctx` surfaces as an error from the sources actually invoked. When no source produced a device, the result is the nil slice — with a nil error when nothing failed, or the joined errors when a present source failed.
 
 Both parsers are deliberately forgiving: prose placeholders (`No running processes found`, `[N/A]`), CRLF endings, and extra comma-separated columns degrade to "no GPUs / no PIDs" instead of an error.
+
+- **`VerifyOpenVINOExecution(ctx, emb)`** (`openvino_verify.go`) is the OpenVINO counterpart of `GPUInUse`: it drives sustained inference on the embedder while sampling `xpu-smi`'s device-level compute-utilization counter and reports whether any sample reached the verification threshold — external, driver-side proof that the OpenVINO execution provider really executes on the Intel GPU rather than sliding to a CPU device inside the plugin. The whole verification is bounded (30 s cap; at most 12 samples, and the sampling cadence is the spawn cadence — there is deliberately no sleep between samples; sampling stops early once the threshold is crossed).
 
 ## Tokenizer
 
@@ -258,7 +262,7 @@ Parameters: `query` (natural-language description; tokens prefixed with `+` are 
 - Bucket assignment uses the smallest fitting length in `64/128/256/512`, never exceeds `MaxSeqLength`, and result vectors retain the caller's original text order.
 - Bucket sessions are lazy and persistent: unused buckets create no session, used buckets are reused, and `Close` serializes with in-flight inference.
 - All embeddings are mean-pooled and L2-normalized before being returned.
-- `GPUInUse(ctx)`/`ListGPUDevices(ctx)` take a caller-supplied context whose deadline composes with the shared 2s probe budget — min(caller deadline, 2s) wins. They treat a missing `nvidia-smi` as "no signal" (empty result, nil error, `ctx` not consulted) and a failed invocation — including a cancelled/expired context — as an error; both complete within that composed budget.
+- `GPUInUse(ctx)`/`ListGPUDevices(ctx)` take a caller-supplied context whose deadline composes with the shared 2s probe budget — min(caller deadline, 2s) wins. They treat a missing probe tool (`nvidia-smi`, `vulkaninfo`) as "no signal" (no devices, nil error, `ctx` not consulted) and a failed invocation — including a cancelled/expired context — as an error; every source completes within that composed budget.
 - Optional telemetry has a fixed three-stage enum and numeric snapshots only; it never records text, model/tokenizer/library paths, or caller-defined labels.
 
 ## Configuration
@@ -270,7 +274,7 @@ Host integration policy: the zero-value configuration is the complete production
 ## Extension Points
 
 - **Custom embedding model**: provide a different ONNX model + tokenizer; adjust `MaxSeqLength`/`HiddenDim` to match. The runtime + chosen `ModelPath`/`LibraryPath` are **final for the entire process lifetime** — `Close()` releases resources but does not allow swapping to a different model in the same process (the underlying `sync.Once` guard is never reset). Choose the custom model before the first `NewEmbedder` in the process.
-- **GPU acceleration**: set `ExecutionProvider` to `auto` (safe default when hardware varies), `cuda` (loud failure when CUDA is expected), or `openvino` (loud failure when Intel hardware is expected; requires the OpenVINO plugin beside `LibraryPath` and `DeviceID = 0`), pair it with a matching ONNX Runtime build, and pick the device with `DeviceID` on CUDA (enumerate candidates via `ListGPUDevices(ctx)`, whose `GPUDevice.Index` matches). Verify a running setup externally with `GPUInUse(ctx)` after the first inference — pass the caller's own context to bound the probe below the internal 2s cap where needed.
+- **GPU acceleration**: set `ExecutionProvider` to `auto` (safe default when hardware varies), `cuda` (loud failure when CUDA is expected), or `openvino` (loud failure when Intel hardware is expected; requires the OpenVINO plugin beside `LibraryPath` and `DeviceID = 0`), pair it with a matching ONNX Runtime build, and pick the device with `DeviceID` on CUDA (enumerate candidates via `ListGPUDevices(ctx)`; `GPUDevice.Index` matches within the entry's `Provider` — device picking is provider-scoped, and an Intel `openvino` entry always maps to `DeviceID` 0). Verify a running setup externally with `GPUInUse(ctx)` after the first inference — pass the caller's own context to bound the probe below the internal 2s cap where needed.
 - **Custom chunking**: implement an alternative splitter producing `[]Chunk` (each with location metadata) and feed chunks to `EmbedDocuments`.
 - **Vector index backend**: the host owns the index/store; `EmbeddingFunc()` returns a chromem-go-compatible function for `chromem.NewCollection`, but any store consuming `[][]float32` works.
 - **Custom search**: supply a `VectorSearchFunc` to `NewVectorSearchTool` implementing the host's retrieval (hybrid/vector/lexical).

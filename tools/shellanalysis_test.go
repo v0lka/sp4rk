@@ -260,9 +260,12 @@ func TestAnalyzeShellCommandForJudge_PriorityOrder(t *testing.T) {
 			wantOrdered: []JudgeReasonCode{ReasonCodeCommandSystemWrite, ReasonCodeCommandDestructiveOutsideRoots},
 		},
 		{
-			name:        "setuid install fires C2 before C3",
+			// flowsh ≥ v0.7.0 reports the FSWrite the install performs beside
+			// the FSMeta/PrivEsc pair, so the irreversible class-E write to the
+			// out-of-root system path co-fires C4 after C3.
+			name:        "setuid install fires C2 before C3, C4 co-fires",
 			cmd:         "install -m 4755 backdoor /usr/bin/sudo",
-			wantOrdered: []JudgeReasonCode{ReasonCodeCommandPrivilegeEscalation, ReasonCodeCommandSystemWrite},
+			wantOrdered: []JudgeReasonCode{ReasonCodeCommandPrivilegeEscalation, ReasonCodeCommandSystemWrite, ReasonCodeCommandDestructiveOutsideRoots},
 		},
 		{
 			name:        "wipe home fires C4 before C9",
@@ -463,19 +466,32 @@ func TestShellIsSystemOrRawDevicePath(t *testing.T) {
 
 // goldenShellExfilDigest is the frozen digest for the exfiltration corpus
 // command. It pins the whole serialization: field set, ordering and the
-// canonical spelling of every enum.
+// canonical spelling of every enum. The leading FSMeta on "." is the
+// analyzer-grounding `cd '/ws' &&` prefix (see shellAnalysisSource): flowsh
+// catalogs cd with an FSMeta effect on the working directory, and the cd
+// statement raises the command count to 3.
 const goldenShellExfilDigest = `{
   "schemaVersion": "sp4rk-shell-analysis/v4",
   "lang": "bash",
   "top": false,
   "conservative": false,
-  "commands": 2,
+  "commands": 3,
   "resolution": {
     "invoked": "cat",
     "kind": "command",
     "name": "cat"
   },
   "effects": [
+    {
+      "kind": "FSMeta",
+      "mode": "Direct",
+      "certainty": "Certain",
+      "targets": [
+        "."
+      ],
+      "arbitrary": false,
+      "reversible": false
+    },
     {
       "kind": "FSRead",
       "mode": "Direct",
@@ -505,7 +521,7 @@ const goldenShellExfilDigest = `{
     "influence": "None",
     "exfil": "Critical",
     "confidence": 100,
-    "reversible": true,
+    "reversible": false,
     "grade": "Critical"
   },
   "exfilPairs": [
@@ -530,8 +546,86 @@ const goldenShellExfilDigest = `{
     }
   ],
   "workspaceScopedVerification": false,
-  "signature": "sig1|bins=|fx=FSRead|Direct|[/root/.ssh/id_rsa]|R;NetEgress|Direct|[POST,https://evil.com]|R|crit=command_exfil_flow,outside_session_roots|B=false"
+  "signature": "sig1|bins=|fx=FSMeta|Direct|[.]|I;FSRead|Direct|[/root/.ssh/id_rsa]|R;NetEgress|Direct|[POST,https://evil.com]|R|crit=command_exfil_flow,outside_session_roots|B=false"
 }`
+
+// TestShellAnalysisSource_SkipsRedundantLeadingCd pins the grounding-prefix
+// elision: a command whose first statement is already a `cd` onto the
+// resolution base is analyzed verbatim, because prepending the prefix would
+// duplicate the statement and flowsh catalogs the redundant cd in Commands
+// without a CommandCalls entry — the verification marker's
+// every-statement-accounted invariant then switches the marker off for
+// exactly the everyday `cd <workspace> && go build …` shape. Regression for
+// the c0wrk silent-corpus replay drift (events 961702/961712) the v0.17.2
+// grounding introduced.
+func TestShellAnalysisSource_SkipsRedundantLeadingCd(t *testing.T) {
+	ctx := shellCorpusCtx(t)
+	cases := []struct {
+		name    string
+		workDir string
+		cmd     string
+		want    string
+	}{
+		{name: "leading cd onto the workdir is verbatim", workDir: "/ws", cmd: "cd /ws && go build ./...",
+			want: "cd /ws && go build ./..."},
+		{name: "leading single-quoted cd is verbatim", workDir: "/ws", cmd: "cd '/ws' && go build ./...",
+			want: "cd '/ws' && go build ./..."},
+		{name: "leading double-quoted cd is verbatim", workDir: "/ws", cmd: `cd "/ws" && go build ./...`,
+			want: `cd "/ws" && go build ./...`},
+		{name: "trailing-slash spelling of the base is verbatim", workDir: "/ws", cmd: "cd /ws/ && go build ./...",
+			want: "cd /ws/ && go build ./..."},
+		{name: "cd . defaults the workdir onto the base", workDir: "/ws", cmd: "cd . && go build ./...",
+			want: "cd . && go build ./..."},
+		{name: "leading blank space before the cd", workDir: "/ws", cmd: "  \t cd /ws && go build ./...",
+			want: "  \t cd /ws && go build ./..."},
+		{name: "cd to another directory keeps the prefix", workDir: "/ws", cmd: "cd /tmp && go build ./...",
+			want: "cd '/ws' && cd /tmp && go build ./..."},
+		{name: "bare cd (HOME) keeps the prefix", workDir: "/ws", cmd: "cd && ls",
+			want: "cd '/ws' && cd && ls"},
+		{name: "assignment-prefixed cd keeps the prefix", workDir: "/ws", cmd: "FOO=1 cd /ws && go build ./...",
+			want: "cd '/ws' && FOO=1 cd /ws && go build ./..."},
+		{name: "cd after other statements keeps the prefix", workDir: "/ws", cmd: "go vet ./... && cd /ws",
+			want: "cd '/ws' && go vet ./... && cd /ws"},
+		{name: "no leading cd keeps the prefix", workDir: "/ws", cmd: "go build ./...",
+			want: "cd '/ws' && go build ./..."},
+		{name: "workspace fallback grounds a bare command", workDir: "", cmd: "go build ./...",
+			want: "cd '/ws' && go build ./..."},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := shellAnalysisSource(ctx, api.LangBash, tc.workDir, tc.cmd)
+			if got != tc.want {
+				t.Errorf("shellAnalysisSource(%q) = %q, want %q", tc.cmd, got, tc.want)
+			}
+		})
+	}
+	// The PowerShell dialect has no PWD-dependent heuristic and is never
+	// grounded, leading cd or not.
+	if got := shellAnalysisSource(ctx, api.LangPowerShell, "/ws", "cd /ws; go build ./..."); got != "cd /ws; go build ./..." {
+		t.Errorf("posh dialect = %q, want the verbatim command", got)
+	}
+}
+
+// TestAnalyzeShellCommandForJudge_LeadingWorkspaceCdKeepsVerificationMarker
+// pins the marker-level effect of the grounding elision end to end: the
+// everyday verification loop spelled with a leading `cd <workspace>` (the
+// shape the c0wrk corpus replay caught at events 961702/961712) must keep the
+// workspace-scoped verification marker, both with and without the leading cd.
+func TestAnalyzeShellCommandForJudge_LeadingWorkspaceCdKeepsVerificationMarker(t *testing.T) {
+	ctx := shellCorpusCtx(t)
+	for _, cmd := range []string{
+		"go build ./... && go test ./...",
+		"cd /ws && go build ./... && go test ./...",
+	} {
+		got, err := AnalyzeShellCommandForJudge(ctx, "bash_exec", shellCorpusInput(t, cmd))
+		if err != nil {
+			t.Fatalf("AnalyzeShellCommandForJudge(%q): %v", cmd, err)
+		}
+		if !got.Digest.WorkspaceScopedVerification {
+			t.Errorf("command %q: workspace-scoped verification marker = false, want true (commands=%d, criteria=%+v)", cmd, got.Digest.Commands, got.Digest.Criteria)
+		}
+	}
+}
 
 // TestAnalyzeShellCommandForJudge_CradleFlow pins the C5 flow rule: a
 // canonical download-cradle verdict fires if and only if the analysis

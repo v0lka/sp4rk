@@ -6,7 +6,7 @@ Accepted
 
 ## Context
 
-Before this decision, every engine component that made a single structured LLM call implemented its own private call/repair loop, and drift had accumulated across the five call sites (router classification, planner, reflector, and the three LLM judges):
+Before this decision, every engine component that made a single structured LLM call implemented its own private call/repair loop, and drift had accumulated across the six call sites (router classification, planner, reflector, and the three LLM judges):
 
 - The router retried a parse failure exactly once; the planner, reflector, and judges each hand-rolled their own loop shape. A parse-repair improvement had to be re-implemented per site and could not be tested in one place.
 - The judges pinned their own `Provider` + `Model` pair, a private 2-minute timeout, and a fixed temperature. That decoupled them from the session's active model (switching the session model left the judges behind on a stale pinned pair), let a slow judge stall past the host's service timeout, let judge tokens escape session accounting (no `TrackingCaller` unless each site remembered to wrap), and hard-4xx'ed on endpoints that reject the temperature parameter outright.

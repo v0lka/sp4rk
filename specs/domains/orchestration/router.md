@@ -7,7 +7,8 @@ Classifies user requests by domain, complexity, and matched skills, and (optiona
 ## Key Files
 
 - `github.com/v0lka/sp4rk/agent/router` — `Router`, `Config`, `New`, `Route`, `RoutingDecision`, `SetReasoningEffort`, `SetToolMatching`, domain constants
-- `github.com/v0lka/sp4rk/llm` — `LLMCaller`, `ExtractJSON`, `Message`
+- `github.com/v0lka/sp4rk/agent` — `LLMCaller` (the caller interface `Route` invokes; defined in `agent/types.go`)
+- `github.com/v0lka/sp4rk/llm` — `ExtractJSON`, `Message`
 - `github.com/v0lka/sp4rk/prompt` — prompt builder (system prompt assembled with cache-aware substitutions)
 - `github.com/v0lka/sp4rk/agent/router` (types) — the router defines its own minimal `SkillDescriptor{Name, Description}` used for matching; it does not import `skills`. (`skills.SkillDescriptor` is the richer type consumed by the planner.)
 
@@ -79,15 +80,14 @@ When disabled, the tool-selection instruction is omitted, the schema resolves to
 
 ### Optional dependencies
 
-- `SetModelRegistry(*llm.ModelRegistry)` — model metadata resolution.
 - `Config.Family` / `Config.Model` — optional identity of the serving model used for reasoning-tier resolution; with both empty (or an unknown family) no reasoning field is sent.
 - `SetReasoningEffort(effort string)` — sets a reasoning effort that overrides the tier-Off resolution for subsequent `Route` calls.
 - `Config.ToolMatching` / `SetToolMatching(enabled bool)` — enable semantic tool selection (see [Tool matching](#tool-matching-optional)); defaults to false. `Config.ToolMatching` is equivalent to calling `SetToolMatching(true)` at construction.
-- `Config.AppendContextSections` — a function producing additional prompt sections (e.g. project conventions) inserted via a `PROJECT-CONTEXT` placeholder; if the template lacks that placeholder the section is appended for backward compatibility.
+- `Config.AppendContextSections` — a function producing additional prompt sections (e.g. project conventions, AGENTS.md) inserted via the `PROJECT-CONTEXT` placeholder in the system-prompt template. When the template lacks that placeholder, the context is inserted immediately after the JSON-output directive via an internal marker (so the conventions are not the last thing the model sees before its decision — avoids recency bias); a template with neither is prepended the context (never appended). The marker is stripped when no context is produced.
 
 ## Error Handling
 
-- **LLM call failure**: returns an error wrapping the failure (no fallback routing). Transport errors are never retried here — provider-level retry is the Router's.
+- **LLM call failure**: returns an error wrapping the failure (no fallback routing). Transport errors are never retried here — transport retry (same active provider) is owned by the `llm.Router` (the LLM router), not by this classification Router; provider switching is an explicit `SetModel` operation, not automatic failover.
 - **JSON parse failure**: retried by the one-shot client with corrective nudges — an assistant echo of the failed output plus a `[System]` user message restating the active JSON output schema (including `matched_tools` when tool matching is enabled); exactly two nudges, three attempts (see [../oneshot.md](../oneshot.md)).
 - **Final parse failure after the two nudges**: returns an error (`ErrRoutingParse` wrapped with the last parse error).
 

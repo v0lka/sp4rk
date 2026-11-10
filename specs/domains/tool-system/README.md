@@ -9,7 +9,7 @@ Provides the tool abstraction for the agent: a single `Tool` interface, a thread
 - `github.com/v0lka/sp4rk/tools` — `Tool` interface, `BaseTool`, `ToolResult`, `ToolPolicy`, `ToolJudger` (`JudgeOutcome` + `JudgeSeverity` + `JudgeReasonCode`), `ToolJudge` (`StrictJudgeRequest`, `Judge`/`JudgeStrict`), `ToolDescriptor` (carries `Group`), `ToolRegistry`, `StripParamsFromSchema`
 - `github.com/v0lka/sp4rk/tools/group.go` — `ToolGroup` and the 8 declared groups (`execute`, `local_read`, `local_write`, `remote_read`, `remote_write`, `system`, `local_mcp`, `remote_mcp`), `AllToolGroups()`, `IsValidToolGroup()`, `MCPToolGroup(transport)`
 - `github.com/v0lka/sp4rk/tools` (registry) — `Register`/`RegisterWithSource`/`RegisterWithSourceCategory`, `Execute` (pre-dispatch input validation + fail-closed policy enforcement), `List`/`ListFiltered`, MCP shadowing protection
-- `github.com/v0lka/sp4rk/tools/inputvalidate.go` — `ValidateToolInput(tool, schema, input)` and `InputValidationError`: the recursive structural tool-input validator `Execute` enforces before any policy (see [Input Validation](#input-validation) below); `SetInputValidationEnabled` on the registry is the opt-out handle
+- `github.com/v0lka/sp4rk/tools/inputvalidate.go` — `ValidateToolInput(tool, schema, input)` (always the strict built-in closed-set default), `ValidateToolInputForCategory(tool, schema, input, category)` (the same category-dependent default the registry applies — closed set for `SourceCategoryCore`, open set for `SourceCategoryMCP`), and `InputValidationError`: the recursive structural tool-input validator `Execute` enforces before any policy (see [Input Validation](#input-validation) below); `SetInputValidationEnabled` on the registry is the opt-out handle
 - `github.com/v0lka/sp4rk/tools` (context helpers) — `WithWorkspacePath`, `WithTempDir`, `WithAllowedRoots`, `SessionRoots`, `WithTaskContext`. `SessionRoots` returns the deduplicated union of workspace + temp + additional allowed roots consulted by every path-containment check.
 - `github.com/v0lka/sp4rk/tools/builtins` — built-in tool catalog
 - `github.com/v0lka/sp4rk/tools/mcp` — MCP gateway (dynamic tool discovery/proxying)
@@ -28,7 +28,7 @@ type Tool interface {
     IsUntrusted() bool
     // Note: Group() is NOT part of Tool. A tool declares its capability
     // group by additionally implementing the optional GroupProvider interface
-    // (tools/group.go); ToolGroupOf(t) returns "" for non-implementers
+    // (tools/tool.go); ToolGroupOf(t) returns "" for non-implementers
     // (undeclared = matches no allow-list, fail-closed).
 }
 
@@ -73,7 +73,8 @@ type ToolDescriptor struct {
 ToolRegistry.Execute(ctx, name, input)
 │
 ├─ 1. Look up the tool by name → not found ⇒ error ToolResult
-├─ 2. Pre-dispatch input validation (ValidateToolInput — fail-open; see
+├─ 2. Pre-dispatch input validation (category-aware — ValidateToolInputForCategory,
+│     closed sets for built-ins, open for MCP; fail-open catalog; see
 │     [Input Validation](#input-validation); opt out via
 │     SetInputValidationEnabled(false)) → structurally invalid ⇒ error
 │     ToolResult naming the offending path and the valid parameters
@@ -91,7 +92,7 @@ The separate LLM-backed `ToolJudge` exposes two host-invoked modes. Advisory `Ju
 
 ## Input Validation
 
-`ToolRegistry.Execute` validates every call's input against the target tool's `InputSchema()` BEFORE any policy, override, or confirmation flow is consulted. Provider-side JSON-schema validation comes for free on native tool definitions (one typed tool call per tool), but it is absent whenever arguments travel as a free-form object — meta-tool envelopes (`batch`, E2S-style `action.args`), replayed or queued calls — and `json.Unmarshal` silently ignores unknown fields, so a wrong argument name would execute the tool with defaulted parameters. The registry-level check closes that gap for every call routed through `Execute` (a host wrapper that shadows `Execute` applies its own check — the SDK-level enforcement only covers the SDK path).
+`ToolRegistry.Execute` validates every call's input against the target tool's `InputSchema()` BEFORE any policy, override, or confirmation flow is consulted. Provider-side JSON-schema validation comes for free on native tool definitions (one typed tool call per tool), but it is absent whenever arguments travel as a free-form object — meta-tool envelopes (`batch`, E2S-style `action.args`), replayed or queued calls — and `json.Unmarshal` silently ignores unknown fields, so a wrong argument name would execute the tool with defaulted parameters. The registry-level check closes that gap for every call routed through `Execute` (a host wrapper that shadows `Execute` applies its own check — the SDK-level enforcement only covers the SDK path). Such a wrapper calls the exported `ValidateToolInputForCategory(tool, schema, input, category)`: the category-aware variant that applies the same default the registry does — a closed set for a `SourceCategoryCore` tool, an open set for a `SourceCategoryMCP` tool — where `ValidateToolInput` always applies the strict built-in (closed) default.
 
 The validator (`ValidateToolInput`) is deliberately lightweight — no external JSON-schema dependency — and **recursive**:
 
@@ -110,7 +111,7 @@ This is defense-in-depth (OWASP ASI02-R2), not a policy gate: it complements, ne
 - `Execute` is **fail-closed**: a `PolicyUserConfirm` tool with no `ConfirmFunc` configured is DENIED — mutating tools never execute silently.
 - A `PolicyAlwaysAllow` tool may implement `ToolJudger` to escalate a call to confirmation; a denied escalation is also fail-closed.
 - `ToolJudge.JudgeStrict` performs one independent LLM evaluation per invocation and always maps ambiguous or failed evaluation to `VerdictConfirm`.
-- An MCP tool may **not** shadow an already-registered non-MCP tool of the same name (`RegisterWithSourceCategory` errors; the legacy path logs and skips). A built-in tool can always replace an MCP tool; an MCP server re-registering its own tools is allowed.
+- An MCP tool may **not** shadow an already-registered non-MCP tool of the same name — `RegisterWithSource` and `RegisterWithSourceCategory` both return an error on shadowing; the log-and-skip lives at the MCP gateway call site (`RegisterTools`/`Reconfigure` log "MCP tool registration rejected" and continue). A built-in tool can always replace an MCP tool; an MCP server re-registering its own tools is allowed.
 - MCP tools default to `PolicyUserConfirm` and always report `IsUntrusted() == true`.
 - Built-in untrusted tools set `Untrusted: true` on their `BaseTool`.
 

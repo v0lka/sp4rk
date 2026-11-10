@@ -36,6 +36,11 @@ type ProviderEntry struct {
     BaseURL      string   // already-expanded base URL
     Models       []string // enabled model names for this provider
     HTTPClient   *http.Client // optional per-provider client override
+
+    ReasoningWire        ReasoningWire // optional non-default JSON spelling for Qwen-family reasoning controls on this provider only; zero value = ReasoningWireVendorDefault
+    TokenSource          TokenSource   // optional per-request bearer credentials; overrides the static APIKey and applies BearerToken.ExtraHeaders
+    RequireStreaming     bool          // endpoint accepts streaming calls ONLY on the wire (see Streaming)
+    OmitReasoningHistory bool          // do not echo assistant ReasoningContent back as the "reasoning_content" extra field
 }
 ```
 
@@ -250,9 +255,9 @@ Resolution order (first match wins; every map lookup uses the lowercased key):
 1. **User overrides** — from the `overrides` map passed to `NewModelRegistry`.
 1.5. **Observed runtime entries** — written by `SetRuntimeMetadata`: how the model is *actually* being served. A self-hosted server's runtime context window outranks the built-in catalog spec — the catalog describes the checkpoint's maximum capability, the runtime entry describes the context length the server is actually enforcing. An explicit user override always wins over a probe.
 2. **Built-in registry** — a hardcoded table of well-known models (OpenAI, Anthropic, Google, DeepSeek, Qwen, GLM, Kimi, xAI Grok, …). Recent entries include `kimi-k2.7-code`, `kimi-k2.7-code-highspeed`, the `kimi-for-coding` aliases, and Qwen 3.8 IDs `qwen/qwen3.8-27b`, `qwen/qwen3.8-2.4t-a95b` plus their `-fp8` variants.
-2b. **Fuzzy match** — a vendor-prefix-, delivery/quantization-postfix- and separator-insensitive lookup across overrides, then observed runtime entries, then built-ins. `normalizeModelID` lowercases the identifier, strips the org/vendor prefix up to the first `/`, strips delivery/quantization postfixes from the end (`-gguf`, `-8bit`/`-8-bit`, and chains of them; `fp8`-style tokens are kept — they are canonical in catalog names like `glm-5.2-fp8`), and removes `.`/`-`/`_` punctuation (alphanumerics are never altered, so distinct versions stay distinct — unlike edit-distance it cannot collapse versions); on a multi-match the key with the lexicographically smallest lowercased spelling wins (the raw key breaks a case-only tie); the hit is cached under the query key. Lookups are O(1) reads against normalized-ID indexes (`overridesIndex`/`builtInIndex` built once at construction, `runtimeIndex` rebuilt under the registry lock on every runtime write). Bridges naming drift between hosts and the registry, e.g. `"gpt4o"` matches `"gpt-4o"`, a bare `"glm-5.2-fp8"` matches the prefixed `"zai-org/glm-5.2-fp8"` — so a probe that observed a server's real window under one spelling is still found under a drifted spelling.
+2b. **Fuzzy match** — a vendor-prefix-, delivery/quantization-postfix- and separator-insensitive lookup across overrides, then observed runtime entries, then built-ins. `normalizeModelID` lowercases the identifier, strips the org/vendor prefix up to the first `/`, drops an `@`-tagged qualifier together with everything after it (`qwen3@q4_k_m` → `qwen3` — the tag is an opaque variant/digest qualifier, never part of the model identity), strips delivery/quantization postfixes from the end (`-gguf`, `-8bit`/`-8-bit`, and chains of them — the literal core list is `safetensors`, `32bit`, `16bit`, `gguf`, `ggml`, `onnx`, `gptq`, `8bit`, `6bit`, `5bit`, `4bit`, `3bit`, `2bit`, `awq`, `nf4`, `mlx`, each expanded over both leading separators (`-` and `_`) and, for the `*bit` cores, the internal `N-bit`/`N_bit` spellings — plus the numeric-parameterized variant families matched by `^(?:mtp|oq\d+e|(?:fp|q|bf)\d+(?:bit|b)?)$`: `mtp`, `oq<N>e`, and `fp<N>`/`q<N>`/`bf<N>` each with an optional `bit`/`b` suffix — those are stripped *even though* some also appear inside canonical catalog keys like `zai-org/glm-5.2-fp8`, because exact-tier lookups still reach such entries verbatim and only the fuzzy index collapses a postfixed spelling onto its base), and removes `.`/`-`/`_` punctuation (alphanumerics are never altered, so distinct versions stay distinct — unlike edit-distance it cannot collapse versions); on a multi-match the key with the lexicographically smallest lowercased spelling wins (the raw key breaks a case-only tie); the hit is cached under the query key. Lookups are O(1) reads against normalized-ID indexes (`overridesIndex`/`builtInIndex` built once at construction, `runtimeIndex` rebuilt under the registry lock on every runtime write). Bridges naming drift between hosts and the registry, e.g. `"gpt4o"` matches `"gpt-4o"`, a bare `"glm-5.2-fp8"` matches the prefixed `"zai-org/glm-5.2-fp8"` — so a probe that observed a server's real window under one spelling is still found under a drifted spelling.
 3. **Cache** — results from previous external lookups.
-4. **External sources** — HuggingFace API lookup (lazy, cached), then any sources registered via `RegisterSource` (e.g. an LM Studio provider). A failed HuggingFace probe is negatively cached for 10 minutes (`negativeCacheTTL`): repeat `Resolve` calls inside the window skip the probe entirely and fall through to registered sources, so an unknown model costs at most one HTTP round-trip per window. A successful re-probe or `Invalidate` clears the record, and an expired record is evicted at read time. Cancellation of the caller's context (`context.Canceled`) is never recorded — it describes the caller, not HuggingFace — while a deadline miss is (the registry's own HTTP timeout surfaces the same sentinel).
+4. **External sources** — HuggingFace API lookup (lazy, cached), then any sources registered via `RegisterSource` (e.g. an LM Studio provider). A failed HuggingFace probe is negatively cached for 10 minutes (`negativeCacheTTL`): repeat `Resolve` calls inside the window skip the probe entirely and fall through to registered sources, so an unknown model costs at most one HTTP round-trip per window. A successful re-probe or `Invalidate` clears the record, and an expired record is evicted at read time. Termination of the caller's context is never recorded — the write is gated on `ctx.Err() == nil`, so a caller cancellation *and* a caller deadline miss alike are excluded: they describe the caller's state (an explicit cancel, a shutdown, a step deadline hit), not HuggingFace's, and the next `Resolve` with a live context re-probes immediately instead of riding out the window on fallback metadata. The registry's own `http.Client` timeout *is* recorded, because it fires while the caller's context is still live and legitimately describes HuggingFace being too slow.
 5. **Fallback defaults** — `ContextWindow: 128000`, `OutputLimit: 32768`, `TokenizerType: "approximate"`; `ok` is false. Unknown and HuggingFace-resolved models default to attachment-capable (`defaultUnknownCapabilities` sets `Attachment: true`) — a runtime provider error is preferred over silently denying image uploads for a model the registry does not know.
 
 Additional methods:
@@ -268,12 +273,12 @@ Additional methods:
 
 #### Partial overrides
 
-A tier-1 override that pins only some fields — a **partial** override — inherits its unset scalar fields from the lower non-network tiers (observed runtime → built-in → cache → fallback). The inheritable fields are `ContextWindow`, `OutputLimit`, `TokenizerType`, and `Capabilities`. This closes two footguns:
+A tier-1 override that pins only some fields — a **partial** override — inherits its unset scalar fields from the lower non-network tiers (observed runtime → built-in → cache → fallback). The inheritable fields are `ContextWindow`, `OutputLimit`, `TokenizerType`, `Family`, and `Capabilities`. This closes two footguns:
 
 - A protocol-only override (e.g. `{Protocol: ChatCompletions}` for a Google-named checkpoint served locally) previously left `ContextWindow`/`OutputLimit` at zero, collapsing the context window and rejecting requests, and left `Capabilities` all-false, silently disabling tool-calling, reasoning, and image uploads. `ModelMetadata.Capabilities` is now a **pointer** (`*ModelCapabilities`): a nil pointer is "unset" and inherited, exactly like a zero `ContextWindow`, while a non-nil value — even with every flag false — is authoritative.
 - A protocol-only override that also carried a fallback `ContextWindow: 128000` shadowed a lazy local-model probe writing the model's real window to the cache tier via `SetCachedMetadata`. Keeping the override's window at zero lets the cache-tier probe result take effect once it arrives.
 
-A field already set in the override is authoritative; a fully-specified override (the common case: a `config.yaml` entry whose scalars and capabilities are all populated) is returned verbatim. `Family` is derived, and `Protocol` is always authoritative — pinning it is precisely what a partial override exists to do. Because "unset" is expressed by the nil pointer rather than by a zero value, "explicitly disable every capability" **is** expressible: `Capabilities: &ModelCapabilities{}` is non-nil and wins over every lower tier.
+A field already set in the override is authoritative; a fully-specified override (the common case: a `config.yaml` entry whose scalars, family, and capabilities are all populated) is returned verbatim. `Family` is inheritable exactly like the scalars — an empty `Family` picks up the lower tiers' declaration (normally the built-in catalog) and is only derived from the model name by `DetectFamily` when no tier declares one, while a family the override *does* name stays authoritative. `Protocol` is always authoritative — pinning it is precisely what a partial override exists to do. Because "unset" is expressed by the nil pointer rather than by a zero value, "explicitly disable every capability" **is** expressible: `Capabilities: &ModelCapabilities{}` is non-nil and wins over every lower tier.
 
 ```go
 registry := llm.NewModelRegistry(map[string]llm.ModelMetadata{
@@ -294,6 +299,7 @@ type ModelMetadata struct {
     Family        string
     Protocol      APIProtocol
     Capabilities  *ModelCapabilities // nil = inherit; non-nil = authoritative (even all-false)
+    GuessedCapabilities bool         // true = Capabilities came from registry guesswork, not an authoritative source
 }
 ```
 
@@ -303,6 +309,7 @@ type ModelMetadata struct {
 - **`Family`** — model family string used for prompt and parameter adaptation. Resolved from metadata or auto-detected via `DetectFamily`.
 - **`Protocol`** — wire protocol / canonical endpoint postfix the model speaks. Populated lazily by `resolveProtocol` at `Resolve` time from `DetectProtocol` (or an explicit override). See [Multi-protocol routing](#multi-protocol-routing).
 - **`Capabilities`** — see below.
+- **`GuessedCapabilities`** — reports whether `Capabilities` was filled by registry guesswork (the tier-5 fallback defaults, a HuggingFace-resolved record whose `config.json` carries no capability data, or a nil-`Capabilities` fill) rather than declared by an authoritative source — the built-in catalog, a user override / `capabilities:` config block, or an observed runtime entry. The **zero value means authoritative**, so a `ModelMetadata` built by host code keeps the historical semantics. The router consults it (see `applyDefaultSampling`) to tell "the catalog says this model rejects temperature" — strip explicitly-set sampling to avoid guaranteed 4xx rejects — from "we optimistically assumed capabilities for a model nobody knows", where the host stays in control.
 
 ### ModelCapabilities
 
@@ -422,7 +429,7 @@ Streaming delivers the assistant's text incrementally instead of as one response
 - **Request hook.** Set `ChatRequest.DeltaSink` (a `func(llm.StreamDelta) error`; runtime-only, never serialized) to ask the provider to stream. The provider invokes it for each incremental text/reasoning delta as it arrives, then returns the **same fully-assembled `*ChatResponse`** (tool calls, usage, stop reason) the synchronous path would. A nil `DeltaSink` — the default, and every structured `oneshot` call — selects the unchanged synchronous path. Returning an error from the sink aborts the stream.
 - **Provider support.** The OpenAI Chat Completions path (`Chat.Completions.NewStreaming`), the OpenAI Responses path (`client.Responses.NewStreaming`) and the Anthropic Messages path (`CreateMessagesStream`) stream; the Google `generateContent` path ignores the hook, so the executor falls back to a single full-text chunk for it. The OpenAI path requests a trailing `include_usage` chunk so token counts match the synchronous result, and retries once without `stream_options` when an endpoint answers that field with an HTTP 400 (usage then reports zeros). A nil `DeltaSink` with `RequireStreaming` set (an endpoint that accepts streaming calls only) still streams on the wire and assembles the buffered response on the Responses path — the only path where that flag is honored (the Chat Completions path streams only for a non-nil sink; the Anthropic branch ignores the flag entirely).
 - **Retries.** `Router.Call` refuses to retry an attempt that already delivered a delta (replaying would duplicate text the host already rendered); a retryable error before any delta is retried normally.
-- **Turning it on.** At the executor layer via `agent.WithStreaming(true)` / `Executor.SetStreaming`, or at the top level via `ExecutionConfig.Streaming` or the fluent `.Streaming(true)`. Streamed deltas surface as `Events.AssistantChunk`; `AssistantDone` is emitted once per response that ends the loop (implicit finish) — a tool-call turn streams its deltas without the terminator. See [../agent-executor.md](agent-executor.md) and [../fluent-api.md](fluent-api.md).
+- **Turning it on.** At the executor layer via `agent.WithStreaming(true)` / `Executor.SetStreaming`, or at the top level via `ExecutionConfig.Streaming` or the fluent `.Streaming(true)`. Streamed deltas surface as `Events.AssistantChunk`; `AssistantDone` is emitted once per response that ends the loop (implicit finish) — a tool-call turn streams its deltas without the terminator. See [agent-executor.md](agent-executor.md) and [fluent-api.md](fluent-api.md).
 
 ## Retry & backoff
 
@@ -518,7 +525,12 @@ type ChatRequest struct {
     Messages        []Message
     Tools           []ToolDefinition
     MaxTokens       int
+    CallPurpose     CallPurpose      // what the call is for; selects the sampling policy (see Purpose-aware sampling)
     Temperature     *float64         // nil = use provider/sampling default
+    TopP            *float64         // nil = use provider default
+    TopK            *int             // nil = use provider default; not part of the official OpenAI schema
+    RepetitionPenalty *float64       // nil = use provider default; OpenAI-compatible servers only
+    PresencePenalty *float64         // nil = use provider default
     ReasoningEffort string           // native reasoning value (e.g. "On", "high")
     DeltaSink       func(StreamDelta) error // optional: non-nil = stream deltas as they arrive (see Streaming)
 }
@@ -568,6 +580,14 @@ type ToolCall struct {
 type ReasoningItem struct {
     ID      string // required to round-trip to the Responses API
     Summary string
+    // EncryptedContent (`json:"encrypted_content,omitempty"`) carries the opaque
+    // encrypted reasoning payload the Responses API attaches to a reasoning
+    // item when the request used `include: ["reasoning.encrypted_content"]`
+    // with `store: false`. Round-tripping it on the next request
+    // (convertToResponsesInput) lets a stateless Codex-style backend that keeps
+    // no stored responses reconstruct the reasoning chain across turns; it is
+    // empty for plain (stored) reasoning items.
+    EncryptedContent string
 }
 ```
 
@@ -658,12 +678,12 @@ type SamplingDefaults struct {
 type SamplingFunc func(family string) SamplingDefaults
 ```
 
-Pointer fields preserve the distinction between an explicit zero and "not set". Priority applies independently to every field: an explicit `ChatRequest` value wins, then the `SamplingFunc` preset, then the provider default (field remains nil). If no sampling function is configured, executor/default-purpose calls receive a fallback temperature of `0`; the other fields remain nil. When a registry is present, presets are skipped unless metadata explicitly declares `Capabilities.Temperature == true`, preventing unsupported sampling parameters from reaching reasoning models.
+Pointer fields preserve the distinction between an explicit zero and "not set". Priority applies independently to every field: an explicit `ChatRequest` value wins, then the `SamplingFunc` preset, then the provider default (field remains nil). If no sampling function is configured, executor/default-purpose calls receive a fallback temperature of `0`; the other fields remain nil. When a registry is present, presets are applied only for metadata that *authoritatively* declares `Capabilities.Temperature == true`: a nil `Capabilities`, or one the registry guessed (`GuessedCapabilities`), skips the preset but leaves explicitly-set values untouched, and an authoritative `Temperature == false` additionally **strips** the explicitly-set sampling fields. Either way, unsupported sampling parameters never reach reasoning models.
 
 Purpose changes which defaults are injected:
 
 - `CallPurposeDefault` and `CallPurposeExecutor` use the full family/vendor preset. The empty purpose deliberately preserves behavior for existing callers.
-- `CallPurposeRouting`, `CallPurposeCompaction`, and `CallPurposeSummarization` use a deterministic profile because their output is parsed or persisted. The router injects **temperature only** when the caller left it unset: `0` for most families, `1.0` for Google (its safe floor), and `0.6` for Qwen. It never presets top-p, top-k, or penalties for these calls.
+- `CallPurposeRouting`, `CallPurposeCompaction`, and `CallPurposeSummarization` use a deterministic profile because their output is parsed or persisted. The router injects **temperature only** when the caller left it unset: `0` for most families, `1.0` for Google and Kimi (their safe floors), and `0.6` for Qwen. It never presets top-p, top-k, or penalties for these calls.
 - Explicit request values always win, including on deterministic calls.
 
 ```go
@@ -687,6 +707,8 @@ resp, err := router.Call(ctx, llm.ChatRequest{
     MaxTokens:   256,
 })
 ```
+
+**Structured one-shot calls.** Purpose-classified calls like the routing example above are normally made through the leaf `oneshot` package (`oneshot.Do[T]`), which sends a request, parses the response into a typed value, and — when parsing fails — re-asks the model with a corrective nudge instead of giving up. Exactly two nudges are issued; the third consecutive parse failure is resolved by `Options.OnFailure`. The package imports only `llm` plus the standard library and accepts any `Caller` (`*llm.Router` and `agent.LLMCaller` both satisfy it). `Do` is metadata-agnostic: `CallPurpose`, `Temperature`, `ReasoningEffort` and `MaxTokens` must be set by the caller on the request it passes in, and it never sets `DeltaSink` — so every `oneshot` call takes the synchronous path. Transport errors are never retried there; the `Router` owns provider-level retry policy. See the package map in [README.md](README.md).
 
 ### Provider parameter filtering
 

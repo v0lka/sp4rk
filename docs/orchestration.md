@@ -18,20 +18,24 @@ import "github.com/v0lka/sp4rk/orchestration"
   - [Run](#run)
   - [Cleanup](#cleanup)
   - [SetReasoningEffort](#setreasoningeffort)
+  - [SetModel](#setmodel)
   - [WithDelegationRegistry](#withdelegationregistry)
-  - [Resume with a user interjection](#resume-with-a-user-interjection)
-  - [Verify edits mechanically](#verify-edits-mechanically)
 - [Interfaces](#interfaces)
   - [Planner](#planner)
   - [Reflector](#reflector)
   - [Events](#events)
+  - [BlackboardFactory](#blackboardfactory)
   - [SystemPromptFactory](#systempromptfactory)
   - [ContextManagerFactory](#contextmanagerfactory)
+  - [Optional ContextManager capabilities](#optional-contextmanager-capabilities)
   - [PruningOverride](#pruningoverride)
   - [StepScopable and RetryScopable](#stepscopable-and-retryscopable)
+- [Resume with a user interjection](#resume-with-a-user-interjection)
+- [Verify edits mechanically](#verify-edits-mechanically)
 - [Blackboard](#blackboard)
   - [Blackboard interface](#blackboard-interface)
   - [MapBlackboard](#mapblackboard)
+  - [GenerateSummary](#generatesummary)
   - [Fact memory](#fact-memory)
 - [Plan data model](#plan-data-model)
   - [Plan](#plan)
@@ -46,6 +50,7 @@ import "github.com/v0lka/sp4rk/orchestration"
   - [ErrExecutionIncomplete](#errexecutionincomplete)
 - [Reflection](#reflection)
 - [Fact](#fact)
+- [Attachment](#attachment)
 - [DAG utilities](#dag-utilities)
   - [FindReadySteps](#findreadysteps)
   - [BuildCarryForward](#buildcarryforward)
@@ -55,6 +60,7 @@ import "github.com/v0lka/sp4rk/orchestration"
   - [Checkpointer](#checkpointer)
   - [CheckpointedBlackboard](#checkpointedblackboard)
   - [RestoreBlackboard](#restoreblackboard)
+  - [StepDumpTracker](#stepdumptracker)
 - [Adapters](#adapters)
 - [Complete Plan & Execute example](#complete-plan--execute-example)
 
@@ -69,6 +75,7 @@ A Conductor is reusable across steps: the system prompt factory receives the ste
 ```go
 type Conductor struct {
     cfg ConductorConfig
+    mu  sync.RWMutex
 }
 ```
 
@@ -94,6 +101,7 @@ type ConductorConfig struct {
     PerToolTruncation map[string]agent.ToolTruncationConfig
     ReasoningEffort   string
     PreWarningPercent int
+    Streaming bool
     VerifyOnEdit agent.EditVerifyRunner
     VerifyOnEditMaxOutputChars int
     NonCacheableTools []string
@@ -103,8 +111,9 @@ type ConductorConfig struct {
     ContentBlocks []llm.ContentBlock
     PendingUserInterjection string
     PauseChecker func(context.Context) bool
-    UserMessageSource func(context.Context) string
     ToolCallTimeout time.Duration
+    ToolCallTimeoutExemptTools []string
+    UserMessageSource func(context.Context) string
     CompactOnStart bool
 }
 ```
@@ -116,17 +125,18 @@ type ConductorConfig struct {
 | `ToolRegistry` | Registry of available tool descriptors. |
 | `TokenCounter` | Counts tokens for context-window management. |
 | `Model` | Active model name; resolved against `ModelRegistry` for metadata. |
-| `ModelRegistry` | Resolves model metadata (context window, output limit, tokenizer). When the model is unknown, a usable fallback (`ContextWindow=128000`, `OutputLimit=4096`) is applied so compaction still works. |
+| `ModelRegistry` | Resolves model metadata (context window, output limit, tokenizer). The `Resolve` ok flag is discarded: whenever the resolved `ContextWindow` is `0` — an unknown model, a nil `ModelRegistry` (resolution skipped entirely), or a known model whose resolved window is zero — a usable fallback (`ContextWindow=128000`, `OutputLimit=4096`, `TokenizerType="approximate"`) is applied so compaction still works. |
 | `ContextFactory` | **Required.** Creates a `ContextManager` for the run. |
 | `SystemPrompt` | **Required.** Factory that builds the system prompt from the step description and model metadata. |
 | `MaxSteps` | Per-run ReAct step budget. Defaults to `80` when zero. |
 | `ToolResultBudget` | Limits how much tool-result text is retained in context. |
 | `CircuitBreaker` | Detects repetitive/looping tool calls and aborts. |
 | `HITLHandler` | Human-in-the-loop handler invoked on tool calls / step-limit extensions. |
-| `ToolCache` | Optional cache for tool results, keyed by tool name + arguments. |
+| `ToolCache` | Optional content-addressed cache for tool results, keyed by a git-style short hash of `SHA256(toolName + "\x00" + content)` (or of the file's path+mtime+size for file-backed entries) — never by call arguments, so identical outputs dedupe to one entry while identical calls returning different outputs stay distinct. This hash is what backs `tool_result_read`. |
 | `PerToolTruncation` | Per-tool Stage 1 truncation configuration. |
 | `ReasoningEffort` | Reasoning effort passed to reasoning-capable models (e.g. `"low"`, `"medium"`, `"high"`). |
 | `PreWarningPercent` | Context-fill percentage that triggers a pre-compaction `store_fact` nudge. `0` disables it. |
+| `Streaming` | Enables live LLM text streaming on the main-loop `Executor`: text deltas are forwarded as `agent.Events.AssistantChunk` as they arrive. Opt-in; `false` (default) preserves the non-streaming behavior. |
 | `VerifyOnEdit` | Trusted, user-configured `agent.EditVerifyRunner`. Runs once after each LLM response group containing a successful `write_file`/`edit_file`; nil disables verification. |
 | `VerifyOnEditMaxOutputChars` | Rune-safe cap for the injected `[verify_on_edit]` output. `<= 0` selects `agent.DefaultVerifyOnEditCap` (4000). |
 | `NonCacheableTools` | Additional tool names whose results must not be cached (e.g. meta-tools whose output is inherently volatile). Extends the SDK-provided defaults. |
@@ -136,8 +146,9 @@ type ConductorConfig struct {
 | `ContentBlocks` | Optional text/image blocks for a multimodal task. When non-empty, requires the optional `BlockTaskAware` path; providers render blocks ahead of plain content. |
 | `PendingUserInterjection` | One-shot resume nudge appended after seeded history as the final user message. Requires `InterjectionAware`; an `InterjectionConsumer` retires it only after a successful LLM response. Empty disables it. |
 | `PauseChecker` | Cooperative pause callback. A true return becomes `ExecutionStatusPaused` with an empty output and preserved trajectory. It is checked at every step boundary and, while a tool call is in flight, polled on the executor's `toolWatchdogInterval` ticker (keep it cheap and idempotent). Nil disables pause. |
-| `UserMessageSource` | Host-owned live-message source polled after pause at each boundary. One non-empty message is delivered in the next LLM request. Nil disables live steering. |
 | `ToolCallTimeout` | Per-tool-call ceiling installed via `SetToolCallTimeout`. A single tool call whose wait exceeds it is abandoned and the tool's context is cancelled (a cooperative request — an uninterruptible tool may still finish) and the run returns an error wrapping `agent.ErrToolTimeout`, named with the tool. Interactive/long-running tools can be exempted via `agent.Executor.SetToolCallTimeoutExempt`. Zero (default) disables it. |
+| `ToolCallTimeoutExemptTools` | Replaces the executor's set of tool names exempt from the `ToolCallTimeout` ceiling (installed via `agent.Executor.SetToolCallTimeoutExempt`). A `nil` slice keeps the executor's built-in default (`agent.DefaultToolCallTimeoutExemptTools`); a non-nil slice — possibly empty — replaces it wholesale. |
+| `UserMessageSource` | Host-owned live-message source polled after pause at each boundary. One non-empty message is delivered in the next LLM request. Nil disables live steering. |
 | `CompactOnStart` | Forces one compaction pass right after resume/nudge seeding — before the first LLM call — regardless of fill thresholds. Intended for manual compaction of a paused task: relaunch with `ResumeSteps` + `CompactOnStart` and the seeded trajectory is compressed up front. Emits a `ContextCompaction` event (empty step ID) only when `Compact` reports a result; a nil result (nothing to compact) emits nothing. The Executor's threshold-driven reactive compaction may still fire later. `false` (default) keeps compaction purely threshold-driven. |
 
 ### NewConductor
@@ -191,16 +202,22 @@ Launches the Conductor's single ReAct loop for one task.
 
 **Returns**
 
-An `*ExecutionResult` whose `Status` is `ExecutionStatusSuccess`, `ExecutionStatusPartial` (the loop ended without finishing), `ExecutionStatusPaused` (a cooperative, resumable checkpoint), or `ExecutionStatusFailed` (an error occurred). A paused result preserves `Steps` and deliberately leaves `Output` empty rather than exposing the pause sentinel. The returned `Blackboard` is the same instance passed in, now populated with any reflections recorded during the run.
+An `*ExecutionResult` whose `Status` is `ExecutionStatusSuccess`, `ExecutionStatusPartial` (the loop ended without finishing), `ExecutionStatusPaused` (a cooperative, resumable checkpoint), `ExecutionStatusCancelled` (the run was cancelled — the executor returned an error satisfying `errors.Is(err, context.Canceled)`, or `ctx.Err()` was non-nil), or `ExecutionStatusFailed` (any other error occurred). A paused result preserves `Steps` and deliberately leaves `Output` empty rather than exposing the pause sentinel. The returned `Blackboard` is the same instance passed in, now populated with any reflections recorded during the run.
 
-`Run` returns an error only when the context factory or system prompt factory is missing, when `ResumeSteps` is set but the `ContextManager` does not implement `StepSeedable`, or when the underlying executor returns an error. A non-nil error is still accompanied by a non-nil `*ExecutionResult` carrying best-effort output. `agent.ErrPaused` is mapped to `ExecutionStatusPaused`; callers may still use `errors.Is(err, agent.ErrPaused)` while resuming from `result.Steps`.
+`Run` returns an error only when the context factory or system prompt factory is missing, when `ResumeSteps` is set but the `ContextManager` does not implement `StepSeedable`, or when the underlying executor returns an error. Only the executor-error path pairs a non-nil error with a non-nil `*ExecutionResult` carrying best-effort output; the missing-factory checks and the `StepSeedable` check fail fast and return `(nil, err)`, so callers must nil-check `result` before dereferencing it. `agent.ErrPaused` is mapped to `ExecutionStatusPaused`; callers may still use `errors.Is(err, agent.ErrPaused)` while resuming from `result.Steps`.
 
 ```go
 result, err := conductor.Run(ctx, step.Description, bb, availableTools, events, "sliding_window")
 if err != nil {
-    log.Printf("run error: %v (status=%s)", err, result.Status)
+    // result is nil on the fail-fast paths (missing factory, ResumeSteps
+    // without StepSeedable) — always nil-check it before dereferencing.
+    if result != nil {
+        log.Printf("run error: %v (status=%s)", err, result.Status)
+    } else {
+        log.Printf("run error: %v", err)
+    }
 }
-if result.Status == orchestration.ExecutionStatusSuccess {
+if result != nil && result.Status == orchestration.ExecutionStatusSuccess {
     fmt.Println(result.Output)
 }
 ```
@@ -220,6 +237,14 @@ func (c *Conductor) SetReasoningEffort(effort string)
 ```
 
 Updates the reasoning effort applied to subsequent runs. Useful when the same Conductor is reused across phases that benefit from different reasoning depths.
+
+### SetModel
+
+```go
+func (c *Conductor) SetModel(model string)
+```
+
+Overrides the model whose metadata the Conductor resolves for the system prompt and the context window (`ConductorConfig.Model`). Use it when the model serving the calls is chosen — or switched — after construction, so the per-step context budget (window, output reserve, tokenizer) is sized against that execution model rather than the framework's construction-time default. Safe to call concurrently with `Run`; `Run` snapshots the value under the same lock.
 
 ### WithDelegationRegistry
 
@@ -270,7 +295,7 @@ Analyzes failures and produces corrective insights. See [reflector.md](reflector
 
 ### Events
 
-`Events` extends `agent.Events` with orchestration-lifecycle hooks. All methods are called by the orchestrator (not the Conductor directly) as it drives the plan.
+`Events` extends `agent.Events` with orchestration-lifecycle hooks. The `On*` hooks are emitted by the host orchestrator as it drives the plan — `Conductor.Run` never calls them. The embedded `agent.Events` methods *are* driven by the Conductor and its executor: `Conductor.Run` emits `ContextCompaction` itself for the `CompactOnStart` pass and hands the same sink to the executor via `agent.WithEvents(events)`, which drives the rest (`AssistantChunk`, `ExecutorDiagnostic`, …).
 
 ```go
 type Events interface {
@@ -299,6 +324,14 @@ func (e *myEvents) OnStepCompleted(id string, ok bool, d time.Duration, _ string
     fmt.Printf("step %s done=%v in %v\n", id, ok, d)
 }
 ```
+
+### BlackboardFactory
+
+```go
+type BlackboardFactory func(taskID string) Blackboard
+```
+
+Creates a `Blackboard` for a new task, keyed by `taskID`. Like [`StepScopable and RetryScopable`](#stepscopable-and-retryscopable), it is a hook the `orchestration` package declares for host orchestrators to supply — the package itself never calls it — so a host decides what backs each task: `NewMapBlackboard` for in-memory runs, or `NewCheckpointedBlackboard`/`RestoreBlackboard` when the task must survive a restart.
 
 ### SystemPromptFactory
 
@@ -395,7 +428,7 @@ type RetryScopable interface {
 }
 ```
 
-When the orchestrator detects that an events object implements one of these, it wraps it so downstream handlers know which step or retry attempt produced each event.
+The `orchestration` package declares them but does not itself type-assert an `Events` value against them — a host orchestrator that wants scoped emitters performs the check and wraps the sink, so downstream handlers know which step or retry attempt produced each event.
 
 ---
 
@@ -464,6 +497,12 @@ type Blackboard interface {
     StoreFact(fact Fact)
     SearchFacts(keywords []string) []Fact
     GetFacts() []Fact
+
+    // Attachment memory (user-attached files converted to markdown)
+    AddAttachment(a Attachment)
+    GetAttachments() []Attachment
+    GetAttachment(id string) (Attachment, bool)
+    RemoveAttachment(id string) bool
 }
 ```
 
@@ -482,6 +521,9 @@ All methods are safe for concurrent use. Read methods return defensive copies, s
 | `AddReflection` | Appends a reflection. |
 | `Search` | Case-insensitive substring search across step summaries, full outputs, and reflection summaries. Returns `[]BlackboardEntry`. |
 | `StoreFact` / `SearchFacts` / `GetFacts` | Fact memory — see [Fact memory](#fact-memory). |
+| `AddAttachment` | Stores a user-attached file (converted to markdown), replacing any existing attachment with the same `ID`; defaults `AttachedAt` to now when it is zero. |
+| `GetAttachments` / `GetAttachment` | Defensive copy of all attachments, or of the one with the given ID plus whether it exists. |
+| `RemoveAttachment` | Removes the attachment with the given ID; returns `true` when one was removed. |
 
 ### MapBlackboard
 
@@ -502,16 +544,27 @@ bb.SetOriginalRequest("Build a Go project that prints hello")
 func WithMaxSummaryLen(n int) MapBlackboardOption
 ```
 
-Sets a character-based cap on auto-generated step summaries. A value of `0` uses the default of `500` characters. The summary skips leading blank lines and leading markdown headings (ATX `# …` and setext `===`/`---` underlines), then takes the first paragraph (text up to the first double-newline) or the first `n` characters, whichever is shorter, appending `…` when truncated.
+Sets a character-based cap on auto-generated step summaries. A value of `0` uses the default of `500` characters. The summary skips leading blank lines and leading markdown headings (ATX `# …` and setext `===`/`---` underlines), then takes the first paragraph (text up to the first double-newline) or the first `n` characters, whichever is shorter, appending `…` when truncated. The configured cap is readable back via the `MaxSummaryLen() int` getter.
 
 ```go
 bb := orchestration.NewMapBlackboard(orchestration.WithMaxSummaryLen(800))
 ```
 
-`MapBlackboard` also exposes two methods used by the persistence layer to hydrate state without regenerating summaries:
+`MapBlackboard` also exposes three methods used by the persistence layer to hydrate state without regenerating summaries:
 
 - `SetStepResultRaw(stepID string, sr StepResult)` — stores a pre-built `StepResult` directly.
 - `SetFacts(facts []Fact)` — replaces the entire facts slice (deep-copied).
+- `SetAttachments(attachments []Attachment)` — replaces the entire attachments slice (copied).
+
+### GenerateSummary
+
+```go
+func GenerateSummary(output string, maxLen int) string
+```
+
+Creates a summary from a step's output: the first meaningful paragraph (up to the first double-newline) or the first `maxLen` characters, whichever is shorter. Leading blank lines and leading markdown headings (ATX `# …` and setext `===`/`---` underlines) are skipped so the summary captures actual content rather than a title; truncation happens on a rune boundary via [`strutil.TruncateUTF8`](utilities.md#truncateutf8), which appends `…`. A `maxLen` of `0` uses the default of `500`, and empty output yields an empty summary.
+
+This is the helper `MapBlackboard.SetStepResult` calls to auto-generate `StepResult.Summary` (capped by `WithMaxSummaryLen`, above); it is exported so a host can produce summaries with identical rules.
 
 ### Fact memory
 
@@ -572,7 +625,7 @@ type PlanStep struct {
 | `DependsOn` | IDs of steps that must complete successfully before this one can start. |
 | `Parallelizable` | Hint that this step can run concurrently with its siblings. |
 | `EstimatedTools` | Tools the step is expected to use. |
-| `Agent` | Optionally names a **Subagent Profile** (an `AGENT.md`-declared persona — see [Subagent Profiles](agents.md)) that should execute this step. When non-empty, the step runs with that profile's system prompt, tools, max-steps, and model instead of the generic orchestrator defaults. The name is resolved by the execution layer (e.g. the Conductor's agent resolver). Orthogonal to `Profile`. |
+| `Agent` | Optionally names a **Subagent Profile** (an `AGENT.md`-declared persona — see [Subagent Profiles](agents.md)) that should execute this step. When non-empty, the step runs with that profile's system prompt, tools, max-steps, and model instead of the generic orchestrator defaults. The name is resolved by the **host's** execution layer — the SDK ships no resolver, and `orchestration.Conductor` passes `PlanStep.Agent` through untouched (it is only declared and copied by `copyPlan`). Orthogonal to `Profile`. |
 | `Profile` | Optional step-level configuration. During JSON deserialization this is `map[string]any`; consumers convert it to a domain-specific profile (e.g. `*planner.AgentProfile`). The field type is `any`. |
 
 ### CompletedStep
@@ -614,13 +667,13 @@ type PlanStepEvent struct {
 }
 ```
 
-A step representation for event emission. `Status` is a string such as `"pending"`, `"running"`, `"completed"`, or `"failed"`.
+A step representation for event emission. The SDK's own producer — `TaskF`'s `planStepsToEvents`, which feeds `OnPlanGenerated` — leaves `Status` empty; the field is a hook for host-side lifecycle annotation, and a host that re-emits enriched events may populate it with values such as `"pending"`, `"running"`, `"completed"`, or `"failed"`.
 
 ### BlackboardEntry
 
 ```go
 type BlackboardEntry struct {
-    Type    string // "step_result", "reflection", etc.
+    Type    string // "step_result", "criterion", "reflection", etc.
     Key     string
     Summary string
 }
@@ -645,6 +698,7 @@ const (
     ExecutionStatusFailed    ExecutionStatus = "failed"
     ExecutionStatusAborted   ExecutionStatus = "aborted"
     ExecutionStatusCancelled ExecutionStatus = "cancelled"
+    ExecutionStatusPaused    ExecutionStatus = "paused"
 )
 ```
 
@@ -655,32 +709,35 @@ const (
 | `failed` | All steps were attempted, some failed, and the retry budget is exhausted. |
 | `aborted` | The reflector recommended aborting after step failures. |
 | `cancelled` | The context was cancelled mid-execution. |
+| `paused` | The executor stopped at a step boundary (or, since the tool-call watchdog, while a tool call was in flight) because a cooperative pause signal tripped (`agent.ErrPaused`). The trajectory so far is preserved in the result's `Steps`; execution may be resumed. Distinct from `cancelled` (user/interrupt) and `partial` (budget exhausted). |
 
 ### ExecutionResult
 
 ```go
 type ExecutionResult struct {
     Output       string          `json:"output"`
+    Summary      string          `json:"summary,omitempty"`
+    Steps        []agent.Step    `json:"-"`
     Plan         *Plan           `json:"plan,omitempty"`
     Blackboard   Blackboard      `json:"-"`
     AttemptCount int             `json:"attempt_count,omitempty"`
     Reflections  []Reflection    `json:"reflections,omitempty"`
     Status       ExecutionStatus `json:"status,omitempty"`
     FailedSteps  int             `json:"failed_steps,omitempty"`
-    Summary      string          `json:"summary,omitempty"`
 }
 ```
 
 | Field | Description |
 | --- | --- |
 | `Output` | Aggregated or best-effort output text. |
+| `Summary` | The model's own final text when the run terminated on a host-designated stop tool rather than the inline `finish` tool (`Output` is then just the tool's confirmation). Empty otherwise. |
+| `Steps` | The executor trajectory (not JSON-serialized). On a paused result it is the resumable checkpoint a caller feeds back via `ResumeSteps`. |
 | `Plan` | The plan that was executed (when applicable). |
 | `Blackboard` | The blackboard instance (not JSON-serialized). |
 | `AttemptCount` | Number of execution attempts. |
 | `Reflections` | Reflections recorded during execution. |
 | `Status` | Terminal status — see [ExecutionStatus](#executionstatus). |
 | `FailedSteps` | Steps that finished with an error in the final attempt. |
-| `Summary` | The model's own final text when the run terminated on a host-designated stop tool rather than the inline `finish` tool (`Output` is then just the tool's confirmation). Empty otherwise. |
 
 ### ErrExecutionIncomplete
 
@@ -688,12 +745,14 @@ type ExecutionResult struct {
 var ErrExecutionIncomplete = errors.New("plan execution incomplete")
 ```
 
-Indicates a plan execution ended before all steps completed (e.g. step limit reached, context cancelled). It accompanies a non-nil `*ExecutionResult` carrying best-effort output. Callers should `errors.Is`-check it and use the returned result for partial output.
+Indicates a plan execution ended before all steps completed (e.g. step limit reached, context cancelled). It accompanies a non-nil `*ExecutionResult` carrying best-effort output. Callers should `errors.Is`-check it and use the returned result for partial output. Within the SDK its only producer is the planned `TaskBuilder.Execute` path: `planCompletionStatus` wraps it (with the completed/total counts) when plan steps were never attempted, and `runPlanned` returns it alongside the partial result.
 
 ```go
-result, err := orchestrator.Execute(ctx, plan, bb, tools, events)
+result, err := fw.TaskF(ctx, task).System(prompt).Plan().Reflect().Execute()
 if errors.Is(err, orchestration.ErrExecutionIncomplete) {
-    log.Printf("partial completion: %d/%d steps", len(result.Blackboard.GetAllStepResults()), len(plan.Steps))
+    // result is non-nil on this path — the partial run keeps its best-effort output.
+    log.Printf("partial completion (status=%s): %d/%d step results",
+        result.Status, len(result.Blackboard.GetAllStepResults()), len(result.Plan.Steps))
 }
 ```
 
@@ -736,7 +795,25 @@ type Fact struct {
 }
 ```
 
-A keyword-tagged piece of information for inter-step communication. Steps store facts via `Blackboard.StoreFact` and retrieve them via `SearchFacts`/`GetFacts`. The `Author` field records which step wrote the fact, aiding traceability. Keywords (3–5 recommended) drive relevance ranking in `SearchFacts`.
+A keyword-tagged piece of information for inter-step communication. Steps store facts via `Blackboard.StoreFact` and retrieve them via `SearchFacts`/`GetFacts`. The `Author` field records which step wrote the fact, aiding traceability. Keywords drive relevance ranking in `SearchFacts`. The 3–10 keyword rule is enforced by the `store_fact` builtin tool, **not** by `Blackboard.StoreFact`, which is a bare append with no validation.
+
+---
+
+## Attachment
+
+```go
+type Attachment struct {
+    ID              string    `json:"id"`
+    OriginalName    string    `json:"original_name"`
+    OriginalPath    string    `json:"original_path"`
+    Format          string    `json:"format"` // normalized extension without dot, e.g. "pdf"
+    SizeBytes       int64     `json:"size_bytes"`
+    MarkdownContent string    `json:"markdown_content"`
+    AttachedAt      time.Time `json:"attached_at"`
+}
+```
+
+A user-attached file that has been converted to markdown and is available to agents as read-only context. Attachment IDs are surfaced to the model in the user message attachment list; agents read `MarkdownContent` via the `read_attachment` tool (backed by [`NewAttachmentStore`](#adapters)). Hosts add attachments to the `Blackboard` via `AddAttachment` before a run.
 
 ---
 
@@ -841,9 +918,9 @@ All persistence calls are **best-effort**: errors are logged but do not propagat
 
 **Lifecycle methods**
 
-- `SetOnChanged(fn func(changeType string))` — optional callback invoked after every successful write. `changeType` is `"plan"`, `"step_result"`, `"fact"`, `"attachment"`, `"reflection"`, etc.
+- `SetOnChanged(fn func(changeType string))` — optional callback invoked after every successful write. `changeType` is one of the seven values `"original_request"`, `"plan"`, `"step_result"`, `"reflection"`, `"fact"`, `"attachment"`, `"final_result"`.
 - `SetPersistContext(ctx context.Context)` — sets the context used for persistence operations (carries cancellation/tracing). Defaults to `context.Background()`.
-- `Shutdown()` — closes the persistence channel and waits for the worker to finish. Safe to call multiple times. **Always call this** when the blackboard is no longer needed to prevent goroutine leaks.
+- `Shutdown()` — closes the persistence channel and waits for the worker to drain, bounded by a grace period (`shutdownGrace`; `<= 0` falls back to `defaultShutdownGrace = 30 * time.Second`). A worker still busy when the grace expires is logged ("persistence worker did not stop before the shutdown grace expired; abandoning it") and abandoned instead of hanging shutdown. Idempotent via `sync.Once` — safe to call multiple times. **Always call this** when the blackboard is no longer needed to prevent goroutine leaks.
 - `ID() string` — returns the checkpoint identifier.
 
 ```go
@@ -890,30 +967,49 @@ defer bb.Shutdown()
 ### StepDumpTracker
 
 ```go
-func NewStepDumpTracker(dir string, logger *slog.Logger) *StepDumpTracker
+func NewStepDumpTracker(dir string, logger *slog.Logger, opts ...StepDumpOption) *StepDumpTracker
 ```
 
-A best-effort manager for **per-step LLM dump files**, used when the conductor records each plan step's LLM traffic to its own file for offline debugging. Pass a directory and a logger (must not be nil); `NewStepDumpTracker` creates the directory (logging a warning on failure, but not returning an error — dumps are best-effort debugging aids). Pass an empty `dir` to disable the tracker.
+A best-effort manager for **per-step LLM dump files**, used when the host records each plan step's LLM traffic to its own file for offline debugging. Pass a directory and a logger (`nil` falls back to `slog.Default()`); `NewStepDumpTracker` creates the directory (logging a warning on failure, but not returning an error — dumps are best-effort debugging aids). Pass an empty `dir` to disable the tracker.
+
+Without options the dumps are plain JSONL (`appendcodec.CodecNone`). Two options select compression, via the `github.com/v0lka/sp4rk/appendcodec` package:
+
+```go
+// WithCodec sets the dump codec: appendcodec.CodecNone (plain JSONL, the
+// default), CodecGzip or CodecZstd. The codec extends the filename —
+// step_<id>.jsonl, step_<id>.jsonl.gz or step_<id>.jsonl.zst.
+func WithCodec(codec appendcodec.Codec) StepDumpOption
+
+// WithCodecWindowLog sizes the zstd encoder window (1<<windowLog, clamped
+// by appendcodec; <=0 keeps the encoder default). Ignored by other codecs.
+func WithCodecWindowLog(windowLog int) StepDumpOption
+```
 
 ```go
 type StepDumpTracker struct{ /* unexported */ }
 
-// OpenStepDump returns an io.Writer for the step's dump file, or nil when
-// disabled/closed. The file is created on first call and cached — repeated
-// calls for the same stepID (including retries) append to the same file.
+// OpenStepDump returns an io.Writer for the step's dump file — an
+// appendcodec wrapper that appends codec-framed records (each completed
+// Write is already decodable on disk) — or nil when disabled/closed. The
+// file is created on first call and the wrapper is cached — repeated calls
+// for the same stepID (including retries) append through the same encoder.
 func (t *StepDumpTracker) OpenStepDump(stepID string) io.Writer
 
-// CloseAll closes every tracked file. Idempotent.
+// CloseAll closes every tracked writer: each wrapper's Close writes the
+// codec footer (gzip trailer / zstd frame epilogue; nothing for CodecNone)
+// and then releases the file descriptor. Idempotent.
 func (t *StepDumpTracker) CloseAll() error
 ```
 
 Key properties:
 
-- **Path-traversal safe** — the filename is `step_<filepath.Base(stepID)>.jsonl`, so any directory components in `stepID` are stripped and the file always lands inside `dir`.
-- **Idempotent** — opening a dump for an already-seen step returns the cached `*os.File`, so retries and sub-steps append rather than overwrite.
+- **Path-traversal safe** — the filename is `step_<filepath.Base(stepID)>.jsonl` plus the codec's extension, so any directory components in `stepID` are stripped and the file always lands inside `dir`.
+- **Codec-consistent** — codec-specific filenames mean different codecs never collide on one path, and `appendcodec.OpenAppend` still verifies the existing file's magic before appending, refusing (with a warning, nil writer) foreign content planted at the codec's own path. Under every codec the open itself is hardened too: a symlink at the final path component (refused on unix; Windows parity per safeio), a non-regular pre-existing target, or a dump file without read permission (the magic sniff reads through the same `O_RDWR` descriptor the appends go through) fails the open with the ordinary warning + nil writer path.
+- **Idempotent** — opening a dump for an already-seen step returns the cached wrapper, so retries and sub-steps append rather than overwrite (and a second live encoder — which would interleave compressed frames — is never created). For the compressed codecs, across trackers in one process, `appendcodec` shares the live encoder: a second open of the same dump path returns an independent queued handle whose records serialize on the one encoder, and the codec footer plus file lock are released by the last tracker's `CloseAll`. From another process, the advisory path lock rejects the open with `appendcodec.ErrLocked`, which degrades to the ordinary warning + nil writer path — frames can never interleave. With the default `appendcodec.CodecNone` none of this applies: opens take no lock and return independent plain handles, so parallel runs' JSONL dumps append side by side exactly as before (records interleave between write calls, never inside one).
+- **Crash-truncated dumps stay readable only up to the crash point** — a host crash mid-run leaves the dump decodable through its last flushed record, but the next run appends behind the truncation point and sequential decoders stop there: post-crash records sit in the file, unreachable. Recovery (scan to the last decodable boundary, truncate) is a consumer concern; `appendcodec` ships no helper yet.
 - **Graceful degradation** — every failure (directory creation, file open, write) is swallowed with a warning; dumps are debugging aids and never affect execution.
 
-The conductor typically feeds each step's writer into the executor context via [`agent.WithDumpWriter`](agent-executor.md#llm-debugging-callers), so each step produces a self-contained `step_<id>.jsonl` (consumable by [`NewDumpCaller`](agent-executor.md#newdumpcaller--full-jsonl-requestresponse-dumps)).
+A host that wants per-step dumps opens each step's writer with `OpenStepDump` and feeds it into the executor context itself via [`agent.WithDumpWriter`](agent-executor.md#llm-debugging-callers) (typically wrapped around a [`NewDumpCaller`](agent-executor.md#newdumpcaller--full-jsonl-requestresponse-dumps) caller through the `CallerForStep` hook), so each step produces a self-contained `step_<id>.jsonl[.gz|.zst]`. The SDK does not wire this for you: the Conductor never opens or consumes these dumps (its `Cleanup` is a no-op) and the executor never reads the context key back.
 
 ---
 
@@ -928,7 +1024,7 @@ func NewAttachmentStore(bb Blackboard) agent.AttachmentStore
 func NewFinalResultStore(bb Blackboard) agent.FinalResultStore
 ```
 
-- `NewStepOutputStore` exposes successful step outputs to the `read_step_output` tool. Only steps that completed without error are visible; outputs are listed in deterministic (step-ID) order.
+- `NewStepOutputStore` exposes step outputs to the `read_step_output` tool, distinguishing three cases. A step that completed **without error** is visible with its full output. A step whose error is the **cooperative-pause sentinel** — matched by `errors.Is(err, agent.ErrPaused)`, plus a trailing-suffix string match on the sentinel's message for hosts that rebuild the error after persistence — is *also* visible, surfaced as the marker `"[paused checkpoint — no final output yet]"`; hiding it would read as vanished/failed. Only **genuinely failed** steps (any other error) are excluded. Visible outputs are listed in deterministic (step-ID) order.
 - `NewFactStore` exposes fact memory to the `store_fact` / `search_facts` tools.
 - `NewAttachmentStore` exposes user-attached files (converted to markdown) to the `read_attachment` tool. Host applications add attachments to the blackboard before a run; the attachment IDs are surfaced in the user message.
 - `NewFinalResultStore` exposes the prior task's final result to the `read_final_result` tool — useful for continuation agents when the conversation history alone is insufficient (e.g. after a restart, or when the result was too large to inject verbatim).
@@ -937,7 +1033,7 @@ func NewFinalResultStore(bb Blackboard) agent.FinalResultStore
 
 ## Complete Plan & Execute example
 
-This example shows the full Plan & Execute pattern: a `Planner` generates a DAG, a `Conductor` executes each step, and a `Reflector` provides self-correction on failure. It is adapted from the SDK's example 06.
+This example shows the full Plan & Execute pattern: a `Planner` generates a DAG, a `Conductor` executes each step, and a `Reflector` provides self-correction on failure. It is adapted from the SDK's example 06. Note the `ConfirmFunc` in the config: `write_file`, `edit_file`, and `create_directory` default to `tools.PolicyUserConfirm`, and the registry is fail-closed — with no `ConfirmFunc` configured, every such call is denied rather than executed.
 
 ```go
 package main
@@ -990,6 +1086,12 @@ func run() error {
 		Execution: sp4rk.ExecutionConfig{
 			MaxSteps:   15, // per-step ReAct budget
 			MaxRetries: 2,  // retries per plan step on failure
+		},
+		// The registry is FAIL-CLOSED for PolicyUserConfirm tools
+		// (write_file, edit_file, create_directory). This example runs in a
+		// throwaway temp workspace, so we auto-approve mutations.
+		ConfirmFunc: func(_ context.Context, _ tools.ConfirmationRequest) (tools.ConfirmationResponse, error) {
+			return tools.ConfirmAllowOnce, nil
 		},
 	})
 	if err != nil {

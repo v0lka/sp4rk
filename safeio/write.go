@@ -50,9 +50,10 @@ var ErrNotDirectory = errors.New("not a directory")
 //
 // On unix the final path component is never followed: a symbolic link at path
 // makes the open fail with ELOOP (*fs.PathError wrapping syscall.ELOOP) and
-// the link's target is never written through. On Windows no O_NOFOLLOW
-// equivalent exists without new dependencies, so a final symlink is still
-// resolved and written through (see OpenFileNoFollow for the parity note).
+// the link's target is never written through. Windows is at parity: the
+// open carries FILE_FLAG_OPEN_REPARSE_POINT, so a final reparse point is
+// refused with the same ELOOP instead of being resolved (see
+// OpenFileNoFollow).
 //
 // A missing file is created; a missing parent directory is an error (use
 // MkdirAllReal first). A non-regular pre-existing target returns a

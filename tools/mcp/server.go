@@ -69,6 +69,9 @@ type ServerConfig struct {
 	// endpoint stall Connect and tool calls indefinitely. Prefer
 	// transport-level bounds over Client.Timeout: the latter also caps the
 	// long-lived SSE event stream itself and would cut live sessions short.
+	// The supplied client is never mutated: connectHTTP shallow-copies it and
+	// installs the origin-pinned redirect policy (originPinnedRedirects) on
+	// the copy, so the host's shared client keeps its own settings.
 	HTTPClient *http.Client
 	// ToolGroupOverride optionally tags every tool served by this server with
 	// an explicit capability group instead of the transport-derived default
@@ -719,14 +722,27 @@ func (s *Server) connectHTTP(ctx context.Context, cfg ServerConfig) (*mcpclient.
 	// transport's Start deliberately runs on a detached context (see the
 	// fallback leg below).
 
+	// Redirect pinning (CVE-2026-116685 class): BOTH transport legs share one
+	// HTTP client whose redirects are pinned to cfg.URL's origin — a trusted-
+	// but-redirecting endpoint must not carry the operator's custom headers
+	// (and, on 307/308, the JSON-RPC body) to an attacker-chosen host. The
+	// host-supplied client is shallow-copied, never mutated; when none is
+	// supplied, the SSE-leg bounded client below doubles as the Streamable
+	// leg's client, adding dial/TLS/header bounds to a leg that previously ran
+	// on the SDK's unbounded default. The pinned copy is exclusive to this
+	// connection, so each server entry pins to its own origin.
+	httpClient := cfg.HTTPClient
+	if httpClient == nil {
+		httpClient = boundedStreamHTTPClient(s.timeout)
+	}
+	httpClient = originPinnedClient(httpClient, cfg.URL)
+
 	// Prepare headers option
 	var opts []transport.StreamableHTTPCOption
 	if len(cfg.Headers) > 0 {
 		opts = append(opts, transport.WithHTTPHeaders(cfg.Headers))
 	}
-	if cfg.HTTPClient != nil {
-		opts = append(opts, transport.WithHTTPBasicClient(cfg.HTTPClient))
-	}
+	opts = append(opts, transport.WithHTTPBasicClient(httpClient))
 
 	// Try Streamable HTTP first
 	client, err := mcpclient.NewStreamableHttpClient(cfg.URL, opts...)
@@ -744,19 +760,6 @@ func (s *Server) connectHTTP(ctx context.Context, cfg ServerConfig) (*mcpclient.
 	var sseOpts []transport.ClientOption
 	if len(cfg.Headers) > 0 {
 		sseOpts = append(sseOpts, transport.WithHeaders(cfg.Headers))
-	}
-	httpClient := cfg.HTTPClient
-	if httpClient == nil {
-		// The SSE transport's built-in client has NO timeouts at all, and its
-		// Start performs the blocking event-stream GET itself with whatever
-		// context it is handed — with the default client and a context without
-		// a deadline (the framework path), a server that accepts the TCP
-		// connection but never sends response headers would hold Connect
-		// indefinitely (finding 40). Install a client whose dial, TLS, and
-		// response-header waits are bounded by the handshake bound instead;
-		// Client.Timeout stays zero because the connected event stream is
-		// long-lived and must not be cut mid-session.
-		httpClient = boundedStreamHTTPClient(s.timeout)
 	}
 	sseOpts = append(sseOpts, transport.WithHTTPClient(httpClient))
 
@@ -787,12 +790,15 @@ func (s *Server) connectHTTP(ctx context.Context, cfg ServerConfig) (*mcpclient.
 	return client, nil
 }
 
-// boundedStreamHTTPClient builds the HTTP client used for the SSE fallback
-// transport when the host supplies none: connection-level waits are bounded so
-// a stalled endpoint cannot hold Connect open indefinitely, while
-// Client.Timeout remains zero — the SSE event stream is a long-lived response
-// body that must stay open for the lifetime of the connection
-// (ResponseHeaderTimeout bounds only the wait for headers, not the body).
+// boundedStreamHTTPClient builds the HTTP client used by BOTH HTTP transport
+// legs when the host supplies none — the Streamable HTTP attempt and the SSE
+// fallback: connection-level waits are bounded so a stalled endpoint cannot
+// hold Connect open indefinitely, while Client.Timeout remains zero — the SSE
+// event stream is a long-lived response body that must stay open for the
+// lifetime of the connection (ResponseHeaderTimeout bounds only the wait for
+// headers, not the body; the Streamable leg's individual requests additionally
+// carry the bounded contexts handed to Initialize/CallTool). A host-supplied
+// client replaces it unchanged and must carry its own bounds.
 func boundedStreamHTTPClient(bound time.Duration) *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{

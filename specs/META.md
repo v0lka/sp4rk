@@ -39,15 +39,20 @@ specs/
 │   ├── tool-system/
 │   │   ├── README.md
 │   │   ├── builtins.md
-│   │   └── mcp-gateway.md
+│   │   ├── mcp-gateway.md
+│   │   └── websearch.md
 │   ├── memory/
 │   │   ├── README.md
 │   │   ├── compaction.md
 │   │   └── blackboard.md
 │   ├── llm-providers.md
+│   ├── oneshot.md
 │   ├── skills.md
+│   ├── agents.md
 │   ├── prompt-building.md
-│   └── embedding.md
+│   ├── embedding.md
+│   ├── safeio.md
+│   └── strutil.md
 │
 ├── contracts/                      interfaces between engine and host application
 │   ├── agent-execution.md

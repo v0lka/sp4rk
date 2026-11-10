@@ -4,7 +4,7 @@
 
 ## Boundary Rule
 
-The host application consumes the agent execution types from `github.com/v0lka/sp4rk/agent` directly. The agent package depends only on sibling sp4rk packages (`llm`, `tools`); it never imports host-application code. An embedder plugs in behavior by **implementing** the interfaces below (`Events`, `HITLHandler`, `ContextManager`, `LLMCaller`, `CompactionStrategy`) and **consuming** the value types (`Step`, `ExecutorResult`) and the executor entry point, rather than subclassing the loop.
+The host application consumes the agent execution types from `github.com/v0lka/sp4rk/agent` directly. The agent package depends only on sibling sp4rk packages (`llm`, `tools`, `strutil`); it never imports host-application code. An embedder plugs in behavior by **implementing** the interfaces below (`Events`, `HITLHandler`, `ContextManager`, `LLMCaller`, `CompactionStrategy`) and **consuming** the value types (`Step`, `ExecutorResult`) and the executor entry point, rather than subclassing the loop.
 
 ## Interfaces
 
@@ -19,12 +19,14 @@ The host application consumes the agent execution types from `github.com/v0lka/s
 | `ContextManager` | agent | Extended by host | Context window management (prompt building, step addition, compaction, fill tracking). **Note:** the SDK-level interface intentionally omits `SetTask`; the host application adds task-context concerns on top |
 | `CompactionStrategy` | agent | Implemented by host / SDK strategies | Compresses step history into a compact `[]llm.Message` within a token budget |
 | `InterjectionConsumer` | agent | Optionally implemented by `ContextManager` | Retires a resume-with-nudge message only after a successful LLM response, so reactive-compaction retries preserve it |
+| `ToolOverheadAware` | agent | Optionally implemented by `ContextManager` | Receives `SetToolOverhead(tokens int)` from the executor — the estimated per-request tool-schema token reserve, subtracted from `EffectiveMax` so fill/compaction thresholds reflect true wire usage |
+| `ContextWindowSizeProvider` | agent | Optionally implemented by `ContextManager` | Exposes `ContextWindowSize() int`, the advertised context-window signal the executor uses to flag real input tokens approaching the server limit |
 | `EditVerifyRunner` / `EditVerifyResult` | agent | Implemented by host / consumed by executor | Runs a user-configured post-edit verification command and returns combined output, exit status, timeout state, and infrastructure error |
 | `Step` | agent | Consumed by host | Single ReAct iteration record (thought, reasoning, action `llm.ToolCall`, observation, error/untrusted flags, cache hash) |
 | `ExecutorResult` | agent | Consumed by host | Executor output: final string, the full `[]Step` trajectory, a `Finished` flag, an optional `AbortReason` (a short structured failure cause for a non-finished run whose `Output` is a meaningful answer rather than an abort message — e.g. the mutation gate), and an optional `Summary` (the model's own final text when the run terminated on a host-designated stop tool rather than the inline `finish` tool) |
 | `StepLimitResponse` | agent | Consumed by host | `allow_once` / `allow_more` / `allow_always` / `deny` returned from `OnStepLimit` |
 | `HITLToolDecision` | agent | Consumed by host | `{Allow bool; ModifiedInput json.RawMessage; Reason string}` returned from `OnToolCall` |
-| `CircuitBreakerConfig` | agent | Provided by host config | Circuit-breaker thresholds (repeat/truncation/parse-error/fruitless abort) protecting the loop |
+| `CircuitBreakerConfig` | agent | Provided by host config | Circuit-breaker thresholds (repeat / same-tool-repeat / truncation / parse-error / fruitless abort) protecting the loop; same-tool-repeat detects one tool re-called with varied arguments but similar results via `SameToolRepeatNudgeThreshold`, `SameToolRepeatAbortThreshold`, and `SameToolResultSizeDelta` |
 
 ## Initialization
 

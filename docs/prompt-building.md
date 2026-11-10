@@ -34,16 +34,21 @@ b := prompt.NewBuilder().
     Core("Available tools:\nAVAILABLE-TOOLS").
     Core("MODE-PREAMBLE").
     Replace("AVAILABLE-TOOLS", "read_file, write_file, finish").
-    Replace("MODE-PREAMBLE", "Work in MODE. RECENT-CONVERSATION").
+    Replace("MODE-PREAMBLE", "Work in WORK-MODE. RECENT-CONVERSATION").
     Replace("RECENT-CONVERSATION", "(none yet)").
-    Replace("MODE", "code")
+    Replace("WORK-MODE", "code")
 
 result := b.Build()
-// Placeholders are resolved across multiple passes, so the final string
+// Output:
+// "You are a coding agent.\n\nAvailable tools:\nread_file, write_file, finish\n\nWork in code. (none yet)"
+// Placeholders are resolved across multiple passes, so — as long as the
+// trusted keys are mutually non-overlapping (see below) — the final string
 // contains no leftover placeholder tokens.
 ```
 
 The pass cap prevents infinite loops from circular placeholder references.
+
+Within each pass, trusted `Replace` keys are applied in Go map iteration order (randomized), with no longest-key-first ordering — unlike `ReplaceData`, which sorts its placeholder keys longest-first before its single `strings.Replacer` pass. A trusted key that is a substring of another key (e.g. `MODE` alongside `MODE-PREAMBLE`) can therefore be substituted first in some runs, shadowing the longer key and leaving residue such as `code-PREAMBLE`. Keep trusted placeholder keys mutually non-overlapping.
 
 ### Untrusted values: `ReplaceData`
 
@@ -75,7 +80,7 @@ Consumers such as `ContextWindow` check for this marker and emit **multiple syst
 
 ## SplitCacheBreak
 
-`SplitCacheBreak` splits a system prompt on `CacheBreakMarker` and returns the non-empty parts (trimmed). It returns one part when no marker is present, two parts when the marker is present, and omits any empty parts.
+`SplitCacheBreak` splits a system prompt on `CacheBreakMarker` and returns the non-empty parts (trimmed). It returns one part when a non-empty prompt carries no marker, two parts when the marker is present, and omits any empty parts. When the whole input is empty or whitespace-only, every part trims away and it returns `nil` — zero parts, not one empty part.
 
 ```go
 func SplitCacheBreak(systemPrompt string) []string
@@ -121,7 +126,9 @@ stable, dynamic := b.BuildParts()
 | `NewSystemPromptBuilder() *SystemPromptBuilder` | Creates a new system prompt builder. |
 | `Core(content string) *SystemPromptBuilder` | Adds a section that is always included in the system prompt. |
 | `Replace(placeholder, value string) *SystemPromptBuilder` | Registers a trusted placeholder substitution. |
+| `ReplaceAll(substitutions map[string]string) *SystemPromptBuilder` | Registers multiple trusted placeholder substitutions. |
 | `ReplaceData(placeholder, value string) *SystemPromptBuilder` | Registers an untrusted-value substitution (applied last, single pass — see `Builder.ReplaceData`). |
+| `ReplaceDataAll(substitutions map[string]string) *SystemPromptBuilder` | Registers multiple untrusted-value substitutions (see `Builder.ReplaceDataAll`). |
 | `Dynamic(content string) *SystemPromptBuilder` | Adds a section that appears after the cache-break boundary (not cached by providers). Must be called after `CacheBreak()`. |
 | `CacheBreak() *SystemPromptBuilder` | Marks the boundary between stable and dynamic content. |
 | `Build() string` | Returns the full system prompt string with `CacheBreakMarker` between stable and dynamic parts (when `CacheBreak` was called). |
@@ -152,7 +159,7 @@ import (
 func main() {
 	// Build a system prompt with a stable (cacheable) prefix and a dynamic
 	// suffix that changes per request.
-spb := prompt.NewSystemPromptBuilder().
+	spb := prompt.NewSystemPromptBuilder().
 		// Stable, cacheable sections:
 		Core("You are a task execution agent.").
 		Core("Available tools:\nAVAILABLE-TOOLS").
@@ -222,4 +229,4 @@ cfg = prompt.DefaultSampling("qwen")        // Temperature: 1.0, TopP: 0.95, Top
 | `kimi` | all nil (server enforces per model) |
 | default | Temperature 0.5, TopP 0.95 |
 
-`SamplingConfig` is converted by the host into `llm.SamplingDefaults` for `RouterConfig.SamplingFunc`. The router applies the full preset only to executor/default-purpose calls. Routing, compaction, and summarization calls use `llm.DeterministicTemperature` instead (temperature-only, with Google/Qwen safe floors), and each provider filters unsupported fields before serialization. See [LLM Providers → Purpose-aware sampling](llm-providers.md#purpose-aware-sampling).
+`SamplingConfig` is converted by the host into `llm.SamplingDefaults` for `RouterConfig.SamplingFunc`. The router applies the full preset only to executor/default-purpose calls. Routing, compaction, and summarization calls use `llm.DeterministicTemperature` instead (temperature-only, with Google/Kimi/Qwen safe floors), and each provider filters unsupported fields before serialization. See [LLM Providers → Purpose-aware sampling](llm-providers.md#purpose-aware-sampling).

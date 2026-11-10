@@ -6,7 +6,7 @@ The `agents` package provides discovery, parsing, and management of **Subagent P
 import "github.com/v0lka/sp4rk/agents"
 ```
 
-The package mirrors the `skills` package's Manager/Parser design, but is intentionally self-contained: it imports only the Go standard library plus `gopkg.in/yaml.v3` and `log/slog`. It does not depend on any engine package — launching a subagent under a profile, applying its model/tools/max-steps, and enforcing `allow-redelegate` are execution-layer concerns (see [Subagents](subagents.md)).
+The package mirrors the `skills` package's Manager/Parser design, but is intentionally self-contained: it imports only the Go standard library, `gopkg.in/yaml.v3`, and the engine's `safeio` package (which supplies the hardened, non-blocking `AGENT.md` read and its size cap). `safeio` is the `agents` package's only direct engine import, and itself pulls in only `pathutil` — launching a subagent under a profile, applying its model/tools/max-steps, and enforcing `allow-redelegate` are execution-layer concerns (see [Subagents](subagents.md)).
 
 ## AgentManager
 
@@ -39,7 +39,7 @@ func (m *AgentManager) Scan() error
 
 `Scan` walks all discovery directories and loads valid agents. It clears any existing catalog first, so it is safe to call repeatedly (e.g. after agents are added or removed). Directories are walked in **reverse priority order** so that higher-priority entries overwrite lower-priority ones with the same name.
 
-An existing `AGENT.md` that fails parsing or validation is skipped and logged as a warning (`skipped invalid agent`) so a broken profile is visible to operators. Ordinary directories that do not contain `AGENT.md` are debug-level discovery noise and are ignored.
+An existing `AGENT.md` that fails parsing or validation is skipped and logged as a warning (`skipped invalid agent`) so a broken profile is visible to operators. An `AGENT.md` that exceeds the `safeio` read cap is skipped with its own warning (`skipped oversized agent`). Ordinary directories that do not contain `AGENT.md` are debug-level discovery noise and are ignored.
 
 **Symlink following:** `Scan` follows symlinks that point to directories (resolved via `os.Stat`, since `os.ReadDir` reports symlinks as non-directories even when they point to one).
 
@@ -87,6 +87,7 @@ type AgentMetadata struct {
     AllowRedelegate bool   `yaml:"allow-redelegate,omitempty"` // permit nested delegation (default false)
     Hidden          bool   `yaml:"hidden,omitempty"`           // hide from #-autocomplete (default false)
     Color           string `yaml:"color,omitempty"`            // UI accent color for the agent badge
+    Skills          string `yaml:"skills,omitempty"`           // comma-list of required skill names (e.g. "code-review,git-conventions"); "" = none
 }
 ```
 
@@ -105,9 +106,16 @@ Translates the declarative `tools` frontmatter field into the shape a delegating
 | `""` or `"all"` (default; surrounding whitespace tolerated) | `nil`, no error | grant the full mutating toolset (a resolver treats nil as all tools) |
 | `"read-only"` | `"read-only"`, no error | the read-only preset — a conforming delegating resolver grants local-read + remote-read on top of the always-included `system` group, with no MCP groups |
 | comma-list of tool-group tokens (e.g. `"local-read,execute"`) | `[]string`, no error | granted capability groups (kebab-case; underscores normalize); a conforming resolver always adds the `system` group |
-| unknown token, empty item, or duplicate group | error | fail-closed — the token is never silently dropped; a partially-dropped list could widen to the full toolset |
+| unknown token, empty item, duplicate group, or a preset mixed into the comma-list — `"all"`/`"read-only"` are whole-field values only and `cannot be combined with other items` | error | fail-closed — the token is never silently dropped; a partially-dropped list could widen to the full toolset |
 
-Valid group tokens come from `ToolGroupTokens()` (`execute`, `local-read`, `local-write`, `remote-read`, `remote-write`, `system`, `local-mcp`, `remote-mcp`). AGENT.md files are validated at parse time (both `ToolPreferenceWithError()` and the parser apply the same `validateToolsField` rules and messages); the error return guards profiles constructed programmatically.
+Valid group tokens come from `ToolGroupTokens()`, which returns every accepted `tools:` group token in canonical kebab-case, in the same order as `tools.AllToolGroups()` (`execute`, `local-read`, `local-write`, `remote-read`, `remote-write`, `system`, `local-mcp`, `remote-mcp`):
+
+```go
+func ToolGroupTokens() []string
+func NormalizeToolGroupToken(token string) (string, bool)
+```
+
+`NormalizeToolGroupToken` is what implements the "underscores normalize" behaviour in the table above: it canonicalizes a single token, accepting both the kebab and the underscore spelling (`"local-read"` and `"local_read"`) and returning the canonical kebab form, with `false` as the second result for a token that is not a declared tool group. AGENT.md files are validated at parse time (both `ToolPreferenceWithError()` and the parser apply the same `validateToolsField` rules and messages); the error return guards profiles constructed programmatically.
 
 The legacy widening method remains source-compatible:
 
@@ -120,6 +128,22 @@ It calls `ToolPreferenceWithError` and discards the error. Invalid programmatic 
 > **Migration note:** an earlier public draft documented `ToolPreference() (any, error)`. The strict method is now named `ToolPreferenceWithError`; replace `pref, err := profile.ToolPreference()` with `pref, err := profile.ToolPreferenceWithError()`. The one-result `ToolPreference()` method is retained only for compatibility.
 
 > **Migration note:** an earlier form of the `tools:` field accepted comma-separated tool **names** (e.g. `edit_file,bash_exec`). That form is now a validation error — the field accepts group tokens only. Express `edit_file,bash_exec` as `local-write,execute` (and `read_file` as `local-read`). A profile whose `tools:` fails validation is skipped from the catalog and logged as a warning (`skipped invalid agent`) rather than silently dropped.
+
+### RequiredSkills
+
+```go
+func (a *Agent) RequiredSkills() ([]string, error)
+```
+
+Translates the declarative `skills` frontmatter field into the list of skill names a subagent launched under this profile must have activated:
+
+| `skills` value | Returns | Meaning |
+| --- | --- | --- |
+| `""` (absent or empty) | `nil`, no error | the profile requires no particular skills |
+| comma-list of skill names (e.g. `"code-review,git-conventions"`) | `[]string`, no error | trimmed skill names the runtime must have activated |
+| invalid name shape, empty item (stray comma), or duplicate name | error | fail-closed — a typo fails the profile loudly instead of silently changing which skills the subagent gets |
+
+Every item must have the same shape as an agent name (lowercase alphanumeric with hyphens, no leading/trailing hyphens); surrounding whitespace is tolerated. The parser applies the same `validateSkillsField` rules (and messages) at load time, so the parse-time and programmatic paths cannot diverge. This package only parses the names — whether a named skill actually exists is resolved by the delegating runtime against its skill catalog at launch time.
 
 ## AgentDescriptor
 
@@ -163,6 +187,8 @@ Report findings as a structured list. Do not modify files.
 | --- | --- |
 | `name` | Required. Lowercase alphanumeric and hyphens, no leading/trailing hyphens (regex `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`). Must match the parent directory name. |
 | `description` | Required (non-empty). |
+| `tools` | Optional. `"all"`/empty, `"read-only"`, or a comma-list of capability-group tokens (`ToolGroupTokens()`); validated at parse time (`validateToolsField`). |
+| `skills` | Optional. Empty, or a comma-list of skill names with the same shape as `name`; validated at parse time (`validateSkillsField`). |
 | unknown keys | Silently ignored — not-yet-supported frontmatter fields do not break parsing. |
 
 A profile whose `name` does not match its parent directory name is rejected. A missing opening or closing `---` frontmatter delimiter is a parse error; the `---` must be at the start of a line so that `---` inside YAML string values is not mistaken for a delimiter.
@@ -173,7 +199,7 @@ A profile whose `name` does not match its parent directory name is rejected. A m
 func ParseAgent(agentMDPath, dirPath string) (*Agent, error)
 ```
 
-Reads and validates an `AGENT.md` file. `agentMDPath` is the path to `AGENT.md`; `dirPath` is the absolute path to the agent directory (used for `DirPath` and name validation). On validation failure, returns a `*ParseError` describing the problem.
+Reads and validates an `AGENT.md` file. `agentMDPath` is the path to `AGENT.md`; `dirPath` is the absolute path to the agent directory (used for `DirPath` and name validation). On validation failure, returns a `*ParseError` describing the problem. The file is read through `safeio.ReadFile`, which refuses a non-regular `AGENT.md` (e.g. a planted FIFO) without blocking on the open and refuses a file larger than `safeio.DefaultMaxFileSize` (10 MiB) instead of reading it into memory.
 
 ## How a profile configures a subagent
 
@@ -202,9 +228,9 @@ caller := agent.NewModelOverrideCaller(router, agentProfile.Model)
 
 ## Targeting a profile from a plan step
 
-A plan step targets a profile via the `PlanStep.Agent` field (see [Planner](planner.md)). When non-empty, the step runs with that profile's system prompt, tools, max-steps, and model instead of the generic orchestrator defaults. The name is resolved by the execution layer (e.g. the Conductor's agent resolver). `Agent` round-trips through JSON so a declared plan survives blackboard persistence and task continuation.
+A plan step targets a profile via the `PlanStep.Agent` field (see [Planner](planner.md)). When non-empty, the step runs with that profile's system prompt, tools, max-steps, and model instead of the generic orchestrator defaults. The name is resolved by the **host's** execution layer — the SDK ships no resolver, and `orchestration.Conductor` passes `PlanStep.Agent` through untouched. `Agent` round-trips through JSON so a declared plan survives blackboard persistence and task continuation.
 
-`Agent` and the existing `Profile` field (`*planner.AgentProfile`) are independent: `Agent` targets a named, externally-declared profile by directory name, while `Profile` carries inline step-level configuration on the plan object itself.
+`Agent` and the existing `Profile` field are independent: `Profile` is typed `any` on `PlanStep` (it deserializes as `map[string]any`, and consumers convert it to a domain-specific profile such as `*planner.AgentProfile`) and carries inline step-level configuration on the plan object itself, while `Agent` targets a named, externally-declared profile by directory name.
 
 ## Complete Example
 

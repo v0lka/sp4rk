@@ -1,8 +1,13 @@
 # sp4rk Agent SDK
 
+> [!WARNING]
+> **Early Alpha Stage** — This project is under active development and not yet stable.
+> Features, APIs, and internal parts may change without notice.
+> Use at your own risk. Do not rely on it for production or critical workflows.
+
 A Go framework for building AI agent systems with **Plan & Execute orchestration**, tool integration, and multi-provider LLM support.
 
-The SDK gives you a production-grade foundation for agents that reason, act, and self-correct: a ReAct execution loop with cooperative pause, live user steering, resumable interjections, and optional verify-on-edit; a DAG-based planner; a reflector for failure analysis; purpose-aware multi-provider LLM routing; a thread-safe capability-grouped tool registry; Model Context Protocol (MCP) integration; context-window management with automatic compaction; human-in-the-loop hooks; structured event streaming; skill discovery; ONNX-based local embeddings; and prompt-injection defenses.
+The SDK gives you an engine-grade foundation for agents that reason, act, and self-correct: a ReAct execution loop with cooperative pause, live user steering, resumable interjections, and optional verify-on-edit; a DAG-based planner; a reflector for failure analysis; purpose-aware multi-provider LLM routing; a thread-safe capability-grouped tool registry; Model Context Protocol (MCP) integration; context-window management with automatic compaction; human-in-the-loop hooks; structured event streaming; skill discovery; ONNX-based local embeddings; and prompt-injection defenses.
 
 It is a standalone library with no opinion about your UI, storage, or deployment — wire it into a CLI, a desktop app, a server, or a test harness.
 
@@ -19,7 +24,7 @@ It is a standalone library with no opinion about your UI, storage, or deployment
 - **Skill discovery** — a `SkillManager` discovers and parses Agent Skills (agentskills.io specification) from priority-ordered directories and exposes lightweight descriptors for routing.
 - **Subagent Profiles** — an `AgentManager` discovers and parses `AGENT.md` profiles (specialized subagent personas and tool budgets) and serves their directive bodies; a `PlanStep.Agent` targets a named profile whose prompt/tools/max-steps/model are applied to the subagent executing that step.
 - **ONNX embeddings** — a local `Embedder` runs jina-embeddings-v2-small-en through ONNX Runtime for vector search without external API calls.
-- **Prompt injection defense** — untrusted tool output (web, MCP, filesystem) is wrapped in `<untrusted-content>` boundary tags and sanitized before entering LLM context.
+- **Prompt injection defense** — untrusted tool output (web, MCP, filesystem) can be wrapped in `<untrusted-content>` boundary tags and sanitized before entering LLM context. The wrap is a `ContextWindow` opt-in (`InjectionDefenseEnabled`) that the framework does not set — see [Security](security.md).
 
 - **Tool execution-context intelligence** — advisory `ToolJudge` evaluates mutating calls with session-aware caching; `JudgeStrict` performs a fresh, fail-safe assessment for soft confirmation gates. Severity prevents strict automation from overriding hard findings such as blacklist, SSRF, or unassessable-input violations; file-coherence and symlink checks protect session scope. See [Tool Safety & Execution Context](tool-safety.md).
 
@@ -56,9 +61,10 @@ func main() {
 	}
 	defer func() { _ = fw.Shutdown() }()
 
-	// 2. Register the finish tool — the agent signals task completion by
-	//    calling it. Without it the loop runs until the step budget is
-	//    exhausted and returns a "partial" status.
+	// 2. Register the finish tool so it shows up in registry listings and
+	//    descriptors. Completion does not depend on this: the executor appends
+	//    the finish definition to every LLM request when absent and intercepts
+	//    a finish call by name before dispatching to the registry.
 	fw.ToolRegistry().Register(agent.NewFinishTool())
 
 	// 3. Define a system prompt factory.
@@ -114,7 +120,7 @@ go run main.go
 | [security.md](security.md) | Prompt injection defense and untrusted-content wrapping |
 | [tool-safety.md](tool-safety.md) | Advisory/strict `ToolJudge`, severity, session-aware path safety, file coherence, environment info, and symlink detection |
 | [embedding.md](embedding.md) | ONNX-based local embeddings and vector search |
-| [utilities.md](utilities.md) | `pathutil`, `strutil`, `sysproc`, and `ignore` helper packages |
+| [utilities.md](utilities.md) | `pathutil`, `safeio`, `strutil`, `sysproc`, and `ignore` helper packages |
 
 ## Package map
 
@@ -125,8 +131,11 @@ go run main.go
 | `…/agent/reflector` | `Reflector` for execution failure analysis and self-correction |
 | `…/agent/router` | `Router` that classifies requests by domain, complexity, and matched skills (optional semantic tool matching) |
 | `…/llm` | `Router`, `Provider`, `ProviderEntry`, `CallPurpose`/`SamplingDefaults`, `ModelRegistry`, token counting, Anthropic/OpenAI/Google protocol adapters |
+| `…/oneshot` | One-shot structured-output LLM calls with a parse-failure retry loop (`Do[T]`, `Options[T]`, `OnFailurePolicy`) plus tolerant response parsers; leaf package over `llm` |
 | `…/tools` | `Tool` interface, `BaseTool`, capability groups, thread-safe `ToolRegistry`, `ToolPolicy`, `ToolDescriptor`, advisory/strict `ToolJudge`, file coherence, `EnvInfo`, symlink detection |
 | `…/tools/builtins` | Built-in tools: file I/O, shell, glob, ripgrep, web fetch, vector search, facts, checklist; configurable limits/timeouts |
+| `…/tools/builtins/websearch` | The `web_search` tool over a pluggable `SearchProvider` (Brave, Tavily, Exa, DuckDuckGo, SearXNG) |
+| `…/tools/internal/judge_prompts` | Embedded system-prompt text for the tool judges (`JudgeSystem`, `JudgeStrictSystem`, `StepLimitSystem`) via `//go:embed` only — no engine imports. Under `internal/`, so it is not importable by downstream hosts |
 | `…/tools/mcp` | MCP `Gateway`, `Server`, `ServerEntry`, and tool proxying |
 | `…/orchestration` | `Conductor`, `Blackboard`, `Plan`, DAG utilities, `Checkpointer`, orchestration interfaces |
 | `…/planner` | `Planner`, `Config`, `PromptSet`, `AgentProfile` for DAG plan generation |
@@ -136,14 +145,15 @@ go run main.go
 | `…/memory` | `ContextWindow`, compaction strategies (sliding_window, summarization, hierarchical), pruning |
 | `…/security` | Prompt-injection defense: `WrapUntrustedContent`, `StripUntrustedTags` |
 | `…/embedding` | ONNX-based `Embedder`, `Tokenizer`, and chunker for local vector embeddings |
+| `…/safeio` | Hardened, non-blocking filesystem I/O: `Open`/`OpenFile`/`OpenFileNoFollow` refuse FIFOs/sockets/devices instead of hanging inside `open(2)`, `ReadFile`/`ReadFileLimited` cap read size, `WriteFile`/`WriteFileAtomic`/`MkdirAllReal` reject planted symlinks |
 | `…/pathutil` | Reusable filesystem-path algorithms: `IsWithinPath`, `SplitPathComponents`, `ResolveExistingPrefix` |
 | `…/strutil` | String helpers: `TruncateUTF8` and related utilities |
-| `…/ignore` | Multi-root `.gitignore`/`.aiignore` resolver: `Resolver`, `Multi`, `IgnoreChecker` |
-| `…/sysproc` | Child-process console-window suppression (`HideConsole`) + process-tree containment (`AssignKillOnCloseJob`): OR-edits `CREATE_NO_WINDOW` on Windows and assigns started processes to a kill-on-close Job Object; no-op elsewhere. `HideConsole` is stdlib-only; the Windows Job-Object helper depends on `golang.org/x/sys/windows` (behind a `//go:build windows` tag) |
+| `…/ignore` | Multi-root `.gitignore`/`.aiignore` resolver: `Resolver`, `Options`, `Multi`, `IgnoreChecker` |
+| `…/sysproc` | Child-process containment: console-window suppression (`HideConsole`, which OR-edits `CREATE_NO_WINDOW` into `SysProcAttr.CreationFlags`), unix-only process-group placement (`SetProcessGroup`, a no-op on Windows) and cross-platform tree kill (`KillTree`: process-group `SIGKILL` on unix, `taskkill /T /F` on Windows), plus Windows process-tree containment (`AssignKillOnCloseJob`): assigns the already-started process and, by inheritance, its descendant tree to a kill-on-close Job Object; no-op elsewhere. `HideConsole` is stdlib-only; the Windows Job-Object helper depends on `golang.org/x/sys/windows` (behind a `//go:build windows` tag) |
 
 ## Prerequisites
 
-- **Go 1.26+** — the SDK targets the Go version in its `go.mod`.
+- **Go 1.27.3+** — the SDK targets the Go version declared in its `go.mod` (`go 1.27.3`).
 - **At least one LLM API key** — Anthropic (`ANTHROPIC_API_KEY`) or OpenAI (`OPENAI_API_KEY`). The framework requires at least one configured provider.
 - **(Optional) ONNX Runtime** — only if you use the local embedding subsystem for vector search.
 

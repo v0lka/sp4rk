@@ -285,8 +285,119 @@ func AnalyzeShellCommandForJudgeWithDialect(ctx context.Context, lang api.Lang, 
 	if err != nil {
 		return nil, fmt.Errorf("shell analysis: flowsh analyzer init: %w", err)
 	}
-	report := analyzer.AnalyzeWith(lang, params.Command, api.Options{Vars: ShellVarBindingsFrom(ctx)})
+	report := analyzer.AnalyzeWith(lang, shellAnalysisSource(ctx, lang, params.WorkingDirectory, params.Command), api.Options{Vars: ShellVarBindingsFrom(ctx)})
 	return evaluateShellReport(ctx, params.WorkingDirectory, params.Command, lang, report), nil
+}
+
+// shellAnalysisSource renders the source handed to the flowsh analyzer for one
+// shell tool input. For the bash dialect it prepends a literal `cd <base> &&`
+// whenever a resolution base is known — the tool's working_directory, else the
+// session workspace, the same base the containment walk resolves against.
+// The bash frontend tracks the working directory only through an in-script
+// `cd`, so without the prefix every relative path is reasoned about against
+// the offline default PWD "/". Since flowsh v0.7.0 the credential-operand
+// heuristic additionally resolves a relative secret-named operand against
+// that PWD and emits the resolved FSRead (always the safe side: it can add a
+// report entry, never remove one); against the default PWD that resolution
+// fabricates a root-level path the command never reads, which the C9
+// containment walk would count as an out-of-root read and the verification
+// marker would refuse — a benign in-workspace read of, say, a source file
+// named secrets.go would escalate. The prefix is SKIPPED when the command's
+// first statement is already a `cd` that leaves the analyzer PWD at the base
+// (see shellGroundingRedundant): prepending a duplicate cd makes flowsh count
+// the redundant statement in Commands without a CommandCalls entry, and the
+// verification marker's "every statement visibly catalogued" invariant
+// (shellWorkspaceScopedVerification) would read that as an unaccounted
+// command and switch the marker off — breaking exactly the everyday
+// `cd <workspace> && go build ...` verification loop the marker exists for.
+// The `cd` builtin is silent about effects and catalogued marker plumbing, so
+// the prefix neither fires a criterion nor breaks the marker for an in-root
+// base; for an out-of-root base the FSMeta it carries is the honest scope
+// signal. The PowerShell frontend has no PWD-dependent heuristic, so
+// posh_exec input is analysed verbatim. The digest, signature and judge echo
+// keep the ORIGINAL command — only the analyzer's view is grounded.
+func shellAnalysisSource(ctx context.Context, lang api.Lang, workDir, command string) string {
+	if lang != api.LangBash {
+		return command
+	}
+	base := workDir
+	if base == "" {
+		base = WorkspacePathFrom(ctx)
+	}
+	if base == "" {
+		return command
+	}
+	if shellGroundingRedundant(command, base) {
+		return command
+	}
+	return "cd " + shellSingleQuote(base) + " && " + command
+}
+
+// shellGroundingRedundant reports whether the command's first statement is
+// already a `cd` that leaves the analyzer PWD at base — a literal `cd <base>`
+// (quoted or not, trailing slash tolerated) or `cd .` (the shell's working
+// directory IS the base: bash_exec defaults it to the workspace root). After
+// such a cd the analyzer PWD is already grounded, so prepending the prefix
+// would only duplicate the statement — and flowsh catalogs the redundant
+// second cd in Commands without a CommandCalls entry, silently failing the
+// workspace-scoped verification marker's every-statement-accounted invariant.
+// Only the plain leading shape qualifies: an env-assignment prefix
+// (FOO=1 cd …), an option-bearing cd (cd -L …) or any other first statement
+// keeps the prefix — the analysis then degrades to today's duplicate-cd shape
+// (marker off, fail-closed), never to an ungrounded one.
+func shellGroundingRedundant(command, base string) bool {
+	target, ok := shellLeadingCdTarget(command)
+	if !ok {
+		return false
+	}
+	if target == "." {
+		return true
+	}
+	return filepath.Clean(target) == filepath.Clean(base)
+}
+
+// shellLeadingCdTarget extracts the unquoted target word of a leading `cd`
+// statement: after optional blank space the first word must be exactly `cd`
+// and the remainder up to the first statement terminator (`;`, `&`, `|`, a
+// newline) or end of input is the target word, stripped of one layer of
+// simple quotes. ok=false for everything else — a target-less `cd` (HOME),
+// `cd -` (OLDPWD), tilde or variable targets, assignment prefixes, and any
+// non-cd first statement; callers keep the grounding prefix in every
+// ok=false case.
+func shellLeadingCdTarget(command string) (target string, ok bool) {
+	s := strings.TrimLeft(command, " \t\n\r")
+	if !strings.HasPrefix(s, "cd") {
+		return "", false
+	}
+	rest := s[2:]
+	if rest == "" {
+		return "", false // bare `cd` → HOME, not the base
+	}
+	if rest[0] != ' ' && rest[0] != '\t' {
+		return "", false // `cdx`, `cd-x`… — not the cd builtin
+	}
+	raw := strings.TrimLeft(rest, " \t")
+	if i := strings.IndexAny(raw, ";&|\n\r"); i >= 0 {
+		raw = raw[:i]
+	}
+	raw = strings.TrimRight(raw, " \t")
+	switch {
+	case len(raw) >= 2 && raw[0] == '\'' && raw[len(raw)-1] == '\'':
+		raw = raw[1 : len(raw)-1]
+	case len(raw) >= 2 && raw[0] == '"' && raw[len(raw)-1] == '"':
+		raw = raw[1 : len(raw)-1]
+	}
+	if raw == "" || raw[0] == '~' || raw[0] == '$' {
+		return "", false
+	}
+	return raw, true
+}
+
+// shellSingleQuote renders s as one POSIX single-quoted word: an embedded
+// quote is spelled as quote, backslash, quote, quote, so any
+// working-directory path survives the analyzer's parser verbatim.
+func shellSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // DeclaredShellKinder is implemented by shell-exec tools that carry a

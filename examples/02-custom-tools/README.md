@@ -33,6 +33,8 @@ result, err := fw.RunF(ctx).System(systemPrompt).Ask(task)
 
 ## Architecture
 
+The registry the **classic** variant (`main.go`) builds — the **fluent** variant's `FileTools()` bundle registers three more file tools (`edit_file`, `glob`, `create_directory`):
+
 ```
                     ToolRegistry
                    ┌──────────────────────────────────┐
@@ -72,7 +74,7 @@ interface rather than enlarging `Tool`:
 
 ```go
 type GroupProvider interface {
-    Group() tools.ToolGroup
+    Group() ToolGroup
 }
 ```
 
@@ -117,7 +119,7 @@ The calculator uses `PolicyAlwaysAllow` because it's read-only and safe. Destruc
 
 ### 3. IsUntrusted
 
-`IsUntrusted() bool` marks whether the tool returns external data (web, MCP, filesystem). When `true`, the executor wraps the tool's output in `<untrusted-content>` tags before injecting it into the LLM context as a prompt-injection defence. The calculator returns trusted internal data, so it's `false` (the `BaseTool` default).
+`IsUntrusted() bool` marks whether the tool returns external data (web, MCP, filesystem). When `true`, `memory.ContextWindow` wraps the tool's output in `<untrusted-content>` tags before it enters the LLM context as a prompt-injection defence — but only when its `InjectionDefenseEnabled` flag is set. The Framework leaves that flag off and `sp4rk.Config` does not expose it, so a Framework-driven run does not wrap automatically; wrap explicitly inside the tool's `Execute` with `security.WrapUntrustedContent` instead (see **example 10**). The calculator returns trusted internal data, so it's `false` (the `BaseTool` default).
 
 ### 4. Registering built-in tools
 
@@ -150,6 +152,7 @@ This context propagates through the Conductor → Executor → tool execution, s
 | `main_fluent.go`     | Fluent wiring: `sp4rk.NewF` + bundled tools (`//go:build fluent`) |
 | `calculator_tool.go` | The custom `CalculatorTool` (shared by both variants — tagless) |
 | `calculator.go`      | Arithmetic expression evaluator (implementation detail, not SDK-specific) |
+| `calculator_test.go` | Local contract tests for the evaluator and `CalculatorTool.Execute` (tagless, no network) |
 
 ## Prerequisites
 
@@ -162,14 +165,14 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 ### Fluent (recommended)
 
 ```bash
-cd sdk/examples/02-custom-tools
+cd examples/02-custom-tools
 go run -tags fluent .
 ```
 
 ### Classic API (advanced control)
 
 ```bash
-cd sdk/examples/02-custom-tools
+cd examples/02-custom-tools
 go run .
 ```
 
@@ -185,6 +188,12 @@ result to result.txt, and read it back to verify the file contains "491".
 File /tmp/sp4rk-example-02-123456/result.txt contains:
 491
 ```
+
+The **classic** variant (`go run .`) additionally prints one `[auto-approving <tool>]`
+line for every confirmation-gated tool call (its `ConfirmFunc` logs before returning
+`tools.ConfirmAllowOnce`), so lines such as `[auto-approving write_file]` are
+interleaved with the agent's own output. The **fluent** variant uses
+`.AutoApprove()`, which satisfies the same fail-closed registry silently.
 
 ## Next
 

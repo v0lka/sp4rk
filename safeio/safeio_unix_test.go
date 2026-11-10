@@ -57,6 +57,62 @@ func TestOpen_RefusesCharacterDevice(t *testing.T) {
 	}
 }
 
+// TestOpenFileNoFollow_AppendCreateDoesNotWriteThroughLink pins the
+// write-open shape the append codec uses: O_RDWR|O_CREATE|O_APPEND against a
+// planted symlink must refuse, and the link's target must keep its exact
+// bytes — write_unix_test.go pins the refusal itself; this one pins that
+// nothing reached the victim through the refused open.
+func TestOpenFileNoFollow_AppendCreateDoesNotWriteThroughLink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "victim")
+	if err := os.WriteFile(target, []byte("original"), 0o644); err != nil {
+		t.Fatalf("seed victim: %v", err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("plant symlink: %v", err)
+	}
+
+	f, err := OpenFileNoFollow(link, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o644)
+	if err == nil {
+		_ = f.Close()
+		t.Fatal("append-create open followed a final symlink, want an ELOOP refusal")
+	}
+	if !errors.Is(err, syscall.ELOOP) {
+		t.Fatalf("OpenFileNoFollow err = %v, want a *fs.PathError wrapping syscall.ELOOP", err)
+	}
+
+	data, rerr := os.ReadFile(target)
+	if rerr != nil || string(data) != "original" {
+		t.Fatalf("victim was written through the link: %q, %v", data, rerr)
+	}
+}
+
+// TestOpenFileNoFollow_CreateRefusesDanglingLinkWithoutCreatingTarget pins
+// that O_CREATE against a DANGLING symlink refuses and leaves the link's
+// target uncreated — an O_NOFOLLOW open must never materialize the
+// destination.
+func TestOpenFileNoFollow_CreateRefusesDanglingLinkWithoutCreatingTarget(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "victim")
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("plant symlink: %v", err)
+	}
+
+	f, err := OpenFileNoFollow(link, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o644)
+	if err == nil {
+		_ = f.Close()
+		t.Fatal("create open followed a dangling symlink, want an ELOOP refusal")
+	}
+	if !errors.Is(err, syscall.ELOOP) {
+		t.Fatalf("OpenFileNoFollow err = %v, want a *fs.PathError wrapping syscall.ELOOP", err)
+	}
+	if _, serr := os.Stat(target); !os.IsNotExist(serr) {
+		t.Fatalf("dangling link's target must stay uncreated: %v", serr)
+	}
+}
+
 // TestIsRegular_FifoDoesNotBlock mirrors the same guarantee through IsRegular.
 func TestIsRegular_FifoDoesNotBlock(t *testing.T) {
 	fifo := filepath.Join(t.TempDir(), "fifo")

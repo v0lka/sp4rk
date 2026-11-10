@@ -88,7 +88,7 @@ Every built-in call site composes `Do` with the same metadata profile (see [ADR-
 | Call site | `Kind` | Parse | Retry hint | Final refusal |
 | --------- | ------ | ----- | ---------- | ------------- |
 | `agent/router.Router.Route` | `routing_decision` | `oneshot.ParseJSON[RoutingDecision]` + `validateRoutingDecision` | the active JSON output schema (incl. `matched_tools`) | `OnFailureError` → routing-decision-unparseable error |
-| `planner.Planner` (Plan/Replan/PlanContinuation) | `plan_generation` | JSON → `*orchestration.Plan` + DAG validation | `RetryHintFn`: two feedback texts (invalid JSON/DAG error vs zero steps), underlying error verbatim | `OnFailureError` → plan-parse error |
+| `planner.Planner` (Plan/Replan/PlanContinuation) | `plan_generation` | JSON → `*orchestration.Plan` + DAG validation | `RetryHintFn`: three feedback texts (invalid JSON vs zero steps (`errPlanZeroSteps`) vs DAG-validation failure (`errPlanInvalidDAG`)), underlying error verbatim | `OnFailureError` → plan-parse error |
 | `agent/reflector.Reflector.Reflect` | `reflection` | `parseReflectionResponse` + sanitize layer | static `reflectionRetryHint` | `OnFailureError` → reflection-parse error |
 | `tools.ToolJudge.Judge` (advisory) | `judge_advisory` | `ParseKeyLines(verdict, reason)` + `SplitInline` + JSON fallback | `advisoryJudgeRetryHint` | `OnFailureFailSafe` → `VerdictConfirm` + unparsed-reason |
 | `tools.ToolJudge.JudgeStrict` | `judge_strict` | strict `VERDICT`/`REASON` parser | `strictJudgeRetryHint` | `OnFailureFailSafe` → `VerdictConfirm` |

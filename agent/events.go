@@ -47,6 +47,21 @@ type Events interface {
 	ExecutorDiagnostic(stepNum int, event string, details map[string]any)
 }
 
+// ToolCallIDEvents optionally lets an emitter return the ID it assigned to a
+// call event. The executor threads this ID into only that call's tool context.
+// An Events implementation without this method keeps its existing behavior.
+type ToolCallIDEvents interface {
+	ToolCallWithID(stepNum, callIdx int, toolName, argsPreview, source string) string
+}
+
+func emitToolCallWithID(emitter Events, stepNum, callIdx int, toolName, argsPreview, source string) string {
+	if withID, ok := emitter.(ToolCallIDEvents); ok {
+		return withID.ToolCallWithID(stepNum, callIdx, toolName, argsPreview, source)
+	}
+	emitter.ToolCall(stepNum, callIdx, toolName, argsPreview, source)
+	return ""
+}
+
 // NoopEvents is a no-op implementation of Events.
 type NoopEvents struct{}
 

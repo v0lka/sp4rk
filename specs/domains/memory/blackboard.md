@@ -82,15 +82,15 @@ type Attachment struct {
 
 ### MapBlackboard
 
-`NewMapBlackboard(opts ...MapBlackboardOption)` is the reference thread-safe, map-backed implementation — the default for in-memory tasks. `WithMaxSummaryLen(n)` caps auto-generated step summaries (default `500` characters; after skipping leading blank lines and markdown headings, the first paragraph up to `n` chars, `…` when truncated). It also exposes `SetStepResultRaw`, `SetFacts`, and `SetAttachments`, used by the persistence layer to hydrate state without regenerating summaries.
+`NewMapBlackboard(opts ...MapBlackboardOption)` is the reference thread-safe, map-backed implementation — the default for in-memory tasks. `WithMaxSummaryLen(n)` caps auto-generated step summaries (default `500` characters; after skipping leading blank lines and markdown headings, the first paragraph up to `n` chars, `…` when truncated). It also exposes `SetStepResultRaw`, `SetFacts`, `SetAttachments`, and `MaxSummaryLen` (reads back the configured summary cap), used by the persistence layer to hydrate state without regenerating summaries.
 
 ### Adapters
 
-Three small adapters wrap a `Blackboard` as the `agent.*Store` interfaces consumed by built-in tools. The [Conductor](../orchestration/conductor.md) injects these into the context automatically:
+Four small adapters wrap a `Blackboard` as the `agent.*Store` interfaces consumed by built-in tools. The [Conductor](../orchestration/conductor.md) injects these into the context automatically:
 
 | Adapter | Exposes | Consumer tool |
 | ------- | ------- | ------------- |
-| `NewStepOutputStore` | successful step outputs (only error-free steps), deterministic step-ID order | `read_step_output` / `list_step_outputs` |
+| `NewStepOutputStore` | error-free steps with non-empty output, plus explicit paused-checkpoint markers (`agent.ErrPaused` → `[paused checkpoint — no final output yet]`), deterministic step-ID order | `read_step_output` / `list_step_outputs` |
 | `NewFactStore` | fact memory | `store_fact` / `search_facts` |
 | `NewAttachmentStore` | user-attached files converted to markdown | `read_attachment` |
 | `NewFinalResultStore` | the prior task's final result | `read_final_result` (recovery for continuation agents) |
@@ -107,13 +107,13 @@ type Checkpointer interface {
 }
 ```
 
-`CheckpointedBlackboard` wraps a `MapBlackboard` and persists every write through a `Checkpointer`. All persistence calls are **best-effort**: errors are logged but do not propagate, and operations run on a single background worker goroutine with a timeout and panic recovery, so a slow or panicking backend cannot hang the agent. `SetOnChanged(fn)` invokes a callback after successful writes; `Shutdown()` closes the persistence channel and waits for the worker (always call this to prevent goroutine leaks).
+`CheckpointedBlackboard` wraps a `MapBlackboard` and persists every write through a `Checkpointer`. All persistence calls are **best-effort**: errors are logged but do not propagate, and operations run on a single background worker goroutine with a timeout and panic recovery, so a slow or panicking backend cannot hang the agent. `SetOnChanged(fn)` invokes a callback after successful writes; `SetPersistContext(ctx)` overrides the context used for background persistence calls (defaults to the context supplied at construction); `ID()` returns the checkpoint identifier; `Shutdown()` closes the persistence channel and waits for the worker (always call this to prevent goroutine leaks).
 
 `RestoreBlackboard(ctx, id, cp, logger, timeout, opts)` loads state from a `Checkpointer` and hydrates a fresh `CheckpointedBlackboard` (returns `nil, nil` when the checkpoint does not exist). When no `Checkpointer` is configured, persistence is disabled.
 
 ### DAG data model
 
-`Plan` is a DAG of `PlanStep`s (`ID`, `Summary`, `Description`, `DependsOn`, `Parallelizable`, `EstimatedTools`, `Profile`). `CompletedStep` / `StepResult` record an executed step's output, error, and full executor trajectory (`Steps`). The trajectory is the evidence reflectors and evaluators use. See [../orchestration/planner.md](../orchestration/planner.md) for plan generation.
+`Plan` is a DAG of `PlanStep`s (`ID`, `Summary`, `Description`, `DependsOn`, `Parallelizable`, `EstimatedTools`, `Agent`, `Profile`). `Agent` (`json:"agent,omitempty"`) names a Subagent Profile to execute the step and round-trips persistence. `CompletedStep` / `StepResult` record an executed step's output, error, and full executor trajectory (`Steps`). The trajectory is the evidence reflectors and evaluators use. See [../orchestration/planner.md](../orchestration/planner.md) for plan generation.
 
 ## Error Handling
 
@@ -131,7 +131,7 @@ type Checkpointer interface {
 - `RemoveAttachment` zeroes the removed slot so a removed attachment's `MarkdownContent` is eligible for garbage collection.
 - `StepResult` writes defensively copy the `Steps` trajectory on both write and read (no aliasing with the caller's `Steps` slice — one level deep; nested slice fields inside a `Step` remain shared, so step contents must be treated as immutable); writing a step ID that already has a result replaces the previous result — pause/resume and re-execution paths rely on the latest execution's result winning
 - `CheckpointedBlackboard` persistence is best-effort and never blocks the agent on a slow backend.
-- `Shutdown()` is idempotent and always closes the persistence worker.
+- `Shutdown()` is idempotent (`sync.Once`); its drain wait is bounded by a 30-second grace period, after which a stuck worker is abandoned and logged.
 
 ## Related Specs
 

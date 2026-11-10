@@ -1,0 +1,10 @@
+{
+  "entries": [
+    {
+      "id": "GO-2026-6911",
+      "module": "github.com/mark3labs/mcp-go",
+      "reason": "SSRF + credential leak via an unvalidated Location header in mcp-go's HTTP client transports. The flagged behavior is not exercised in this build: mcp-go's transports are constructed at exactly one site, tools/mcp/server.go connectHTTP, which ALWAYS installs an origin-pinned CheckRedirect (tools/mcp/redirect.go originPinnedClient) before the transport is started — on BOTH the Streamable HTTP leg (WithHTTPBasicClient) and the SSE fallback leg (WithHTTPClient), covering the host-supplied ServerConfig.HTTPClient (shallow-copied, never mutated) as well as the built-in boundedStreamHTTPClient default. The library's own unpinned default client (a nil CheckRedirect) is therefore never the client any request travels on, so a trusted-but-redirecting endpoint cannot carry the operator's headers — or, on 307/308, the JSON-RPC body — off the endpoint's origin: cross-host, subdomain, port-change, https->http-downgrade and non-http(s) redirects are refused before any header or body is replayed (spec: specs/domains/tool-system/mcp-gateway.md). No upstream fix exists — v0.45.0 is unfixed and the vulnerability database records 'Fixed in: N/A' — so the residual risk is regression, not current exposure: tools/mcp/redirect_test.go pins the policy's behavior and tools/mcp/transport_pinning_test.go fails any new transport construction site that omits the pinning. Bump mcp-go to the first release whose transport sets a safe default CheckRedirect, then DELETE this entry.",
+      "review_by": "2027-05-07"
+    }
+  ]
+}

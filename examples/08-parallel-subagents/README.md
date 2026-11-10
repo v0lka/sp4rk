@@ -3,7 +3,7 @@
 The SDK exposes a low-level **parallel-execution primitive** that no other
 example touches: `agent.RunSubAgent` / `agent.RunSubAgentsParallel`. (The
 `Conductor` and `fw.TaskF` execute plan steps **sequentially** — the
-`PlanStep.Parallelible` flag is defined but never consumed by the engine.)
+`PlanStep.Parallelizable` flag is defined but never consumed by the engine.)
 
 This example demonstrates that primitive directly: two genuinely independent
 file-generation tasks run **concurrently**, each in its own goroutine.
@@ -13,7 +13,7 @@ This example ships in **two variants**:
 | Variant     | File            | Command                 | Notes                                            |
 |-------------|-----------------|-------------------------|--------------------------------------------------|
 | **Fluent**  | `main_fluent.go`| `go run -tags fluent .` | Fluent assembly (`NewF`) + classic `RunSubAgentsParallel` escape |
-| **Classic** | `main.go`       | `go run .`              | Low-level: `RunSubAgent` per goroutine, results in completion order |
+| **Classic** | `main.go`       | `go run .`              | Low-level: `RunSubAgent` per goroutine, each result stored at its task index, printed in input order |
 
 See [`docs/subagents.md`](../../docs/subagents.md).
 
@@ -22,7 +22,7 @@ See [`docs/subagents.md`](../../docs/subagents.md).
 - Why an `Executor` cannot be shared across goroutines (and why each subagent needs its own)
 - How to build a per-subagent `Executor` + `ContextManager` via `fw.ContextFactory()`
 - `agent.RunSubAgent` (one subagent, returns a result **channel**) vs. `agent.RunSubAgentsParallel` (many, blocks, input-order results)
-- The `SubAgentResult` contract (`StepID`, `Output`, `Error`, `Steps`)
+- The `SubAgentResult` contract (`StepID`, `Output`, `Error`, `Steps`, `Summary`)
 
 ## The model
 
@@ -40,7 +40,9 @@ Each `RunSubAgent` call:
 1. emits `SubAgentLaunch(stepID, taskDesc)`,
 2. injects the task description + step ID into the context,
 3. runs `executor.Run` in the goroutine,
-4. emits `SubAgentComplete(stepID, success, duration, errMsg)`,
+4. emits `SubAgentComplete(stepID, success, duration, errMsg)` — or, **instead**,
+   `SubAgentPaused(stepID, duration)` when the run hit a cooperative pause
+   (`agent.ErrPaused`), a recoverable checkpoint rather than a failure,
 5. sends one `SubAgentResult` on a buffered (cap 1) channel and closes it.
 
 The result channel is **always closed** (via `defer`), so receivers never block
@@ -48,8 +50,12 @@ forever — even after context cancellation.
 
 ### Manual vs. parallel collection
 
-- **`RunSubAgent`** (classic variant) returns one channel per subagent. Reading
-  them yourself lets you observe results in **completion order**.
+- **`RunSubAgent`** (classic variant) returns one channel per subagent. A
+  `select`-based reader over those channels *would* let you observe results in
+  **completion order** — but this example instead stores each result at its own
+  pre-allocated task index (`results[i] = <-ch`, one writer per index) and then
+  ranges over the slice, so the order it prints is **input order**, identical to
+  `RunSubAgentsParallel`.
 - **`RunSubAgentsParallel`** (fluent variant) collects all results and returns
   them in **input order**: a slow agent blocks later results from being returned.
 
@@ -57,7 +63,7 @@ forever — even after context cancellation.
 
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
-cd sdk/examples/08-parallel-subagents
+cd examples/08-parallel-subagents
 go run -tags fluent .   # or: go run .
 ```
 
@@ -78,4 +84,4 @@ ch := agent.RunSubAgent(stepCtx, …)
 // after <-ch: store.Steps() holds the full ReAct trajectory
 ```
 
-This is the same mechanism the Reflector uses to analyze a failed step.
+The `Reflector` does **not** read this store: `Reflector.Reflect(ctx, trajectory, plan, prevReflections)` takes the trajectory as an explicit parameter (see example 06). The store exists so that *tools* running inside the loop — a host-supplied `reflect` tool, for instance — can read the current trajectory from context.

@@ -14,7 +14,8 @@ execution*: a verification driver pointed at code outside the trusted session
 roots — `npx vitest run /tmp/debug.test.ts`,
 `./node_modules/.bin/vitest run /tmp/x.test.ts` — carried no dedicated reason.
 
-flowsh v0.4.0 (`bind/runner.go`) resolves package runners and
+flowsh (v0.4.0 at decision time; go.mod pins v0.6.0 today; `bind/runner.go`)
+resolves package runners and
 `node_modules/.bin` wrappers onto the driven binary's knowledge-base signature.
 Those calls therefore became bounded — they no longer fell to the C6 unbounded
 reason — yet their out-of-root operand still had no criterion of its own. The

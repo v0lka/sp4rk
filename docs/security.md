@@ -34,7 +34,7 @@ Wrapped content looks like:
 func WrapUntrustedContent(content, source string, metadata map[string]string) string
 ```
 
-`WrapUntrustedContent` wraps content in `<untrusted-content>` XML tags with a `source` attribute identifying the tool that produced the data. Optional metadata entries are added as additional XML attributes (values are quote-escaped).
+`WrapUntrustedContent` wraps content in `<untrusted-content>` XML tags with a `source` attribute identifying the tool that produced the data. Optional metadata entries are added as additional XML attributes; keys must be valid XML attribute names (`^[A-Za-z][A-Za-z0-9_-]*$` — non-matching keys are silently dropped), and both the `source` and the metadata values are XML-escaped (`&`, `<`, `>`, `"`). Metadata attributes are emitted in sorted-key order.
 
 The content is **first sanitized** via `StripUntrustedTags` to prevent tag breakout attacks — an attacker cannot close the wrapper early by embedding a literal `</untrusted-content>` inside their payload.
 
@@ -78,7 +78,7 @@ cleaned := security.StripUntrustedTags(input)
 
 The prompt injection defense integrates with the memory package's `ContextWindow`. When `NewContextWindow` is called with `InjectionDefenseEnabled: true`, tool outputs from tools that return external data are automatically wrapped before being added to the prompt.
 
-A tool marks its output as untrusted by setting the step's `IsUntrusted` flag. Tools that return external data — web fetchers, MCP gateways, filesystem readers of untrusted paths — set this flag so their output is wrapped:
+A tool declares its output untrusted via `tools.BaseTool.Untrusted`, surfaced through the `Tool.IsUntrusted()` method. `ToolRegistry.IsToolUntrusted(name)` reports it — returning `true` for every MCP-sourced tool regardless of that value — and the executor copies the result onto the step's `IsUntrusted` flag. Tools that return external data — web fetchers, MCP gateways, filesystem readers of untrusted paths — set this flag so their output is wrapped:
 
 ```go
 cw := memory.NewContextWindow(memory.ContextWindowConfig{
@@ -93,6 +93,8 @@ cw := memory.NewContextWindow(memory.ContextWindowConfig{
 ```
 
 When `BuildPrompt` assembles the step history, each tool message whose `IsUntrusted` flag is set is passed through `security.WrapUntrustedContent` with the tool name as the `source`. The wrapping is applied **after** history mutation and pruning, so the defense always wraps the final content the model sees.
+
+> **Note:** this is a `ContextWindow`-level opt-in. `sp4rk.Framework` builds its `ContextWindow` internally and does **not** set `InjectionDefenseEnabled` (`sp4rk.Config` exposes no field for it), so on the Framework path the automatic wrap is off — call `security.WrapUntrustedContent` yourself inside the tool's `Execute` (as example 10 does), or construct the `ContextWindow` directly with the flag set.
 
 This guarantee holds across compaction. The compaction strategies build verbatim tool messages that bypass the `BuildPrompt` wrap, so the `ContextWindow` re-wraps any tool message in the frozen compacted prefix whose source step was flagged `IsUntrusted`. Untrusted output never re-enters context without the boundary.
 
@@ -122,7 +124,7 @@ MCP servers are untrusted; a malicious or compromised server could advertise a t
 
 ## MCP stdio environment isolation
 
-MCP servers run arbitrary third-party commands. To avoid leaking host secrets (LLM API keys, proxy credentials) into every stdio child process, stdio servers inherit only an **allowlisted** subset of the parent environment — rather than the full `os.Environ()`. The allowlist covers what a process needs to boot and reach the network: `PATH`, `HOME`, `USER`, `SHELL`, `USERPROFILE`, `LANG`, `TERM`, `TMPDIR`, `TEMP`, `TMP`, `LC_*` locale variables, Windows essentials (`APPDATA`, `LOCALAPPDATA`, `SystemRoot`, `ComSpec`, `PATHEXT`), CA trust anchors (`SSL_CERT_FILE`, `SSL_CERT_DIR`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`), Python/conda activation variables (`VIRTUAL_ENV`, `CONDA_*`), and proxy configuration (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `ALL_PROXY`, plus lowercase spellings). Proxy variables are forwarded with any credentials embedded in their userinfo component stripped, so an authenticated proxy URL never leaks its password into the child. Anything else a server needs must be declared explicitly in its `ServerEntry.Env`; explicit entries are applied on top and always win. See [MCP integration](mcp-integration.md#stdio-transport) for configuration details.
+MCP servers run arbitrary third-party commands. To avoid leaking host secrets (LLM API keys, proxy credentials) into every stdio child process, stdio servers inherit only an **allowlisted** subset of the parent environment — rather than the full `os.Environ()`. The allowlist covers what a process needs to boot and reach the network: `PATH`, `HOME`, `USER`, `SHELL`, `USERPROFILE`, `LANG`, `TERM`, `TMPDIR`, `TEMP`, `TMP`, `LC_*` locale variables, Windows essentials (`APPDATA`, `LOCALAPPDATA`, `SystemRoot`, `ComSpec`, `PATHEXT`), CA trust anchors (`SSL_CERT_FILE`, `SSL_CERT_DIR`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`), Python/conda activation variables (`VIRTUAL_ENV`, plus the exact conda keys `CONDA_PREFIX`, `CONDA_DEFAULT_ENV`, `CONDA_SHLVL`, `CONDA_PREFIX_1`, `CONDA_PROMPT_MODIFIER`, `CONDA_EXE`, `CONDA_PYTHON_EXE`), and proxy configuration (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `ALL_PROXY`, plus lowercase spellings). Only `LC_` is prefix-matched; every other allowlist entry is an exact name match, compared case-insensitively on Windows and case-sensitively elsewhere. Proxy variables are forwarded with any credentials embedded in their userinfo component stripped, so an authenticated proxy URL never leaks its password into the child. Anything else a server needs must be declared explicitly in its `ServerEntry.Env`; explicit entries are applied on top and always win. See [MCP integration](mcp-integration.md#stdio-transport) for configuration details.
 
 ## Harmless device-path exemption
 

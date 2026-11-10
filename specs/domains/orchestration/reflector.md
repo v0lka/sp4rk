@@ -13,7 +13,7 @@ Provides structured self-correction. After a step fails, a `Reflector` analyses 
 
 ## Behavior
 
-The `Reflector` is a stateless wrapper around an `LLMCaller`: each `Reflect` call sends the trajectory, the plan, and any prior reflections to the LLM and parses the JSON response into an `orchestration.Reflection`.
+The `Reflector` is a stateless wrapper around an `LLMCaller`: stateless across `Reflect` calls except its configuration (system prompt, footer, reasoning effort). Each `Reflect` call sends the trajectory, the plan, and any prior reflections to the LLM and parses the JSON response into an `orchestration.Reflection`. `SetReasoningEffort` mutates that persistent configuration and must not race an in-flight `Reflect`.
 
 ### Config
 
@@ -45,7 +45,7 @@ func (r *Reflector) Reflect(ctx, trajectory []agent.Step, plan *orchestration.Pl
 
 ### How the trajectory is built
 
-The reflector constructs a user message presenting the trajectory in step-by-step **Thought / Action / Observation** format. When a plan is provided, it is appended as a section listing each step's ID, description, and dependencies. The trajectory is captured by injecting an `agent.TrajectoryStore` into the context before running the executor; the executor syncs its step history to the store at each iteration, so the full trajectory is available after the run.
+The reflector constructs a user message presenting the trajectory in step-by-step **Thought / Action / Observation** format. The Action entry includes the tool `Input` on its own line when present. Observations flagged `step.IsUntrusted` are wrapped in untrusted-content boundary tags via `security.WrapUntrustedContent(obs, step.Action.Name, nil)` before entering the reflection prompt, mirroring the ContextWindow defense — omitting this would let a malicious tool observation inject instructions into the reflection call. When a plan is provided, it is appended as a section listing each step's ID, description, and dependencies. The trajectory is captured by injecting an `agent.TrajectoryStore` into the context before running the executor; the executor syncs its step history to the store at each iteration, so the full trajectory is available after the run.
 
 ### Previous reflections
 
@@ -87,12 +87,12 @@ Reflections persist on the `orchestration.Blackboard` (`AddReflection` appends; 
 
 ## Error Handling
 
-- Returns an error if the LLM call fails (transport errors are never retried here — provider-level retry is the Router's), returns nil, or stays unparseable after the one-shot client's repair loop: exactly two corrective nudges (assistant echo of the failed output + a `[System]` user message restating the required JSON schema — see [../oneshot.md](../oneshot.md)), then a final refusal wrapping the last parse error. The sanitize layer (below) is untouched by the repair loop.
+- Returns an error if the LLM call fails (transport errors are never retried here — transport retry, on the same active provider, is owned by the `llm.Router`, the LLM router; provider switching is an explicit `SetModel` operation, not automatic failover), returns nil, or stays unparseable after the one-shot client's repair loop: exactly two corrective nudges (assistant echo of the failed output + a `[System]` user message restating the required JSON schema — see [../oneshot.md](../oneshot.md)), then a final refusal wrapping the last parse error. The sanitize layer (below) is untouched by the repair loop.
 - An unrecognised/empty `SuggestedAction` is normalized to `"retry"` rather than treated as an error.
 
 ## Invariants
 
-- The `Reflector` is stateless across calls; all context is passed explicitly.
+- The `Reflector` is stateless across `Reflect` calls except its configuration (system prompt, footer, reasoning effort); all other context is passed explicitly. `SetReasoningEffort` mutates persistent configuration and must not race an in-flight `Reflect`.
 - `agent/reflector.Reflector` satisfies `orchestration.Reflector` (compile-time check).
 - `Reflection.Timestamp` is always set by the reflector.
 - `SuggestedAction` is always one of `"retry"` / `"replan"` / `"abort"` after parsing.

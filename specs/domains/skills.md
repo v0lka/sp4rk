@@ -10,6 +10,7 @@ Discovery, parsing, and serving of Agent Skills following the open agentskills.i
 - `github.com/v0lka/sp4rk/skills` (parsing) — `Skill`, `SkillMetadata`, `SkillDescriptor`, `ParseSkill`, `ParseError`
 - `github.com/v0lka/sp4rk/skills` — `ReadSkillResourceTool`, `SkillPathResolver`
 - `github.com/v0lka/sp4rk/pathutil` — `IsWithinPath`, `ResolveExistingPrefix` (used by `SafeResolvePath`)
+- `github.com/v0lka/sp4rk/tools` — `IsWithinRoot`, `CaseInsensitivePathsFrom` (case-aware containment used by `SafeResolvePath`)
 
 ## Core Types
 
@@ -46,7 +47,8 @@ NewSkillManager(dirs []string, logger)         // dirs in priority order, highes
   │
   ├─ Scan()                                    // walks dirs in reverse priority order so
   │      higher-priority entries overwrite lower-priority ones of the same name;
-  │      invalid SKILL.md files are logged at debug and skipped
+  │      an oversized SKILL.md (safeio.ErrTooLarge) is logged at warn and
+  │      skipped, other parse errors are logged at debug and skipped
   │        ├─ follows directory symlinks
   │        └─ ParseSkill each SKILL.md → validate → catalog
   │
@@ -59,7 +61,7 @@ NewSkillManager(dirs []string, logger)         // dirs in priority order, highes
 
 ## SKILL.md format & validation
 
-A `SKILL.md` is YAML frontmatter (delimited by `---`) followed by a markdown body. `ParseSkill(skillMDPath, dirPath)` validates and returns a `*Skill` or a `*ParseError`.
+A `SKILL.md` is YAML frontmatter (delimited by `---`) followed by a markdown body. `ParseSkill(skillMDPath, dirPath)` validates and returns a `*Skill` or a `*ParseError`. The file is read via `safeio.ReadFile`, which refuses non-regular files (FIFOs/devices) without blocking and rejects files over the 10 MiB `safeio.DefaultMaxFileSize` cap with `safeio.ErrTooLarge`; a read failure returns a wrapped error (not a `*ParseError`), while frontmatter/validation failures return `*ParseError`.
 
 | Field | Rule |
 | ----- | ---- |
@@ -71,16 +73,16 @@ A skill whose `name` does not match its parent directory name is rejected.
 
 ## SafeResolvePath
 
-`SafeResolvePath(baseDir, relPath)` resolves a relative path within a base directory, preventing path traversal. It is used by both `SkillManager` and `ReadSkillResourceTool` to safely access skill-bundled resources:
+`SafeResolvePath(ctx, baseDir, relPath) (string, error)` resolves a relative path within a base directory, preventing path traversal. The context carries the session case-sensitivity flag; a nil `ctx` falls back to plain `pathutil` containment. It is used by both `SkillManager` and `ReadSkillResourceTool` to safely access skill-bundled resources:
 
 1. Cleans `baseDir`; if `baseDir` itself is a symlink, resolves it (but does not resolve ancestor symlinks like macOS `/var → /private/var`, preserving textual path consistency).
 2. Joins and cleans the relative path.
 3. Resolves symlinks in the joined path to their real filesystem paths (through the longest existing prefix via `pathutil.ResolveExistingPrefix`), so partially-existing paths are still symlink-checked — no textual-only fallback.
-4. Verifies the resolved path is within `baseDir` via `pathutil.IsWithinPath`; returns an error if it escapes.
+4. Verifies the resolved path is within `baseDir` via the case-sensitivity-aware `tools.IsWithinRoot(ctx, base, abs)` when `ctx` is non-nil (session flag from `tools.CaseInsensitivePathsFrom`); with a nil `ctx` it falls back to `pathutil.IsWithinPath`. Returns an error if it escapes.
 
 ## ReadSkillResourceTool
 
-`read_skill_resource` reads resource files from activated skill directories. It is constructed with a `SkillPathResolver` (`func(ctx, skillName) (dirPath string, ok bool)`) that resolves a skill name to its directory path, carrying per-session activation state. It uses `SafeResolvePath` to prevent traversal, so an agent cannot read files outside a skill's directory. Skill resources are read-only and safe, so the tool uses an always-allow policy.
+`read_skill_resource` reads resource files from activated skill directories. It is constructed with a `SkillPathResolver` (`func(ctx, skillName) (dirPath string, ok bool)`) that resolves a skill name to its directory path, carrying per-session activation state. It uses `SafeResolvePath` to prevent traversal, so an agent cannot read files outside a skill's directory. Resource reads go through `safeio.ReadFile` (regular files only, 10 MiB `safeio.DefaultMaxFileSize` cap); an oversized resource returns an explicit `exceeds the N byte read limit` error. Skill resources are read-only and safe, so the tool uses an always-allow policy and declares `ToolGroup: tools.GroupSystem` (the reserved host-trusted group that bypasses policy gates).
 
 ## Invariants
 
@@ -90,7 +92,7 @@ A skill whose `name` does not match its parent directory name is rejected.
 - `Scan` follows directory symlinks.
 - A skill's `name` must match its parent directory name.
 - `List()` returns only lightweight descriptors (~100 tokens); `Get()` returns the full body.
-- `SafeResolvePath` never resolves ancestor symlinks and always verifies containment via `IsWithinPath`.
+- `SafeResolvePath` never resolves ancestor symlinks and always verifies containment (via the case-sensitivity-aware `tools.IsWithinRoot` when a context is supplied, `pathutil.IsWithinPath` otherwise).
 
 ## Configuration
 
@@ -104,6 +106,7 @@ A skill whose `name` does not match its parent directory name is rejected.
 
 ## Related Specs
 
+- [safeio.md](safeio.md) — read hardening (`ReadFile`, size cap, regular-files-only) behind SKILL.md and resource reads
 - [orchestration/router.md](orchestration/router.md) — matches `SkillDescriptor`s to requests
 - [orchestration/planner.md](orchestration/planner.md) — consumes activated skills via host context functions
 - [tool-system/builtins.md](tool-system/builtins.md) — `read_skill_resource` tool

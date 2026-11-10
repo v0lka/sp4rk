@@ -21,22 +21,22 @@ See [`docs/memory.md`](../../docs/memory.md).
 
 - `sp4rk.CompactionConfig` — the three trigger thresholds + strategy name
 - The three strategies: `sliding_window`, `summarization`, `hierarchical`
-- The `ContextFill` event (emitted every step: fill %, tokens used/max, status)
+- The `ContextFill` event (emitted after each completed step iteration — the terminal finish iteration exits before the post-step pass — reporting fill %, tokens used/max, status)
 - The `ContextCompaction` event (emitted when space is reclaimed: before → after %)
 - Per-task strategy override via `TaskBuilder.Compaction(...)` (fluent variant)
 
 ## How it works
 
 ```
-every ReAct step ──► ContextWindow.CheckFill()
-                        │  fill % vs thresholds → status: ok|compact|warning|emergency
-                        ▼
-                   emitter.ContextFill(percent, used, max, status, stepID)
-                        │
-            status ∈ {compact,warning,emergency}?
-                        │ yes
-                        ▼
-                   ContextWindow.Compact(ctx)  ──► emitter.ContextCompaction(before, after)
+each completed step iteration ──► ContextWindow.CheckFill()
+                                      │  fill % vs thresholds → status: ok|compact|warning|emergency|reject
+                                      ▼
+                                 emitter.ContextFill(percent, used, max, status, stepID)
+                                      │
+                          status ∈ {compact,warning,emergency}?
+                                      │ yes
+                                      ▼
+                                 ContextWindow.Compact(ctx)  ──► emitter.ContextCompaction(before, after, stepID)
 ```
 
 The three thresholds (default → demo value):
@@ -44,7 +44,7 @@ The three thresholds (default → demo value):
 | Threshold           | Default | Demo | Meaning                                   |
 |---------------------|---------|------|-------------------------------------------|
 | `PredictivePercent` | 85      | 10   | proactive compaction kicks in             |
-| `WarningPercent`    | 92      | 50   | aggressive compaction                     |
+| `WarningPercent`    | 92      | 50   | same compaction, at a higher fill level   |
 | `EmergencyPercent`  | 98      | 70   | last-resort compaction to avoid rejection |
 
 The demo lowers `PredictivePercent` and seeds several files so the fill climbs
@@ -56,19 +56,31 @@ which is exactly why the threshold is configurable.
 
 | Strategy          | How it reclaims space                            | Needs an LLM summarizer? |
 |-------------------|--------------------------------------------------|--------------------------|
-| `sliding_window`  | keep first N + last M messages, drop the middle  | No                       |
+| `sliding_window`  | keep first N + last M **steps**, middle → […]    | No                       |
 | `summarization`   | LLM-summarize older blocks into compact summaries | Yes                      |
 | `hierarchical`    | tiered resolution: distant/middle/recent detail  | Yes                      |
 
-`sliding_window` works out of the box; the other two require a summarizer
-dependency wired into the Framework. Tool-output pruning (keeping only the last
-N results, protecting named tools) runs alongside every strategy.
+`sliding_window` works out of the box. The other two need an LLM summarizer
+(`memory.CompactionDeps.Summarize`); with none, `memory.NewCompactionStrategy`
+fails closed and returns the sliding-window strategy instead. The Framework
+always builds its context windows with `Summarize: nil` and `sp4rk.Config`
+exposes no summarizer hook, so a Framework-driven run — including this
+example's fluent `.Compaction("hierarchical")` override — compacts with the
+sliding window in practice. To exercise the LLM-backed strategies, build the
+`memory.ContextWindow` yourself and supply it through an
+`orchestration.ContextManagerFactory` set on `ConductorConfig.ContextFactory`, or
+the separately-declared `planner.ContextManagerFactory` set on
+`planner.Config.ContextFactory`. The two factory types are not interchangeable: `orchestration.ContextManagerFactory` takes a trailing variadic `...PruningOverride` while `planner.ContextManagerFactory` does not. `sp4rk.Config` exposes no such hook — the
+Framework hard-wires its own factory, and `fw.ContextFactory()` only hands that
+built-in factory back read-only.
+Tool-output pruning (keeping only the last N results, protecting named tools)
+runs alongside every strategy.
 
 ## Run it
 
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
-cd sdk/examples/09-context-memory
+cd examples/09-context-memory
 go run -tags fluent .   # or: go run .
 ```
 

@@ -6,17 +6,18 @@ require (
 	codeberg.org/readeck/go-readability/v2 v2.1.2
 	github.com/JohannesKaufmann/html-to-markdown v1.6.0
 	github.com/bmatcuk/doublestar/v4 v4.10.0
+	github.com/klauspost/compress v1.20.3
 	github.com/liushuangls/go-anthropic/v2 v2.17.3
 	github.com/mark3labs/mcp-go v0.45.0
 	github.com/openai/openai-go v1.12.0
 	github.com/philippgille/chromem-go v0.7.0
 	github.com/pkoukk/tiktoken-go v0.1.8
 	github.com/sugarme/tokenizer v0.3.0
-	github.com/v0lka/flowsh v0.6.0
+	github.com/v0lka/flowsh v0.8.0
 	github.com/yalue/onnxruntime_go v1.29.0
-	golang.org/x/net v0.60.0
-	golang.org/x/sys v0.48.0
-	golang.org/x/text v0.42.0
+	golang.org/x/net v0.62.0
+	golang.org/x/sys v0.49.0
+	golang.org/x/text v0.43.0
 	gopkg.in/yaml.v3 v3.0.1
 	mvdan.cc/sh/v3 v3.10.0
 )

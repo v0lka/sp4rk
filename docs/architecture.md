@@ -4,7 +4,7 @@ This document describes the layered design of the SDK, how the packages relate, 
 
 ## Layered design
 
-The SDK is organized in four layers. Import direction flows downward — upper layers depend on lower layers, never the reverse.
+The SDK is organized in four layers. Import direction flows downward — upper layers depend on lower layers, never the reverse. (One intentional exception: `tools/builtins` imports `agent` because its meta-tool built-ins — facts, checklist, workspace, tool-result-read, attachments — need agent context types. No import cycle arises because neither `agent` nor `tools` imports `tools/builtins`.)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -25,12 +25,12 @@ The SDK is organized in four layers. Import direction flows downward — upper l
 
 | Layer | Package(s) | Responsibility |
 | --- | --- | --- |
-| **Entry point** | `sp4rk` | The `Framework` owns shared infrastructure (LLM router, tool registry, MCP gateway, tool cache) and creates per-session orchestrators. `Execute` and `NewConductor` are the two ways to run a task. |
+| **Entry point** | `sp4rk` | The `Framework` owns shared infrastructure (LLM router, tool registry, MCP gateway, tool cache) and creates per-session orchestrators. `Execute` and `NewConductor` run a task directly; the fluent `RunF`/`TaskF` builders (`run.go`, `task.go`) wrap the same infrastructure — `TaskF` additionally drives the multi-step Plan & Execute loop. |
 | **Orchestration** | `orchestration`, `planner`, `agent/reflector`, `agent/router` | Coordinates multi-step tasks. The `Conductor` runs a single task end-to-end. The `Planner` generates a DAG of steps. The `Reflector` analyzes failures. The `Router` classifies requests by domain and complexity. |
 | **Agent** | `agent` | The `Executor` runs the ReAct loop: think, call a tool, observe, repeat. Manages the step budget, circuit breakers, tool-result caching, and sub-agent parallelism. |
-| **Primitives** | `llm`, `tools`, `tools/builtins`, `tools/mcp` | The `Router` routes LLM calls to the active provider. The `ToolRegistry` holds and executes tools. Built-in tools cover file, shell, and search operations; the MCP gateway proxies external servers. |
+| **Primitives** | `llm`, `tools`, `tools/builtins`, `tools/builtins/websearch`, `tools/mcp` | The `Router` routes LLM calls to the active provider. The `ToolRegistry` holds and executes tools. Built-in tools cover file, shell, and search operations (including the `web_search` tool over a pluggable provider); the MCP gateway proxies external servers. |
 
-Supporting packages — `memory`, `prompt`, `skills`, `agents`, `security`, `embedding`, `pathutil`, `strutil`, `sysproc`, `ignore` — are consumed across layers as needed.
+Supporting packages — `memory`, `prompt`, `skills`, `agents`, `security`, `embedding`, `oneshot`, `safeio`, `pathutil`, `strutil`, `sysproc`, `ignore` — are consumed across layers as needed.
 
 ## Package dependency graph
 
@@ -39,37 +39,50 @@ The arrows show import direction (`A → B` means A imports B).
 ```
 sdk (root)
   ├──→ agent
+  ├──→ agent/reflector
   ├──→ llm
   ├──→ memory
   ├──→ orchestration
+  ├──→ planner
+  ├──→ skills
+  ├──→ tools
+  ├──→ tools/builtins
   └──→ tools/mcp
 
 orchestration
   ├──→ agent
   ├──→ llm
+  ├──→ safeio
   ├──→ skills
+  ├──→ strutil
   └──→ tools
 
 planner
   ├──→ agent
   ├──→ llm
+  ├──→ oneshot
   ├──→ orchestration
   ├──→ prompt
   ├──→ skills
+  ├──→ strutil
   └──→ tools
 
 agent
   ├──→ llm
+  ├──→ strutil
   └──→ tools
 agent/reflector
   ├──→ agent
   ├──→ llm
+  ├──→ oneshot
   ├──→ orchestration
   ├──→ prompt
+  ├──→ security
   └──→ tools
 agent/router
   ├──→ agent
   ├──→ llm
+  ├──→ oneshot
   ├──→ prompt
   └──→ tools
 
@@ -80,35 +93,60 @@ memory
   ├──→ security
   └──→ strutil
 
+llm
+  └──→ strutil
+
+oneshot
+  └──→ llm
+
 tools
   ├──→ llm
+  ├──→ oneshot
   ├──→ pathutil
+  ├──→ security
   ├──→ strutil
   ├──→ sysproc
   └──→ tools/internal/judge_prompts
 
 tools/builtins
+  ├──→ agent   (intentional upward edge — meta-tool context types)
+  ├──→ pathutil
+  ├──→ safeio
+  ├──→ sysproc
+  └──→ tools
+tools/builtins/websearch
   ├──→ tools
-  └──→ sysproc
+  └──→ tools/builtins
 tools/mcp
-  ├──→ tools
-  └──→ sysproc
+  ├──→ sysproc
+  └──→ tools
 
 skills
   ├──→ pathutil
+  ├──→ safeio
   └──→ tools
 
 agents
-  (stdlib + yaml.v3 + log/slog only; no engine packages)
+  └──→ safeio   (otherwise stdlib + yaml.v3 + log/slog only)
+
+embedding
+  └──→ sysproc   (external chromem-go, sugarme/tokenizer, onnxruntime_go otherwise)
+
+safeio
+  └──→ pathutil
+
+ignore
+  ├──→ pathutil
+  └──→ safeio   (external doublestar only otherwise)
 
 sysproc
   (stdlib on non-Windows; Windows process-tree containment uses golang.org/x/sys/windows behind a //go:build windows tag; no engine packages)
 
-ignore
-  └──→ pathutil   (external doublestar only otherwise)
+pathutil, prompt, security, strutil, tools/internal/judge_prompts
+  (pure leaves; no engine imports)
 ```
 
-The `tools` package is a near-leaf dependency — it imports `llm`, `pathutil`, `strutil`, `sysproc`, and `tools/internal/judge_prompts` (for the LLM-backed `ToolJudge`). The `llm` package is similarly foundational. This keeps the primitive layers free of higher-level concerns and prevents import cycles.
+The `tools` package is a near-leaf dependency — it imports `llm`, `oneshot`, `pathutil`, `security`, `strutil`, `sysproc`, and `tools/internal/judge_prompts` (for the LLM-backed `ToolJudge`), plus the external `github.com/v0lka/flowsh/api` and `github.com/v0lka/flowsh/engine` (for the deterministic shell analysis). The `llm` package is similarly foundational — it imports only `strutil`. This keeps the primitive layers free of higher-level concerns and prevents import cycles.
 
 ## The ReAct loop
 
@@ -137,7 +175,7 @@ The `Executor` (in `agent/executor.go`) runs a **Reason → Act → Observe** lo
         next iteration           deny → return (Finished=false)
 ```
 
-A `Step` captures one iteration:
+A `Step` captures one iteration (abridged — `json` tags omitted, field order matches `agent.Step`):
 
 ```go
 type Step struct {
@@ -147,10 +185,10 @@ type Step struct {
     Action           llm.ToolCall   // the tool it chose to call
     Observation      string         // the tool's result
     IsError          bool           // whether the tool returned an error
-    IsUntrusted      bool           // whether the observation is external data
     TokensUsed       int            // token consumption for this step
     UserNudge        string         // optional injected user message (e.g. nudges)
     ResponseGroup    int64          // links steps from the same multi-tool-call response
+    IsUntrusted      bool           // whether the observation is external data
     CacheHash        string         // hash for tool-result cache retrieval
 }
 ```
@@ -190,13 +228,13 @@ For complex tasks, the SDK composes three orchestration primitives:
 ```
 
 1. **Planner** — `Planner.Plan` generates a `Plan`: a DAG of `PlanStep` values, each with a summary, description, dependencies (`DependsOn`), a parallelism hint, estimated tools, and an optional `AgentProfile` (role, allowed tools, domain, step budget).
-2. **Conductor** — for each step, the `Conductor` creates an `Executor` and runs a ReAct loop. Steps with no unmet dependencies can run in parallel via `RunSubAgent` goroutines. Results are written to the `Blackboard`.
+2. **Conductor** — the root `TaskBuilder` (`fw.TaskF(ctx)…`) drives the DAG: it selects steps with no unmet dependencies via `orchestration.FindReadySteps` and calls `Conductor.Run` once per step attempt. Each `Conductor.Run` creates one `Executor` and runs a single ReAct loop. The built-in loop executes a ready wave sequentially; hosts that want parallel steps fan out with `agent.RunSubAgentsParallel`/`agent.RunSubAgent` (each with its own `Executor` and `ContextManager`). Results are written to the `Blackboard`.
 3. **Reflector** — when a step fails, `Reflector.Reflect` examines the execution trajectory and prior reflections, then returns a `Reflection` with a root cause, hypotheses, and a suggested action: `"retry"`, `"replan"`, or `"abort"`.
-4. **Retry/replan** — the orchestrator consults the reflection. A retry re-runs the step (up to `ExecutionConfig.MaxRetries`). A replan asks the `Planner` to generate a new plan accounting for completed steps and the failure. An abort stops execution with `Status == "aborted"`.
+4. **Retry/replan** — the orchestrator consults the reflection. A retry re-runs the step (up to the `TaskBuilder` per-step retry budget — `MaxRetries(n)`, default 2). A replan asks the `Planner` to generate a new plan accounting for completed steps and the failure, bounded by the global replan budget (`MaxReplans(n)`, default 3). An abort stops execution with `Status == "aborted"`.
 
 ## Request classification (agent/router)
 
-The `agent/router` package provides a `Router` that classifies user requests before planning. It uses a single LLM call to determine:
+The `agent/router` package provides a `Router` that classifies user requests before planning. It uses a single one-shot call (`oneshot.Do`) — the initial response plus up to two corrective nudges when it is unparseable, i.e. at most three LLM round-trips — to determine:
 
 - **Domain** — `"code"` (source modification, build/test), `"research"` (information gathering), `"general"` (default), or `"mixed"`.
 - **Complexity** — an integer from 1 (trivial) to 5 (highly complex).
@@ -232,7 +270,7 @@ rt := router.New(llmCaller, router.Config{
 
 decision, err := rt.Route(ctx, userMessage, availableTools, history, skillDescriptors)
 if errors.Is(err, router.ErrRoutingParse) {
-    // The original response and one repair attempt were both invalid JSON.
+    // The original response and both repair attempts were invalid JSON.
     // Fall back to the host's conservative default routing decision.
 }
 // decision.Domain, decision.Complexity, decision.MatchedSkills, decision.NeedsClarification
@@ -241,7 +279,7 @@ if errors.Is(err, router.ErrRoutingParse) {
 // ("sliding_window" | "summarization" | "hierarchical") per the table above.
 ```
 
-`ErrRoutingParse` is the exported sentinel returned when both the initial routing JSON and the built-in repair retry fail to parse. Detect it with `errors.Is`; hosts can degrade to a conservative default decision without treating malformed classification output as a fatal task failure.
+`ErrRoutingParse` is the exported sentinel returned when the initial routing JSON and both built-in repair nudges fail to parse (three attempts total). Transport failures never match it. Detect it with `errors.Is`; hosts can degrade to a conservative default decision without treating malformed classification output as a fatal task failure.
 
 ### Semantic tool matching
 
@@ -268,8 +306,8 @@ The SDK is built around small, focused interfaces that let you swap implementati
 | --- | --- | --- |
 | `LLMCaller` | `agent` | What the `Executor` needs from the LLM layer: `Call(ctx, ChatRequest) (*ChatResponse, error)`. The `llm.Router` satisfies it. |
 | `ToolExecutor` | `agent` | What the `Executor` needs from the tools layer: `Execute`, `GetToolSource`, `IsToolUntrusted`, `CacheStrategy`. The `tools.ToolRegistry` satisfies it. |
-| `ContextManager` | `agent` | Manages the LLM context window: `BuildPrompt`, `AddStep`, `Compact`, `CheckFill`, `FillPercent`, `AvailableTokens`. The `memory.ContextWindow` satisfies it. |
-| `CompactionStrategy` | `agent` | Compresses step history: `Compact(ctx, steps, budgetTokens) []llm.Message`. Implementations: sliding, summary, hierarchical. |
+| `ContextManager` | `agent` | Manages the LLM context window: `BuildPrompt`, `AddStep`, `Compact`, `SetStrategy`, `CheckFill`, `CorrectTokenCount`, `FillPercent`, `AvailableTokens`, `OutputLimit`, `VulnerableOutputs`. The `memory.ContextWindow` satisfies it. |
+| `CompactionStrategy` | `agent` | Compresses step history: `Compact(ctx, steps, budgetTokens) []llm.Message`. Implementations: `sliding_window`, `summarization`, `hierarchical`. |
 | `HITLHandler` | `agent` | Human-in-the-loop hooks: `OnToolCall` (confirm/modify/reject) and `OnStepLimit` (grant or deny more steps). |
 | `Events` | `agent` | Streams lifecycle events: `StepStart`, `Thought`, `ToolCall`, `ToolResult`, `AssistantChunk`, `ContextFill`, `ContextCompaction`, `SubAgentLaunch`, `Finishing`, etc. `NoopEvents` is the no-op default. |
 | `Blackboard` | `orchestration` | Structured access to shared task state: plan, step results, reflections, facts, final result. `MapBlackboard` is the in-memory implementation. |
@@ -286,7 +324,8 @@ user message
     │
     ▼
 Framework.Execute(ctx, systemPrompt, events, userMessage)
-    │  creates a Conductor and a MapBlackboard
+    │  creates a Conductor and a Blackboard (a CheckpointedBlackboard
+    │  when Config.Checkpointer is set, else a MapBlackboard)
     ▼
 Conductor.Run(ctx, message, blackboard, tools, events, strategy)
     │  resolves model metadata, builds the system prompt,
@@ -322,7 +361,7 @@ The `Blackboard` is a thread-safe shared-state container that holds everything a
 | Facts | `GetFacts` / `StoreFact` / `SearchFacts` | Keyword-tagged facts for inter-step communication. |
 | Final result | `GetFinalResult` / `SetFinalResult` | The terminal outcome. |
 
-Steps communicate through the blackboard rather than direct references. A step can `StoreFact` with keywords, and a later step can `SearchFacts` to retrieve it. The `OnBlackboardChanged` callback on `Config` notifies the host application after every successful write, enabling live UI updates.
+Steps communicate through the blackboard rather than direct references. A step can `StoreFact` with keywords, and a later step can `SearchFacts` to retrieve it. The `OnBlackboardChanged` callback on `Config` notifies the host application after every successful write, enabling live UI updates — but only when `Config.Checkpointer` is set, because the callback is wired onto the `CheckpointedBlackboard` while the default in-memory `MapBlackboard` emits no notifications.
 
 `MapBlackboard` is the default in-memory implementation. For persistence, provide a `Checkpointer` and use `RestoreBlackboard` to reload state across restarts.
 
@@ -333,12 +372,12 @@ Steps communicate through the blackboard rather than direct references. A step c
 | `llm.Router` | **Yes** | Protected by a `sync.RWMutex`. `SetModel` takes a write lock; `Call` snapshots the active provider and model under a read lock, then releases it before the retry loop so `SetModel` is not blocked by backoff sleeps. Safe to share across goroutines. |
 | `tools.ToolRegistry` | **Yes** | Protected by a `sync.RWMutex`. Register, unregister, get, list, and execute are safe for concurrent use. |
 | `orchestration.MapBlackboard` | **Yes** | Protected by a `sync.RWMutex`. All read and write methods are safe for concurrent use. |
-| `embedding.Embedder` | **Yes** | Protected by a `sync.Mutex`. Safe for concurrent embedding calls. |
+| `embedding.Embedder` | **Yes** | Protected by a `sync.RWMutex`. Safe for concurrent embedding calls. |
 | `skills.SkillManager` | **Yes** | Protected by a `sync.RWMutex`. Scan and lookups are safe for concurrent use. |
 | `agents.AgentManager` | **Yes** | Protected by a `sync.RWMutex`. Scan and lookups are safe for concurrent use. |
 | `agent.Executor` | **No** | An executor owns a single ReAct loop. For parallel steps, create separate executors and run them via `RunSubAgent` goroutines. |
 
-The `Conductor` runs one task at a time. Parallelism within a plan is achieved by launching multiple subagent goroutines (`RunSubAgent`), each with its own `Executor` and `ContextManager`, writing results back to the shared `Blackboard`.
+The `Conductor` runs one task at a time. Parallelism within a plan is achieved by launching multiple subagent goroutines (`agent.RunSubAgent`, or `agent.RunSubAgentsParallel`, which fans out unbounded by default and can be capped per invocation with `agent.WithMaxParallelSubagents(n)`), each with its own `Executor` and `ContextManager`; the caller writes the returned `SubAgentResult`s back to the shared `Blackboard`.
 
 ## Next steps
 

