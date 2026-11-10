@@ -18,8 +18,8 @@
 // specs/decisions/).
 //
 // Every open goes through safeio: DetectMagic refuses to traverse a symlink
-// at the final path component (ELOOP on unix; see the safeio Windows parity
-// note), refuses non-regular files instead of blocking on a planted FIFO, and
+// at the final path component (ELOOP, on every platform), refuses non-regular
+// files instead of blocking on a planted FIFO, and
 // OpenAppend reads the existing magic from the SAME descriptor it appends
 // through, so there is no Stat→Open window in which the file could be swapped
 // for a differently-compressed target. OpenAppend also verifies the detected
@@ -41,6 +41,13 @@
 // different codec fails with an error matching ErrMagicMismatch. From
 // ANOTHER process the lock cannot be shared, so the conflicting open fails
 // with ErrLocked instead of interleaving frames.
+//
+// The advisory lock is assumed reliable: the one-encoder guarantee holds
+// wherever advisory locks hold — local filesystems, and network filesystems
+// with a functioning lock manager. On NFS mounts without a working lock
+// manager (classic NFSv3 without lockd) an flock(2)/range lock may silently
+// succeed for BOTH processes, and two encoders could then interleave frames;
+// keep appendcodec logs on local volumes or properly locked shares.
 //
 // CodecNone deliberately keeps the pre-appendcodec semantics: no lock, no
 // registry, no queue. Every open returns an independent plain O_APPEND

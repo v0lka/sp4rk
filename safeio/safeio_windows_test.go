@@ -64,6 +64,41 @@ func TestOpenFileNoFollow_RefusesFinalSymlink(t *testing.T) {
 	}
 }
 
+// TestWriteFile_RefusesFinalSymlink pins the O_TRUNC write shape against a
+// final symlink. This is the one Windows shape where the stdlib can surface
+// an error other than the documented ELOOP: syscall.Open implements O_TRUNC
+// as a post-open Ftruncate on the reparse-point handle (before OpenFileNoFollow's
+// fstat ever sees it), and a SetEndOfFile failure there escapes the open as
+// its own *fs.PathError. Per MS "Symbolic Link Effects on File Systems
+// Functions" the truncation affects the LINK, never the target, so the
+// realistic outcome is ELOOP with an empty-$DATA side effect on the link —
+// the byte-divergence from unix, where the link stays byte-identical. The
+// last assertion pins the link-survives property so the divergence stays
+// documented: the link itself still resolves after the refusal.
+func TestWriteFile_RefusesFinalSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "victim")
+	if err := os.WriteFile(target, []byte("original"), 0o644); err != nil {
+		t.Fatalf("seed victim: %v", err)
+	}
+	link := filepath.Join(dir, "link")
+	requireFileSymlink(t, target, link)
+
+	if err := WriteFile(link, []byte("payload"), 0o644); err == nil {
+		t.Fatal("WriteFile wrote through a final symlink, want a refusal")
+	} else if !errors.Is(err, syscall.ELOOP) {
+		t.Fatalf("WriteFile err = %v, want a *fs.PathError wrapping syscall.ELOOP", err)
+	}
+
+	data, rerr := os.ReadFile(target)
+	if rerr != nil || string(data) != "original" {
+		t.Fatalf("victim was truncated or written through the link: %q, %v", data, rerr)
+	}
+	if _, lerr := os.Readlink(link); lerr != nil {
+		t.Fatalf("symlink itself must survive and still resolve: %v", lerr)
+	}
+}
+
 // TestOpenFileNoFollow_AppendCreateDoesNotWriteThroughLink pins the
 // write-open shape the append codec uses: O_RDWR|O_CREATE|O_APPEND against a
 // planted symlink must refuse, never append through the link.

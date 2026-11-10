@@ -89,10 +89,13 @@ func checkRegularHandle(f *os.File, path string) error {
 // through, matching the unix kernel-level O_NOFOLLOW guarantee.
 //
 // The post-open fstat then classifies the handle: fileStat's mode reports
-// fs.ModeSymlink for IO_REPARSE_TAG_SYMLINK and fs.ModeIrregular for every
-// other non-surrogate reparse tag (junctions, app exec links; the DEDUP tag
-// is deliberately reported as a regular file and stays openable). A handle
-// carrying either bit is refused: the descriptor is closed and
+// fs.ModeSymlink for IO_REPARSE_TAG_SYMLINK and fs.ModeIrregular for
+// every other reparse tag — junctions, app exec links, any tag that is
+// neither SYMLINK nor DEDUP (junctions are themselves Microsoft-name-
+// surrogate tags; what matters here is only that they land in os's
+// default reparse-tag branch). The DEDUP tag is deliberately reported
+// as a regular file and stays openable. A handle carrying either bit is
+// refused: the descriptor is closed and
 // syscall.ELOOP is returned, so callers can treat both platforms with one
 // errors.Is against syscall.ELOOP. A regular file is returned exactly as
 // OpenFile would return it.

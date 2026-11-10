@@ -152,7 +152,7 @@ func OpenFileNoFollow(path string, flag int, perm fs.FileMode) (*os.File, error)
 
 `OpenFileNoFollow` adds `O_NOFOLLOW`: the kernel refuses to open a symbolic link at the **final** path component (`ELOOP`, wrapped in `*fs.PathError`) instead of resolving it, so a write-open can never be redirected through a planted symlink. Intermediate symlinks are still resolved by the kernel — use `MkdirAllReal` to build intermediate paths out of real directories only.
 
-> **Windows parity:** no `O_NOFOLLOW` equivalent exists there without new dependencies, so `OpenFileNoFollow` delegates to `OpenFile` and a symlink at the final path component **is still resolved** (`os.OpenFile` follows reparse points). The handle-based regularity check still applies. Callers that must never write through a final symlink should use `WriteFileAtomic`, whose rename replaces the link itself instead of following it, on every platform.
+> **Windows parity:** `OpenFileNoFollow` is at parity with unix there — `os.OpenFile` carries `FILE_FLAG_OPEN_REPARSE_POINT` (forwarded to `CreateFile` by the syscall layer's own flag pass-through), so a reparse point at the final path component is opened **as the reparse point itself**, never its destination. The post-open handle classification refuses it with the same `*fs.PathError` wrapping `syscall.ELOOP` unix produces, so one `errors.Is(err, syscall.ELOOP)` covers both platforms. Intermediate symlinks are still resolved, as on unix — use `MkdirAllReal` to build intermediate paths out of real directories only. `WriteFileAtomic` remains the belt-and-braces option whose rename replaces a link itself instead of following it.
 
 ### ReadFile / ReadFileLimited
 
@@ -173,7 +173,7 @@ func WriteFile(path string, data []byte, perm fs.FileMode) error
 func WriteFileAtomic(path string, data []byte, perm fs.FileMode) error
 ```
 
-`WriteFile` is the hardened replacement for `os.WriteFile`. On unix the final path component is never followed: a symbolic link at `path` makes the open fail with `ELOOP` and the link's target is never written through. A missing file is created; **a missing parent directory is an error** — call `MkdirAllReal` first.
+`WriteFile` is the hardened replacement for `os.WriteFile`. The final path component is never followed on any platform: a symbolic link at `path` makes the open fail with `ELOOP` (wrapped in `*fs.PathError`) and the link's target is never written through. A missing file is created; **a missing parent directory is an error** — call `MkdirAllReal` first.
 
 `WriteFileAtomic` writes a temporary file in the same directory, chmods it to `perm`, writes, `fsync`s, then `os.Rename`s it over the target, so readers never observe a partial file. The permission bits are applied with `Chmod`, which is **not** filtered by the process umask — pass the exact bits you want (e.g. `0600` for private state) and mask the mode yourself if umask filtering is intended.
 
