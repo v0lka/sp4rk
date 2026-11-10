@@ -9,7 +9,7 @@ Hardened, non-blocking filesystem I/O primitives: every open of a fixed, user- o
 - `github.com/v0lka/sp4rk/safeio/safeio.go` - package contract, the refusal error taxonomy, and capped reads (`ReadFile`, `ReadFileLimited`, `IsRegular`)
 - `github.com/v0lka/sp4rk/safeio/write.go` - hardened and atomic writes (`WriteFile`, `WriteFileAtomic`) plus real-directory creation (`MkdirAllReal`, `CheckRealDirsBelow`, `MkdirAllRealWithin`)
 - `github.com/v0lka/sp4rk/safeio/open_unix.go` - unix safe-open (`//go:build unix`): `syscall.Open` with `O_NONBLOCK|O_CLOEXEC`, regularity by fstat on the open descriptor, `O_NOFOLLOW` in `OpenFileNoFollow`
-- `github.com/v0lka/sp4rk/safeio/open_windows.go` - Windows safe-open (`//go:build windows`): plain open plus handle-based regularity check
+- `github.com/v0lka/sp4rk/safeio/open_windows.go` - Windows safe-open (`//go:build windows`): `os.Open`/`os.OpenFile` with a handle-based regularity check; `OpenFileNoFollow` carries `FILE_FLAG_OPEN_REPARSE_POINT` and refuses a final reparse point with `syscall.ELOOP`
 
 ## Core Types
 
@@ -64,9 +64,12 @@ Every open funnels through the shared guard; writes and directory creation build
         regular │                 non-regular (FIFO, socket, device, directory)
                 ▼                           ▼
         caller proceeds              *NotRegularError (errors.Is → ErrNotRegular)
-        OpenFileNoFollow (unix):     write-open of a readerless FIFO (unix):
-        +O_NOFOLLOW — final          O_NONBLOCK makes the open fail fast
-        symlink → ELOOP              with ENXIO (*fs.PathError)
+        write-open of a readerless FIFO (unix):    OpenFileNoFollow:
+        O_NONBLOCK makes the open fail fast          unix: +O_NOFOLLOW —
+        with ENXIO (*fs.PathError)                   final symlink → ELOOP
+        OpenFileNoFollow (windows): +FILE_FLAG_OPEN_REPARSE_POINT — the
+        reparse point opens as itself and the post-open fstat refuses it
+        → ELOOP (same errors.Is(syscall.ELOOP) contract as unix)
 
   reads:  ReadFileLimited reads at most limit+1 bytes;
           over the cap → *TooLargeError (errors.Is → ErrTooLarge)
@@ -88,7 +91,7 @@ Directory creation (`MkdirAllReal`, extended by `MkdirAllRealWithin`):
 - Every open performed by the package returns or fails without waiting: a FIFO at a probed path is refused, never awaited.
 - Regularity is always decided on the already-open descriptor, so the file that is checked is exactly the file that is read or written — there is no Stat→Open window.
 - `ReadFile` always bounds a single read at `DefaultMaxFileSize` bytes and `ReadFileLimited` at `limit` bytes; a file of exactly the cap reads in full, and a file over it is refused with `ErrTooLarge` instead of being read into memory.
-- Every refusal class is distinguishable with `errors.Is`: `ErrNotRegular`, `ErrTooLarge`, `ErrSymlink`, `ErrNotDirectory`, and (unix, final symlink at a write target) `syscall.ELOOP`.
+- Every refusal class is distinguishable with `errors.Is`: `ErrNotRegular`, `ErrTooLarge`, `ErrSymlink`, `ErrNotDirectory`, and (final symlink at an open target, both platforms) `syscall.ELOOP`.
 - A missing file always surfaces the underlying open error (testable with `errors.Is(err, fs.ErrNotExist)`).
 - `WriteFileAtomic` always publishes by rename: a reader of the target sees either the complete old or the complete new contents, and on any failure the target keeps its old contents and the temporary file is removed.
 - `WriteFileAtomic` applies `perm` exactly via fchmod, independent of the process umask; `WriteFile` and `MkdirAllReal` pass `perm` through `open(2)`/`mkdir(2)`, which apply the umask.
@@ -110,7 +113,7 @@ Directory creation (`MkdirAllReal`, extended by `MkdirAllRealWithin`):
 
 - New hardened read or write operations route through `Open`, `OpenFile`, or `OpenFileNoFollow` so the regularity guard and refusal taxonomy apply uniformly; direct use of `os.Open`/`os.ReadFile`/`os.WriteFile` on fixed or workspace-controlled paths is the anti-pattern this package exists to replace.
 - New directory-tree operations build on `MkdirAllReal`, pairing it with `CheckRealDirsBelow` (content-controlled subtrees) or `MkdirAllRealWithin` (containment boundaries).
-- Platform divergence stays confined to `open_unix.go` and `open_windows.go` behind identical exported signatures; behavior differences (notably `OpenFileNoFollow` final-symlink handling) are documented in the platform files' doc comments.
+- Platform divergence stays confined to `open_unix.go` and `open_windows.go` behind identical exported signatures; behavior differences are documented in the platform files' doc comments (with the nofollow contract itself unified at `errors.Is(err, syscall.ELOOP)` on both).
 
 ## Related Specs
 

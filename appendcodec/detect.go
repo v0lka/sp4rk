@@ -18,7 +18,7 @@ const magicLen = 6
 
 // DetectMagic sniffs the codec of an existing file from its first bytes and
 // never follows a symlink: the open refuses a symlink at the final path
-// component with ELOOP (unix; on Windows see the safeio parity note), and a
+// component with ELOOP (on every platform), and a
 // non-regular pre-existing target (FIFO, socket, device, directory) is
 // refused with safeio's *NotRegularError instead of blocking inside open(2).
 //

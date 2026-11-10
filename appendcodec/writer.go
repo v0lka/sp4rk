@@ -36,6 +36,14 @@ const (
 // whether or not it has Closed itself — and Write reports no error. Close
 // itself is idempotent and reports nil after the first call. Test it with
 // errors.Is.
+//
+// This is deliberately unlike the io.WriteCloser convention (a
+// write-after-close returns an error): while a sibling handle keeps the
+// shared stream alive, a handle whose OWN Close already returned keeps
+// writing — "handle A: A.Close(); A.Write(p)" appends p to the stream and
+// reports (len(p), nil) until the LAST handle's Close makes the write
+// surface ErrClosed. Hosts that must not append behind their own Close
+// should track handle liveness themselves.
 var ErrClosed = errors.New("appendcodec: writer already closed")
 
 // ErrMagicMismatch is returned by OpenAppend when the existing content of the
@@ -95,8 +103,8 @@ type codecStream interface {
 // descriptor.
 //
 // The open is link-safe and TOCTOU-free: safeio.OpenFileNoFollow refuses a
-// symlink at the final path component (ELOOP on unix; Windows parity per
-// safeio) and any non-regular pre-existing target instead of blocking, and
+// symlink at the final path component (ELOOP, on every platform) and any
+// non-regular pre-existing target instead of blocking, and
 // the existing magic is read from the SAME O_RDWR|O_APPEND|O_CREATE
 // descriptor that is then appended through — there is no window in which the
 // path can be swapped for a differently-compressed file between inspection
@@ -269,6 +277,10 @@ var streamRegistry = struct {
 // only this handle — the last Close writes the codec footer, closes the
 // descriptor, releases the OS lock and drops the registry entry — and is
 // idempotent per handle, so a double Close never counts a reference twice.
+// Note the io.WriteCloser divergence this enables (see ErrClosed): after
+// this handle's own Close, while a sibling keeps the stream alive, Write
+// still succeeds and appends through the one encoder — ErrClosed surfaces
+// only once the LAST handle's Close shut the stream down.
 // CodecNone never produces a queuedWriter: its opens return independent
 // plain handles.
 type queuedWriter struct {

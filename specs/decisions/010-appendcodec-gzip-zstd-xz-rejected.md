@@ -17,9 +17,11 @@ zstd multi-frame). Additionally, the open path must be link-safe and
 TOCTOU-free: the existing content is inspected through the same descriptor
 that is later appended through, and symlinks and non-regular files are
 refused (via `safeio.OpenFileNoFollow`). The link-safety half — the refusal
-of a final-component symlink (ELOOP) — is a unix guarantee; on Windows,
-`safeio.OpenFileNoFollow` still resolves final-component symlinks (the safeio
-Windows parity note). The TOCTOU closure — inspection through the same
+of a final-component symlink — holds on both platforms: unix via
+`O_NOFOLLOW` (ELOOP), Windows via `FILE_FLAG_OPEN_REPARSE_POINT` and the
+post-open reparse-point classification (the same ELOOP contract; the safeio
+Windows parity note has been closed by `safeio/windows-nofollow`). The
+TOCTOU closure — inspection through the same
 descriptor that is appended through — holds on both platforms.
 
 Candidate encoder libraries: the standard library's `compress/gzip`,
@@ -115,6 +117,12 @@ is recorded here so the rejection is not re-litigated by accident; the
   the end of file (compatibility with hosts that already fan plain JSONL
   logs out over several writers); only the best-effort magic sniff is
   retained.
+- The one-encoder guarantee rests on advisory locks being reliable: it holds
+  on local filesystems and on network shares with a functioning lock
+  manager. On NFS mounts without a working lock manager (classic NFSv3
+  without lockd) an advisory lock may silently succeed for BOTH processes,
+  and two encoders could then interleave frames — keep appendcodec logs on
+  local volumes or properly locked shares.
 - Appending to a crash-truncated file is NOT a recovery path: the truncated
   member/frame head never becomes decodable, so a sequential decoder stops
   there with a truncation error and never reaches the records appended after
