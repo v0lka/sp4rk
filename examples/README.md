@@ -43,7 +43,7 @@ Each example is a self-contained `package main` with its own `README.md`.
 
 ### Go
 
-Go 1.27.3+ is required (matches the SDK's `go.mod`).
+Go 1.27.4+ is required (matches the SDK's `go.mod`).
 
 ### API keys
 
