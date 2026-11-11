@@ -157,7 +157,20 @@ func (p CallPurpose) Deterministic() bool {
 
 // ChatRequest — request to LLM.
 type ChatRequest struct {
-	Model       string `json:"model"`
+	Model string `json:"model"`
+	// Provider optionally overrides provider routing for THIS request only:
+	// when non-empty the Router resolves the named provider (its configured
+	// logical name, e.g. "openai_compatible") instead of the active one. The
+	// name must match a configured provider entry; an unknown name fails the
+	// call immediately with a non-retryable error — no attempt is made against
+	// any provider and the retry loop never runs. When empty (the default) the
+	// request routes to the active provider exactly as before, so existing
+	// callers and request dumps are byte-identical. The caller is responsible
+	// for pairing the override with a Model the named provider actually serves
+	// (req.Model is still only filled when empty — with the active bare model).
+	// See ADR-011 for why this is a request field rather than part of
+	// req.Model or a separate caller type.
+	Provider    string `json:"provider,omitempty"`
 	ModelFamily string `json:"model_family,omitempty"` // model family hint (e.g. "anthropic", "deepseek"); auto-detected if empty
 	// Protocol is the wire protocol / endpoint postfix the model speaks (the
 	// protocol-level analogue of ModelFamily). When empty it is auto-detected

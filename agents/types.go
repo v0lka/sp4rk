@@ -47,12 +47,16 @@ type AgentMetadata struct {
 }
 
 // AgentDescriptor is the lightweight discovery-time representation of an agent
-// (name + description + hidden flag). It is returned by List() for use by
-// #-autocomplete and the "Available Subagents" UI, where hidden agents are
-// filtered out by the consumer.
+// (name + description + hidden flag + optional model override). It is returned
+// by List() for use by #-autocomplete and the "Available Subagents" UI, where
+// hidden agents are filtered out by the consumer. Model carries the profile's
+// `model:` frontmatter value so consumers (roster UI, delegation planning) can
+// surface it at discovery time without loading the full profile; it mirrors
+// AgentMetadata.Model.
 type AgentDescriptor struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
+	Model       string `json:"model,omitempty"`
 	Hidden      bool   `json:"hidden,omitempty"`
 }
 
@@ -61,6 +65,7 @@ func (a *Agent) Descriptor() AgentDescriptor {
 	return AgentDescriptor{
 		Name:        a.Metadata.Name,
 		Description: a.Metadata.Description,
+		Model:       a.Metadata.Model,
 		Hidden:      a.Metadata.Hidden,
 	}
 }

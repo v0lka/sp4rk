@@ -166,3 +166,4 @@ See [META.md](META.md) for document templates, naming rules, and update protocol
 - [008-unified-oneshot-service-client.md](decisions/008-unified-oneshot-service-client.md) - Unified one-shot service client
 - [009-opt-in-request-scoped-streaming.md](decisions/009-opt-in-request-scoped-streaming.md) - Opt-in request-scoped streaming channel
 - [010-appendcodec-gzip-zstd-xz-rejected.md](decisions/010-appendcodec-gzip-zstd-xz-rejected.md) - Append-safe codec writers: gzip and zstd, xz rejected
+- [011-per-request-provider-override.md](decisions/011-per-request-provider-override.md) - Per-request provider override on ChatRequest
