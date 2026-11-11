@@ -562,7 +562,7 @@ func (r *Router) Call(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 			// sentinel-wrapped error (no HTTP status, never retried —
 			// the loop below is never entered); hosts detect it via
 			// errors.Is(err, ErrUnknownProvider).
-			return nil, fmt.Errorf("llm: per-request provider %q: %w", req.Provider, ErrUnknownProvider)
+			return nil, fmt.Errorf("llm: per-request provider override %q: %w", req.Provider, ErrUnknownProvider)
 		}
 		provider = overridden
 	}
