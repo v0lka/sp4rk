@@ -536,6 +536,15 @@ An empty `Provider` keeps the legacy path byte-identical (the field is `json:"pr
 
 `agent.NewModelProviderOverrideCaller(inner LLMCaller, provider, model string)` pins both fields on every call (each override applies independently and only when non-empty; both empty returns `inner` unchanged). Because the pinning is stateless per call, a caller pinned this way is immune to a mid-task `SetModel`; the legacy `NewModelOverrideCaller` is its model-only form. Hosts can validate a composite `provider/model` override before launching a pinned caller with the read-only `Router.ProviderForModel` and `Router.KnownProviders`.
 
+Order the wrappers so the pin is applied before the log: `NewDumpCaller` marshals each request exactly as it received it, so a dump records `provider` (and `model`) only when the pinned caller wraps the chain from OUTSIDE the dump caller:
+
+```go
+base   := agent.NewDumpCaller(router, w, logger) // the JSONL LLM log
+pinned := agent.NewModelProviderOverrideCaller(base, "local-qwen", "qwen3:32b")
+```
+
+Assembled the other way round (`NewDumpCaller(NewModelProviderOverrideCaller(…))`) the call still routes to the pinned provider, but the dump silently logs empty `provider`/`model` keys — a misrouted call would then be indistinguishable from a legacy one in the log ([ADR-011](../specs/decisions/011-per-request-provider-override.md), the composition bullet).
+
 ## Message types
 
 ```go

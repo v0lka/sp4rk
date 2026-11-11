@@ -761,7 +761,9 @@ func (r *Router) SetModel(ctx context.Context, model string) error {
 //
 // A bare model name resolves like SetModel: the provider behind the first
 // composite ID (sorted) whose bare model matches; ok=false when no provider
-// lists the name.
+// lists the name. For a bare name the answer describes SetModel routing only:
+// a call carrying a pre-set req.Model without req.Provider still goes to the
+// ACTIVE provider, regardless of what this method returns.
 func (r *Router) ProviderForModel(model string) (provider string, ok bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

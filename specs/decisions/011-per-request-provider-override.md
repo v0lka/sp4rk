@@ -23,6 +23,7 @@ Provider string `json:"provider,omitempty"`
 - **Legacy path byte-identical:** an empty `Provider` (the zero value, `omitempty`) selects the active provider exactly as before, and the field is absent from serialized requests — existing callers and request dumps are unchanged byte-for-byte.
 - **Model pairing is the caller's responsibility:** `prepareRequest`/`validateContextWindow` are unchanged and keep working on the bare `req.Model`. A caller that overrides the provider should also pin a model the named provider serves (otherwise the active bare model string is sent there, exactly as a pre-set `req.Model` is sent to the active provider today).
 - **Wrapper:** `agent.NewModelProviderOverrideCaller(inner, provider, model)` stamps `req.Provider` and `req.Model` on every call (each applies independently and only when non-empty; both empty → inner returned unchanged). The legacy `agent.NewModelOverrideCaller(inner, model)` is kept as the model-only form and delegates with an empty provider. A pinned caller is stateless per call, so a mid-task `SetModel` cannot affect it.
+- **Composition with the dump caller:** the dump caller marshals each request exactly as it received it (`agent.NewDumpCaller`), so the JSONL log records the pin only when the pinned caller wraps the chain from OUTSIDE the dump caller: build the logged base chain `base := NewDumpCaller(router, w, log)` and wrap it at launch — `NewModelProviderOverrideCaller(base, provider, model)` (override → dump → router). Wrapped the other way round (dump → override → router) the call still routes to the pinned provider, but the dump records empty `provider`/`model` keys and a misrouted call is indistinguishable from a legacy one in the log.
 - **Read-only validation surface:** `Router.ProviderForModel(model) (provider string, ok bool)` answers "which provider would this identifier route to" without mutating state — a composite resolves to its named provider (ok tracks the provider NAME only, exactly the runtime `Call` miss predicate; the bare model need not appear in the provider's list), a bare name resolves like `SetModel`. `Router.KnownProviders() []string` snapshots the configured provider names, sorted. Hosts pair the two to fail a composite `provider/model` override closed BEFORE launching the caller it pins, with an error naming the model and the known providers.
 - **Discovery:** `agents.AgentDescriptor` gains `Model string json:"model,omitempty"` (mirroring `AgentMetadata.Model`), populated by `Descriptor()`, so consumers see a profile's model override at discovery time without loading the full profile.
 
@@ -31,7 +32,7 @@ Provider string `json:"provider,omitempty"`
 Positive:
 
 - Per-call provider pinning with no global switching, no new router instance, and no extra concurrency surface; the retry/backoff/sampling/validation machinery is reused unchanged.
-- Request dumps record the override (`provider` key) for debugging misrouted calls.
+- Request dumps record the override (`provider` key) for debugging misrouted calls — provided the pinned caller wraps the chain outside the dump caller (see the composition bullet in Decision); the wrong wrap order routes correctly but logs empty keys.
 - Fully additive: empty `Provider` is byte-identical, so existing hosts, providers, and dumps are unaffected.
 
 Negative:
