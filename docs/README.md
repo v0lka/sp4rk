@@ -153,7 +153,7 @@ go run main.go
 
 ## Prerequisites
 
-- **Go 1.27.3+** — the SDK targets the Go version declared in its `go.mod` (`go 1.27.3`).
+- **Go 1.27.4+** — the SDK targets the Go version declared in its `go.mod` (`go 1.27.4`).
 - **At least one LLM API key** — Anthropic (`ANTHROPIC_API_KEY`) or OpenAI (`OPENAI_API_KEY`). The framework requires at least one configured provider.
 - **(Optional) ONNX Runtime** — only if you use the local embedding subsystem for vector search.
 

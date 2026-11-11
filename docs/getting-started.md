@@ -12,7 +12,7 @@ go get github.com/v0lka/sp4rk@latest
 
 ### Go version
 
-Go **1.27.3+** is required. The SDK's `go.mod` declares this version (`go 1.27.3`); older toolchains will fail to build.
+Go **1.27.4+** is required. The SDK's `go.mod` declares this version (`go 1.27.4`); older toolchains will fail to build.
 
 ### API keys
 
