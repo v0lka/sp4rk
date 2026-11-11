@@ -57,8 +57,9 @@ func TestRouter_Call_ProviderOverride_RoutesToNamedProvider(t *testing.T) {
 }
 
 // TestRouter_Call_ProviderOverride_UnknownProvider_NoRetry verifies that an
-// unknown provider name fails the call immediately with a non-retryable config
-// error: zero attempts against any provider, so the retry loop never runs.
+// unknown provider name fails the call immediately with the ErrUnknownProvider
+// sentinel (never retried): zero attempts against any provider, so the retry
+// loop never runs.
 func TestRouter_Call_ProviderOverride_UnknownProvider_NoRetry(t *testing.T) {
 	mock := &mockProvider{
 		name: "primary",
@@ -85,15 +86,14 @@ func TestRouter_Call_ProviderOverride_UnknownProvider_NoRetry(t *testing.T) {
 		t.Errorf("expected nil response on provider-miss error, got %+v", resp)
 	}
 
-	var llmErr *Error
-	if !errors.As(err, &llmErr) {
-		t.Fatalf("error is %T, want *llm.Error", err)
+	if !errors.Is(err, ErrUnknownProvider) {
+		t.Fatalf("error %v does not match ErrUnknownProvider; hosts detect the miss via errors.Is", err)
 	}
-	if llmErr.Retryable {
+	if IsRetryable(err) {
 		t.Errorf("provider-miss error must be non-retryable, got retryable=true (%v)", err)
 	}
-	if llmErr.Provider != "does-not-exist" {
-		t.Errorf("error names provider %q, want %q", llmErr.Provider, "does-not-exist")
+	if !strings.Contains(err.Error(), `"does-not-exist"`) {
+		t.Errorf("error message must name the unknown provider, got %v", err)
 	}
 
 	// Zero retry attempts: any attempt (initial or retried) would have

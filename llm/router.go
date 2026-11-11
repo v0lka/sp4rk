@@ -558,12 +558,25 @@ func (r *Router) Call(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 		overridden, ok := r.providers[req.Provider]
 		if !ok {
 			r.mu.RUnlock()
-			return nil, NewError(req.Provider, 0, false,
-				fmt.Errorf("llm: per-request provider %q is not configured", req.Provider))
+			// Configuration miss, not a transport failure: a plain
+			// sentinel-wrapped error (no HTTP status, never retried —
+			// the loop below is never entered); hosts detect it via
+			// errors.Is(err, ErrUnknownProvider).
+			return nil, fmt.Errorf("llm: per-request provider %q: %w", req.Provider, ErrUnknownProvider)
 		}
 		provider = overridden
 	}
 	r.mu.RUnlock()
+
+	// Observability for the ADR-011 "pairing is the caller's responsibility"
+	// contract: with an empty req.Model, prepareRequest silently substitutes
+	// the ACTIVE bare model, so a caller pinning only the provider gets the
+	// active model's metadata (sampling presets, context-window guard) on the
+	// pinned provider. The Debug line makes that implicit pairing visible.
+	if req.Provider != "" && req.Model == "" && r.logger != nil {
+		r.logger.Debug("router: provider override without explicit model; sending active model",
+			"provider", req.Provider, "model", bareModel)
+	}
 
 	if err := r.prepareRequest(ctx, &req, bareModel); err != nil {
 		return nil, err

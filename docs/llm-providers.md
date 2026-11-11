@@ -476,6 +476,7 @@ router, err := llm.NewRouter(ctx, llm.RouterConfig{
 
 ```go
 type ChatRequest struct {
+    Provider        string           // optional: route THIS call to a named configured provider (see "Pinning a provider for a single call")
     Model           string           // bare model name (filled from active model only when empty)
     ModelFamily     string           // family hint; auto-detected if empty
     Protocol        APIProtocol      // wire protocol; auto-resolved from the registry when empty, else DetectProtocol
@@ -514,6 +515,26 @@ type TokenUsage struct {
 The "fill only when empty" rule for `Model` is part of the router contract: a pre-set `req.Model` is preserved and sent to the active provider (`r.activeProvider`) unchanged, while the provider that handles the call is always the active one. This lets a caller force a specific model string without switching providers.
 
 `agent.NewModelOverrideCaller(inner LLMCaller, model string)` exploits this: it wraps an `LLMCaller` so every `Call` sets `req.Model` to `model` before delegating to `inner`, relying on the rule above to bypass the router's active-model selection for that caller. It returns `inner` unchanged when `model` is empty, so the override applies conditionally — used to apply a per-agent `Model` from a [Subagent Profile](agents.md). It is a `Caller` wrapper in the same spirit as the usage-tracking wrapper described in [Usage tracking](#usage-tracking).
+
+### Pinning a provider for a single call
+
+`ChatRequest.Provider` is the per-call counterpart of the model rule: a non-empty value routes THIS call to the named configured provider (a `ProviderEntry` logical name) instead of the active one. The router resolves it right after the active-state snapshot, before model-metadata resolution and the retry loop; an unknown name fails the call immediately with a non-retryable error wrapping the `ErrUnknownProvider` sentinel — no provider is ever attempted, no backoff runs:
+
+```go
+req := llm.ChatRequest{
+    Provider: "local-qwen", // configured ProviderEntry.Name — this call goes there
+    Model:    "qwen3:32b",  // pair it with a model the named provider serves
+    Messages: msgs,
+}
+resp, err := router.Call(ctx, req)
+if errors.Is(err, llm.ErrUnknownProvider) {
+    // provider name miss — a configuration error, not a transport failure
+}
+```
+
+An empty `Provider` keeps the legacy path byte-identical (the field is `json:"provider,omitempty"`, so request dumps are unchanged). Pairing is the caller's responsibility ([ADR-011](../specs/decisions/011-per-request-provider-override.md)): with `Model` empty, the router fills it with the ACTIVE bare model and resolves metadata against it, so a provider pinned without a model sends the active model's name — and uses the active model's sampling presets and context-window guard — to the pinned provider.
+
+`agent.NewModelProviderOverrideCaller(inner LLMCaller, provider, model string)` pins both fields on every call (each override applies independently and only when non-empty; both empty returns `inner` unchanged). Because the pinning is stateless per call, a caller pinned this way is immune to a mid-task `SetModel`; the legacy `NewModelOverrideCaller` is its model-only form. Hosts can validate a composite `provider/model` override before launching a pinned caller with the read-only `Router.ProviderForModel` and `Router.KnownProviders`.
 
 ## Message types
 
@@ -701,4 +722,5 @@ type Error struct {
 - `WrapProviderError(provider, statusCode, err)` — classify by HTTP status and network error type.
 - `IsRetryable(err)` — true when the chain contains a `*Error` with `Retryable == true`.
 - `NewContextWindowError(...)` — non-retryable error for context window overflow, wrapping `ErrContextWindowExceeded`.
+- `ErrUnknownProvider` — sentinel for a per-request provider override (`ChatRequest.Provider`) naming a provider that is not configured; the router returns it wrapped (plain error, no HTTP status) with the provider name before any attempt, non-retryable. Detect with `errors.Is`.
 - `ErrKind` — transport-independent failure class: `ErrKindRateLimit`, `ErrKindOverloaded`, or `""` (unknown). It is derived from the HTTP status on status-carrying transports (429 → `rate_limit`, 529 → `overloaded`) and from the Anthropic SDK's error type field otherwise (that SDK parses the JSON error body without exposing a status). Match on `ErrKind` instead of `StatusCode` when the failure class — not the raw transport detail — is what matters (e.g. arming a rate-limit backoff). Not to be confused with `anthropic.ErrType`, whose constants carry the provider-side `"rate_limit_error"` spelling — always bridge via the SDK's `Is*Err()` helpers.
