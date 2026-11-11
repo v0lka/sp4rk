@@ -886,41 +886,40 @@ func applyGLMReasoning(params *oai.ChatCompletionNewParams, model, effort string
 	})
 }
 
-// kimiK3SeriesRe recognizes the K3 series of Kimi (Moonshot AI) models — the
-// only Kimi models whose OpenAI-compatible API documents a per-request
-// reasoning control (reasoning_effort, values low/high/max; see the catalog
-// section comment and the K3 quickstart). It anchors "k3" on identifier
+// kimiK3SeriesRe recognizes the K3-series portion of the Kimi (Moonshot AI)
+// models whose reasoning control applyKimiReasoning supports; K2.8 Preview is
+// handled separately by its subscription alias. It anchors "k3" on identifier
 // boundaries (start/end or a separator) so the platform ID "kimi-k3", the
-// Kimi Code endpoint aliases "k3"/"k3-256k", and future K3 variants match,
-// while unrelated substrings ("k2.7-code", "mk3", a "k30" version token)
-// do not. Matching is case-insensitive; the caller passes the bare model
-// name already lowercased.
+// Kimi Code endpoint aliases "k3"/"k3-256k", and K3.1 variants match, while
+// unrelated substrings ("k2.7-code", "mk3", a "k30" version token) do not.
+// Matching is case-insensitive; the caller passes the bare model name already
+// lowercased.
 var kimiK3SeriesRe = regexp.MustCompile(`(^|[-_.])k3([-_.]|$)`)
 
 // applyKimiReasoning sets the reasoning control for Kimi (Moonshot AI) models
 // served through OpenAI-compatible endpoints (platform.kimi.ai and
 // api.kimi.com/coding alike).
 //
-// Only the K3 series documents a per-request effort field — reasoning_effort
-// (low/high/max). Every other kimi model exposes no documented wire spelling
-// in this catalog: K2.7 Code runs with thinking always on (a thinking-disable
-// routes the request to K2.6), K2.5/K2.6 document thinking/non-thinking modes
-// without a documented field, and kimi-k2 carries no reasoning capability at
-// all (gated upstream by ReasoningForCall, so it never reaches this switch).
-// The effort value is therefore emitted ONLY for K3-series models and fails
-// closed to no field for everything else: a strict gateway rejects unknown
-// request fields outright, and for the thinking-locked models the omitted
-// parameter resolves to the server-managed default — the only control they
-// accept. Values outside the documented set fail closed the same way (the
-// tier resolver only produces "low" for kimi, but a host may set the field
-// directly).
+// The K3 series and the Kimi Code K2.8 Preview alias "kimi-for-coding"
+// document a per-request effort field — reasoning_effort (low/high/max).
+// Every other kimi model exposes no documented wire spelling in this catalog:
+// K2.7 Code Highspeed has fixed thinking, K2.5/K2.6 document
+// thinking/non-thinking modes without a documented effort field, and kimi-k2
+// carries no reasoning capability at all (gated upstream by ReasoningForCall,
+// so it never reaches this switch). The effort value is therefore emitted ONLY
+// for K3-series models and K2.8 Preview and fails closed to no field for
+// everything else: a strict gateway rejects unknown request fields outright,
+// and for fixed-thinking models the omitted parameter resolves to the
+// server-managed default. Values outside the documented set fail closed the
+// same way (the tier resolver only produces "low" for kimi, but a host may
+// set the field directly).
 //
 // The SDK's typed ReasoningEffort field serializes to the same top-level
 // "reasoning_effort" key the K3 API documents, exactly like the
 // openai_* families above.
 func applyKimiReasoning(params *oai.ChatCompletionNewParams, model, effort string) {
 	bare := strings.ToLower(strings.TrimSpace(BareModel(model)))
-	if !kimiK3SeriesRe.MatchString(bare) {
+	if bare != "kimi-for-coding" && !kimiK3SeriesRe.MatchString(bare) {
 		return
 	}
 	switch effort {
