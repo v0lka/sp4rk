@@ -273,7 +273,7 @@ func (r *recordingEvents) StepComplete(stepNum int, _ time.Duration) {
 	r.record(fmt.Sprintf("StepComplete:%d", stepNum))
 }
 
-func (r *recordingEvents) SubAgentLaunch(stepID, description string) {
+func (r *recordingEvents) SubAgentLaunch(stepID, description, model string) {
 	r.record("SubAgentLaunch:" + stepID)
 }
 

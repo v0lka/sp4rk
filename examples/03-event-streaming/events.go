@@ -88,7 +88,7 @@ func (e *PrintingEvents) ExecutorDiagnostic(stepNum int, event string, details m
 
 // --- Sub-agent events (not used in this example but required by the interface) ---
 
-func (e *PrintingEvents) SubAgentLaunch(stepID, description string) {
+func (e *PrintingEvents) SubAgentLaunch(stepID, description, model string) {
 	fmt.Printf("│ 🚀 SubAgent launched: %s — %s\n", stepID, truncate(description, 80))
 }
 

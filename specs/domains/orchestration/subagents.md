@@ -34,13 +34,13 @@ type SubAgentTask struct {
 
 ```go
 func RunSubAgent(ctx, stepID string, executor *Executor, cm ContextManager,
-    taskTools []tools.ToolDescriptor, taskDesc string, emitter Events,
+    taskTools []tools.ToolDescriptor, taskDesc, model string, emitter Events,
     todoUpdateFunc StepTodoUpdateFunc) (resultCh <-chan SubAgentResult)
 ```
 
 The returned channel is buffered (capacity 1) and closed when the goroutine finishes. Read exactly one `SubAgentResult`. What it does:
 
-1. **Emits `SubAgentLaunch`** — `emitter.SubAgentLaunch(stepID, taskDesc)` fires before the executor starts.
+1. **Emits `SubAgentLaunch`** — `emitter.SubAgentLaunch(stepID, taskDesc, model)` fires before the executor starts.
 2. **Injects context** — task description (`WithTaskContext`), step ID (`WithStepID`), and (if provided) the checklist callback (`WithStepTodoUpdateFunc`).
 3. **Runs the executor** — `executor.Run(ctx, taskTools, cm)` inside the goroutine.
 4. **Defense-in-depth check** — even if the executor reports `Finished: true`, the output is scanned for printed tool-call syntax; if detected the result is treated as a failure.

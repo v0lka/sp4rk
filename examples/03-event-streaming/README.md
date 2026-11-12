@@ -62,7 +62,7 @@ type Events interface {
     ToolCall(stepNum, callIdx int, toolName, argsPreview, source string)
     ToolResult(stepNum, callIdx, resultLen int, preview string, isError bool)
     StepComplete(stepNum int, duration time.Duration)
-    SubAgentLaunch(stepID, description string)
+    SubAgentLaunch(stepID, description, model string)
     SubAgentComplete(stepID string, success bool, duration time.Duration, errMsg string)
     SubAgentPaused(stepID string, duration time.Duration)
     AssistantChunk(content string)
@@ -106,7 +106,7 @@ This is the **recommended pattern** for custom event sinks. It also future-proof
 | `ContextCompaction`| After context compaction runs              | `beforePercent`, `afterPercent`    |
 | `Finishing`        | When the agent calls `finish`              | `summary`                          |
 | `ExecutorDiagnostic`| Internal nudges, circuit breakers         | `event`, `details`                 |
-| `SubAgentLaunch`   | A delegated sub-agent starts               | `stepID`, `description`            |
+| `SubAgentLaunch`   | A delegated sub-agent starts               | `stepID`, `description`, `model`   |
 | `SubAgentComplete` | A delegated sub-agent finishes             | `success`, `duration`, `errMsg`    |
 | `SubAgentPaused`   | A delegated sub-agent pauses (resumable)   | `stepID`, `duration`               |
 

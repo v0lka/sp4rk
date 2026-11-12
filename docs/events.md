@@ -22,7 +22,7 @@ type Events interface {
     ToolCall(stepNum, callIdx int, toolName, argsPreview, source string)
     ToolResult(stepNum, callIdx, resultLen int, preview string, isError bool)
     StepComplete(stepNum int, duration time.Duration)
-    SubAgentLaunch(stepID, description string)
+    SubAgentLaunch(stepID, description, model string)
     SubAgentComplete(stepID string, success bool, duration time.Duration, errMsg string)
     SubAgentPaused(stepID string, duration time.Duration)
     AssistantChunk(content string)
@@ -60,7 +60,7 @@ type Events interface {
 
 | Method | Description |
 |--------|-------------|
-| `SubAgentLaunch(stepID, description)` | Fired when a sub-agent starts running a plan step in a goroutine. `description` is the task description. |
+| `SubAgentLaunch(stepID, description, model)` | Fired when a sub-agent starts running a plan step in a goroutine. `description` is the task description. |
 | `SubAgentComplete(stepID, success, duration, errMsg)` | Fired when a sub-agent finishes. `success` is `true` only if the executor finished without error; `errMsg` carries the failure reason (`""` on success). See [Subagents](subagents.md). |
 | `SubAgentPaused(stepID, duration)` | Fired **instead of** `SubAgentComplete` when the sub-agent stopped at a cooperative pause checkpoint (`ErrPaused`). A pause is a recoverable checkpoint, not a failure; the trajectory is preserved in the `SubAgentResult` for a later resume. |
 
@@ -278,7 +278,7 @@ func (e *PrintingEvents) ExecutorDiagnostic(stepNum int, event string, details m
 
 // --- Sub-agent events ---
 
-func (e *PrintingEvents) SubAgentLaunch(stepID, description string) {
+func (e *PrintingEvents) SubAgentLaunch(stepID, description, model string) {
     fmt.Printf("│ 🚀 SubAgent launched: %s — %s\n", stepID, truncate(description, 80))
 }
 
