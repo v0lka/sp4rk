@@ -102,15 +102,19 @@ func (e *Embedder) embedFixedPipeline(ctx context.Context, texts []string) ([][]
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		var (
-			vecs [][]float32
-			err  error
-		)
-		e.onORTThread(func() {
-			vecs, err = e.batchSess.runBatch(batch.end-batch.start,
-				batch.inputIDs, batch.attentionMask, batch.tokenTypeIDs)
-		})
-		if err != nil {
+		var vecs [][]float32
+		// runChunk re-reads e.batchSess on every attempt: the first attempt
+		// uses the live session, the post-degradation retry the freshly
+		// recreated one (ensureBatchSession below).
+		runChunk := func() error {
+			var chunkErr error
+			e.onORTThread(func() {
+				vecs, chunkErr = e.batchSess.runBatch(batch.end-batch.start,
+					batch.inputIDs, batch.attentionMask, batch.tokenTypeIDs)
+			})
+			return chunkErr
+		}
+		if err := e.embedInference(runChunk, e.ensureBatchSession); err != nil {
 			return nil, fmt.Errorf("embedding batch chunk [%d:%d] of %d documents: %w",
 				batch.start, batch.end, len(texts), err)
 		}

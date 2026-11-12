@@ -72,6 +72,17 @@ type EmbedderConfig struct {
     // Telemetry optionally collects bounded, content-free stage aggregates.
     // Nil disables collection.
     Telemetry *Telemetry
+    // OnProviderDegrade optionally observes a runtime execution-provider
+    // degradation — the embedder stopping inference on one provider and
+    // continuing on another after construction (the post-construction
+    // hardware→CPU fallbacks of an "auto" request, including the
+    // consecutive-inference-failure degradation). from/to are provider
+    // identifiers ("cuda" -> "cpu"); cause is the triggering error text.
+    // Fires synchronously under the embedder's internal write lock: must be
+    // quick and must not call back into the Embedder. The initial provider
+    // resolution inside NewEmbedder does not fire it. Nil disables
+    // notification.
+    OnProviderDegrade func(from, to, cause string)
 }
 ```
 
@@ -105,7 +116,7 @@ The initialization sequence is:
 3. `NewTokenizer(tokenizerPath)` — loads the HuggingFace tokenizer.
 4. `newONNXSession(modelPath, batchSize, seqLen, hiddenDim, sessOpts, telemetry)` — creates a persistent ONNX session with pre-allocated tensors for the fast path.
 
-The resulting `sessOpts` is reused for the persistent single-text session, the batch session, and the per-bucket sessions. `EmbedderConfig.ExecutionProvider` / `DeviceID` select the provider: `"cuda"` and `"openvino"` request a specific hardware provider (an `"openvino"` request rejects a non-zero `DeviceID` loudly — `0` lets the rung resolve the device itself). `"auto"` walks the ladder CUDA → OpenVINO; when a rung fails at the options stage — or when the winning provider accepts the *options* but the *session* itself cannot be built on it, the remaining rungs are retried at the session stage first — and only when every attempt has failed, a WARN naming each failure is logged and initialization continues on the CPU (the eager session, and, in length-bucket mode, the first lazily created bucket session). `Embedder.ExecutionProvider()` reports which provider inference actually runs on (`cpu`, `cuda`, or `openvino`).
+The resulting `sessOpts` is reused for the persistent single-text session, the batch session, and the per-bucket sessions. `EmbedderConfig.ExecutionProvider` / `DeviceID` select the provider: `"cuda"` and `"openvino"` request a specific hardware provider (an `"openvino"` request rejects a non-zero `DeviceID` loudly — `0` lets the rung resolve the device itself). `"auto"` walks the ladder CUDA → OpenVINO; when a rung fails at the options stage — or when the winning provider accepts the *options* but the *session* itself cannot be built on it, the remaining rungs are retried at the session stage first — and only when every attempt has failed, a WARN naming each failure is logged and initialization continues on the CPU (the eager session, and, in length-bucket mode, the first lazily created bucket session). `Embedder.ExecutionProvider()` reports which provider inference actually runs on (`cpu`, `cuda`, or `openvino`). A hardware provider that dies *after* construction is recovered by the runtime degradation — see [Execution provider degradation](#execution-provider-degradation).
 
 Inside the OpenVINO rung the *device* is resolved the same empirical way, because the plugin applies its own priority to an appended device list but then uses only the first device, and the wrapper exposes no hardware-device class to filter with. The first session attempt appends every device the plugin reports; if that session cannot be created (on Intel Core Ultra hosts the first device is the NPU, whose compiler rejects this model's dynamic shapes), the remaining devices are tried one at a time through the same session creation, and the winner is remembered process-wide (`openVINOPreferredDevice`) so later sessions append only it. See `specs/domains/embedding.md` → *OpenVINO device resolution*.
 
@@ -172,6 +183,40 @@ For `jina-embeddings-v2-small-en`:
 - **Inputs:** `input_ids`, `attention_mask`, `token_type_ids` (all `int64`, shape `[batch, seq]`).
 - **Output:** `last_hidden_state` (`float32`, shape `[batch, seq, hiddenDim]`).
 - **Post-processing:** mean pooling with the attention mask, then L2 normalization.
+
+## Execution provider degradation
+
+A hardware-backed execution provider can die *after* a successful initialization: a wedged driver following a driver upgrade, a device lost across a suspend/resume cycle, device memory exhausted by another process. The embedder survives this with a degradation ladder of **three stages**, each covering the failure window the previous one cannot see:
+
+1. **Initialization ladder** — an `"auto"` request walks CUDA → OpenVINO at the session-options stage and again at the session-creation stage (see [NewEmbedder](#newembedder)); when every hardware rung has failed, a WARN naming each reason is logged and initialization continues on the CPU provider.
+2. **Session-creation fallback** — after initialization, a persistent session that cannot be created on the hardware provider (for example the first lazy batch or length-bucket session, after the hardware went bad between calls) is retried on the remaining rungs and finally on the CPU provider. This path fires only while **no hardware-backed session is live yet**.
+3. **Runtime degradation** — inference itself failing repeatedly on a **live** hardware session moves the embedder to the CPU provider inside the running process. Before this stage existed, such a failure bricked the embedder until the process was restarted: every call kept failing even though the CPU provider remained perfectly usable.
+
+Stages 2 and 3 are one-shot per embedder and funnel through the same `degradeToCPU` choke point.
+
+### Runtime degradation
+
+Every failed ONNX inference attempt bumps a consecutive-failure counter; any successful inference resets it to zero. The counter spans all sessions — the eager single-text session, the batch session, the pipeline and the length buckets. When the counter reaches `inferenceDegradeThreshold` (a compile-time constant, `2`) on an `"auto"` request still running on a hardware provider, the embedder degrades to the CPU provider **once**:
+
+- `degradeToCPU` builds the CPU session options **first** — if that build fails, the embedder is left exactly as it was, still on the hardware provider with its options and sessions intact, never half-degraded. It then destroys every live session on the dedicated ONNX thread (the thread those sessions belong to), stops the thread, and commits the CPU state. A WARN log names the provider, the causing error and the device ID.
+- The call that hit the threshold lazily re-creates the session it needs and retries the failed inference **exactly once** on the CPU provider. The retry is structurally once: the degradation clears the pending flag, so a later failure can never trigger a second degradation.
+- An eligible call therefore either completes on the CPU provider (a `nil` error) or returns **one loud error** chaining the original hardware failure with whichever degradation or retry step failed. Ineligible calls — explicit `cuda`/`openvino` requests, an already-CPU embedder, a closed embedder, or a streak below the threshold — return the inference error unchanged, exactly as before.
+
+One failure stays a loud error: a transient hiccup must not demote the embedder on its own. The second consecutive failure is the evidence that the provider stopped working mid-flight. An explicit `"cuda"` or `"openvino"` request **never** degrades at runtime — the caller asked for that specific hardware, so its failures keep surfacing as loud errors. After a successful degradation `ExecutionProvider()` reports `cpu`.
+
+### Observing a degradation
+
+Besides the WARN log, hosts can observe the flip programmatically through `EmbedderConfig.OnProviderDegrade`:
+
+```go
+cfg.OnProviderDegrade = func(from, to, cause string) {
+    logger.Warn("embedding provider degraded", "from", from, "to", to, "cause", cause)
+}
+```
+
+The callback fires **once per degradation**, synchronously under the embedder's internal write lock, right next to the WARN log. It covers both post-construction degradation paths (the session-creation fallback and the runtime degradation); the initial provider resolution inside `NewEmbedder` does **not** fire it — that resolution is already reported through the WARN log and the `requestedExecutionProvider` field of the "embedder initialized" log entry. `from` and `to` are provider identifiers (`"cuda"` → `"cpu"`) and `cause` is the same error text the WARN log carries. Because the callback runs under the write lock, it **must be quick and must not call back into the `Embedder`** (including `ExecutionProvider`); a nil callback disables notification.
+
+See `specs/domains/embedding.md` → *Execution providers* (the three-stage degradation walk) and `specs/decisions/011-runtime-hardware-cpu-degradation.md` for the full contract, including the rejected alternatives.
 
 ## GPU diagnostics
 
