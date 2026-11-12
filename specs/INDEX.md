@@ -43,7 +43,7 @@
 | Subagent Profiles, AGENT.md discovery, per-agent model/tools  | [domains/agents.md](domains/agents.md)                                          |
 | Prompt builder, system-prompt composition                     | [domains/prompt-building.md](domains/prompt-building.md)                        |
 | Embeddings, chunking, ONNX                                    | [domains/embedding.md](domains/embedding.md)                                    |
-| GPU/CUDA inference, execution providers, GPU diagnostics      | [domains/embedding.md](domains/embedding.md)                                    |
+| GPU/CUDA inference, execution providers, GPU diagnostics      | [domains/embedding.md](domains/embedding.md), [decisions/011-runtime-hardware-cpu-degradation.md](decisions/011-runtime-hardware-cpu-degradation.md) |
 | What an embedding application must provide (events, confirm)  | [contracts/agent-execution.md](contracts/agent-execution.md)                    |
 | LLM provider contract                                         | [contracts/llm-providers.md](contracts/llm-providers.md)                        |
 | Tool interface contract                                       | [contracts/tools.md](contracts/tools.md)                                        |
@@ -167,3 +167,4 @@ See [META.md](META.md) for document templates, naming rules, and update protocol
 - [009-opt-in-request-scoped-streaming.md](decisions/009-opt-in-request-scoped-streaming.md) - Opt-in request-scoped streaming channel
 - [010-appendcodec-gzip-zstd-xz-rejected.md](decisions/010-appendcodec-gzip-zstd-xz-rejected.md) - Append-safe codec writers: gzip and zstd, xz rejected
 - [011-per-request-provider-override.md](decisions/011-per-request-provider-override.md) - Per-request provider override on ChatRequest
+- [011-runtime-hardware-cpu-degradation.md](decisions/011-runtime-hardware-cpu-degradation.md) - One-shot auto hardware→CPU degradation after consecutive inference failures

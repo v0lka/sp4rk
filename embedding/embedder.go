@@ -35,6 +35,16 @@ const (
 	// x 4 bytes = B MiB) and single-call latency (B=32 ~0.75s vs B=128
 	// ~3.1s) with no additional throughput.
 	DefaultBatchSize = 32
+
+	// inferenceDegradeThreshold is the number of consecutive failed ONNX
+	// inference attempts that triggers the runtime hardware->CPU degradation
+	// for an "auto" request (see Embedder.embedInference). One failure stays
+	// a loud error as before — a transient CUDA/OpenVINO hiccup must not
+	// demote the embedder on its own; the second consecutive failure is the
+	// evidence that the provider stopped working mid-flight (wedged driver,
+	// device lost, exhausted device memory), which is exactly the situation
+	// the one-shot degradation exists to survive.
+	inferenceDegradeThreshold = 2
 )
 
 // EmbedderConfig holds configuration for creating an Embedder.
@@ -139,6 +149,24 @@ type EmbedderConfig struct {
 	// Telemetry optionally collects bounded, content-free stage aggregates.
 	// Nil disables collection with no background goroutines or exporters.
 	Telemetry *Telemetry
+
+	// OnProviderDegrade optionally observes a runtime execution-provider
+	// degradation — the embedder stopping inference on one provider and
+	// continuing on another after construction. Today that is exactly the
+	// hardware->CPU degradation of an "auto" request: the eager/lazy
+	// session-creation fallbacks and the consecutive-inference-failure
+	// degradation (see Embedder.embedInference). The initial provider
+	// resolution inside NewEmbedder (an "auto" request whose whole ladder
+	// fails before any session exists) does not fire it — that resolution is
+	// already reported through the WARN log and the requestedExecutionProvider
+	// field of the "embedder initialized" entry.
+	//
+	// from and to are provider identifiers ("cuda" -> "cpu"); cause is the
+	// error text that triggered the degradation (the same text the WARN log
+	// carries). The callback fires synchronously under the embedder's
+	// internal write lock: it must be quick and must not call back into the
+	// Embedder (including ExecutionProvider). Nil disables notification.
+	OnProviderDegrade func(from, to, cause string)
 }
 
 // sessionKey identifies one persistent fixed-shape ONNX session.
@@ -198,8 +226,22 @@ type Embedder struct {
 	// (CUDA or OpenVINO) that an "auto" request selected. A lazily created
 	// session that cannot be built on that provider then degrades the embedder
 	// to the CPU provider once and retries (see newSessionWithFallback),
-	// mirroring the eager-session fallback in NewEmbedder.
+	// mirroring the eager-session fallback in NewEmbedder. The same state
+	// gates the runtime degradation of embedInference: consecutive inference
+	// failures destroy the live sessions and move the embedder to the CPU
+	// provider (see degradeToCPU). degradeToCPU clears it, so both
+	// degradations are one-shot per embedder.
 	fallbackPending bool
+	// inferenceErrStreak counts consecutive failed ONNX inference attempts
+	// across all sessions; any successful inference resets it to zero. When
+	// the streak reaches inferenceDegradeThreshold on an "auto" request still
+	// running on a hardware provider, embedInference degrades the embedder to
+	// the CPU provider once and retries the failed inference there. It is
+	// always read and written under e.mu.
+	inferenceErrStreak int
+	// degradeCallback carries EmbedderConfig.OnProviderDegrade; nil when the
+	// host did not configure one. Invoked by degradeToCPU under e.mu.
+	degradeCallback func(from, to, cause string)
 }
 
 // runOnORTThread executes fn on r's dedicated thread, or inline when r is nil.
@@ -639,6 +681,7 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 		// the eager-session fallback above already ran, effective is CPU and
 		// this stays false.
 		fallbackPending: requestedAuto && effective != ExecutionProviderCPU,
+		degradeCallback: cfg.OnProviderDegrade,
 	}, nil
 }
 
@@ -715,12 +758,21 @@ func (e *Embedder) EmbedDocuments(ctx context.Context, texts []string) ([][]floa
 	// This is the common case when chromem-go calls EmbeddingFunc one text at a time.
 	if numTexts == 1 && e.sess != nil {
 		e.logger.Debug("running inference (persistent session)", "seqLen", e.maxSeqLen)
-		var (
-			vec []float32
-			err error
-		)
-		e.onORTThread(func() { vec, err = e.sess.run(inputIDs, attentionMask, tokenTypeIDs) })
-		if err != nil {
+		var vec []float32
+		runQuery := func() error {
+			var runErr error
+			e.onORTThread(func() { vec, runErr = e.sess.run(inputIDs, attentionMask, tokenTypeIDs) })
+			return runErr
+		}
+		recreate := func() error {
+			sess, sErr := e.newSession(1, e.maxSeqLen)
+			if sErr != nil {
+				return sErr
+			}
+			e.sess = sess
+			return nil
+		}
+		if err := e.embedInference(runQuery, recreate); err != nil {
 			return nil, fmt.Errorf("embedding document: %w", err)
 		}
 		return [][]float32{vec}, nil
@@ -755,15 +807,19 @@ func (e *Embedder) EmbedDocuments(ctx context.Context, texts []string) ([][]floa
 			end = numTexts
 		}
 		lo, hi := start*e.maxSeqLen, end*e.maxSeqLen
-		var (
-			vecs [][]float32
-			err  error
-		)
-		e.onORTThread(func() {
-			vecs, err = e.batchSess.runBatch(end-start,
-				inputIDs[lo:hi], attentionMask[lo:hi], tokenTypeIDs[lo:hi])
-		})
-		if err != nil {
+		var vecs [][]float32
+		// runChunk re-reads e.batchSess on every attempt: the first attempt
+		// uses the live session, the post-degradation retry the freshly
+		// recreated one (ensureBatchSession below).
+		runChunk := func() error {
+			var chunkErr error
+			e.onORTThread(func() {
+				vecs, chunkErr = e.batchSess.runBatch(end-start,
+					inputIDs[lo:hi], attentionMask[lo:hi], tokenTypeIDs[lo:hi])
+			})
+			return chunkErr
+		}
+		if err := e.embedInference(runChunk, e.ensureBatchSession); err != nil {
 			return nil, fmt.Errorf("embedding batch chunk [%d:%d] of %d documents: %w",
 				start, end, numTexts, err)
 		}
@@ -820,18 +876,27 @@ func (e *Embedder) embedLengthBuckets(ctx context.Context, inputIDs, attentionMa
 				copy(types[dst:dst+bucket], tokenTypeIDs[src:src+bucket])
 			}
 
-			sess, err := e.ensureBucketSession(bucket)
-			if err != nil {
+			if _, err := e.ensureBucketSession(bucket); err != nil {
 				return nil, err
 			}
-			var (
-				vecs [][]float32
-				rErr error
-			)
-			e.onORTThread(func() {
-				vecs, rErr = sess.runBatch(rows, ids, mask, types)
-			})
-			if rErr != nil {
+			var vecs [][]float32
+			// key re-resolves the bucket session on every attempt: the first
+			// attempt uses the live session, the post-degradation retry the
+			// freshly recreated one (ensureBucketSession below).
+			key := sessionKey{batchSize: e.batchSize, seqLen: bucket}
+			runRows := func() error {
+				sess := e.bucketSessions[key]
+				var runErr error
+				e.onORTThread(func() {
+					vecs, runErr = sess.runBatch(rows, ids, mask, types)
+				})
+				return runErr
+			}
+			recreate := func() error {
+				_, sErr := e.ensureBucketSession(bucket)
+				return sErr
+			}
+			if rErr := e.embedInference(runRows, recreate); rErr != nil {
 				return nil, fmt.Errorf("embedding length bucket %d rows [%d:%d]: %w", bucket, start, end, rErr)
 			}
 			for row, item := range items[start:end] {
@@ -967,20 +1032,92 @@ func (e *Embedder) newSessionWithFallback(batchSize, seqLen int) (*onnxSession, 
 
 // canDegradeToCPU reports whether the embedder can safely retry session creation
 // on the CPU provider: the request was an "auto" one now running on a hardware
-// provider (CUDA or OpenVINO), and no hardware-backed session is live yet — a
-// live session needs the dedicated ONNX thread the fallback stops, so
-// degrading mid-flight would strand it. In practice this is the first session
+// provider (CUDA or OpenVINO), and no hardware-backed session is live yet. The
+// session-stage degradation walks the remaining provider ladder first, and
+// every rung rebuilds the session options — replacing options a live session
+// was built from (and that degradeToCPU would destroy under it) is only safe
+// while no session references them. In practice this is the first session
 // creation in length-bucket mode, which is exactly the path the eager fallback
-// does not cover.
+// does not cover. The runtime degradation of embedInference does not go
+// through this gate: it destroys the live sessions (inside degradeToCPU)
+// before rebuilding anything.
 func (e *Embedder) canDegradeToCPU() bool {
 	return e.fallbackPending && e.sess == nil && e.batchSess == nil && len(e.bucketSessions) == 0
 }
 
-// degradeToCPU rebuilds the session options on the CPU provider, stops the
-// dedicated ONNX thread, and records that inference now runs on the CPU. It is
-// called when a session could not be built on a hardware provider chosen by an
-// "auto" request. The caller must hold e.mu, must have verified
-// canDegradeToCPU, and must retry session creation afterwards.
+// canDegradeAtRuntime reports whether the runtime hardware->CPU degradation
+// of embedInference is available for this embedder: it is open, and the
+// request was an "auto" one still running on a hardware provider
+// (fallbackPending). An explicit "cuda" or "openvino" request never
+// degrades at runtime — its inference failures stay loud errors — and a
+// closed embedder has nothing left to degrade. degradeToCPU clears
+// fallbackPending, which makes the degradation structurally one-shot.
+// The caller must hold e.mu.
+func (e *Embedder) canDegradeAtRuntime() bool {
+	return !e.closed && e.fallbackPending
+}
+
+// embedInference executes one ONNX inference attempt through run and
+// implements the runtime provider-degradation contract: consecutive inference
+// failures are counted (any success resets the streak), and when the streak
+// reaches inferenceDegradeThreshold while the embedder is an "auto" request
+// still running on a hardware provider (canDegradeAtRuntime), the embedder
+// destroys its live sessions, rebuilds its options on the CPU provider
+// (degradeToCPU — WARN log and OnProviderDegrade callback included), lets
+// recreate lazily rebuild the session this call needs, and retries the
+// inference exactly once on the CPU provider. The retry is structurally
+// once: after degradeToCPU the embedder reports "cpu" and fallbackPending is
+// cleared, so a later failure can never degrade again.
+//
+// An eligible call therefore either completes on the CPU provider (nil
+// error) or returns ONE loud error chaining the original hardware failure
+// with whichever step of the degradation or retry failed. Ineligible calls —
+// explicit cuda/openvino requests, an already-CPU embedder, a closed
+// embedder, or a streak below the threshold — return the inference error
+// unchanged (the site wraps it with its own context, as before).
+//
+// The caller must hold e.mu, which also keeps the dedicated ONNX thread
+// quiescent: the destruction and options rebuild run on it via
+// e.onORTThread while nothing else can reach the sessions.
+func (e *Embedder) embedInference(run, recreate func() error) error {
+	err := run()
+	if err == nil {
+		e.inferenceErrStreak = 0
+		return nil
+	}
+	e.inferenceErrStreak++
+	if e.inferenceErrStreak < inferenceDegradeThreshold || !e.canDegradeAtRuntime() {
+		return err
+	}
+	hardwareProvider := e.executionProvider
+	if dErr := e.degradeToCPU(err); dErr != nil {
+		return fmt.Errorf("inference on %s failed (%w) and the runtime degradation to CPU failed: %w", hardwareProvider, err, dErr)
+	}
+	if rErr := recreate(); rErr != nil {
+		return fmt.Errorf("inference on %s failed (%w); recreating sessions after the runtime %s->CPU degradation also failed: %w", hardwareProvider, err, hardwareProvider, rErr)
+	}
+	if rErr := run(); rErr != nil {
+		return fmt.Errorf("inference failed on %s (%w) and again on the CPU provider after the runtime degradation: %w", hardwareProvider, err, rErr)
+	}
+	e.inferenceErrStreak = 0
+	return nil
+}
+
+// degradeToCPU rebuilds the session options on the CPU provider, destroys
+// every live session on the dedicated ONNX thread, stops that thread, and
+// records that inference now runs on the CPU. It serves both degradation
+// paths: the session-creation fallback (called via newSessionWithFallback
+// after canDegradeToCPU verified no session is live — the destruction loop
+// below is a no-op there) and the runtime degradation of embedInference,
+// where live sessions exist and are destroyed here, on the dedicated thread
+// they belong to, right before the thread stops. The caller must hold e.mu
+// and must retry session creation (or inference) afterwards.
+//
+// On failure the embedder is left exactly as it was — still on the hardware
+// provider with its options and sessions intact — never in a half-degraded
+// state. On success the host's OnProviderDegrade callback (when configured)
+// fires with the provider that was degraded from, the CPU provider, and the
+// cause, synchronously under e.mu.
 func (e *Embedder) degradeToCPU(cause error) error {
 	e.logger.Warn("execution provider unavailable, falling back to CPU",
 		"provider", e.executionProvider, "error", cause.Error(), "deviceID", e.deviceID)
@@ -988,22 +1125,38 @@ func (e *Embedder) degradeToCPU(cause error) error {
 		opts *ort.SessionOptions
 		err  error
 	)
-	// Build the CPU options FIRST, before tearing down the hardware handle: if
-	// this fails (ort.NewSessionOptions error) the embedder must be left
-	// exactly as it was — still on the hardware provider with its options
-	// intact — never in a half-degraded state with sessOpts == nil but
-	// executionProvider still reporting hardware. The library path is empty
-	// because the CPU provider never reads it (no provider lookup happens on
-	// the CPU path).
+	// Build the CPU options FIRST, before tearing down the hardware handle
+	// or any session: if this fails (ort.NewSessionOptions error) the
+	// embedder must be left exactly as it was — still on the hardware
+	// provider with its options and live sessions intact. The library path
+	// is empty because the CPU provider never reads it (no provider lookup
+	// happens on the CPU path).
 	e.onORTThread(func() {
 		opts, err = buildSessionOptions(ExecutionProviderCPU, "", e.deviceID, e.intraOpThreads)
 	})
 	if err != nil {
 		return fmt.Errorf("building ONNX session options: %w", err)
 	}
-	// The CPU options are in hand; now destroy the hardware handle and commit
-	// the new state, so every mutation that follows is unconditional.
+	// The CPU options are in hand; now destroy the hardware state and commit
+	// the new state, so every mutation that follows is unconditional. Live
+	// sessions are destroyed as one job on the dedicated thread they were
+	// created and run on — the same single-job teardown Close uses — because
+	// they touch the same provider context the thread pins; after this job
+	// the thread stops, so no ONNX call can outlive its session.
+	from := e.executionProvider
 	e.onORTThread(func() {
+		if e.sess != nil {
+			e.sess.destroy()
+			e.sess = nil
+		}
+		if e.batchSess != nil {
+			e.batchSess.destroy()
+			e.batchSess = nil
+		}
+		for key, sess := range e.bucketSessions {
+			sess.destroy()
+			delete(e.bucketSessions, key)
+		}
 		if e.sessOpts != nil {
 			_ = e.sessOpts.Destroy()
 		}
@@ -1015,6 +1168,9 @@ func (e *Embedder) degradeToCPU(cause error) error {
 	e.sessOpts = opts
 	e.executionProvider = ExecutionProviderCPU
 	e.fallbackPending = false
+	if e.degradeCallback != nil {
+		e.degradeCallback(from, ExecutionProviderCPU, cause.Error())
+	}
 	return nil
 }
 
