@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	chromem "github.com/philippgille/chromem-go"
@@ -210,7 +211,15 @@ type Embedder struct {
 	executionProvider string
 	// runner pins every ONNX Runtime call to one OS thread; nil for the CPU
 	// provider, which does not need the pinning. See ortRunner.
-	runner *ortRunner
+	//
+	// It is an atomic.Pointer, NOT an e.mu-guarded plain field, because Wedged
+	// must read it without taking e.mu: EmbedDocuments holds e.mu write-locked
+	// across all ONNX inference, so a mutex-synchronized read would park until
+	// the inference returns — and a wedged inference never returns, which is
+	// exactly the condition Wedged exists to report. Writers (degradeToCPU,
+	// Close) already run under e.mu; the atomic store keeps that discipline
+	// while letting the lock-free reader observe the pointer instantly.
+	runner atomic.Pointer[ortRunner]
 	// deviceID and intraOpThreads retain the config NewEmbedder used to build
 	// session options, so a later session-creation failure can rebuild them on
 	// the CPU provider or on the ladder's next rung (see degradeToCPU and
@@ -257,7 +266,7 @@ func runOnORTThread(r *ortRunner, fn func()) {
 // when no runner is in use. The caller must hold e.mu, which is what keeps the
 // ONNX sessions single-threaded for the CPU provider too.
 func (e *Embedder) onORTThread(fn func()) {
-	runOnORTThread(e.runner, fn)
+	runOnORTThread(e.runner.Load(), fn)
 }
 
 // autoAttemptLadder is the ordered hardware providers an "auto" request tries
@@ -404,7 +413,7 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 	effective := requested
 	var runner *ortRunner
 	if providerUsesDedicatedThread(effective) {
-		runner = newORTRunner()
+		runner = newORTRunner(logger)
 	}
 
 	// cleanup releases whatever the aborted initialization already acquired
@@ -658,7 +667,7 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 	}
 	logger.Info("embedder initialized", initialized...)
 
-	return &Embedder{
+	e := &Embedder{
 		tokenizer:         tok,
 		modelPath:         cfg.ModelPath,
 		maxSeqLen:         maxSeqLen,
@@ -672,7 +681,6 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 		bucketSessions:    make(map[sessionKey]*onnxSession, 4),
 		sessOpts:          sessOpts,
 		executionProvider: effective,
-		runner:            runner,
 		deviceID:          cfg.DeviceID,
 		intraOpThreads:    cfg.IntraOpThreads,
 		libraryPath:       cfg.LibraryPath,
@@ -682,7 +690,11 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 		// this stays false.
 		fallbackPending: requestedAuto && effective != ExecutionProviderCPU,
 		degradeCallback: cfg.OnProviderDegrade,
-	}, nil
+	}
+	// The runner pointer is published atomically (nil for the CPU provider):
+	// Wedged reads it without e.mu — see the field comment.
+	e.runner.Store(runner)
+	return e, nil
 }
 
 // ExecutionProvider reports the execution provider the embedder actually runs
@@ -705,6 +717,35 @@ func (e *Embedder) ExecutionProvider() string {
 		return ExecutionProviderCPU
 	}
 	return provider
+}
+
+// Wedged reports whether the embedder's dedicated ONNX inference thread is
+// wedged: a job has been running on that thread for at least bound. The
+// verdict comes from the worker's own per-job heartbeat (ortRunner), so it is
+// authoritative — a caller whose embed call timed out or was cancelled
+// cannot tell the difference between "slow inference" and "the thread is
+// stuck inside a C call and will never return"; this query can. False on the
+// CPU provider (no dedicated thread exists to wedge — an inline call blocks
+// only its own goroutine), while idle between jobs, and for a non-positive
+// bound. The intended consumer contract (c0wrk's vector-index manager):
+// consult Wedged for the honest diagnosis instead of inferring a wedge from
+// a streak of consecutive timeouts; keep the caller-side timeout bound
+// solely as the backstop that bounds the wait itself.
+//
+// The runner pointer is read WITHOUT e.mu, deliberately: EmbedDocuments
+// holds e.mu write-locked across all ONNX inference, so an RLock here would
+// park until the inference returns — forever under the very wedge this
+// method diagnoses, turning the authoritative probe into a deadlock (the
+// runner pointer is therefore an atomic.Pointer; see the field comment).
+// The runner's own mutex guards only the per-job heartbeat stamps, never
+// the job body, so wedged below answers even while the worker is stuck
+// inside a C call.
+func (e *Embedder) Wedged(bound time.Duration) bool {
+	r := e.runner.Load()
+	if r == nil {
+		return false
+	}
+	return r.wedged(bound)
 }
 
 // EmbedDocuments embeds a batch of text documents and returns their embedding vectors.
@@ -1161,9 +1202,9 @@ func (e *Embedder) degradeToCPU(cause error) error {
 			_ = e.sessOpts.Destroy()
 		}
 	})
-	if e.runner != nil {
-		e.runner.stop()
-		e.runner = nil
+	if r := e.runner.Load(); r != nil {
+		r.stop()
+		e.runner.Store(nil)
 	}
 	e.sessOpts = opts
 	e.executionProvider = ExecutionProviderCPU
@@ -1267,9 +1308,9 @@ func (e *Embedder) Close() error {
 		}
 		destroyErr = destroyONNXRuntime()
 	})
-	if e.runner != nil {
-		e.runner.stop()
-		e.runner = nil
+	if r := e.runner.Load(); r != nil {
+		r.stop()
+		e.runner.Store(nil)
 	}
 	// Mark the embedder closed so EmbedDocuments/EmbedQuery return an error
 	// instead of touching the destroyed ONNX environment.

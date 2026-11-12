@@ -368,7 +368,10 @@ func TestEmbedder_degradeToCPU_DestroysLiveSessionsOnORTThread(t *testing.T) {
 		callbackCall++
 		callbackFrom, callbackTo = from, to
 	})
-	e.runner = newORTRunner()
+	// atomic.Pointer since the wedge-detection commit; the runner is nil-
+	// logger (silent, like runner_test.go) and is stopped by degradeToCPU
+	// itself, which is part of the behavior under test.
+	e.runner.Store(newORTRunner(nil))
 	e.sess = &onnxSession{}
 	e.batchSess = &onnxSession{}
 	e.bucketSessions[sessionKey{batchSize: 32, seqLen: 128}] = &onnxSession{}

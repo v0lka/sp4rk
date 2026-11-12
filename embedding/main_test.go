@@ -86,9 +86,9 @@ func closeSessionOnly(e *Embedder) {
 			e.sessOpts = nil
 		}
 	})
-	if e.runner != nil {
-		e.runner.stop()
-		e.runner = nil
+	if r := e.runner.Load(); r != nil {
+		r.stop()
+		e.runner.Store(nil)
 	}
 	e.closed = true
 	e.tokenizer = nil

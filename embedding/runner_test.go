@@ -73,7 +73,7 @@ func TestProviderUsesDedicatedThread(t *testing.T) {
 func TestORTRunner_SingleThreadAcrossCallers(t *testing.T) {
 	// The whole point of the runner: no matter how many different goroutines
 	// (and therefore OS threads) call in, ONNX work lands on exactly one.
-	r := newORTRunner()
+	r := newORTRunner(nil)
 	defer r.stop()
 
 	const callers = 20
@@ -106,7 +106,7 @@ func TestORTRunner_SingleThreadAcrossCallers(t *testing.T) {
 func TestORTRunner_Serializes(t *testing.T) {
 	// Jobs must never overlap: the ONNX sessions they drive are not
 	// concurrency-safe.
-	r := newORTRunner()
+	r := newORTRunner(nil)
 	defer r.stop()
 
 	var (
@@ -145,7 +145,7 @@ func TestORTRunner_PanicReachesCallerAndRunnerSurvives(t *testing.T) {
 	// re-raised value must also be the ORIGINAL panic value with its type
 	// intact, so a caller matching on the value (rather than just checking
 	// non-nil) sees exactly what the job panicked with.
-	r := newORTRunner()
+	r := newORTRunner(nil)
 	defer r.stop()
 
 	func() {
@@ -192,8 +192,9 @@ func TestEmbedderOnORTThread_ParallelCallsShareOneThread(t *testing.T) {
 	// footprint must stay flat over the embedder's lifetime, not just within
 	// one burst. No ONNX assets are needed: the calls stop at the runner and
 	// never reach the runtime.
-	e := &Embedder{runner: newORTRunner()}
-	defer e.runner.stop()
+	e := &Embedder{}
+	e.runner.Store(newORTRunner(nil))
+	defer e.runner.Load().stop()
 
 	const callers = 32
 	ids := make([]uint64, callers)
