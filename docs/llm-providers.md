@@ -476,8 +476,8 @@ router, err := llm.NewRouter(ctx, llm.RouterConfig{
 
 ```go
 type ChatRequest struct {
-    Provider        string           // optional: route THIS call to a named configured provider (see "Pinning a provider for a single call")
     Model           string           // bare model name (filled from active model only when empty)
+    Provider        string           // optional: route THIS call to a named configured provider (see "Pinning a provider for a single call")
     ModelFamily     string           // family hint; auto-detected if empty
     Protocol        APIProtocol      // wire protocol; auto-resolved from the registry when empty, else DetectProtocol
     Messages        []Message

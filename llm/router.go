@@ -754,10 +754,12 @@ func (r *Router) SetModel(ctx context.Context, model string) error {
 // without mutating any router state (read-only).
 //
 // A composite "provider/model" identifier routes to its named provider: ok
-// reports whether that provider is configured. The bare model need not appear
-// in the provider's model list — per-request provider routing (req.Provider,
-// see ADR-011) pins the provider name only and leaves model pairing to the
-// caller, exactly like the runtime miss check in Call.
+// reports whether that provider is configured. On ok=false the returned
+// provider name (composite branch) is the *requested*, not a known, name.
+// The bare model need not appear in the provider's model list — per-request
+// provider routing (req.Provider, see ADR-011) pins the provider name only
+// and leaves model pairing to the caller, exactly like the runtime miss
+// check in Call.
 //
 // A bare model name resolves like SetModel: the provider behind the first
 // composite ID (sorted) whose bare model matches; ok=false when no provider
