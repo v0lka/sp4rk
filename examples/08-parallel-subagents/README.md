@@ -37,7 +37,8 @@ shared: Framework (Router, ToolRegistry, ContextManagerFactory)
 
 Each `RunSubAgent` call:
 
-1. emits `SubAgentLaunch(stepID, taskDesc)`,
+1. emits `SubAgentLaunch(stepID, taskDesc, model)` — `model` is the pinned model
+   identity the host passed to `RunSubAgent`, or `""` for the host default,
 2. injects the task description + step ID into the context,
 3. runs `executor.Run` in the goroutine,
 4. emits `SubAgentComplete(stepID, success, duration, errMsg)` — or, **instead**,

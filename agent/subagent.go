@@ -14,12 +14,17 @@ import (
 
 // SubAgentTask bundles an agent with its task tools, context manager, and events.
 type SubAgentTask struct {
-	StepID         string
-	Executor       *Executor
-	CM             ContextManager
-	TaskTools      []tools.ToolDescriptor
-	TaskDesc       string             // task description (for SubAgentLaunch event)
-	Model          string             // forced model identity the sub-agent runs on, "" = host default (for SubAgentLaunch event)
+	StepID    string
+	Executor  *Executor
+	CM        ContextManager
+	TaskTools []tools.ToolDescriptor
+	TaskDesc  string // task description (for SubAgentLaunch event)
+	// Model is the model identity carried verbatim into the SubAgentLaunch
+	// event ("" = host default). It is display-only metadata: it does NOT pin
+	// the model — pinning is a separate host concern (e.g. an executor caller
+	// override, ADR-011). Keep it in sync with what the host actually pins,
+	// or the event reports a wrong identity.
+	Model          string
 	Emitter        Events             // event emitter (nil-safe)
 	TodoUpdateFunc StepTodoUpdateFunc // optional callback for update_checklist tool
 }
