@@ -22,7 +22,7 @@ type SubAgentTask struct {
 	// Model is the model identity carried verbatim into the SubAgentLaunch
 	// event ("" = host default). It is display-only metadata: it does NOT pin
 	// the model — pinning is a separate host concern (e.g. an executor caller
-	// override, ADR-011). Keep it in sync with what the host actually pins,
+	// override, ADR-012). Keep it in sync with what the host actually pins,
 	// or the event reports a wrong identity.
 	Model          string
 	Emitter        Events             // event emitter (nil-safe)

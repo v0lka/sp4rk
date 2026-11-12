@@ -11,7 +11,7 @@ import (
 // delegating. This enables per-subagent provider+model routing without
 // constructing a new caller/router.
 //
-// It relies on two llm.Router contracts (see llm/router.go and ADR-011):
+// It relies on two llm.Router contracts (see llm/router.go and ADR-012):
 //
 //   - req.Provider, when non-empty, routes the request to the named
 //     configured provider instead of the active one.

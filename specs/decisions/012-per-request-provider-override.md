@@ -1,4 +1,4 @@
-# ADR-011: Per-request provider override on ChatRequest
+# ADR-012: Per-request provider override on ChatRequest
 
 ## Status
 

@@ -168,7 +168,7 @@ type ChatRequest struct {
 	// callers and request dumps are byte-identical. The caller is responsible
 	// for pairing the override with a Model the named provider actually serves
 	// (req.Model is still only filled when empty — with the active bare model).
-	// See ADR-011 for why this is a request field rather than part of
+	// See ADR-012 for why this is a request field rather than part of
 	// req.Model or a separate caller type.
 	Provider    string `json:"provider,omitempty"`
 	ModelFamily string `json:"model_family,omitempty"` // model family hint (e.g. "anthropic", "deepseek"); auto-detected if empty

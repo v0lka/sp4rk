@@ -532,7 +532,7 @@ if errors.Is(err, llm.ErrUnknownProvider) {
 }
 ```
 
-An empty `Provider` keeps the legacy path byte-identical (the field is `json:"provider,omitempty"`, so request dumps are unchanged). Pairing is the caller's responsibility ([ADR-011](../specs/decisions/011-per-request-provider-override.md)): with `Model` empty, the router fills it with the ACTIVE bare model and resolves metadata against it, so a provider pinned without a model sends the active model's name — and uses the active model's sampling presets and context-window guard — to the pinned provider.
+An empty `Provider` keeps the legacy path byte-identical (the field is `json:"provider,omitempty"`, so request dumps are unchanged). Pairing is the caller's responsibility ([ADR-012](../specs/decisions/012-per-request-provider-override.md)): with `Model` empty, the router fills it with the ACTIVE bare model and resolves metadata against it, so a provider pinned without a model sends the active model's name — and uses the active model's sampling presets and context-window guard — to the pinned provider.
 
 `agent.NewModelProviderOverrideCaller(inner LLMCaller, provider, model string)` pins both fields on every call (each override applies independently and only when non-empty; both empty returns `inner` unchanged). Because the pinning is stateless per call, a caller pinned this way is immune to a mid-task `SetModel`; the legacy `NewModelOverrideCaller` is its model-only form. Hosts can validate a composite `provider/model` override before launching a pinned caller with the read-only `Router.ProviderForModel` and `Router.KnownProviders`.
 
@@ -543,7 +543,7 @@ base   := agent.NewDumpCaller(router, w, logger) // the JSONL LLM log
 pinned := agent.NewModelProviderOverrideCaller(base, "local-qwen", "qwen3:32b")
 ```
 
-Assembled the other way round (`NewDumpCaller(NewModelProviderOverrideCaller(…))`) the call still routes to the pinned provider, but the dump silently logs empty `provider`/`model` keys — a misrouted call would then be indistinguishable from a legacy one in the log ([ADR-011](../specs/decisions/011-per-request-provider-override.md), the composition bullet).
+Assembled the other way round (`NewDumpCaller(NewModelProviderOverrideCaller(…))`) the call still routes to the pinned provider, but the dump silently logs empty `provider`/`model` keys — a misrouted call would then be indistinguishable from a legacy one in the log ([ADR-012](../specs/decisions/012-per-request-provider-override.md), the composition bullet).
 
 ## Message types
 

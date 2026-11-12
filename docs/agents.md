@@ -211,7 +211,7 @@ When a subagent is launched under a named profile, the execution layer resolves 
 | `Body` | the subagent's core directive / system prompt (replaces the generic orchestrator default) |
 | `Tools` (`ToolPreferenceWithError`) | the subagent's tool budget |
 | `MaxSteps` | the ReAct iteration cap (0/absent → derived from task complexity) |
-| `Model` | forced via `agent.NewModelProviderOverrideCaller` (pins `req.Provider` + `req.Model` per call — see the [LLM provider contract](llm-providers.md) and [ADR-011](../specs/decisions/011-per-request-provider-override.md)); the legacy model-only `agent.NewModelOverrideCaller` is kept and delegates with an empty provider. Carried on `AgentDescriptor.Model` for discovery-time visibility |
+| `Model` | forced via `agent.NewModelProviderOverrideCaller` (pins `req.Provider` + `req.Model` per call — see the [LLM provider contract](llm-providers.md) and [ADR-012](../specs/decisions/012-per-request-provider-override.md)); the legacy model-only `agent.NewModelOverrideCaller` is kept and delegates with an empty provider. Carried on `AgentDescriptor.Model` for discovery-time visibility |
 | `AllowRedelegate` | whether the subagent may launch further subagents |
 | `Hidden` | discovery visibility only (never blocks invocation) |
 | `Color` | UI badge accent (host/UI concern) |
@@ -223,11 +223,11 @@ When a subagent is launched under a named profile, the execution layer resolves 
 ```go
 // agent.NewModelProviderOverrideCaller wraps an LLMCaller so each Call pins
 // req.Provider and req.Model (each applies only when non-empty). The provider
-// is a host-side routing decision (ADR-011) — profiles carry only model:.
+// is a host-side routing decision (ADR-012) — profiles carry only model:.
 caller := agent.NewModelProviderOverrideCaller(router, "openai_compatible", agentProfile.Model)
 ```
 
-`NewModelProviderOverrideCaller(inner LLMCaller, provider, model string)` pins `req.Provider` and/or `req.Model` on every call; each override applies independently and only when non-empty, and both empty returns `inner` unchanged, so the override applies conditionally without callers branching on it. It relies on the [LLM router contract](llm-providers.md) that `req.Model` is only filled when empty — setting it beforehand bypasses the router's active-model selection for that caller — and that a non-empty `req.Provider` routes the call to the named configured provider (unknown name: immediate non-retryable error, zero attempts; see [ADR-011](../specs/decisions/011-per-request-provider-override.md)). A caller pinned this way is immune to a mid-task `SetModel`. `NewModelOverrideCaller(inner LLMCaller, model string)` is the legacy model-only form and never touches provider routing.
+`NewModelProviderOverrideCaller(inner LLMCaller, provider, model string)` pins `req.Provider` and/or `req.Model` on every call; each override applies independently and only when non-empty, and both empty returns `inner` unchanged, so the override applies conditionally without callers branching on it. It relies on the [LLM router contract](llm-providers.md) that `req.Model` is only filled when empty — setting it beforehand bypasses the router's active-model selection for that caller — and that a non-empty `req.Provider` routes the call to the named configured provider (unknown name: immediate non-retryable error, zero attempts; see [ADR-012](../specs/decisions/012-per-request-provider-override.md)). A caller pinned this way is immune to a mid-task `SetModel`. `NewModelOverrideCaller(inner LLMCaller, model string)` is the legacy model-only form and never touches provider routing.
 
 ## Targeting a profile from a plan step
 

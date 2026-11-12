@@ -568,7 +568,7 @@ func (r *Router) Call(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 	}
 	r.mu.RUnlock()
 
-	// Observability for the ADR-011 "pairing is the caller's responsibility"
+	// Observability for the ADR-012 "pairing is the caller's responsibility"
 	// contract: with an empty req.Model, prepareRequest silently substitutes
 	// the ACTIVE bare model, so a caller pinning only the provider gets the
 	// active model's metadata (sampling presets, context-window guard) on the
@@ -757,7 +757,7 @@ func (r *Router) SetModel(ctx context.Context, model string) error {
 // reports whether that provider is configured. On ok=false the returned
 // provider name (composite branch) is the *requested*, not a known, name.
 // The bare model need not appear in the provider's model list — per-request
-// provider routing (req.Provider, see ADR-011) pins the provider name only
+// provider routing (req.Provider, see ADR-012) pins the provider name only
 // and leaves model pairing to the caller, exactly like the runtime miss
 // check in Call.
 //

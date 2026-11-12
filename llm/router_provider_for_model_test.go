@@ -31,7 +31,7 @@ func newProviderForModelTestRouter(t *testing.T) *Router {
 // TestRouter_ProviderForModel_Composite verifies the composite branch: ok
 // tracks the provider NAME only — the bare model need not appear in the
 // provider's model list, because per-request provider routing (req.Provider)
-// pins the provider name only (ADR-011).
+// pins the provider name only (ADR-012).
 func TestRouter_ProviderForModel_Composite(t *testing.T) {
 	router := newProviderForModelTestRouter(t)
 
