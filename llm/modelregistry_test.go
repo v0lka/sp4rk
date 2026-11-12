@@ -104,14 +104,19 @@ func TestModelRegistry_BuiltInResolution(t *testing.T) {
 		{"glm-5.1", 200000, 128000, "approximate"},
 		{"glm-5", 200000, 128000, "approximate"},
 
-		// Kimi models (Moonshot AI) — verified from platform.kimi.ai/docs and
-		// kimi.com/code/docs (the Kimi Code endpoint serves short, non-prefixed
-		// IDs that contain no "kimi" substring).
+		// Kimi models (Moonshot AI) — verified from platform.kimi.ai/docs,
+		// kimi.com/code/docs and the open-weight model card. The Kimi Code
+		// endpoint serves short, non-prefixed IDs that contain no "kimi"
+		// substring.
+		{"kimi-k3.1-pro", 1048576, 131072, "approximate"},
+		{"kimi-k3.1-pro-highspeed", 1048576, 131072, "approximate"},
+		{"k3.1-pro", 1048576, 131072, "approximate"},
+		{"k3.1-pro-highspeed", 1048576, 131072, "approximate"},
 		{"kimi-k3", 1000000, 131072, "approximate"},
 		{"k3", 1000000, 131072, "approximate"},
 		{"k3-256k", 262144, 65536, "approximate"},
 		{"kimi-k2.7-code", 262144, 65536, "approximate"},
-		{"kimi-for-coding", 262144, 65536, "approximate"},
+		{"kimi-for-coding", 1048576, 131072, "approximate"},
 		{"kimi-for-coding-highspeed", 262144, 65536, "approximate"},
 	}
 
@@ -132,19 +137,73 @@ func TestModelRegistry_BuiltInResolution(t *testing.T) {
 	}
 }
 
-// The K3 and K2.7-code models are thinking-locked: K3 always has thinking
-// mode enabled (platform "kimi-k3" and the Kimi Code endpoint's "k3"/
-// "k3-256k" alike) and is tuned via reasoning_effort instead of sampling
-// knobs; K2.7 Code runs with thinking always on. The Kimi Code endpoint
-// additionally enforces temperature=1, rejecting any other value with
-// HTTP 400 "invalid temperature: only 1 is allowed for this model". Their
-// built-in capabilities must therefore leave Temperature unset so
-// applyDefaultSampling injects no sampling fields for any call purpose —
-// the same shape as kimi-k2-thinking and the o-series. Regression guard for
-// routing calls failing with HTTP 400 against api.kimi.com/coding.
+// The open-weight checkpoint and OpenRouter-style serving names differ from
+// the hosted API ID only by vendor prefix, casing, or separators. They must
+// reuse the canonical K3.1 metadata through the network-free fuzzy tier
+// instead of requiring duplicate catalog records.
+func TestModelRegistry_KimiK31ServingNames(t *testing.T) {
+	registry := NewModelRegistry(nil)
+	for _, model := range []string{
+		"kimi-k3.1-pro",
+		"kimi-k3.1-pro-highspeed",
+		"k3.1-pro",
+		"k3.1-pro-highspeed",
+	} {
+		if _, ok := registry.builtIn[model]; !ok {
+			t.Errorf("canonical model %q is not an exact built-in key", model)
+		}
+	}
+	if _, ok := registry.builtIn["moonshotai/kimi-k3.1-pro"]; ok {
+		t.Error("open-weight serving name must not duplicate the canonical built-in record")
+	}
+
+	resolvers := []struct {
+		name    string
+		resolve func(string) (ModelMetadata, bool)
+	}{
+		{name: "ResolveLocal", resolve: registry.ResolveLocal},
+		{name: "ResolveBuiltInModel", resolve: ResolveBuiltInModel},
+	}
+	for _, model := range []string{
+		"moonshotai/Kimi-K3.1-Pro",
+		"moonshotai/kimi-k3.1-pro",
+		"Kimi_K31_Pro",
+	} {
+		t.Run(model, func(t *testing.T) {
+			for _, resolver := range resolvers {
+				t.Run(resolver.name, func(t *testing.T) {
+					meta, ok := resolver.resolve(model)
+					if !ok {
+						t.Fatalf("expected a built-in fuzzy hit for %q", model)
+					}
+					if meta.ContextWindow != 1048576 || meta.OutputLimit != 131072 {
+						t.Errorf("limits = %d/%d, want 1048576/131072", meta.ContextWindow, meta.OutputLimit)
+					}
+					if meta.TokenizerType != "approximate" || meta.Family != "kimi" || meta.Protocol != ProtocolChatCompletions {
+						t.Errorf("metadata = %+v, want approximate/kimi/chat_completions", meta)
+					}
+					if meta.Capabilities == nil || !meta.Capabilities.Attachment || !meta.Capabilities.Reasoning || !meta.Capabilities.ToolCall || meta.Capabilities.Temperature {
+						t.Errorf("Capabilities = %+v, want attachment/reasoning/tool_call without temperature", meta.Capabilities)
+					}
+				})
+			}
+		})
+	}
+}
+
+// K3/K3.1 and K2.7-code models are thinking-locked, while K2.8 Preview also
+// uses server-managed sampling and adjustable reasoning_effort. The hosted
+// endpoints enforce temperature=1, rejecting any other value with HTTP 400
+// "invalid temperature: only 1 is allowed for this model". Their built-in
+// capabilities must therefore leave Temperature unset so applyDefaultSampling
+// injects no sampling fields for any call purpose — the same shape as
+// kimi-k2-thinking and the o-series. Regression guard for routing calls
+// failing with HTTP 400 against api.kimi.com/coding.
 func TestModelRegistry_KimiThinkingLockedModelsRejectSampling(t *testing.T) {
 	registry := NewModelRegistry(nil)
 	models := []string{
+		"kimi-k3.1-pro", "kimi-k3.1-pro-highspeed", "k3.1-pro", "k3.1-pro-highspeed",
+		"moonshotai/Kimi-K3.1-Pro",
 		"kimi-k3", "k3", "k3-256k",
 		"kimi-for-coding", "kimi-for-coding-highspeed",
 		"kimi-k2.7-code", "kimi-k2.7-code-highspeed",
