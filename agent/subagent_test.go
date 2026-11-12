@@ -47,7 +47,7 @@ func TestRunSubAgent_WithEmitter(t *testing.T) {
 	events := &recordingEvents{}
 	exec := newExecutorDefaultHITL(mockLLM, newMockToolExecutor(), &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
 
-	ch := RunSubAgent(context.Background(), "step_1", exec, cm, nil, "task desc", "", events, nil)
+	ch := RunSubAgent(context.Background(), "step_1", exec, cm, nil, "task desc", "test-model", events, nil)
 	result := <-ch
 	if result.Error != nil {
 		t.Fatalf("unexpected error: %v", result.Error)
@@ -57,7 +57,7 @@ func TestRunSubAgent_WithEmitter(t *testing.T) {
 	foundLaunch := false
 	foundComplete := false
 	for _, e := range events.events {
-		if e == "SubAgentLaunch:step_1" {
+		if e == "SubAgentLaunch:step_1:test-model" {
 			foundLaunch = true
 		}
 		if e == "SubAgentComplete:step_1:true" {
