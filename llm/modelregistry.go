@@ -1722,41 +1722,64 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 		},
 
 		// ── Kimi models (Moonshot AI) ───────────────────────────────────
-		// Source: https://platform.kimi.ai/docs/models.md
-		// Current (Aug 2026): kimi-k3 (1M context, native vision, deep
-		// reasoning), the kimi-k2.7-code series (256K, coding-dedicated,
-		// thinking always on) and the kimi-k2.5/k2.6 series (256K context,
-		// multimodal, thinking + non-thinking modes). All support Agent/tool
-		// tasks.
-		// The Kimi Code subscription endpoint (api.kimi.com/coding) serves the
-		// same models under SHORT, non-prefixed IDs — "k3" (up to 1M, tier
-		// dependent), "k3-256k" (fixed 256K), "kimi-for-coding" and
-		// "kimi-for-coding-highspeed" (K2.7 Code, 256K). Source:
-		// https://www.kimi.com/code/docs/en/kimi-code/models
-		// These short IDs contain no "kimi" substring, so DetectFamily would
-		// miss them — the explicit Family here is load-bearing.
+		// Sources: https://platform.kimi.ai/docs/models and
+		// https://www.kimi.com/code/docs/en/kimi-code/models.
+		// The API serves K3.1 Pro as "kimi-k3.1-pro" and
+		// "kimi-k3.1-pro-highspeed". The Kimi Code subscription endpoint uses
+		// the shorter "k3.1-pro" and "k3.1-pro-highspeed" IDs. Its
+		// "kimi-for-coding" alias now selects K2.8 Preview (up to 1M), while
+		// "kimi-for-coding-highspeed" remains K2.7 Code Highspeed (256K).
+		// The open-weight checkpoint is named "moonshotai/Kimi-K3.1-Pro"
+		// (https://huggingface.co/moonshotai/Kimi-K3.1-Pro); the normalized
+		// fuzzy tier maps it and other cosmetic serving variants to the API
+		// record, so no duplicate entry is needed. The short subscription IDs
+		// contain no "kimi" substring, making their explicit Family
+		// load-bearing.
 		//
-		// Sampling: K3 always has thinking mode enabled — both the platform
-		// "kimi-k3" and the endpoint's "k3"/"k3-256k" (source:
-		// https://platform.kimi.ai/docs/guide/kimi-k3-quickstart) — and is
-		// tuned via the reasoning_effort field (low/high/max) instead of
-		// sampling knobs; K2.7 Code likewise runs with thinking always on
-		// (disabling thinking routes the request to K2.6). The Kimi Code
-		// endpoint additionally enforces temperature=1, rejecting any other
-		// value with HTTP 400 "invalid temperature: only 1 is allowed for
-		// this model". The K3 and K2.7-code entries therefore carry no
-		// Temperature capability (same shape as kimi-k2-thinking and the
-		// o-series): no sampling fields are injected for any purpose, and the
-		// omitted parameter resolves to the server-managed value — the only
-		// one these thinking-locked models accept.
-		// Note: OutputLimit is a context-window reserve (subtracted from the
-		// window), so we store a practical reserve, not the absolute ceiling.
-		// kimi-k3: 131K default (configurable up to 1M).
-		// kimi-k2.7-code / kimi-k2.6 / kimi-k2.5: 256K max output; reserve 65K
-		// (the 256K ceiling would zero the input budget under EffectiveMax).
-		// kimi-k3 is the platform-style ID of the same always-thinking K3
-		// served as "k3"/"k3-256k" on the Kimi Code endpoint — see the
-		// sampling note in the section comment above.
+		// Sampling: K3 and K3.1 always have thinking enabled and are tuned via
+		// reasoning_effort (low/high/max); K2.8 Preview supports the same
+		// field, while K2.7 Code Highspeed has fixed thinking. These hosted
+		// endpoints enforce temperature=1 and reject other values, so K3,
+		// K2.8 Preview, and K2.7-code entries carry no Temperature capability.
+		// The omitted parameter resolves to the server-managed value instead
+		// of provoking HTTP 400 on routing and other auxiliary calls.
+		//
+		// OutputLimit is a context-window reserve, not the absolute completion
+		// ceiling. K3.1 and K2.8 Preview use the API's 131K default reserve
+		// and the documented 1,048,576-token context maximum. Subscription
+		// tiers and self-hosted runtimes with smaller effective windows remain
+		// covered by user overrides and observed runtime metadata.
+		// kimi-k2.7-code / kimi-k2.6 / kimi-k2.5 retain a 65K reserve because
+		// using their 256K ceiling would zero the input budget under
+		// EffectiveMax.
+		"kimi-k3.1-pro": {
+			ContextWindow: 1048576,
+			OutputLimit:   131072,
+			TokenizerType: "approximate",
+			Family:        "kimi",
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
+		},
+		"kimi-k3.1-pro-highspeed": {
+			ContextWindow: 1048576,
+			OutputLimit:   131072,
+			TokenizerType: "approximate",
+			Family:        "kimi",
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
+		},
+		"k3.1-pro": {
+			ContextWindow: 1048576,
+			OutputLimit:   131072,
+			TokenizerType: "approximate",
+			Family:        "kimi",
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
+		},
+		"k3.1-pro-highspeed": {
+			ContextWindow: 1048576,
+			OutputLimit:   131072,
+			TokenizerType: "approximate",
+			Family:        "kimi",
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
+		},
 		"kimi-k3": {
 			ContextWindow: 1000000,
 			OutputLimit:   131072,
@@ -1764,7 +1787,6 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			Family:        "kimi",
 			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
 		},
-		// Kimi Code endpoint aliases (see the section comment above).
 		"k3": {
 			ContextWindow: 1000000,
 			OutputLimit:   131072,
@@ -1794,8 +1816,8 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
 		},
 		"kimi-for-coding": {
-			ContextWindow: 262144,
-			OutputLimit:   65536,
+			ContextWindow: 1048576,
+			OutputLimit:   131072,
 			TokenizerType: "approximate",
 			Family:        "kimi",
 			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},

@@ -2200,12 +2200,12 @@ func TestApplyGLMReasoning(t *testing.T) {
 }
 
 // TestApplyKimiReasoning pins the Kimi reasoning-control mapping, in
-// particular the fail-closed contract: only the K3 series documents the
-// reasoning_effort field, so the value is emitted for K3-series models with a
-// documented effort spelling and dropped (no field at all) for every other
-// kimi model and every value outside the documented set — a strict gateway
-// rejects unknown request fields, and for the thinking-locked models the
-// omitted parameter resolves to the server-managed default.
+// particular the fail-closed contract: the K3 series and K2.8 Preview
+// (kimi-for-coding) document reasoning_effort, so a documented effort is
+// emitted for those models and dropped (no field at all) for every other kimi
+// model and every value outside the documented set — a strict gateway rejects
+// unknown request fields, and for fixed-thinking models the omitted parameter
+// resolves to the server-managed default.
 func TestApplyKimiReasoning(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -2218,6 +2218,11 @@ func TestApplyKimiReasoning(t *testing.T) {
 		{"kimi-k3 max emits reasoning_effort", "kimi-k3", "max", "max"},
 		{"kimi code alias k3 emits reasoning_effort", "k3", "low", "low"},
 		{"kimi code alias k3-256k emits reasoning_effort", "k3-256k", "low", "low"},
+		{"kimi-k3.1 API low emits reasoning_effort", "kimi-k3.1-pro", "low", "low"},
+		{"kimi-k3.1 subscription high emits reasoning_effort", "k3.1-pro", "high", "high"},
+		{"kimi-k3.1 open-weight max emits reasoning_effort", "moonshotai/Kimi-K3.1-Pro", "max", "max"},
+		{"kimi-k3.1 API highspeed emits reasoning_effort", "kimi-k3.1-pro-highspeed", "low", "low"},
+		{"kimi-k3.1 subscription highspeed emits reasoning_effort", "k3.1-pro-highspeed", "low", "low"},
 		{"kimi-k3 matching is case-insensitive", "KIMI-K3", "low", "low"},
 		{"composite model id strips the provider prefix", "moonshotai/kimi-k3", "low", "low"},
 		{"kimi-k3 On is outside the documented set", "kimi-k3", "On", ""},
@@ -2227,7 +2232,9 @@ func TestApplyKimiReasoning(t *testing.T) {
 		{"kimi-mk3 is not the K3 series", "kimi-mk3", "low", ""},
 		{"kimi-k30 is not the K3 series", "kimi-k30", "low", ""},
 		{"kimi-k2.7-code has no documented effort field", "kimi-k2.7-code", "low", ""},
-		{"kimi-for-coding has no documented effort field", "kimi-for-coding", "low", ""},
+		{"kimi-for-coding K2.8 emits reasoning_effort", "kimi-for-coding", "low", "low"},
+		{"kimi-for-coding K2.8 unknown effort fails closed", "kimi-for-coding", "turbo", ""},
+		{"kimi-for-coding-highspeed K2.7 has no adjustable effort", "kimi-for-coding-highspeed", "low", ""},
 		{"kimi-k2.6 has no documented effort field", "kimi-k2.6", "low", ""},
 		{"kimi-k2.5 has no documented effort field", "kimi-k2.5", "low", ""},
 		{"kimi-k2 has no documented effort field", "kimi-k2", "low", ""},
@@ -2246,8 +2253,8 @@ func TestApplyKimiReasoning(t *testing.T) {
 
 // TestOpenAIProvider_KimiReasoningSwitch pins the buildChatParams family
 // switch routing for the kimi family: the resolved effort reaches the wire as
-// the top-level reasoning_effort key for K3-series models and is absent for
-// models without a documented field.
+// the top-level reasoning_effort key for K3-series and K2.8 Preview models and
+// is absent for models without a documented field.
 func TestOpenAIProvider_KimiReasoningSwitch(t *testing.T) {
 	p, err := NewOpenAIProvider(OpenAIProviderConfig{
 		Name:    "kimi",
@@ -2268,6 +2275,12 @@ func TestOpenAIProvider_KimiReasoningSwitch(t *testing.T) {
 		t.Errorf("reasoning_effort = %v (%T), want \"low\"", out["reasoning_effort"], out["reasoning_effort"])
 	}
 
+	req.Model = "kimi-for-coding"
+	out = jsonMap(t, p.buildChatParams(req))
+	if out["reasoning_effort"] != "low" {
+		t.Errorf("K2.8 reasoning_effort = %v (%T), want \"low\"", out["reasoning_effort"], out["reasoning_effort"])
+	}
+
 	locked := ChatRequest{
 		Model:           "kimi-k2.7-code",
 		ModelFamily:     "kimi",
@@ -2277,6 +2290,12 @@ func TestOpenAIProvider_KimiReasoningSwitch(t *testing.T) {
 	out = jsonMap(t, p.buildChatParams(locked))
 	if _, present := out["reasoning_effort"]; present {
 		t.Errorf("reasoning_effort = %v, want no field for a thinking-locked kimi model", out["reasoning_effort"])
+	}
+
+	locked.Model = "kimi-for-coding-highspeed"
+	out = jsonMap(t, p.buildChatParams(locked))
+	if _, present := out["reasoning_effort"]; present {
+		t.Errorf("K2.7 Highspeed reasoning_effort = %v, want no field", out["reasoning_effort"])
 	}
 }
 

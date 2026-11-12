@@ -284,12 +284,12 @@ func minimalReasoningEffort(options []string) string {
 // kimiMinimalReasoningEffort is the floor of the Kimi reasoning_effort range
 // (low/high/max — see the kimi-k3 catalog entry). The kimi family declares no
 // option set in FamilyReasoningOptions — its models are thinking-locked with
-// heterogeneous, partly undocumented controls — but the effort-tuned K3 /
-// K2.7-code models document this floor, so it is the minimal available
+// heterogeneous, partly undocumented controls — but the effort-tuned K3 and
+// K2.8 Preview models document this floor, so it is the minimal available
 // effort a tier can target. Whether the field is actually emitted for a given
 // Kimi model remains the wire layer's decision (see the provider family
-// switch): only the K3 series documents the field, so the wire emits it for
-// K3-series models and drops it (fail-closed) for every other kimi model,
+// switch): the K3 series and K2.8 Preview document the field, so the wire
+// emits it for them and drops it (fail-closed) for every other kimi model,
 // same as for every other spelling this helper returns.
 const kimiMinimalReasoningEffort = "low"
 
