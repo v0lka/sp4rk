@@ -14,8 +14,9 @@ import "time"
 // SubAgentComplete gained an errMsg argument, becoming
 // SubAgentComplete(stepID string, success bool, duration time.Duration, errMsg string);
 // and SubAgentLaunch gained a model argument, becoming
-// SubAgentLaunch(stepID, description, model string) — the host-rendered model
-// identity the sub-agent was pinned to ("" when none).
+// SubAgentLaunch(stepID, description, model string) — model is the host-rendered,
+// display-only model identity carried verbatim into the event ("" when none); it
+// does NOT pin the model (pinning is the caller's concern, ADR-012).
 // All implementations of Events (and orchestration.Events, which embeds it)
 // MUST implement these methods or fail to compile. A no-op stub is provided by
 // NoopEvents for struct embedding convenience.

@@ -40,7 +40,18 @@
 // lock are released by the LAST handle's Close. Opening the live path with a
 // different codec fails with an error matching ErrMagicMismatch. From
 // ANOTHER process the lock cannot be shared, so the conflicting open fails
-// with ErrLocked instead of interleaving frames.
+// with ErrLocked instead of interleaving frames — and this process reaches
+// the same error whenever a path alias normalizes differently and so misses
+// the sharing registry (see ErrLocked: it is not a cross-process-only
+// signal). A join matches by path string, not by file identity: close every
+// handle on a path before renaming or replacing the file under it, or the
+// next OpenAppend joins the renamed inode through the still-live stream
+// while the new file at the path stays empty. Nothing but Close releases
+// that stream, so a compressed handle dropped without Close keeps the
+// descriptor, the lock and its registry entry until process death —
+// in-process the next same-path open silently joins the leaked stream,
+// while every other process sees ErrLocked for the rest of this process's
+// lifetime. Always defer Close.
 //
 // The advisory lock is assumed reliable: the one-encoder guarantee holds
 // wherever advisory locks hold — local filesystems, and network filesystems

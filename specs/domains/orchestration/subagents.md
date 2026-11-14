@@ -25,10 +25,19 @@ type SubAgentTask struct {
     CM             ContextManager     // isolated prompt history + compaction
     TaskTools      []tools.ToolDescriptor
     TaskDesc       string             // emitted in the SubAgentLaunch event
+    Model          string             // display-only identity carried verbatim into
+                                      // SubAgentLaunch ("" = host default); does NOT pin
+                                      // the model — see the Model note below
     Emitter        Events             // nil-safe (replaced with NoopEvents)
     TodoUpdateFunc StepTodoUpdateFunc // optional update_checklist callback
 }
 ```
+
+**`SubAgentTask.Model`** is display-only metadata: the identity string is carried verbatim into the
+`SubAgentLaunch` event, `""` meaning "host default". It never pins the model — pinning is a separate
+host concern performed with `agent.NewModelProviderOverrideCaller` (provider+model, ADR-012) or
+`NewModelOverrideCaller` (model only). Keep the value in sync with what the host actually pins, or
+the event reports a wrong identity.
 
 ### RunSubAgent
 
@@ -75,7 +84,7 @@ func RunSubAgentsParallel(ctx context.Context, agents []SubAgentTask,
     opts ...RunSubAgentsParallelOption) []SubAgentResult
 ```
 
-Runs multiple `SubAgentTask`s concurrently and collects all results. Results are collected in **input order** (not completion order); a slow agent blocks subsequent results from being returned. Blocks until all subagents have reported. Returns `nil` for an empty slice. By default every subagent launches at once (unbounded fan-out). `WithMaxParallelSubagents(n)` caps how many run concurrently within a single invocation: subagents beyond the cap are queued and started as running slots free up, while the result set and its input order stay unchanged (`n <= 0` keeps the unbounded default). The cap is per-invocation, not process-wide — a host firing several `RunSubAgentsParallel` calls (or nesting a delegation) enforces any global limit itself. For streaming results as they arrive, launch subagents individually and select on their channels.
+Runs multiple `SubAgentTask`s concurrently and collects all results. Results are collected in **input order** (not completion order); a slow agent blocks subsequent results from being returned. Blocks until all subagents have reported. Returns `nil` for an empty slice. By default every subagent launches at once (unbounded fan-out). `WithMaxParallelSubagents(n)` caps how many run concurrently within a single invocation: subagents beyond the cap are queued and started as running slots free up, while the result set and its input order stay unchanged (`n <= 0` keeps the unbounded default). The cap is per-invocation, not process-wide — a host firing several `RunSubAgentsParallel` calls (or nesting a delegation) enforces any global limit itself. For streaming results as they arrive, launch subagents individually and select on their channels. A parallel task's model identity therefore reaches the `SubAgentLaunch` event **only** through `SubAgentTask.Model` (there is no separate `model` argument on this path, unlike `RunSubAgent`) — and, as above, it is display-only: it never pins the model.
 
 ### Defense-in-depth
 
@@ -103,7 +112,7 @@ A subagent may be launched under a named **Subagent Profile** (an `AGENT.md`-dec
 | `AllowRedelegate` | whether the subagent may launch further subagents |
 | `Hidden` | discovery visibility only (never blocks invocation) |
 
-`NewModelProviderOverrideCaller(inner LLMCaller, provider, model string)` wraps an `LLMCaller` so every `Call` pins `req.Provider` and/or `req.Model` before delegating to `inner`; each override applies independently and only when non-empty, and both empty returns `inner` unchanged, so the override applies conditionally without callers branching. It relies on the [LLM router contract](../../contracts/llm-providers.md) that `req.Model` is filled with the active model only when empty — setting it beforehand bypasses the router's active-model selection for that caller — and that a non-empty `req.Provider` routes the call to the named configured provider instead of the active one (unknown name: immediate non-retryable error, zero attempts; see [ADR-012](../../decisions/012-per-request-provider-override.md)). A pinned caller is immune to a mid-task `SetModel`. `NewModelOverrideCaller(inner LLMCaller, model string)` is the legacy model-only form: it sets `req.Model` and never touches provider routing (the request still routes to the active provider).
+`NewModelProviderOverrideCaller(inner LLMCaller, provider, model string)` wraps an `LLMCaller` so every `Call` pins `req.Provider` and/or `req.Model` before delegating to `inner`; each override applies independently and only when non-empty, and both empty returns `inner` unchanged, so the override applies conditionally without callers branching. It relies on the [LLM router contract](../../contracts/llm-providers.md) that `req.Model` is filled with the active model only when empty — setting it beforehand bypasses the router's active-model selection for that caller — and that a non-empty `req.Provider` routes the call to the named configured provider instead of the active one (unknown name: immediate non-retryable error, zero attempts; see [ADR-012](../../decisions/012-per-request-provider-override.md)). A caller whose model is pinned is immune to a mid-task `SetModel`; a provider-only pin (empty model) keeps routing to the named provider but its model keeps tracking the router's active model. `NewModelOverrideCaller(inner LLMCaller, model string)` is the legacy model-only form: it sets `req.Model` and never touches provider routing (the request still routes to the active provider).
 
 Profile application is an execution-layer concern: `RunSubAgent`/`RunSubAgentsParallel` themselves are profile-agnostic primitives. The host or Conductor resolves the profile and constructs the `Executor`, `ContextManager`, `TaskTools`, and caller before handing them to `RunSubAgent` as a `SubAgentTask`.
 

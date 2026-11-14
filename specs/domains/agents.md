@@ -57,7 +57,7 @@ NewAgentManager(dirs []string, logger)        // dirs in priority order, highest
   │        ├─ follows directory symlinks (resolved via os.Stat)
   │        └─ ParseAgent each AGENT.md → validate → catalog (keyed by name)
   │
-  ├─ List()  → []AgentDescriptor              // name + description + hidden flag
+  ├─ List()  → []AgentDescriptor              // name + description + model + hidden flag
   └─ Get(name) → (*Agent, bool)               // full body + metadata
 ```
 
@@ -122,7 +122,7 @@ When a subagent is launched under a named profile, the execution layer applies t
 | `Hidden` | discovery visibility only (does not affect invocation) |
 | `Color` | UI badge accent (host/UI concern) |
 
-`NewModelProviderOverrideCaller(inner LLMCaller, provider, model string)` pins `req.Provider` and/or `req.Model` on every call; each override applies independently and only when non-empty, and both empty returns `inner` unchanged, so the override applies conditionally without callers branching on it. It relies on the [LLM router contract](../contracts/llm-providers.md) that `req.Model` is only filled when empty — setting it beforehand bypasses the router's active-model selection for that caller — and that a non-empty `req.Provider` routes the call to the named configured provider (unknown name: immediate non-retryable error, zero attempts; see [ADR-012](../decisions/012-per-request-provider-override.md)). A caller pinned this way is immune to a mid-task `SetModel`. `NewModelOverrideCaller(inner LLMCaller, model string)` is the legacy model-only form and never touches provider routing.
+`NewModelProviderOverrideCaller(inner LLMCaller, provider, model string)` pins `req.Provider` and/or `req.Model` on every call; each override applies independently and only when non-empty, and both empty returns `inner` unchanged, so the override applies conditionally without callers branching on it. It relies on the [LLM router contract](../contracts/llm-providers.md) that `req.Model` is only filled when empty — setting it beforehand bypasses the router's active-model selection for that caller — and that a non-empty `req.Provider` routes the call to the named configured provider (unknown name: immediate non-retryable error, zero attempts; see [ADR-012](../decisions/012-per-request-provider-override.md)). A caller whose model is pinned is immune to a mid-task `SetModel`; a provider-only pin (empty model) keeps routing to the named provider but its model keeps tracking the router's active model. `NewModelOverrideCaller(inner LLMCaller, model string)` is the legacy model-only form and never touches provider routing.
 
 A plan step targets a profile via the `PlanStep.Agent` field (see [orchestration/planner.md](orchestration/planner.md)); the name is resolved by the execution layer (e.g. the Conductor's agent resolver).
 

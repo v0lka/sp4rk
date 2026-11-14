@@ -512,7 +512,7 @@ type TokenUsage struct {
 
 ### Forcing a specific model without switching providers
 
-The "fill only when empty" rule for `Model` is part of the router contract: a pre-set `req.Model` is preserved and sent to the active provider (`r.activeProvider`) unchanged, while the provider that handles the call is always the active one. This lets a caller force a specific model string without switching providers.
+The "fill only when empty" rule for `Model` is part of the router contract: a pre-set `req.Model` is preserved and sent unchanged to whichever provider handles the call. By default the provider that handles the call is the active one (`r.activeProvider`); a non-empty `ChatRequest.Provider` overrides this per call — see [Pinning a provider for a single call](#pinning-a-provider-for-a-single-call) below. This lets a caller force a specific model string without switching providers.
 
 `agent.NewModelOverrideCaller(inner LLMCaller, model string)` exploits this: it wraps an `LLMCaller` so every `Call` sets `req.Model` to `model` before delegating to `inner`, relying on the rule above to bypass the router's active-model selection for that caller. It returns `inner` unchanged when `model` is empty, so the override applies conditionally — used to apply a per-agent `Model` from a [Subagent Profile](agents.md). It is a `Caller` wrapper in the same spirit as the usage-tracking wrapper described in [Usage tracking](#usage-tracking).
 
@@ -534,7 +534,7 @@ if errors.Is(err, llm.ErrUnknownProvider) {
 
 An empty `Provider` keeps the legacy path byte-identical (the field is `json:"provider,omitempty"`, so request dumps are unchanged). Pairing is the caller's responsibility ([ADR-012](../specs/decisions/012-per-request-provider-override.md)): with `Model` empty, the router fills it with the ACTIVE bare model and resolves metadata against it, so a provider pinned without a model sends the active model's name — and uses the active model's sampling presets and context-window guard — to the pinned provider.
 
-`agent.NewModelProviderOverrideCaller(inner LLMCaller, provider, model string)` pins both fields on every call (each override applies independently and only when non-empty; both empty returns `inner` unchanged). Because the pinning is stateless per call, a caller pinned this way is immune to a mid-task `SetModel`; the legacy `NewModelOverrideCaller` is its model-only form. Hosts can validate a composite `provider/model` override before launching a pinned caller with the read-only `Router.ProviderForModel` and `Router.KnownProviders`.
+`agent.NewModelProviderOverrideCaller(inner LLMCaller, provider, model string)` pins both fields on every call (each override applies independently and only when non-empty; both empty returns `inner` unchanged). Because the pinning is stateless per call, a caller whose model is pinned is immune to a mid-task `SetModel` (a provider-only pin keeps routing to the named provider, but its model keeps tracking the router's active model); the legacy `NewModelOverrideCaller` is its model-only form. Hosts can validate a composite `provider/model` override before launching a pinned caller with the read-only `Router.ProviderForModel` and `Router.KnownProviders`.
 
 Order the wrappers so the pin is applied before the log: `NewDumpCaller` marshals each request exactly as it received it, so a dump records `provider` (and `model`) only when the pinned caller wraps the chain from OUTSIDE the dump caller:
 

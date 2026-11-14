@@ -13,8 +13,10 @@ import (
 // TestDetectMagicRefusesSymlink pins the link-safe guarantee of DetectMagic:
 // a symlink at the final path component is refused (ELOOP) instead of being
 // resolved, so the sniff can never be redirected to a planted target.
-// Windows is covered by the safeio parity note — its OpenFileNoFollow still
-// resolves symlinks and the unix-tagged assertion has no equivalent there.
+// Windows has the same guarantee — its OpenFileNoFollow opens with
+// FILE_FLAG_OPEN_REPARSE_POINT and refuses a reparse-point handle with
+// syscall.ELOOP, pinned by safeio_windows_test.go. This file stays
+// unix-tagged only because it asserts syscall.ELOOP directly.
 func TestDetectMagicRefusesSymlink(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "target.log")

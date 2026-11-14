@@ -42,9 +42,16 @@ const (
 	// for an "auto" request (see Embedder.embedInference). One failure stays
 	// a loud error as before — a transient CUDA/OpenVINO hiccup must not
 	// demote the embedder on its own; the second consecutive failure is the
-	// evidence that the provider stopped working mid-flight (wedged driver,
-	// device lost, exhausted device memory), which is exactly the situation
-	// the one-shot degradation exists to survive.
+	// evidence that the provider stopped working mid-flight (device lost,
+	// exhausted device memory), which is exactly the situation the one-shot
+	// degradation exists to survive.
+	//
+	// The counter only observes attempts that RETURN: a driver wedged inside
+	// the ONNX Runtime C call never returns, so nothing is counted, the
+	// threshold is never reached and no degradation fires for that failure
+	// mode. Embedder.Wedged is the authoritative diagnosis there — consult it
+	// instead of inferring a wedge from a streak of timeouts, and keep the
+	// caller-side timeout as the backstop that bounds the wait.
 	inferenceDegradeThreshold = 2
 )
 
@@ -154,13 +161,16 @@ type EmbedderConfig struct {
 	// OnProviderDegrade optionally observes a runtime execution-provider
 	// degradation — the embedder stopping inference on one provider and
 	// continuing on another after construction. Today that is exactly the
-	// hardware->CPU degradation of an "auto" request: the eager/lazy
-	// session-creation fallbacks and the consecutive-inference-failure
-	// degradation (see Embedder.embedInference). The initial provider
+	// post-construction hardware->CPU degradation of an "auto" request: the
+	// lazy session-creation fallback and the consecutive-inference-failure
+	// degradation (see Embedder.embedInference), both of which call back from
+	// degradeToCPU. Two related slides do NOT fire it: the initial provider
 	// resolution inside NewEmbedder (an "auto" request whose whole ladder
-	// fails before any session exists) does not fire it — that resolution is
-	// already reported through the WARN log and the requestedExecutionProvider
-	// field of the "embedder initialized" entry.
+	// fails before any session exists), and the eager hardware->CPU session
+	// fallback, which runs in-constructor before this callback can be wired.
+	// Both of those are reported through the WARN log and the
+	// requestedExecutionProvider field of the "embedder initialized" entry
+	// instead.
 	//
 	// from and to are provider identifiers ("cuda" -> "cpu"); cause is the
 	// error text that triggered the degradation (the same text the WARN log
@@ -251,6 +261,11 @@ type Embedder struct {
 	// degradeCallback carries EmbedderConfig.OnProviderDegrade; nil when the
 	// host did not configure one. Invoked by degradeToCPU under e.mu.
 	degradeCallback func(from, to, cause string)
+	// newSessionFn, when non-nil, replaces newSession. It exists solely for the
+	// tests that pin the lazy session-creation gates (ensureBatchSession,
+	// ensureBucketSession, ensureQuerySession) without an ONNX Runtime
+	// environment; production embedders never set it.
+	newSessionFn func(batchSize, seqLen int) (*onnxSession, error)
 }
 
 // runOnORTThread executes fn on r's dedicated thread, or inline when r is nil.
@@ -795,6 +810,21 @@ func (e *Embedder) EmbedDocuments(ctx context.Context, texts []string) ([][]floa
 		return e.embedLengthBuckets(ctx, inputIDs, attentionMask, tokenTypeIDs, lengths)
 	}
 
+	// The query session can be missing on an open embedder: the runtime
+	// hardware->CPU degradation destroys every live session (degradeToCPU) and
+	// only the sites that pass a recreate closure rebuild what they need.
+	// Re-create it here, before the fast-path gate, so a degradation triggered
+	// by a multi-text call cannot silently downgrade every later single-text
+	// query to the [BatchSize x MaxSeqLen] batch session below (runBatch
+	// computes the full session capacity, ~15-25x the single-text cost).
+	// A failed re-create is logged and swallowed: the call then falls through to
+	// the batch path exactly as it did before this gate existed, so the attempt
+	// can only ever restore throughput, never turn a working query into an
+	// error.
+	if numTexts == 1 {
+		e.ensureQuerySession()
+	}
+
 	// Fast path: use the persistent session for single-text embedding.
 	// This is the common case when chromem-go calls EmbeddingFunc one text at a time.
 	if numTexts == 1 && e.sess != nil {
@@ -951,6 +981,9 @@ func (e *Embedder) embedLengthBuckets(ctx context.Context, inputIDs, attentionMa
 // newSession builds one persistent ONNX session on the embedder's current
 // provider. The caller must hold e.mu.
 func (e *Embedder) newSession(batchSize, seqLen int) (*onnxSession, error) {
+	if e.newSessionFn != nil {
+		return e.newSessionFn(batchSize, seqLen)
+	}
 	var (
 		sess *onnxSession
 		err  error
@@ -1251,6 +1284,54 @@ func (e *Embedder) ensureBatchSession() error {
 	e.logger.Info("persistent batch ONNX session ready",
 		"batchSize", e.batchSize, "elapsed", elapsed.Round(time.Millisecond))
 	return nil
+}
+
+// ensureQuerySession lazily (re-)creates the persistent batchSize=1 query
+// session the single-text fast path runs on. NewEmbedder creates it eagerly in
+// every non-bucket mode, so a nil e.sess on an open embedder means the runtime
+// hardware->CPU degradation destroyed it (degradeToCPU nils every live
+// session). Without this gate the fast path would stay disabled for the rest
+// of the process and each single-text query would run on the batch session's
+// [BatchSize x MaxSeqLen] shape — correct results, but the full-capacity
+// compute of a multi-row call.
+//
+// Session creation goes through newSessionWithFallback for uniformity with the
+// other lazy sites and because it is the one place that honours the provider
+// state (`sessOpts`/`executionProvider`, already CPU after a degradation). Its
+// own session-stage degradation branch cannot engage here: this gate returns
+// early while e.sess is live, in every non-bucket mode a pending fallback
+// implies a live eager session, and after a real degradation fallbackPending is
+// already false. Bucket mode has no query session by design (the constructor
+// skips the eager one). The caller must hold e.mu.
+//
+// A failed re-create is logged at WARN and deliberately not reported to the
+// caller, which is why this method returns nothing: the gate is a throughput
+// recovery, not a correctness step. The call then falls through to the batch
+// path, which serves the text on the batch session exactly as it did before
+// this gate existed — so a failing re-create can never turn a query that would
+// have succeeded into an error, while a successful one re-enables the fast
+// path for the rest of the process. No failure is memoized either: while
+// e.sess stays nil each single-text call makes one bounded creation attempt,
+// which is what lets a transient failure heal on its own (the host's Wedged
+// probe and caller-side timeout remain the backstop for a slow attempt).
+func (e *Embedder) ensureQuerySession() {
+	if e.sess != nil || e.lengthBuckets {
+		return
+	}
+	e.logger.Info("re-creating persistent ONNX session (no live query session; loading the model takes a few seconds)",
+		"seqLen", e.maxSeqLen)
+	started := time.Now()
+	sess, err := e.newSessionWithFallback(1, e.maxSeqLen)
+	if err != nil {
+		e.logger.Warn("re-creating the persistent query session failed; single-text embedding falls back to the batch session",
+			"seqLen", e.maxSeqLen, "error", err.Error())
+		return
+	}
+	elapsed := time.Since(started)
+	e.sess = sess
+	e.telemetry.observeSession(elapsed)
+	e.logger.Info("persistent ONNX session ready",
+		"seqLen", e.maxSeqLen, "elapsed", elapsed.Round(time.Millisecond))
 }
 
 // EmbedQuery embeds a single text query and returns its embedding vector.

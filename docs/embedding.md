@@ -76,12 +76,13 @@ type EmbedderConfig struct {
     // degradation — the embedder stopping inference on one provider and
     // continuing on another after construction (the post-construction
     // hardware→CPU fallbacks of an "auto" request, including the
-    // consecutive-inference-failure degradation). from/to are provider
-    // identifiers ("cuda" -> "cpu"); cause is the triggering error text.
-    // Fires synchronously under the embedder's internal write lock: must be
-    // quick and must not call back into the Embedder. The initial provider
-    // resolution inside NewEmbedder does not fire it. Nil disables
-    // notification.
+    // consecutive-inference-failure degradation of attempts that RETURN an
+    // error). from/to are provider identifiers ("cuda" -> "cpu"); cause is
+    // the triggering error text. Fires synchronously under the embedder's
+    // internal write lock: must be quick and must not call back into the
+    // Embedder. The initial provider resolution inside NewEmbedder does not
+    // fire it, and a HANG fires nothing (nothing returns to degrade — use
+    // Wedged for that diagnosis). Nil disables notification.
     OnProviderDegrade func(from, to, cause string)
 }
 ```
@@ -135,8 +136,9 @@ The ONNX Runtime is a **process-global singleton** — only one `Embedder` can e
 | `EmbeddingFunc() chromem.EmbeddingFunc` | Returns a chromem-go compatible embedding function for use with `chromem.NewCollection`. |
 | `Close() error` | Releases the ONNX Runtime environment and associated resources. |
 | `ExecutionProvider() string` | Reports which execution provider inference actually runs on (`cpu`, `cuda`, or `openvino`). |
+| `Wedged(bound time.Duration) bool` | Reports whether the dedicated ONNX inference thread has been stuck in one job for at least `bound` — the authoritative hang diagnosis (see [Wedge detection](#wedge-detection)). |
 
-`EmbedDocuments` uses a **fast path** for single-text embedding: a persistent ONNX session with pre-allocated tensors is reused, eliminating per-call session creation overhead. Creating an ONNX session is expensive (~2s for model loading and graph optimization), while inference is fast (~50ms). For multi-text batches, a persistent batch ONNX session (fixed row capacity `BatchSize`, default 32) is created lazily on the first multi-text call — a one-time ~2s init — and reused for every later call; batches larger than the capacity are processed in zero-padded chunks with a single inference per chunk.
+`EmbedDocuments` uses a **fast path** for single-text embedding: a persistent ONNX session with pre-allocated tensors is reused, eliminating per-call session creation overhead. Creating an ONNX session is expensive (~2s for model loading and graph optimization), while inference is fast (~50ms). If a runtime degradation destroyed that query session, the fast path re-creates it (`ensureQuerySession`) instead of falling back to the batch session; a re-create that itself fails is logged at WARN and that call falls back to the batch session, so the attempt can only restore throughput — never fail a query that the batch session could serve. For multi-text batches, a persistent batch ONNX session (fixed row capacity `BatchSize`, default 32) is created lazily on the first multi-text call — a one-time ~2s init — and reused for every later call; batches larger than the capacity are processed in zero-padded chunks with a single inference per chunk.
 
 All embeddings are **mean-pooled** (using the attention mask) and **L2-normalized** before being returned.
 
@@ -186,7 +188,7 @@ For `jina-embeddings-v2-small-en`:
 
 ## Execution provider degradation
 
-A hardware-backed execution provider can die *after* a successful initialization: a wedged driver following a driver upgrade, a device lost across a suspend/resume cycle, device memory exhausted by another process. The embedder survives this with a degradation ladder of **three stages**, each covering the failure window the previous one cannot see:
+A hardware-backed execution provider can die *after* a successful initialization: a driver that starts **returning** errors (a bad driver upgrade, a device lost across a suspend/resume cycle, device memory exhausted by another process), or one that **hangs** instead of returning. The returning failure modes are survived by a degradation ladder of **three stages**, each covering the failure window the previous one cannot see (a hang is a different failure mode the ladder cannot observe — see [Wedge detection](#wedge-detection)):
 
 1. **Initialization ladder** — an `"auto"` request walks CUDA → OpenVINO at the session-options stage and again at the session-creation stage (see [NewEmbedder](#newembedder)); when every hardware rung has failed, a WARN naming each reason is logged and initialization continues on the CPU provider.
 2. **Session-creation fallback** — after initialization, a persistent session that cannot be created on the hardware provider (for example the first lazy batch or length-bucket session, after the hardware went bad between calls) is retried on the remaining rungs and finally on the CPU provider. This path fires only while **no hardware-backed session is live yet**.
@@ -196,13 +198,32 @@ Stages 2 and 3 are one-shot per embedder and funnel through the same `degradeToC
 
 ### Runtime degradation
 
-Every failed ONNX inference attempt bumps a consecutive-failure counter; any successful inference resets it to zero. The counter spans all sessions — the eager single-text session, the batch session, the pipeline and the length buckets. When the counter reaches `inferenceDegradeThreshold` (a compile-time constant, `2`) on an `"auto"` request still running on a hardware provider, the embedder degrades to the CPU provider **once**:
+Every ONNX inference attempt that **returns** an error bumps a consecutive-failure counter; any successful inference resets it to zero. The counter spans all sessions — the eager single-text session, the batch session, the pipeline and the length buckets. A hang counts nothing here: the attempt never returns, so no stage of this ladder fires for it ([Wedge detection](#wedge-detection) is the diagnosis). When the counter reaches `inferenceDegradeThreshold` (a compile-time constant, `2`) on an `"auto"` request still running on a hardware provider, the embedder degrades to the CPU provider **once**:
 
 - `degradeToCPU` builds the CPU session options **first** — if that build fails, the embedder is left exactly as it was, still on the hardware provider with its options and sessions intact, never half-degraded. It then destroys every live session on the dedicated ONNX thread (the thread those sessions belong to), stops the thread, and commits the CPU state. A WARN log names the provider, the causing error and the device ID.
 - The call that hit the threshold lazily re-creates the session it needs and retries the failed inference **exactly once** on the CPU provider. The retry is structurally once: the degradation clears the pending flag, so a later failure can never trigger a second degradation.
+- Every later call rebuilds what it needs too, including the single-text fast path (`ensureQuerySession`): a degradation triggered by a multi-text call does not leave subsequent queries running on the much larger `[BatchSize, MaxSeqLength]` batch session. A re-create that fails is logged at WARN and only that call falls back to the batch session; the failure is not memoized, so a transient one heals on the next single-text call.
 - An eligible call therefore either completes on the CPU provider (a `nil` error) or returns **one loud error** chaining the original hardware failure with whichever degradation or retry step failed. Ineligible calls — explicit `cuda`/`openvino` requests, an already-CPU embedder, a closed embedder, or a streak below the threshold — return the inference error unchanged, exactly as before.
 
 One failure stays a loud error: a transient hiccup must not demote the embedder on its own. The second consecutive failure is the evidence that the provider stopped working mid-flight. An explicit `"cuda"` or `"openvino"` request **never** degrades at runtime — the caller asked for that specific hardware, so its failures keep surfacing as loud errors. After a successful degradation `ExecutionProvider()` reports `cpu`.
+
+### Wedge detection
+
+Every stage above is driven by failures that **return**. A provider that *hangs* — the classic wedged driver, stuck inside the ONNX Runtime C call — returns nothing to count, so no stage fires: the call parks in `Session.Run`, `EmbedDocuments` holds the embedder's write lock across the whole inference, every other caller queues behind it, and `Close` parks too. `Embedder.Wedged(bound)` is the diagnosis for that failure mode:
+
+```go
+if embedder.Wedged(30 * time.Second) {
+    // the dedicated inference thread has been stuck for 30s: fail the
+    // vector-index operation (or restart) instead of waiting forever
+}
+```
+
+- **Authoritative verdict, not an inference.** The answer comes from the worker's own per-job heartbeat on the dedicated ONNX thread. A caller whose embed call timed out or was cancelled cannot distinguish "slow inference" from "stuck forever"; `Wedged` can. Treat `true` as authoritative — do not infer a wedge from a streak of caller timeouts.
+- **Lock-free by contract.** `Wedged` reads the runner pointer atomically and never takes the embedder mutex, so it answers while `EmbedDocuments` holds the write lock across the very inference that is stuck (an `RLock` there would deadlock on the wedge it diagnoses). It is safe to call from any goroutine, including a watchdog.
+- **`bound` semantics.** `bound` is how long the current job may run before it counts as wedged: `false` while idle (between jobs, before the first job, after the runner stopped), `false` for a non-positive `bound` ("no opinion"), and `false` on the CPU provider, where no dedicated thread exists to wedge — an inline call blocks only its own goroutine.
+- **Caller-side timeout is the backstop.** Keep a caller deadline to bound how long *it* waits; `Wedged` is the diagnosis, never the timeout.
+
+The runner also logs a WARN when a single job crosses its slow-job threshold — the usual precursor to a wedge — so the slow batch before a hang is visible in the log as well.
 
 ### Observing a degradation
 
@@ -214,7 +235,7 @@ cfg.OnProviderDegrade = func(from, to, cause string) {
 }
 ```
 
-The callback fires **once per degradation**, synchronously under the embedder's internal write lock, right next to the WARN log. It covers both post-construction degradation paths (the session-creation fallback and the runtime degradation); the initial provider resolution inside `NewEmbedder` does **not** fire it — that resolution is already reported through the WARN log and the `requestedExecutionProvider` field of the "embedder initialized" log entry. `from` and `to` are provider identifiers (`"cuda"` → `"cpu"`) and `cause` is the same error text the WARN log carries. Because the callback runs under the write lock, it **must be quick and must not call back into the `Embedder`** (including `ExecutionProvider`); a nil callback disables notification.
+The callback fires **once per degradation**, synchronously under the embedder's internal write lock, right next to the WARN log. It covers both post-construction degradation paths (the **lazy** session-creation fallback — bucket mode's first session — and the runtime degradation); the initial provider resolution inside `NewEmbedder` and the in-constructor eager session fallback of fixed mode do **not** fire it — that resolution is already reported through the WARN log and the `requestedExecutionProvider` field of the "embedder initialized" log entry. It also never fires for a hang: nothing returns, so nothing degrades — that case is what [Wedge detection](#wedge-detection) reports. `from` and `to` are provider identifiers (`"cuda"` → `"cpu"`) and `cause` is the same error text the WARN log carries. Because the callback runs under the write lock, it **must be quick and must not call back into the `Embedder`** (including `ExecutionProvider`); a nil callback disables notification.
 
 See `specs/domains/embedding.md` → *Execution providers* (the three-stage degradation walk) and `specs/decisions/011-runtime-hardware-cpu-degradation.md` for the full contract, including the rejected alternatives.
 

@@ -44,7 +44,7 @@ func TestNewModelProviderOverrideCaller_EmptyPins_ReturnsInner(t *testing.T) {
 // non-empty provider and model are stamped onto EVERY call — overriding empty
 // and pre-set request values alike — and that the caller's original request is
 // not mutated. Because the stamping is stateless, a mid-task router SetModel
-// cannot affect a pinned caller: each Call re-asserts the same pair (the
+// cannot affect this caller: each Call re-asserts the same pair (the
 // router half of that guarantee is tested in the llm package:
 // TestRouter_Call_ProviderOverride_SurvivesSetModel).
 func TestNewModelProviderOverrideCaller_PinsProviderAndModel(t *testing.T) {

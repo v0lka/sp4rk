@@ -57,10 +57,15 @@ unblocked. Within one process the one-encoder rule is invisible: a second
 refcounted handle whose records queue through the one live encoder (never a
 second encoder), and the last handle's `Close` writes the footer and
 releases the lock. Opening the live path with a different codec fails with
-an error matching `ErrMagicMismatch`. `ErrLocked` remains for genuine
-cross-process conflicts (compressed codecs only): another process holding
-the path fails the open instead of queueing, because records cannot be
-merged across process boundaries — and the lock dies with the descriptor (a
+an error matching `ErrMagicMismatch`. `ErrLocked` covers every open that
+cannot share the live stream (compressed codecs only): the usual case is
+another process holding the path — records cannot be merged across process
+boundaries, so the open fails instead of queueing — but a same-process open
+whose path normalizes to a different registry key (symlinked parent, hardlink,
+Windows 8.3 short-name alias) reaches the same error, so it is not a
+cross-process-only signal. A Windows case alias is *not* such a case: the key
+is lower-cased there, so case variants of one path hit one entry — see the
+case-sensitive-directory caveat below. The lock dies with the descriptor (a
 last Close or a crash releases it). On Windows the same-process registry
 keys on the lower-cased path — correct for default (case-insensitive)
 directories, where the fold prevents spurious `ErrLocked` between
@@ -110,13 +115,29 @@ is recorded here so the rejection is not re-litigated by accident; the
 - For the compressed codecs one path has exactly one live encoder, enforced
   by the advisory `OpenAppend` lock: a second encoder cannot interleave
   frames into the stream. Same-process writers share the encoder through
-  refcounted queued handles; a cross-process second open fails with
-  `ErrLocked`. Sequential reopen-after-Close (the rotation flow) is
-  unaffected. `CodecNone` keeps the pre-appendcodec semantics — no lock, no
+  refcounted queued handles; a second open that cannot share the stream —
+  another process holding the lock, or a same-process path alias that misses
+  the registry — fails with `ErrLocked`. Sequential reopen-after-Close (the
+  rotation flow) is unaffected. `CodecNone` keeps the pre-appendcodec semantics — no lock, no
   queue: concurrent writers append side by side, each `write(2)` atomic at
   the end of file (compatibility with hosts that already fan plain JSONL
   logs out over several writers); only the best-effort magic sniff is
   retained.
+- The same-process join matches by **normalized path string, not file identity**:
+  the registry is keyed on that string, and a join neither re-runs the magic
+  sniff nor compares the live descriptor with what the path names now. A
+  rename-style rotator that overlaps a still-open writer therefore keeps
+  appending into the renamed inode (which the rotator then deletes) while the
+  new file at the path stays empty — silently. Close every handle on a path
+  before renaming or replacing the file under it; a future identity check
+  (dev/ino, volume serial + file index) would close the gap.
+- Release is by `Close` only (no finalizer): a compressed-codec handle dropped
+  without `Close` holds the descriptor, the advisory lock and the registry
+  entry until process death. In-process the leak stays invisible — the next
+  same-path `OpenAppend` silently joins the leaked stream — while every other
+  process's `OpenAppend` on that path gets `ErrLocked` for the rest of this
+  process's lifetime. Hosts must track handles and `defer Close`
+  (orchestration's `StepDumpTracker.CloseAll` is the reference shape).
 - The one-encoder guarantee rests on advisory locks being reliable: it holds
   on local filesystems and on network shares with a functioning lock
   manager. On NFS mounts without a working lock manager (classic NFSv3

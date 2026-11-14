@@ -19,8 +19,11 @@ import (
 //     setting req.Model beforehand bypasses the router's active-model
 //     selection for this caller.
 //
-// Both fields are caller-pinned, so a mid-task Router.SetModel does not
-// affect a pinned caller: every Call re-stamps the same provider+model.
+// A pinned model is immune to a mid-task Router.SetModel: every Call re-stamps
+// the same req.Model. Immunity is scoped to the MODEL pin — a provider-only
+// pinned caller (model == "") keeps routing to the named provider while its
+// model keeps tracking the router's active model, because prepareRequest still
+// fills req.Model from the per-call active snapshot.
 type modelProviderOverrideCaller struct {
 	inner    LLMCaller
 	provider string

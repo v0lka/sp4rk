@@ -60,7 +60,7 @@ type Events interface {
 
 | Method | Description |
 |--------|-------------|
-| `SubAgentLaunch(stepID, description, model)` | Fired when a sub-agent starts running a plan step in a goroutine. `description` is the task description. |
+| `SubAgentLaunch(stepID, description, model)` | Fired when a sub-agent starts running a plan step in a goroutine. `description` is the task description. `model` is the host-rendered model identity for display (`""` when none); it does **not** pin the model — see [Subagents](subagents.md). |
 | `SubAgentComplete(stepID, success, duration, errMsg)` | Fired when a sub-agent finishes. `success` is `true` only if the executor finished without error; `errMsg` carries the failure reason (`""` on success). See [Subagents](subagents.md). |
 | `SubAgentPaused(stepID, duration)` | Fired **instead of** `SubAgentComplete` when the sub-agent stopped at a cooperative pause checkpoint (`ErrPaused`). A pause is a recoverable checkpoint, not a failure; the trajectory is preserved in the `SubAgentResult` for a later resume. |
 

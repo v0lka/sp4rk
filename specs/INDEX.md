@@ -63,7 +63,7 @@ per-task conductors, and imports every engine layer:
 
 Upper layers (import direction flows downward, never the reverse):
 
-    orchestration   → agent, llm, safeio, skills, strutil, tools
+    orchestration   → agent, appendcodec, llm, safeio, skills, strutil, tools
     planner         → agent, llm, oneshot, orchestration, prompt, skills, strutil, tools
     memory          → agent, llm, prompt, security, strutil
     agent           → llm, strutil, tools
@@ -83,7 +83,8 @@ Supporting / leaf packages (no engine imports beyond what is listed):
     oneshot   → llm                (one-shot structured-call client; consumed by planner,
                                     agent/router, agent/reflector, and the tools judges)
     appendcodec → safeio           (stdlib compress/gzip + klauspost/compress zstd otherwise;
-                                    consumed by host rotation wrappers, not by engine layers)
+                                    consumed by orchestration's StepDumpTracker and by host
+                                    rotation wrappers)
     skills    → pathutil, safeio, tools
     agents    → safeio             (stdlib + yaml.v3 + log/slog otherwise; no coupling to
                                     tools/agent/orchestration)

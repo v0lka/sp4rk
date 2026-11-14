@@ -428,3 +428,113 @@ func TestNewEmbedder_OnProviderDegradeWiring(t *testing.T) {
 		t.Error("fallbackPending = true on a plain cpu embedder, want false")
 	}
 }
+
+// TestEmbedder_ensureQuerySession_NoopWhenSessionLive pins the healthy path:
+// a live query session is returned untouched, so the single-text fast path
+// costs no model reload and no ONNX call.
+func TestEmbedder_ensureQuerySession_NoopWhenSessionLive(t *testing.T) {
+	e, buf := newDegradeTestEmbedder(nil)
+	live := &onnxSession{}
+	e.sess = live
+
+	e.mu.Lock()
+	e.ensureQuerySession()
+	current := e.sess
+	e.mu.Unlock()
+
+	if current != live {
+		t.Error("ensureQuerySession replaced a live query session; the fast path must reuse it")
+	}
+	if strings.Contains(buf.String(), "re-creating") {
+		t.Errorf("ensureQuerySession logged a re-create on a live session: %s", buf.String())
+	}
+}
+
+// TestEmbedder_ensureQuerySession_RecreatesAfterDegradation pins the recovery
+// the single-text fast path depends on: degradeToCPU nils e.sess, and nothing
+// else rebuilds it, so the gate must attempt a fresh query-session creation.
+// Before the gate existed this site fell through to the batch path and every
+// later single-text query paid the full [BatchSize x MaxSeqLen] compute.
+//
+// The creation itself is expected to fail here (no ONNX Runtime environment is
+// required by this test — newONNXSession reports NotInitializedError, and with
+// the environment managed by TestMain it reports the model-load failure); the
+// assertion is on the ATTEMPT, identified by the re-create log line. The
+// successful assignment is pinned separately by
+// TestEmbedder_ensureQuerySession_SetsSessionOnSuccess.
+//
+// A failed attempt must stay non-fatal — the gate returns nothing and leaves
+// e.sess nil, so the caller falls through to the batch path, which is what
+// served the text before the gate existed.
+func TestEmbedder_ensureQuerySession_RecreatesAfterDegradation(t *testing.T) {
+	e, buf := newDegradeTestEmbedder(nil)
+	// The post-degradation shape: CPU provider, nothing pending, no session.
+	e.executionProvider = ExecutionProviderCPU
+	e.fallbackPending = false
+	e.maxSeqLen = DefaultMaxSeqLength
+	e.hiddenDim = DefaultHiddenDim
+
+	e.mu.Lock()
+	e.ensureQuerySession()
+	stillNil := e.sess == nil
+	e.mu.Unlock()
+
+	if !stillNil {
+		t.Error("e.sess was set despite the failed creation; a partial session must never be published")
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, "re-creating persistent ONNX session") {
+		t.Errorf("re-creation attempt was not logged: %s", logged)
+	}
+	if !strings.Contains(logged, "level=WARN") || !strings.Contains(logged, "falls back to the batch session") {
+		t.Errorf("failed re-create was not logged loudly with the batch-path fallback: %s", logged)
+	}
+	if strings.Contains(logged, "persistent ONNX session ready") {
+		t.Errorf("failed re-create reported success: %s", logged)
+	}
+}
+
+// TestEmbedder_ensureQuerySession_SetsSessionOnSuccess pins the fix itself: a
+// successful re-create ASSIGNS e.sess — re-enabling the single-text fast path —
+// and a later call is a no-op. The session constructor is stubbed through the
+// newSessionFn seam, so the assertion runs without an ONNX Runtime environment;
+// a dropped `e.sess = sess` (or an assignment before the error check) would
+// otherwise stay green while the ~15-25x per-query regression returned.
+func TestEmbedder_ensureQuerySession_SetsSessionOnSuccess(t *testing.T) {
+	e, buf := newDegradeTestEmbedder(nil)
+	// The post-degradation shape: CPU provider, nothing pending, no session.
+	e.executionProvider = ExecutionProviderCPU
+	e.fallbackPending = false
+	e.maxSeqLen = DefaultMaxSeqLength
+	e.hiddenDim = DefaultHiddenDim
+
+	fresh := &onnxSession{}
+	var calls int
+	e.newSessionFn = func(batchSize, seqLen int) (*onnxSession, error) {
+		calls++
+		if batchSize != 1 {
+			t.Errorf("query session batchSize = %d, want 1", batchSize)
+		}
+		if seqLen != DefaultMaxSeqLength {
+			t.Errorf("query session seqLen = %d, want %d", seqLen, DefaultMaxSeqLength)
+		}
+		return fresh, nil
+	}
+
+	e.mu.Lock()
+	e.ensureQuerySession()
+	got := e.sess
+	// The session is live now, so a second call must not create again.
+	e.ensureQuerySession()
+	e.mu.Unlock()
+
+	if got != fresh {
+		t.Fatal("e.sess was not set to the created session; the single-text fast path stays disabled")
+	}
+	if calls != 1 {
+		t.Errorf("session constructor calls = %d, want 1 (a live query session must not be replaced)", calls)
+	}
+	if !strings.Contains(buf.String(), "persistent ONNX session ready") {
+		t.Errorf("successful re-create was not logged: %s", buf.String())
+	}
+}

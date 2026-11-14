@@ -71,7 +71,8 @@ func NewStepDumpTracker(dir string, logger *slog.Logger, opts ...StepDumpOption)
 	case appendcodec.CodecNone, appendcodec.CodecGzip, appendcodec.CodecZstd:
 	default:
 		// An invalid codec would fail every OpenAppend with ErrUnknownCodec
-		// after creating an empty dump file; degrade once, here, instead.
+		// (pre-flight validation — no file is created, no lock is taken),
+		// silently killing the dump stream; degrade once, here, instead.
 		logger.Warn("step_dump_tracker: unknown codec; falling back to plain JSONL",
 			"codec", cfg.codec.String())
 		cfg.codec = appendcodec.CodecNone

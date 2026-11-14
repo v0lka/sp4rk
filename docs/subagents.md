@@ -26,7 +26,7 @@ type SubAgentTask struct {
     CM             ContextManager
     TaskTools      []tools.ToolDescriptor
     TaskDesc       string             // task description (for SubAgentLaunch event)
-    Model          string             // forced model identity, "" = host default (for SubAgentLaunch event)
+    Model          string             // display-only model identity, "" = host default (for SubAgentLaunch event)
     Emitter        Events        // event emitter (nil-safe)
     TodoUpdateFunc StepTodoUpdateFunc // optional callback for update_checklist tool
 }
@@ -39,7 +39,7 @@ type SubAgentTask struct {
 | `CM` | The `ContextManager` owning this step's prompt history and compaction. |
 | `TaskTools` | The tools available to this step. A registered `finish` tool is not required: the executor appends the `finish` definition to every LLM request at call time, so completion works even when `TaskTools` has no `finish` entry (registering it only makes it visible in registry listings and group-filtered toolsets). |
 | `TaskDesc` | A human-readable task description, emitted in the `SubAgentLaunch` event. |
-| `Model` | The model identity the sub-agent is pinned to (`""` = host default), emitted in the `SubAgentLaunch` event. |
+| `Model` | Display-only model identity carried verbatim into the `SubAgentLaunch` event (`""` = host default). It does **not** pin the model — the run uses whatever the executor's caller resolves. To actually pin a model, wrap the caller with `agent.NewModelProviderOverrideCaller` (or the legacy model-only `agent.NewModelOverrideCaller`) — see [Subagent Profiles](#subagent-profiles). Keep this field in sync with what you pin, or the event reports a wrong identity. |
 | `Emitter` | The `Events` sink for this subagent. `nil` is replaced with `NoopEvents`. |
 | `TodoUpdateFunc` | Optional callback invoked when the step's checklist is updated. Wired into the context for the `update_checklist` tool. |
 
@@ -61,7 +61,7 @@ func RunSubAgent(
 ) (resultCh <-chan SubAgentResult)
 ```
 
-The returned channel is buffered (capacity 1) and closed when the goroutine finishes. Read exactly one `SubAgentResult` from it.
+The returned channel is buffered (capacity 1) and closed when the goroutine finishes. Read exactly one `SubAgentResult` from it. `model` is display-only: it is carried verbatim into the `SubAgentLaunch` event (`""` = host default) and never pins the model — pinning is the caller's job (see [Subagent Profiles](#subagent-profiles)).
 
 ### What RunSubAgent does
 
@@ -288,7 +288,7 @@ A subagent may be launched under a named **Subagent Profile** (an `AGENT.md`-dec
 
 Only `Body` (alongside `DirPath`) is a field of `agents.Agent` itself — the frontmatter fields (`Tools`, `MaxSteps`, `Model`, `AllowRedelegate`, `Hidden`, …) live on `agents.AgentMetadata`, reached through `Agent.Metadata`.
 
-`agent.NewModelProviderOverrideCaller(inner LLMCaller, provider, model string)` wraps an `LLMCaller` so every `Call` pins `req.Provider` and/or `req.Model` before delegating to `inner`; each override applies independently and only when non-empty, and both empty returns `inner` unchanged, so the override applies conditionally without callers branching. It relies on the [LLM router contract](llm-providers.md) that `req.Model` is filled with the active model only when empty — setting it beforehand bypasses the router's active-model selection for that caller — and that a non-empty `req.Provider` routes the call to the named configured provider instead of the active one (unknown name: immediate non-retryable error, zero attempts; see [ADR-012](../specs/decisions/012-per-request-provider-override.md)). A pinned caller is immune to a mid-task `SetModel`. `agent.NewModelOverrideCaller(inner LLMCaller, model string)` is the legacy model-only form: it sets `req.Model` and never touches provider routing (the request still routes to the active provider).
+`agent.NewModelProviderOverrideCaller(inner LLMCaller, provider, model string)` wraps an `LLMCaller` so every `Call` pins `req.Provider` and/or `req.Model` before delegating to `inner`; each override applies independently and only when non-empty, and both empty returns `inner` unchanged, so the override applies conditionally without callers branching. It relies on the [LLM router contract](llm-providers.md) that `req.Model` is filled with the active model only when empty — setting it beforehand bypasses the router's active-model selection for that caller — and that a non-empty `req.Provider` routes the call to the named configured provider instead of the active one (unknown name: immediate non-retryable error, zero attempts; see [ADR-012](../specs/decisions/012-per-request-provider-override.md)). A caller whose model is pinned is immune to a mid-task `SetModel`; a provider-only pin (empty model) keeps routing to the named provider but its model keeps tracking the router's active model. `agent.NewModelOverrideCaller(inner LLMCaller, model string)` is the legacy model-only form: it sets `req.Model` and never touches provider routing (the request still routes to the active provider).
 
 Profile application is an execution-layer concern: `RunSubAgent`/`RunSubAgentsParallel` themselves are profile-agnostic primitives. The **host's** execution layer resolves the profile and constructs the `Executor`, `ContextManager`, `TaskTools`, and caller before handing them to `RunSubAgent` as a `SubAgentTask` — the SDK ships no resolver, and `orchestration.Conductor` passes `PlanStep.Agent` through untouched.
 

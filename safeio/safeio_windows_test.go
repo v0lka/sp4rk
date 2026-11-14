@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"syscall"
 	"testing"
@@ -14,6 +15,12 @@ import (
 // errorPrivilegeNotHeld is Windows' ERROR_PRIVILEGE_NOT_HELD (1314); the
 // stdlib syscall package does not export it by name.
 const errorPrivilegeNotHeld = syscall.Errno(1314)
+
+// createNoWindow is the Windows process creation flag CREATE_NO_WINDOW
+// (0x08000000): the child allocates no console window at all. It is inlined
+// here rather than imported from sysproc so safeio keeps its leaf-package
+// import set; the SDK's own children get the same flag via sysproc.HideConsole.
+const createNoWindow = 0x08000000
 
 // requireFileSymlink plants a symlink at link pointing to target, skipping
 // the test when the host lacks the privilege: file-symlink creation on
@@ -191,5 +198,86 @@ func TestOpenFileNoFollow_RegularFileUnaffected(t *testing.T) {
 	data, rerr = os.ReadFile(path)
 	if rerr != nil || string(data) != "x" {
 		t.Fatalf("read after truncate = %q, %v; want \"x\"", data, rerr)
+	}
+}
+
+// requireJunction plants a directory junction at link pointing to the
+// directory target (created here). Junction creation — unlike file-symlink
+// creation — needs no elevation, so this plant runs on every Windows host,
+// including the non-elevated ones where requireFileSymlink skips.
+func requireJunction(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatalf("seed junction target: %v", err)
+	}
+	cmd := exec.CommandContext(t.Context(), "cmd", "/c", "mklink", "/J", link, target)
+	// mklink is not interactive, so its console must never flash. This sets
+	// CREATE_NO_WINDOW in CreationFlags — the same flag sysproc.HideConsole
+	// OR-s in for SDK-spawned children — because it suppresses console
+	// allocation entirely. SysProcAttr.HideWindow would not do: it only adds
+	// STARTF_USESHOWWINDOW + SW_HIDE to the startup info, so the console is
+	// still created and can flash before it is hidden. The constant is
+	// inlined because safeio is a leaf package and does not import sysproc
+	// for a test.
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("plant directory junction: %v (output: %s)", err, out)
+	}
+}
+
+// TestOpenFileNoFollow_RefusesJunction pins the reparse branch the symlink
+// tests above cannot reach: Go maps IO_REPARSE_TAG_MOUNT_POINT to
+// fs.ModeIrregular (not fs.ModeSymlink), and OpenFileNoFollow refuses both
+// with syscall.ELOOP. A junction is a directory reparse point, and a read open
+// is the shape that gets a handle at all: syscall.Open adds
+// FILE_FLAG_BACKUP_SEMANTICS for a read access mode, which lets CreateFile
+// open the junction itself rather than failing on a directory. That is also
+// why this test needs no elevation, unlike the file-symlink tests above.
+func TestOpenFileNoFollow_RefusesJunction(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	link := filepath.Join(dir, "junction")
+	requireJunction(t, target, link)
+
+	f, err := OpenFileNoFollow(link, os.O_RDONLY, 0)
+	if err == nil {
+		_ = f.Close()
+		t.Fatal("OpenFileNoFollow opened through a directory junction, want an ELOOP refusal")
+	}
+	if !errors.Is(err, syscall.ELOOP) {
+		t.Fatalf("OpenFileNoFollow err = %v, want a *fs.PathError wrapping syscall.ELOOP", err)
+	}
+	if _, lerr := os.Lstat(link); lerr != nil {
+		t.Fatalf("junction itself must survive the refusal: %v", lerr)
+	}
+}
+
+// TestWriteFile_RefusesJunction pins the write shape: a junction is never
+// written through. syscall.Open adds FILE_FLAG_BACKUP_SEMANTICS only for a
+// read access mode, so a write open of a directory junction is refused by
+// CreateFile before OpenFileNoFollow's reparse check is reached, and the
+// stdlib maps that ERROR_ACCESS_DENIED to EISDIR for a target carrying
+// FILE_ATTRIBUTE_DIRECTORY. Whichever refusal fires (EISDIR here, ELOOP from
+// the reparse branch), the junction's target stays untouched.
+func TestWriteFile_RefusesJunction(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	link := filepath.Join(dir, "junction")
+	requireJunction(t, target, link)
+	keep := filepath.Join(target, "keep")
+	if err := os.WriteFile(keep, []byte("original"), 0o644); err != nil {
+		t.Fatalf("seed junction target content: %v", err)
+	}
+
+	err := WriteFile(link, []byte("payload"), 0o644)
+	if err == nil {
+		t.Fatal("WriteFile wrote through a directory junction, want a refusal")
+	}
+	if !errors.Is(err, syscall.EISDIR) && !errors.Is(err, syscall.ELOOP) {
+		t.Fatalf("WriteFile err = %v, want a refusal wrapping syscall.EISDIR (directory handle) or syscall.ELOOP (reparse check)", err)
+	}
+	data, rerr := os.ReadFile(keep)
+	if rerr != nil || string(data) != "original" {
+		t.Fatalf("junction target was disturbed: %q, %v", data, rerr)
 	}
 }

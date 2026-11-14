@@ -44,6 +44,11 @@ const (
 // reports (len(p), nil) until the LAST handle's Close makes the write
 // surface ErrClosed. Hosts that must not append behind their own Close
 // should track handle liveness themselves.
+//
+// Every handle must still be Closed: for the compressed codecs an abandoned
+// handle keeps the shared stream — descriptor, advisory lock and registry
+// entry — alive until process death, because nothing else releases it (see
+// OpenAppend).
 var ErrClosed = errors.New("appendcodec: writer already closed")
 
 // ErrMagicMismatch is returned by OpenAppend when the existing content of the
@@ -52,20 +57,37 @@ var ErrClosed = errors.New("appendcodec: writer already closed")
 // errors.Is; the concrete type is *MagicMismatchError.
 var ErrMagicMismatch = errors.New("appendcodec: existing content does not match codec")
 
-// ErrLocked is returned by OpenAppend when another PROCESS holds the target
-// path. It applies only to the compressed codecs (CodecGzip, CodecZstd),
-// which serialize every writer of a path behind one advisory lock and one
-// encoder; CodecNone is the compatibility codec — it takes no lock at all
-// and never reports this error. Within one process there is no such error
-// for a compressed path either: further OpenAppend calls for the same path
-// share the live writer — each returns an independent handle whose records
-// queue through the one encoder's mutex, so nothing interleaves and the OS
-// lock is taken only once. Across processes the lock cannot be shared or
-// merged, so a conflicting open fails immediately with ErrLocked instead of
-// interleaving its frames into the other process's stream. The lock dies
-// with the descriptor — released by the LAST handle Close, and by process
-// death. Test it with errors.Is.
-var ErrLocked = errors.New("appendcodec: path already locked by another process")
+// ErrLocked is returned by OpenAppend when the advisory lock on the target
+// path is already held by an open that cannot share this stream. It applies
+// only to the compressed codecs (CodecGzip, CodecZstd), which serialize
+// every writer of a path behind one advisory lock and one encoder; CodecNone
+// is the compatibility codec — it takes no lock at all and never reports
+// this error.
+//
+// The usual cause is another PROCESS: across processes the lock cannot be
+// shared or merged, so a conflicting open fails immediately with ErrLocked
+// instead of interleaving its frames into the other process's stream. But
+// the error is NOT cross-process-only. This process also receives it on a
+// registry miss: the sharing registry is keyed on the normalized absolute
+// path string, so an alias that normalizes differently (a symlinked parent
+// directory, a hardlink, a Windows 8.3 short-name alias) does not find the
+// live stream, goes fresh to the file and hits the lock this same process
+// holds — exactly what TestOpenAppendErrLockedOnAliasedPath pins. A Windows
+// case alias is NOT such a case: the registry key is lower-cased there, so
+// case variants of one path hit one entry (see the case-sensitive-directory
+// caveat in the OpenAppend docs). Read ErrLocked as "an open that cannot
+// share this stream holds the path", never as proof that another process is
+// involved.
+//
+// Within one process the same-path case produces no error: further
+// OpenAppend calls for the same path share the live writer — each returns an
+// independent handle whose records queue through the one encoder's mutex, so
+// nothing interleaves and the OS lock is taken only once. The lock dies with
+// the descriptor — released by the LAST handle Close, and by process death,
+// so a compressed-codec handle dropped without Close keeps the path locked
+// for the rest of this process's lifetime (see OpenAppend). Test it with
+// errors.Is.
+var ErrLocked = errors.New("appendcodec: path already locked by another open")
 
 // MagicMismatchError reports the codec requested for OpenAppend and the
 // unrecognised-or-conflicting leading bytes found in the target file. It
@@ -141,6 +163,23 @@ type codecStream interface {
 //     ErrMagicMismatch. From another process the lock cannot be shared, so
 //     the open fails with ErrLocked. Write after the last Close reports
 //     ErrClosed; Close is idempotent.
+//
+//     A join matches by PATH, not by file identity. The registry is keyed on
+//     the normalized absolute path string, so a handle obtained after the
+//     file under that path was renamed or replaced still shares the stream
+//     of the ORIGINAL inode: its records land in the renamed file (which a
+//     rotator then deletes) while the new file at path stays empty, and
+//     nothing reports an error. A rename-style rotator must therefore close
+//     every handle on a path before rotating it. (CodecNone has no registry,
+//     so the same sequence there opens the newly named file.)
+//
+//     Release is by Close only: this package registers no finalizer, so a
+//     compressed-codec handle dropped without Close holds the descriptor,
+//     the advisory lock and the registry entry until process death. The leak
+//     stays invisible in-process — a later same-path OpenAppend joins the
+//     leaked stream — while every other process's OpenAppend on that path
+//     gets ErrLocked for the rest of this process's lifetime. Track handles
+//     and defer Close; CodecNone is unaffected (no lock, no registry).
 //
 //   - CodecNone: the compatibility codec, keeping the semantics this package
 //     replaced — no advisory lock, no sharing registry, no queue. Every open
@@ -266,6 +305,13 @@ type sharedStream struct {
 // under two keys) miss the registry and degrade to the advisory lock's
 // ErrLocked — never to interleaved frames. CodecNone streams never enter
 // the registry: the compatibility codec has no lock and no shared encoder.
+//
+// A hit is decided by PATH STRING, not by file identity: nothing re-runs the
+// magic sniff or compares the live descriptor with what the path names now.
+// A file renamed or replaced while its stream is open therefore keeps
+// receiving the appended records through the original descriptor, and the
+// new file at the path stays empty — silently. Rotators must close every
+// handle on a path before rotating it (see OpenAppend).
 var streamRegistry = struct {
 	mu sync.Mutex
 	m  map[string]*sharedStream
@@ -299,8 +345,8 @@ func (q *queuedWriter) Close() error {
 	// (the footer write is real disk I/O) would leave the descriptor open
 	// and locked but unlisted: a concurrent same-process OpenAppend for the
 	// path would miss the registry, go fresh to the file and hit the
-	// still-held advisory lock as a spurious ErrLocked — an error the
-	// contract reserves for cross-process conflicts. Lock order is
+	// still-held advisory lock as an ErrLocked that misreports a
+	// self-inflicted race as a sharing conflict. Lock order is
 	// registry.mu -> appendWriter.mu (Write and appendWriter.Close never
 	// take registry.mu), so this cannot deadlock.
 	streamRegistry.mu.Lock()

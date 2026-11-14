@@ -33,8 +33,10 @@ type SubAgentTask struct {
 // The goroutine respects context cancellation — when ctx is cancelled,
 // executor.Run will return because its LLM calls and tool executions use the same context.
 // emitter is optional (nil-safe) for console output.
-// model is the host-resolved model identity the sub-agent is pinned to ("" = none);
-// it is carried verbatim in the SubAgentLaunch event for host-side display.
+// model is the host-resolved model identity reported in the SubAgentLaunch event
+// ("" = host default). It is display-only: it is carried verbatim for host-side
+// display and does NOT pin the model — pinning is the caller's concern (an
+// executor caller override, e.g. NewModelProviderOverrideCaller, ADR-012).
 func RunSubAgent(ctx context.Context, stepID string, executor *Executor, cm ContextManager, taskTools []tools.ToolDescriptor, taskDesc, model string, emitter Events, todoUpdateFunc StepTodoUpdateFunc) (resultCh <-chan SubAgentResult) {
 	// Use NoopEvents if nil to avoid nil checks
 	if emitter == nil {

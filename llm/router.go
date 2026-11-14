@@ -148,7 +148,8 @@ type ProviderEntry struct {
 	OmitReasoningHistory bool
 }
 
-// Router routes LLM calls to the active provider.
+// Router routes LLM calls to the active provider unless the request pins one
+// via ChatRequest.Provider.
 //
 // Concurrency: Router is safe for concurrent use from multiple goroutines.
 // SetModel takes a write lock; all other methods take read locks. Call
@@ -535,7 +536,9 @@ func (r *Router) prepareRequest(ctx context.Context, req *ChatRequest, bareModel
 	return r.validateContextWindow(req.Model, req.Messages, meta)
 }
 
-// Call sends a chat request to the active provider.
+// Call sends a chat request to the active provider, or to the provider named by
+// req.Provider when that per-request override is set (see ChatRequest.Provider;
+// an unknown name fails immediately with ErrUnknownProvider, non-retryably).
 func (r *Router) Call(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
 	// Snapshot the active provider and bare model under the read lock, then
 	// release the lock before the retry loop. The retry loop includes

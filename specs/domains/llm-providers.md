@@ -92,6 +92,9 @@ Router.Call(ctx, req)
 │
 ├─ Snapshot active (provider, model) under a read lock; release before the retry loop
 │      so SetModel is not blocked by backoff sleeps.
+├─ Resolve a per-call provider override: a non-empty req.Provider replaces the snapshot for
+│      THIS call; an unknown name fails immediately with ErrUnknownProvider (non-retryable,
+│      zero attempts) — see [ADR-012](../decisions/012-per-request-provider-override.md).
 ├─ Fill the bare model name when req.Model is empty; auto-detect family if empty.
 ├─ Resolve model metadata at most once (a single Resolve honoring a tier-1 override); when the
 │      caller left req.Protocol empty, fill it from the resolved ModelMetadata.Protocol so a
@@ -115,7 +118,8 @@ Router.Call(ctx, req)
 │      its local models (LM Studio, Ollama, vLLM, config-only entries).
 ├─ Validate estimated tokens against the effective context window (SafetyMarginPercent +
 │      OutputTokenReserve); reject oversized requests with ErrContextWindowExceeded.
-├─ Dispatch to the active provider. The OpenAI provider honors req.Protocol when set and otherwise
+├─ Dispatch to the resolved provider (the active one, or the one pinned by req.Provider).
+│      The OpenAI provider honors req.Protocol when set and otherwise
 │      falls back to DetectProtocol(req.Model) (see [Multi-protocol routing](#multi-protocol-routing)):
 │      Responses API for gpt-5/gpt-6/codex, /messages (co-located AnthropicProvider) for Claude,
 │      generateContent (googleCompletion) for Gemini/Gemma, /chat/completions for everything else.
