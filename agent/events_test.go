@@ -17,7 +17,7 @@ func TestNoopEvents_NoPanic(t *testing.T) {
 	n.ToolCall(1, 0, "tool", `{"arg":"val"}`, "core")
 	n.ToolResult(1, 0, 42, "preview", false)
 	n.StepComplete(1, 100*time.Millisecond)
-	n.SubAgentLaunch("step_1", "do something")
+	n.SubAgentLaunch("step_1", "do something", "")
 	n.SubAgentComplete("step_1", true, 200*time.Millisecond, "")
 	n.SubAgentPaused("step_1", 250*time.Millisecond)
 	n.AssistantChunk("partial")

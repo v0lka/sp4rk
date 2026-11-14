@@ -10,9 +10,12 @@ import "time"
 // MUST be safe for concurrent use (e.g. guard shared state with a mutex).
 //
 // BREAKING CHANGE (v0.x): Finishing(stepNum int, summary string) was added;
-// SubAgentPaused(stepID string, duration time.Duration) was added; and
+// SubAgentPaused(stepID string, duration time.Duration) was added;
 // SubAgentComplete gained an errMsg argument, becoming
-// SubAgentComplete(stepID string, success bool, duration time.Duration, errMsg string).
+// SubAgentComplete(stepID string, success bool, duration time.Duration, errMsg string);
+// and SubAgentLaunch gained a model argument, becoming
+// SubAgentLaunch(stepID, description, model string) — the host-rendered model
+// identity the sub-agent was pinned to ("" when none).
 // All implementations of Events (and orchestration.Events, which embeds it)
 // MUST implement these methods or fail to compile. A no-op stub is provided by
 // NoopEvents for struct embedding convenience.
@@ -22,7 +25,7 @@ type Events interface {
 	ToolCall(stepNum, callIdx int, toolName, argsPreview, source string)
 	ToolResult(stepNum, callIdx, resultLen int, preview string, isError bool)
 	StepComplete(stepNum int, duration time.Duration)
-	SubAgentLaunch(stepID, description string)
+	SubAgentLaunch(stepID, description, model string)
 	// SubAgentComplete is emitted when a sub-agent finishes (or fails). success
 	// reports whether the executor finished without error, and errMsg carries
 	// the failure reason ("" on success) — the sub-agent counterpart of the
@@ -83,7 +86,7 @@ func (n *NoopEvents) ToolResult(_, _, _ int, _ string, _ bool) {}
 func (n *NoopEvents) StepComplete(_ int, _ time.Duration) {}
 
 // SubAgentLaunch is a no-op.
-func (n *NoopEvents) SubAgentLaunch(_, _ string) {}
+func (n *NoopEvents) SubAgentLaunch(_, _, _ string) {}
 
 // SubAgentComplete is a no-op.
 func (n *NoopEvents) SubAgentComplete(_ string, _ bool, _ time.Duration, _ string) {}

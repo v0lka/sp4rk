@@ -154,6 +154,12 @@ func classifyNetError(err error) bool {
 // Use errors.Is(err, ErrContextWindowExceeded) to detect this condition.
 var ErrContextWindowExceeded = errors.New("context window exceeded")
 
+// ErrUnknownProvider is a sentinel error for a per-request provider override
+// (ChatRequest.Provider) naming a provider that is not configured on the
+// router. The call fails before any provider is attempted and is never
+// retried. Use errors.Is(err, ErrUnknownProvider) to detect this condition.
+var ErrUnknownProvider = errors.New("provider not configured")
+
 // TransportKind classifies a connection-level provider error into a short,
 // stable diagnostic label: "timeout", "dns", "connect" (refused/unreachable),
 // "reset", "tls", "eof", or "other" for any other non-nil error. It is

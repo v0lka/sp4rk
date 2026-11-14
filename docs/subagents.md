@@ -26,6 +26,7 @@ type SubAgentTask struct {
     CM             ContextManager
     TaskTools      []tools.ToolDescriptor
     TaskDesc       string             // task description (for SubAgentLaunch event)
+    Model          string             // forced model identity, "" = host default (for SubAgentLaunch event)
     Emitter        Events        // event emitter (nil-safe)
     TodoUpdateFunc StepTodoUpdateFunc // optional callback for update_checklist tool
 }
@@ -38,6 +39,7 @@ type SubAgentTask struct {
 | `CM` | The `ContextManager` owning this step's prompt history and compaction. |
 | `TaskTools` | The tools available to this step. A registered `finish` tool is not required: the executor appends the `finish` definition to every LLM request at call time, so completion works even when `TaskTools` has no `finish` entry (registering it only makes it visible in registry listings and group-filtered toolsets). |
 | `TaskDesc` | A human-readable task description, emitted in the `SubAgentLaunch` event. |
+| `Model` | The model identity the sub-agent is pinned to (`""` = host default), emitted in the `SubAgentLaunch` event. |
 | `Emitter` | The `Events` sink for this subagent. `nil` is replaced with `NoopEvents`. |
 | `TodoUpdateFunc` | Optional callback invoked when the step's checklist is updated. Wired into the context for the `update_checklist` tool. |
 
@@ -53,6 +55,7 @@ func RunSubAgent(
     cm ContextManager,
     taskTools []tools.ToolDescriptor,
     taskDesc string,
+    model string,
     emitter Events,
     todoUpdateFunc StepTodoUpdateFunc,
 ) (resultCh <-chan SubAgentResult)
@@ -62,7 +65,7 @@ The returned channel is buffered (capacity 1) and closed when the goroutine fini
 
 ### What RunSubAgent does
 
-1. **Emits `SubAgentLaunch`** — `emitter.SubAgentLaunch(stepID, taskDesc)` fires immediately, before the executor starts.
+1. **Emits `SubAgentLaunch`** — `emitter.SubAgentLaunch(stepID, taskDesc, model)` fires immediately, before the executor starts.
 2. **Injects context** — the task description, step ID, and (if provided) the checklist callback are attached to the context (see [Context injection](#context-injection)).
 3. **Runs the executor** — `executor.Run(ctx, taskTools, cm)` is called inside the goroutine.
 4. **Defense-in-depth check** — even if the executor reports `Finished: true`, the output is scanned for printed tool-call syntax (a failure mode where the model writes a fenced code block with a tool-name tag instead of emitting a `tool_use` block). If detected, the result is treated as a failure.
@@ -78,7 +81,7 @@ The goroutine respects context cancellation. Because the executor's LLM calls an
 ctx, cancel := context.WithCancel(context.Background())
 defer cancel()
 
-resultCh := agent.RunSubAgent(ctx, "step_2", exec, cm, taskTools, "Refactor auth module", events, nil)
+resultCh := agent.RunSubAgent(ctx, "step_2", exec, cm, taskTools, "Refactor auth module", "", events, nil)
 
 // Later, if you need to abort:
 cancel()
@@ -145,7 +148,7 @@ These are the same helpers used in standalone executor runs (see [Agent Executor
 
 Subagents emit sub-agent lifecycle events through the provided `Events` sink:
 
-- **`SubAgentLaunch(stepID, description)`** — fired when the goroutine starts, before the executor runs.
+- **`SubAgentLaunch(stepID, description, model)`** — fired when the goroutine starts, before the executor runs.
 - **`SubAgentComplete(stepID, success, duration, errMsg)`** — fired when the goroutine finishes, with the success flag, wall-clock duration, and the failure reason (`""` on success). On the non-error paths the `SubAgentResult` also carries `Summary` (the model's final text when the run ended on a host-designated stop tool); it is empty when the run returned an error.
 - **`SubAgentPaused(stepID, duration)`** — fired instead of `SubAgentComplete` when the subagent stopped at a cooperative pause checkpoint (`agent.ErrPaused`). A pause is a recoverable checkpoint, not a failure: the trajectory is preserved in the `SubAgentResult` for a later resume. So `SubAgentComplete` does **not** always fire — do not pair launch/complete counters without accounting for paused runs. On a paused run the result carries `StepID`, `Steps` (the resumable trajectory) and `Error` = `agent.ErrPaused`; `Output` and `Summary` are empty. Detect the pause with `errors.Is(result.Error, agent.ErrPaused)`.
 
@@ -215,7 +218,7 @@ For finer control (e.g. streaming results as they arrive), launch subagents indi
 channels := make([]<-chan agent.SubAgentResult, len(tasks))
 for i, t := range tasks {
     channels[i] = agent.RunSubAgent(ctx, t.StepID, t.Executor, t.CM,
-        t.TaskTools, t.TaskDesc, t.Emitter, t.TodoUpdateFunc)
+        t.TaskTools, t.TaskDesc, t.Model, t.Emitter, t.TodoUpdateFunc)
 }
 
 // Collect results as they complete.
@@ -250,7 +253,7 @@ func (s *trajStore) Steps() []agent.Step     { s.mu.Lock(); defer s.mu.Unlock();
 store := &trajStore{}
 ctx = agent.WithTrajectoryStore(ctx, store)
 
-resultCh := agent.RunSubAgent(ctx, "step_2", exec, cm, taskTools, "Investigate bug", events, nil)
+resultCh := agent.RunSubAgent(ctx, "step_2", exec, cm, taskTools, "Investigate bug", "", events, nil)
 <-resultCh
 
 // The store now holds the full trajectory, synced at each iteration.
@@ -279,13 +282,13 @@ A subagent may be launched under a named **Subagent Profile** (an `AGENT.md`-dec
 | `Agent.Body` | the core directive / system prompt (replaces the generic orchestrator default) |
 | `Agent.Metadata.Tools` (`ToolPreference`) | the tool budget (`nil`=all, `"read-only"`, or a comma-list of tool-group tokens). Resolve it with `ToolPreferenceWithError()`, which returns an error for an invalid field; the legacy `ToolPreference() any` silently maps an invalid field to `nil` (the full toolset) and must not be used for security-sensitive resolution |
 | `Agent.Metadata.MaxSteps` | the ReAct iteration cap (0/absent → derived from task complexity) |
-| `Agent.Metadata.Model` | forced per-call via `NewModelOverrideCaller` |
+| `Agent.Metadata.Model` | forced per-call via `NewModelProviderOverrideCaller` (provider+model pinning); the legacy model-only `NewModelOverrideCaller` is kept |
 | `Agent.Metadata.AllowRedelegate` | whether the subagent may launch further subagents |
 | `Agent.Metadata.Hidden` | discovery visibility only (never blocks invocation) |
 
 Only `Body` (alongside `DirPath`) is a field of `agents.Agent` itself — the frontmatter fields (`Tools`, `MaxSteps`, `Model`, `AllowRedelegate`, `Hidden`, …) live on `agents.AgentMetadata`, reached through `Agent.Metadata`.
 
-`agent.NewModelOverrideCaller(inner LLMCaller, model string)` wraps an `LLMCaller` so every `Call` sets `req.Model` before delegating to `inner`. It returns `inner` unchanged when `model` is empty, so the override applies conditionally without callers branching. It relies on the [LLM router contract](llm-providers.md) that `req.Model` is filled with the active model only when empty — setting it beforehand bypasses the router's active-model selection for that caller while still routing to the active provider.
+`agent.NewModelProviderOverrideCaller(inner LLMCaller, provider, model string)` wraps an `LLMCaller` so every `Call` pins `req.Provider` and/or `req.Model` before delegating to `inner`; each override applies independently and only when non-empty, and both empty returns `inner` unchanged, so the override applies conditionally without callers branching. It relies on the [LLM router contract](llm-providers.md) that `req.Model` is filled with the active model only when empty — setting it beforehand bypasses the router's active-model selection for that caller — and that a non-empty `req.Provider` routes the call to the named configured provider instead of the active one (unknown name: immediate non-retryable error, zero attempts; see [ADR-012](../specs/decisions/012-per-request-provider-override.md)). A pinned caller is immune to a mid-task `SetModel`. `agent.NewModelOverrideCaller(inner LLMCaller, model string)` is the legacy model-only form: it sets `req.Model` and never touches provider routing (the request still routes to the active provider).
 
 Profile application is an execution-layer concern: `RunSubAgent`/`RunSubAgentsParallel` themselves are profile-agnostic primitives. The **host's** execution layer resolves the profile and constructs the `Executor`, `ContextManager`, `TaskTools`, and caller before handing them to `RunSubAgent` as a `SubAgentTask` — the SDK ships no resolver, and `orchestration.Conductor` passes `PlanStep.Agent` through untouched.
 
@@ -302,9 +305,9 @@ ctxA := agent.WithTrajectoryStore(ctx, storeA)
 ctxB := agent.WithTrajectoryStore(ctx, storeB)
 
 chA := agent.RunSubAgent(ctxA, "step_2", newExecutorForStep("step_2"),
-    newContextManagerForStep("step_2"), taskTools, "Implement feature A", events, nil)
+    newContextManagerForStep("step_2"), taskTools, "Implement feature A", "", events, nil)
 chB := agent.RunSubAgent(ctxB, "step_3", newExecutorForStep("step_3"),
-    newContextManagerForStep("step_3"), taskTools, "Implement feature B", events, nil)
+    newContextManagerForStep("step_3"), taskTools, "Implement feature B", "", events, nil)
 
 // Collect in launch order; select on the channels instead to stream arrivals.
 for _, r := range []agent.SubAgentResult{<-chA, <-chB} {

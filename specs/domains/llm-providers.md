@@ -12,7 +12,7 @@ Provides LLM provider abstractions, a model registry, and routing for multi-prov
 - `github.com/v0lka/sp4rk/llm` (protocol) — `APIProtocol`, `DetectProtocol`, and the four protocol constants (`ProtocolChatCompletions`, `ProtocolResponses`, `ProtocolAnthropic`, `ProtocolGoogle`)
 - `github.com/v0lka/sp4rk/llm` (token accounting) — `TokenCounter`, `SimpleTokenCounter`, `TiktokenCounter`, `NewTokenCounter`, `ContextTokenTracker`, `UsageTracker`, `UsageObserver`, `TimedUsageObserver`, `TrackingCaller`
 - `github.com/v0lka/sp4rk/llm` (request/response) — `ChatRequest`, `ChatResponse`, `Message`, `ContentBlock`, `NormalizeContentBlocks`, `ValidateContentBlocks`, `ToolCall`, `ToolDefinition`, `TokenUsage`
-- `github.com/v0lka/sp4rk/llm` (errors) — `Error`, `ErrKind` (`ErrKindRateLimit`, `ErrKindOverloaded`), `NewError`, `WrapProviderError`, `IsRetryable`, `ErrContextWindowExceeded`
+- `github.com/v0lka/sp4rk/llm` (errors) — `Error`, `ErrKind` (`ErrKindRateLimit`, `ErrKindOverloaded`), `NewError`, `WrapProviderError`, `IsRetryable`, `ErrContextWindowExceeded`, `ErrUnknownProvider`
 - `github.com/v0lka/sp4rk/llm` (streaming) — `StreamDelta`, the optional `ChatRequest.DeltaSink` hook, the internal per-attempt retry guard (`deltaGuard`), and provider streaming for the OpenAI Chat Completions path (`OpenAIProvider.chatCompletionStream`), the OpenAI Responses path (`responsesAPICompletionStream`), and the Anthropic Messages path (`AnthropicProvider.chatCompletionStream`)
 
 ## Core Types
@@ -252,6 +252,7 @@ Retry interaction: `Router.Call` wraps the sink in a **per-attempt guard**. A re
 - A probe aborted by the caller's context — cancellation or deadline; recording requires a live context (`ctx.Err() == nil`) at the write site — is never recorded in the negative cache, while the registry's own HTTP client timeout is; an expired negative record is evicted at read time.
 - `NewTokenCounter` always returns a non-nil counter.
 - Pre-call validation rejects oversized requests with `ErrContextWindowExceeded` (detectable via `errors.Is`); this is independent of the agent loop's ongoing context-fill tracking.
+- A non-empty `ChatRequest.Provider` routes the call to the named configured provider; an unknown name fails immediately, before any provider attempt (zero retries), with a non-retryable error wrapping `ErrUnknownProvider` (detectable via `errors.Is`).
 - Retryable errors are classified by `WrapProviderError` (HTTP 408/429/500/502/503/504/520–524/529 — request timeout, rate limit, upstream server/gateway faults, Cloudflare edge errors, Anthropic overload — plus transient network errors); `IsRetryable` reports whether a chain contains a retryable `*Error`.
 - `Error.ErrKind` is the transport-independent failure class (`rate_limit`, `overloaded`, `""` unknown): `NewError` derives it from the HTTP status (429/529), and the Anthropic transport sets it from the SDK's error type field for `APIError` cases, which carry no HTTP status. Callers match on `ErrKind` rather than `StatusCode` to stay transport-agnostic. Hand-built `Error` literals must set it explicitly; it is not derived for them.
 - An explicit `ModelMetadata.Protocol` is always honored over substring `DetectProtocol` detection; the router threads the resolved protocol into `ChatRequest.Protocol`, and the provider honors `req.Protocol` when set.

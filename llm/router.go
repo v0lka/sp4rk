@@ -547,7 +547,36 @@ func (r *Router) Call(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 	r.mu.RLock()
 	provider := r.activeProvider
 	bareModel := r.activeBareModel
+	// Per-request provider override: a non-empty req.Provider routes THIS call
+	// to the named configured provider instead of the active one. Resolution
+	// happens here — after the snapshot, before prepareRequest and the retry
+	// loop — so an unknown name fails the call immediately with a
+	// non-retryable error and no provider is ever attempted. req.Provider is
+	// left on the request untouched: providers ignore it (routing is the
+	// router's job) and request dumps record it for debugging.
+	if req.Provider != "" {
+		overridden, ok := r.providers[req.Provider]
+		if !ok {
+			r.mu.RUnlock()
+			// Configuration miss, not a transport failure: a plain
+			// sentinel-wrapped error (no HTTP status, never retried —
+			// the loop below is never entered); hosts detect it via
+			// errors.Is(err, ErrUnknownProvider).
+			return nil, fmt.Errorf("llm: per-request provider override %q: %w", req.Provider, ErrUnknownProvider)
+		}
+		provider = overridden
+	}
 	r.mu.RUnlock()
+
+	// Observability for the ADR-012 "pairing is the caller's responsibility"
+	// contract: with an empty req.Model, prepareRequest silently substitutes
+	// the ACTIVE bare model, so a caller pinning only the provider gets the
+	// active model's metadata (sampling presets, context-window guard) on the
+	// pinned provider. The Debug line makes that implicit pairing visible.
+	if req.Provider != "" && req.Model == "" && r.logger != nil {
+		r.logger.Debug("router: provider override without explicit model; sending active model",
+			"provider", req.Provider, "model", bareModel)
+	}
 
 	if err := r.prepareRequest(ctx, &req, bareModel); err != nil {
 		return nil, err
@@ -700,16 +729,10 @@ func (r *Router) SetModel(ctx context.Context, model string) error {
 	}
 
 	// Bare identifier: resolve to a composite ID via reverse scan of the index.
-	var matches []string
-	for id := range r.modelToProvider {
-		if BareModel(id) == model {
-			matches = append(matches, id)
-		}
-	}
+	matches := r.bareModelCandidatesLocked(model)
 	if len(matches) == 0 {
 		return fmt.Errorf("model %q is not enabled in any provider", model)
 	}
-	sort.Strings(matches) // deterministic first-match when ambiguous
 	compositeID := matches[0]
 	if len(matches) > 1 && r.logger != nil {
 		r.logger.Warn("model name is ambiguous across providers; selecting first match — use a composite \"provider/model\" identifier to disambiguate",
@@ -725,4 +748,64 @@ func (r *Router) SetModel(ctx context.Context, model string) error {
 	r.activeBareModel = model
 	r.activeProviderName = providerName
 	return nil
+}
+
+// ProviderForModel returns the provider a model identifier would route to,
+// without mutating any router state (read-only).
+//
+// A composite "provider/model" identifier routes to its named provider: ok
+// reports whether that provider is configured. On ok=false the returned
+// provider name (composite branch) is the *requested*, not a known, name.
+// The bare model need not appear in the provider's model list — per-request
+// provider routing (req.Provider, see ADR-012) pins the provider name only
+// and leaves model pairing to the caller, exactly like the runtime miss
+// check in Call.
+//
+// A bare model name resolves like SetModel: the provider behind the first
+// composite ID (sorted) whose bare model matches; ok=false when no provider
+// lists the name. For a bare name the answer describes SetModel routing only:
+// a call carrying a pre-set req.Model without req.Provider still goes to the
+// ACTIVE provider, regardless of what this method returns.
+func (r *Router) ProviderForModel(model string) (provider string, ok bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if provider, _, composite := ParseCompositeModelID(model); composite {
+		_, known := r.providers[provider]
+		return provider, known
+	}
+	matches := r.bareModelCandidatesLocked(model)
+	if len(matches) == 0 {
+		return "", false
+	}
+	return r.modelToProvider[matches[0]], true
+}
+
+// KnownProviders returns the configured provider names, sorted (read-only
+// snapshot). Hosts use it to fail fast with an actionable error when a pinned
+// provider name matches nothing.
+func (r *Router) KnownProviders() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	names := make([]string, 0, len(r.providers))
+	for name := range r.providers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// bareModelCandidatesLocked returns every composite model ID whose bare model
+// matches, sorted (the deterministic first-match order SetModel and
+// ProviderForModel share). Caller holds r.mu.
+func (r *Router) bareModelCandidatesLocked(model string) []string {
+	var matches []string
+	for id := range r.modelToProvider {
+		if BareModel(id) == model {
+			matches = append(matches, id)
+		}
+	}
+	sort.Strings(matches)
+	return matches
 }

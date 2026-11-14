@@ -24,7 +24,7 @@ func TestRunSubAgent_Success(t *testing.T) {
 	cm := newMockContextManager()
 	exec := newExecutorDefaultHITL(mockLLM, newMockToolExecutor(), &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
 
-	ch := RunSubAgent(context.Background(), "step_1", exec, cm, nil, "test task", nil, nil)
+	ch := RunSubAgent(context.Background(), "step_1", exec, cm, nil, "test task", "", nil, nil)
 	result := <-ch
 	if result.Error != nil {
 		t.Fatalf("unexpected error: %v", result.Error)
@@ -47,7 +47,7 @@ func TestRunSubAgent_WithEmitter(t *testing.T) {
 	events := &recordingEvents{}
 	exec := newExecutorDefaultHITL(mockLLM, newMockToolExecutor(), &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
 
-	ch := RunSubAgent(context.Background(), "step_1", exec, cm, nil, "task desc", events, nil)
+	ch := RunSubAgent(context.Background(), "step_1", exec, cm, nil, "task desc", "test-model", events, nil)
 	result := <-ch
 	if result.Error != nil {
 		t.Fatalf("unexpected error: %v", result.Error)
@@ -57,7 +57,7 @@ func TestRunSubAgent_WithEmitter(t *testing.T) {
 	foundLaunch := false
 	foundComplete := false
 	for _, e := range events.events {
-		if e == "SubAgentLaunch:step_1" {
+		if e == "SubAgentLaunch:step_1:test-model" {
 			foundLaunch = true
 		}
 		if e == "SubAgentComplete:step_1:true" {
@@ -85,7 +85,7 @@ func TestRunSubAgent_CompleteCarriesFailureReason(t *testing.T) {
 		mockLLM := &mockLLMCaller{errors: []error{errors.New("llm failed")}}
 		exec := newExecutorDefaultHITL(mockLLM, newMockToolExecutor(), &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
 
-		ch := RunSubAgent(context.Background(), "step_1", exec, newMockContextManager(), nil, "task", events, nil)
+		ch := RunSubAgent(context.Background(), "step_1", exec, newMockContextManager(), nil, "task", "", events, nil)
 		result := <-ch
 		if result.Error == nil {
 			t.Fatal("expected error")
@@ -107,7 +107,7 @@ func TestRunSubAgent_CompleteCarriesFailureReason(t *testing.T) {
 
 		ch := RunSubAgent(context.Background(), "step_1", exec, newMockContextManager(), []tools.ToolDescriptor{
 			{Name: "tool1", Description: "t", Source: "core"},
-		}, "task", events, nil)
+		}, "task", "", events, nil)
 		result := <-ch
 		if result.Error == nil {
 			t.Fatal("expected error for max steps exhaustion")
@@ -122,7 +122,7 @@ func TestRunSubAgent_CompleteCarriesFailureReason(t *testing.T) {
 		events := &recordingEvents{}
 		exec := newExecutorDefaultHITL(panickingLLMCaller{}, newMockToolExecutor(), &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
 
-		ch := RunSubAgent(context.Background(), "step_panic", exec, newMockContextManager(), nil, "task", events, nil)
+		ch := RunSubAgent(context.Background(), "step_panic", exec, newMockContextManager(), nil, "task", "", events, nil)
 		result := <-ch
 		if result.Error == nil {
 			t.Fatal("expected an error from the recovered panic")
@@ -150,7 +150,7 @@ func TestRunSubAgent_CompleteCarriesFailureReason(t *testing.T) {
 
 		ch := RunSubAgent(context.Background(), "step_1", exec, newMockContextManager(), []tools.ToolDescriptor{
 			{Name: "read_file", Description: "read", Source: "core"},
-		}, "task", events, nil)
+		}, "task", "", events, nil)
 		result := <-ch
 		if result.Error == nil {
 			t.Fatal("expected error for mutation-gate rejection")
@@ -183,7 +183,7 @@ func TestRunSubAgent_Paused(t *testing.T) {
 	exec := newExecutorDefaultHITL(mockLLM, newMockToolExecutor(), &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
 	exec.SetPauseChecker(func(context.Context) bool { return true })
 
-	ch := RunSubAgent(context.Background(), "step_1", exec, cm, nil, "pausable task", events, nil)
+	ch := RunSubAgent(context.Background(), "step_1", exec, cm, nil, "pausable task", "", events, nil)
 	result := <-ch
 
 	if !errors.Is(result.Error, ErrPaused) {
@@ -213,7 +213,7 @@ func TestRunSubAgent_LLMError(t *testing.T) {
 	cm := newMockContextManager()
 	exec := newExecutorDefaultHITL(mockLLM, newMockToolExecutor(), &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
 
-	ch := RunSubAgent(context.Background(), "step_1", exec, cm, nil, "test", nil, nil)
+	ch := RunSubAgent(context.Background(), "step_1", exec, cm, nil, "test", "", nil, nil)
 	result := <-ch
 	if result.Error == nil {
 		t.Fatal("expected error")
@@ -237,7 +237,7 @@ func TestRunSubAgent_MaxStepsExhausted(t *testing.T) {
 
 	ch := RunSubAgent(context.Background(), "step_1", exec, cm, []tools.ToolDescriptor{
 		{Name: "tool1", Description: "t", Source: "core"},
-	}, "test", nil, nil)
+	}, "test", "", nil, nil)
 	result := <-ch
 	if result.Error == nil {
 		t.Fatal("expected error for max steps exhaustion")
@@ -264,7 +264,7 @@ func TestRunSubAgent_RecoversPanic(t *testing.T) {
 	events := &recordingEvents{}
 	exec := newExecutorDefaultHITL(panickingLLMCaller{}, newMockToolExecutor(), &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
 
-	ch := RunSubAgent(context.Background(), "step_panic", exec, cm, nil, "panicking task", events, nil)
+	ch := RunSubAgent(context.Background(), "step_panic", exec, cm, nil, "panicking task", "", events, nil)
 	result := <-ch
 
 	if result.Error == nil {
@@ -473,14 +473,14 @@ type concurrencyGaugeEvents struct {
 	peak   int
 }
 
-func (e *concurrencyGaugeEvents) SubAgentLaunch(stepID, description string) {
+func (e *concurrencyGaugeEvents) SubAgentLaunch(stepID, description, model string) {
 	e.mu.Lock()
 	e.active++
 	if e.active > e.peak {
 		e.peak = e.active
 	}
 	e.mu.Unlock()
-	e.recordingEvents.SubAgentLaunch(stepID, description)
+	e.recordingEvents.SubAgentLaunch(stepID, description, model)
 }
 
 func (e *concurrencyGaugeEvents) SubAgentComplete(stepID string, success bool, d time.Duration, errMsg string) {

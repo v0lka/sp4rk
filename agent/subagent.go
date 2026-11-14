@@ -14,11 +14,17 @@ import (
 
 // SubAgentTask bundles an agent with its task tools, context manager, and events.
 type SubAgentTask struct {
-	StepID         string
-	Executor       *Executor
-	CM             ContextManager
-	TaskTools      []tools.ToolDescriptor
-	TaskDesc       string             // task description (for SubAgentLaunch event)
+	StepID    string
+	Executor  *Executor
+	CM        ContextManager
+	TaskTools []tools.ToolDescriptor
+	TaskDesc  string // task description (for SubAgentLaunch event)
+	// Model is the model identity carried verbatim into the SubAgentLaunch
+	// event ("" = host default). It is display-only metadata: it does NOT pin
+	// the model — pinning is a separate host concern (e.g. an executor caller
+	// override, ADR-012). Keep it in sync with what the host actually pins,
+	// or the event reports a wrong identity.
+	Model          string
 	Emitter        Events             // event emitter (nil-safe)
 	TodoUpdateFunc StepTodoUpdateFunc // optional callback for update_checklist tool
 }
@@ -27,7 +33,9 @@ type SubAgentTask struct {
 // The goroutine respects context cancellation — when ctx is cancelled,
 // executor.Run will return because its LLM calls and tool executions use the same context.
 // emitter is optional (nil-safe) for console output.
-func RunSubAgent(ctx context.Context, stepID string, executor *Executor, cm ContextManager, taskTools []tools.ToolDescriptor, taskDesc string, emitter Events, todoUpdateFunc StepTodoUpdateFunc) (resultCh <-chan SubAgentResult) {
+// model is the host-resolved model identity the sub-agent is pinned to ("" = none);
+// it is carried verbatim in the SubAgentLaunch event for host-side display.
+func RunSubAgent(ctx context.Context, stepID string, executor *Executor, cm ContextManager, taskTools []tools.ToolDescriptor, taskDesc, model string, emitter Events, todoUpdateFunc StepTodoUpdateFunc) (resultCh <-chan SubAgentResult) {
 	// Use NoopEvents if nil to avoid nil checks
 	if emitter == nil {
 		emitter = &NoopEvents{}
@@ -69,7 +77,7 @@ func RunSubAgent(ctx context.Context, stepID string, executor *Executor, cm Cont
 		}()
 
 		// Emit subagent launch
-		emitter.SubAgentLaunch(stepID, taskDesc)
+		emitter.SubAgentLaunch(stepID, taskDesc, model)
 
 		// Set task context for tool execution
 		ctx = tools.WithTaskContext(ctx, taskDesc)
@@ -224,7 +232,7 @@ func RunSubAgentsParallel(ctx context.Context, agents []SubAgentTask, opts ...Ru
 			sem <- struct{}{}        // acquire a running slot
 			defer func() { <-sem }() // release it once this subagent settles
 			ag := agents[i]
-			results[i] = <-RunSubAgent(ctx, ag.StepID, ag.Executor, ag.CM, ag.TaskTools, ag.TaskDesc, ag.Emitter, ag.TodoUpdateFunc)
+			results[i] = <-RunSubAgent(ctx, ag.StepID, ag.Executor, ag.CM, ag.TaskTools, ag.TaskDesc, ag.Model, ag.Emitter, ag.TodoUpdateFunc)
 		}(i)
 	}
 	wg.Wait()

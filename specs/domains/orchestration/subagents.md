@@ -7,7 +7,7 @@ The delegated-execution primitive: goroutine-based wrappers around an `Executor`
 ## Key Files
 
 - `github.com/v0lka/sp4rk/agent` — `SubAgentTask`, `RunSubAgent`, `RunSubAgentsParallel`, `SubAgentResult`, `DetectToolCallSyntaxInContent`, `StepTodoUpdateFunc`, context helpers (`WithStepID`, `WithStepTodoUpdateFunc`)
-- `github.com/v0lka/sp4rk/agent` — `Executor`, `ContextManager`, `Events` (`SubAgentLaunch`/`SubAgentComplete` hooks), `NewModelOverrideCaller`
+- `github.com/v0lka/sp4rk/agent` — `Executor`, `ContextManager`, `Events` (`SubAgentLaunch`/`SubAgentComplete` hooks), `NewModelProviderOverrideCaller` (provider+model pinning; the legacy `NewModelOverrideCaller` is its model-only form)
 - `github.com/v0lka/sp4rk/tools` — `ToolDescriptor`, `WithTaskContext`
 - `github.com/v0lka/sp4rk/orchestration` — `CompletedStep`, DAG utilities (`FindReadySteps`) used to select independent steps, `PlanStep.Agent` (names a Subagent Profile that should execute a step)
 - `github.com/v0lka/sp4rk/agents` — `AgentManager`, `Agent` profile discovery/parsing (resolves `PlanStep.Agent` to a profile)
@@ -34,13 +34,13 @@ type SubAgentTask struct {
 
 ```go
 func RunSubAgent(ctx, stepID string, executor *Executor, cm ContextManager,
-    taskTools []tools.ToolDescriptor, taskDesc string, emitter Events,
+    taskTools []tools.ToolDescriptor, taskDesc, model string, emitter Events,
     todoUpdateFunc StepTodoUpdateFunc) (resultCh <-chan SubAgentResult)
 ```
 
 The returned channel is buffered (capacity 1) and closed when the goroutine finishes. Read exactly one `SubAgentResult`. What it does:
 
-1. **Emits `SubAgentLaunch`** — `emitter.SubAgentLaunch(stepID, taskDesc)` fires before the executor starts.
+1. **Emits `SubAgentLaunch`** — `emitter.SubAgentLaunch(stepID, taskDesc, model)` fires before the executor starts.
 2. **Injects context** — task description (`WithTaskContext`), step ID (`WithStepID`), and (if provided) the checklist callback (`WithStepTodoUpdateFunc`).
 3. **Runs the executor** — `executor.Run(ctx, taskTools, cm)` inside the goroutine.
 4. **Defense-in-depth check** — even if the executor reports `Finished: true`, the output is scanned for printed tool-call syntax; if detected the result is treated as a failure.
@@ -99,11 +99,11 @@ A subagent may be launched under a named **Subagent Profile** (an `AGENT.md`-dec
 | `Body` | the core directive / system prompt (replaces the generic orchestrator default) |
 | `Tools` (`ToolPreference`) | the tool budget (`nil`=all, `"read-only"`, or a comma-list of tool-group tokens). Resolve it with `ToolPreferenceWithError()`, which returns an error for an invalid field; the legacy `ToolPreference() any` silently maps an invalid field to `nil` (the full toolset) and must not be used for security-sensitive resolution |
 | `MaxSteps` | the ReAct iteration cap (0/absent → derived from task complexity) |
-| `Model` | forced per-call via `NewModelOverrideCaller` |
+| `Model` | forced per-call via `NewModelProviderOverrideCaller` (provider+model pinning); the legacy model-only `NewModelOverrideCaller` is kept |
 | `AllowRedelegate` | whether the subagent may launch further subagents |
 | `Hidden` | discovery visibility only (never blocks invocation) |
 
-`NewModelOverrideCaller(inner LLMCaller, model string)` wraps an `LLMCaller` so every `Call` sets `req.Model` before delegating to `inner`. It returns `inner` unchanged when `model` is empty, so the override applies conditionally without callers branching. It relies on the [LLM router contract](../../contracts/llm-providers.md) that `req.Model` is filled with the active model only when empty — setting it beforehand bypasses the router's active-model selection for that caller while still routing to the active provider.
+`NewModelProviderOverrideCaller(inner LLMCaller, provider, model string)` wraps an `LLMCaller` so every `Call` pins `req.Provider` and/or `req.Model` before delegating to `inner`; each override applies independently and only when non-empty, and both empty returns `inner` unchanged, so the override applies conditionally without callers branching. It relies on the [LLM router contract](../../contracts/llm-providers.md) that `req.Model` is filled with the active model only when empty — setting it beforehand bypasses the router's active-model selection for that caller — and that a non-empty `req.Provider` routes the call to the named configured provider instead of the active one (unknown name: immediate non-retryable error, zero attempts; see [ADR-012](../../decisions/012-per-request-provider-override.md)). A pinned caller is immune to a mid-task `SetModel`. `NewModelOverrideCaller(inner LLMCaller, model string)` is the legacy model-only form: it sets `req.Model` and never touches provider routing (the request still routes to the active provider).
 
 Profile application is an execution-layer concern: `RunSubAgent`/`RunSubAgentsParallel` themselves are profile-agnostic primitives. The host or Conductor resolves the profile and constructs the `Executor`, `ContextManager`, `TaskTools`, and caller before handing them to `RunSubAgent` as a `SubAgentTask`.
 

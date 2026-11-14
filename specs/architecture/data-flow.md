@@ -168,7 +168,7 @@ Parallelism within a plan is achieved by launching subagents rather than sharing
 root orchestration layer (TaskBuilder) dispatches ready steps (no unmet DependsOn)
          │
          ▼
-for each step → agent.RunSubAgent(ctx, stepID, executor, cm, taskTools, taskDesc, emitter, todoUpdateFunc)
+for each step → agent.RunSubAgent(ctx, stepID, executor, cm, taskTools, taskDesc, model, emitter, todoUpdateFunc)
          │  (takes a pre-built *Executor + ContextManager; separate goroutine)
          ▼
 events: SubAgentLaunch(step)   ← streamed to host

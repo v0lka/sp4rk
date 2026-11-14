@@ -132,7 +132,7 @@ Use the available tools. Verify your work, then call finish with a short summary
 				agent.WithEvents(&agent.NoopEvents{}))
 
 			// Launch in a goroutine; read exactly one result from the channel.
-			ch := agent.RunSubAgent(ctx, t.id, exec, cm, taskTools, t.prompt,
+			ch := agent.RunSubAgent(ctx, t.id, exec, cm, taskTools, t.prompt, "",
 				&agent.NoopEvents{}, nil)
 			results[i] = <-ch // each index is written by exactly one goroutine
 		}(i, t)
