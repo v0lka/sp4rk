@@ -945,6 +945,27 @@ func (e *Executor) processSingleToolCall(
 		input = decision.ModifiedInput
 	}
 
+	// --- Executor short-circuit cache: replay identical whitelisted discovery calls ---
+	// An identical-input repeat of a whitelisted pure discovery tool
+	// (shortCircuitCacheableTools) is served from the cache — cached
+	// observation + "[unchanged since turn N]" — when no non-whitelisted tool
+	// has executed since the cached result. Placed AFTER the repeat circuit
+	// breaker (which still counts this call toward its thresholds, so a
+	// consecutive identical loop is still nudged/aborted as before) and AFTER
+	// HITL (so the key reflects the input that actually executes — a
+	// HITL-modified input must not resolve an entry stored under the model's
+	// original request). The replay skips execution and the truncation
+	// pipeline entirely; see replayShortCircuitObservation.
+	if _, cacheable := shortCircuitCacheableTools[action.Name]; cacheable {
+		if entry, ok := e.lookupShortCircuitCache(action.Name, input); ok {
+			if act := e.replayShortCircuitObservation(ctx, entry, action, callIdx, thought, resp, state, cw); act != actionNone {
+				return nil, act, nil
+			}
+			return nil, actionNone, nil
+		}
+	}
+	// --- End executor short-circuit cache ---
+
 	// Execute the tool (task context should already be set by the caller)
 	// Inject tool result cache into context so tool_result_read can access it.
 	// Also inject per-tool truncation config for num_lines enforcement.
@@ -985,8 +1006,16 @@ func (e *Executor) processSingleToolCall(
 		return nil, actionNone, err
 	}
 
+	// Short-circuit cache bookkeeping for the completed execution: a
+	// non-whitelisted tool invalidates the whole replay cache (its side
+	// effects must be treated as having possibly occurred), a whitelisted
+	// error evicts its own key (a cached success must not keep replaying
+	// while the tool transiently fails). The replayable observation itself is
+	// stored after processToolResult below.
+	e.shortCircuitNoteExecution(action.Name, input, result.IsError)
+
 	observation := result.Content
-	e.lastToolResultIsError = result.IsError
+	e.repeat.lastIsError = result.IsError
 
 	// Determine if the tool output is from an untrusted external source
 	// for prompt injection defense wrapping in BuildPrompt().
@@ -1024,6 +1053,26 @@ func (e *Executor) processSingleToolCall(
 	}
 	// --- End parse error tracker ---
 
+	// --- Validation error tracker (schema rejections) ---
+	// A schema rejection is not a parse failure: the JSON parsed fine but
+	// violates the tool's input schema (missing required parameter, wrong
+	// type, unknown parameter). Tracked separately so both loops can trip
+	// their own breakers without masking each other.
+	{
+		obs, valAction, valResult, valErr := e.checkValidationErrors(ctx, action, callIdx, observation, result, state, cw)
+		if valErr != nil {
+			return nil, actionNone, valErr
+		}
+		observation = obs
+		if valAction != actionNone {
+			return valResult, valAction, nil
+		}
+		if valResult != nil {
+			return valResult, actionNone, nil
+		}
+	}
+	// --- End validation error tracker ---
+
 	// Stage 1 + 2: truncation, caching, token budget (shared helper).
 	// Pass the EFFECTIVE input (post-HITL modification): the cache entry's
 	// file-backed metadata (FilePath/FileBacked) and display args must
@@ -1032,6 +1081,12 @@ func (e *Executor) processSingleToolCall(
 	// would stream from a file the tool never read.
 	var cacheHash string
 	observation, cacheHash = e.processToolResult(execCtx, observation, result.Content, action.Name, input, cw)
+
+	// Short-circuit cache store: the observation is now FINAL (truncation
+	// notices and cache-hash nudges included), so a successful whitelisted
+	// call becomes replayable verbatim — preserving the cache-on-truncate
+	// invariant on replay without re-running the truncation pipeline.
+	e.shortCircuitStoreResult(action.Name, input, state.stepNum, observation, cacheHash, result.IsError)
 
 	// Verify-on-edit hook: after the last call of a group containing at
 	// least one successful write_file/edit_file, run the configured
@@ -1483,6 +1538,87 @@ func (e *Executor) processBatchTool(
 		return nil, actionNone, nil
 	}
 
+	// Whole-batch repeat detection: the batch meta-call itself (its name plus
+	// the full calls array) is the dedup key, tracked in the batch namespace
+	// so the per-sub-call updates inside the loop below cannot reset it
+	// between two identical batches. A model resending the same batch — valid
+	// or rejected by pre-flight — rides the same nudge/reprieve/abort ladder
+	// as a repeated standalone call. The batch-level tool card is emitted
+	// only when the breaker intercepts (valid batches deliberately stay
+	// card-free), keeping the emitted ToolResult paired with a ToolCall.
+	if loopAct, execResult, err := e.checkBatchRepeatIdentical(ctx, action, callIdx, thought, resp, state, cw, func() {
+		e.emitter.ToolCall(state.stepNum, callIdx, action.Name, string(action.Input), e.tools.GetToolSource(action.Name))
+	}); loopAct != actionNone || execResult != nil {
+		return execResult, loopAct, err
+	}
+
+	// Pre-flight: validate EVERY sub-call input BEFORE executing anything.
+	// A batch carrying structurally invalid sub-call input must not execute a
+	// valid prefix: the prefix's side effects would land, the model would
+	// never learn the invalid tail was skipped, and resending the batch would
+	// double-execute the prefix. Instead, ONE aggregated rejection lists every
+	// offending index with its rendered reason — each carrying the schema
+	// digest (required parameters, types, minimal example) — and nothing
+	// runs. Validation mirrors exactly what the registry's Execute enforces
+	// per sub-call (category-aware key admission), so a batch that passes
+	// pre-flight cannot fail validation later. When the tool source does not
+	// expose schema validation (test fakes), pre-flight is skipped fail-open
+	// and per-call validation remains the only gate.
+	if validator, ok := e.tools.(batchInputValidator); ok {
+		rejections := make([]string, 0, len(batchInput.Calls))
+		for i, sub := range batchInput.Calls {
+			// A nested batch is handled by its own guard inside the loop
+			// below (an implementation-internal message, not a schema
+			// matter); skip it here so the aggregate stays purely about
+			// schema violations.
+			if sub.Tool == tools.ToolBatch {
+				continue
+			}
+			if err := validator.ValidateInput(sub.Tool, sub.Input); err != nil {
+				rejections = append(rejections, fmt.Sprintf("- calls[%d] (%q): %v", i, sub.Tool, err))
+			}
+		}
+		if len(rejections) > 0 {
+			obs := fmt.Sprintf("batch rejected: no sub-call was executed because %d of %d sub-call inputs failed schema validation. Fix the calls listed below and resend the ENTIRE batch.\n%s",
+				len(rejections), len(batchInput.Calls), strings.Join(rejections, "\n"))
+			e.emitter.ToolCall(state.stepNum, callIdx, action.Name, string(action.Input), e.tools.GetToolSource(action.Name))
+			// The rejection is itself a validation signature: run it through
+			// the validation circuit breaker so a model looping on DIFFERENT
+			// invalid batches still trips a breaker even though no two
+			// batches are identical. The repeat tracker's error-lowering is
+			// deliberately NOT armed here — the validation breaker owns
+			// rejection escalation, keeping the batch rhythm at the
+			// configured nudge/abort counts.
+			obs, valAct, valResult, valErr := e.checkValidationErrors(ctx, action, callIdx, obs, tools.ToolResult{Content: obs, IsError: true}, state, cw)
+			if valErr != nil {
+				return nil, actionNone, valErr
+			}
+			if valAct != actionNone {
+				return valResult, valAct, nil
+			}
+			if valResult != nil {
+				return valResult, actionNone, nil
+			}
+			e.emitter.ToolResult(state.stepNum, callIdx, len(obs), obs, true)
+			// Ungated reasoning carry — same read-only-when-not-first
+			// rationale as the parse-error branch above: needed when this
+			// step is the group's first, inert otherwise.
+			step := Step{
+				Thought:          thought,
+				ReasoningContent: resp.Message.ReasoningContent,
+				ReasoningItems:   resp.Message.ReasoningItems,
+				Action:           action,
+				Observation:      obs,
+				IsError:          true,
+				TokensUsed:       resp.Usage.InputTokens + resp.Usage.OutputTokens,
+				ResponseGroup:    responseGroup,
+			}
+			state.allSteps = append(state.allSteps, step)
+			cw.AddStep(step)
+			return nil, actionNone, nil
+		}
+	}
+
 	// Use unique index space for batch sub-calls to avoid collisions
 	// with standalone tool call indices in the emitter's localToolIDs map.
 	// The +1 keeps the batch space entirely above the standalone range
@@ -1674,8 +1810,15 @@ func (e *Executor) processBatchTool(
 			result = tools.ToolResult{Content: fmt.Sprintf("error executing %q: %v", subCall.Name, execErr), IsError: true}
 		}
 
+		// Short-circuit cache bookkeeping for the completed sub-call — same
+		// contract as the standalone path: non-whitelisted execution (even an
+		// infra-error-converted one, whose side effects may have occurred)
+		// invalidates the whole replay cache; a whitelisted error evicts its
+		// own key. HITL rejections never reach this line (nothing executed).
+		e.shortCircuitNoteExecution(subCall.Name, subInput, result.IsError)
+
 		observation := result.Content
-		e.lastToolResultIsError = result.IsError
+		e.repeat.lastIsError = result.IsError
 
 		// Fruitless result detector.
 		if loopAct, execResult, err := e.checkFruitlessResult(ctx, subCall, effectiveIdx, observation, result.IsError, state, cw); loopAct != actionNone || execResult != nil {
@@ -1685,6 +1828,21 @@ func (e *Executor) processBatchTool(
 		// Same-tool repetition detector.
 		if loopAct, execResult, err := e.checkSameToolRepetition(ctx, subCall, effectiveIdx, observation, result, state, cw); loopAct != actionNone || execResult != nil {
 			return execResult, loopAct, err
+		}
+
+		// Validation error tracker (schema rejections, e.g. a HITL-modified
+		// input the registry still rejects). Batch pre-flight normally
+		// rejects invalid inputs before this loop ever runs them, so this
+		// site mostly sees post-HITL rejections.
+		observation, valAction, valResult, valErr := e.checkValidationErrors(ctx, subCall, effectiveIdx, observation, result, state, cw)
+		if valErr != nil {
+			return nil, actionNone, valErr
+		}
+		if valAction != actionNone {
+			return valResult, valAction, nil
+		}
+		if valResult != nil {
+			return valResult, actionNone, nil
 		}
 
 		// Ensure non-empty observation (OpenAI API requirement).
@@ -1700,6 +1858,10 @@ func (e *Executor) processBatchTool(
 		// actually executed.
 		var batchCacheHash string
 		observation, batchCacheHash = e.processToolResult(execCtx, observation, result.Content, subCall.Name, subInput, cw)
+
+		// Short-circuit cache store — the observation is now FINAL; see the
+		// standalone path's store comment.
+		e.shortCircuitStoreResult(subCall.Name, subInput, state.stepNum, observation, batchCacheHash, result.IsError)
 
 		// Verify-on-edit hook (debounced per response group): runs once at
 		// the last sub-call of the last batch call when any edit succeeded.
@@ -1867,6 +2029,8 @@ func (e *Executor) processToolResult(
 
 // checkRepeatIdenticalTool detects repeated identical tool calls and applies
 // the repeat circuit breaker: nudge the LLM or abort the step based on thresholds.
+// Tracks e.repeat — the namespace shared by standalone tool calls and batch
+// sub-calls (the same call executed in either shape is the same repeat).
 func (e *Executor) checkRepeatIdenticalTool(
 	ctx context.Context,
 	action llm.ToolCall,
@@ -1876,21 +2040,61 @@ func (e *Executor) checkRepeatIdenticalTool(
 	state *runState,
 	cw ContextManager,
 ) (loopAction, *ExecutorResult, error) {
+	return e.checkRepeatIdenticalTracked(ctx, action, callIdx, thought, resp, state, cw, &e.repeat, nil)
+}
+
+// checkBatchRepeatIdentical is checkRepeatIdenticalTool for WHOLE batch
+// meta-calls: the dedup key is the batch call's own full input (name plus the
+// compacted calls array), tracked in the batch namespace so the per-sub-call
+// updates inside the batch loop cannot reset the count between two identical
+// batches. Identical batches count whether pre-flight later rejects them or
+// they execute — the repeat breaker measures the resend pattern, not the
+// outcome. emitToolCall, nil at the standalone/sub-call sites (which already
+// emitted the card), is invoked by the core ONLY when the breaker intercepts,
+// so the emitted ToolResult stays paired with a ToolCall event while valid
+// batches remain card-free.
+func (e *Executor) checkBatchRepeatIdentical(
+	ctx context.Context,
+	action llm.ToolCall,
+	callIdx int,
+	thought string,
+	resp *llm.ChatResponse,
+	state *runState,
+	cw ContextManager,
+	emitToolCall func(),
+) (loopAction, *ExecutorResult, error) {
+	return e.checkRepeatIdenticalTracked(ctx, action, callIdx, thought, resp, state, cw, &e.batchRepeat, emitToolCall)
+}
+
+// checkRepeatIdenticalTracked is the shared repeat-breaker core behind
+// checkRepeatIdenticalTool and checkBatchRepeatIdentical, parameterized by
+// the tracking namespace and the optional lazy ToolCall emitter.
+func (e *Executor) checkRepeatIdenticalTracked(
+	ctx context.Context,
+	action llm.ToolCall,
+	callIdx int,
+	thought string,
+	resp *llm.ChatResponse,
+	state *runState,
+	cw ContextManager,
+	track *repeatTracker,
+	emitToolCall func(),
+) (loopAction, *ExecutorResult, error) {
 	responseGroup := state.responseGroup
 	toolKey := action.Name + ":" + compactJSON(action.Input)
-	if toolKey == e.lastToolKey {
-		e.consecutiveRepeatCount++
+	if toolKey == track.lastKey {
+		track.count++
 	} else {
-		e.consecutiveRepeatCount = 1
-		e.lastToolKey = toolKey
-		e.lastToolResultIsError = false
+		track.count = 1
+		track.lastKey = toolKey
+		track.lastIsError = false
 	}
 
 	// Use lower thresholds when the previous identical call produced an error.
 	// Guard against zero-value (disabled) thresholds to prevent integer underflow.
 	nudgeThreshold := e.circuitBreaker.RepeatNudgeThreshold
 	abortThreshold := e.circuitBreaker.RepeatAbortThreshold
-	if e.lastToolResultIsError {
+	if track.lastIsError {
 		if e.circuitBreaker.RepeatNudgeThreshold > 0 {
 			nudgeThreshold = e.circuitBreaker.RepeatNudgeThreshold - 1
 		}
@@ -1899,14 +2103,17 @@ func (e *Executor) checkRepeatIdenticalTool(
 		}
 	}
 
-	if abortThreshold > 0 && e.consecutiveRepeatCount >= abortThreshold {
-		e.emitter.ExecutorDiagnostic(state.stepNum, "repeated_tool_call_abort", map[string]any{"tool": action.Name, "repeat_count": e.consecutiveRepeatCount})
-		abortReason := fmt.Sprintf("Tool '%s' called %d times consecutively with identical arguments", action.Name, e.consecutiveRepeatCount)
+	if abortThreshold > 0 && track.count >= abortThreshold {
+		if emitToolCall != nil {
+			emitToolCall()
+		}
+		e.emitter.ExecutorDiagnostic(state.stepNum, "repeated_tool_call_abort", map[string]any{"tool": action.Name, "repeat_count": track.count})
+		abortReason := fmt.Sprintf("Tool '%s' called %d times consecutively with identical arguments", action.Name, track.count)
 		slResp, slErr := e.hitl.OnStepLimit(ctx, state.stepNum, state.effectiveMaxSteps, abortReason)
 		if slErr == nil {
 			switch slResp {
 			case StepLimitAllowOnce, StepLimitAllowMore:
-				e.consecutiveRepeatCount = 0
+				track.count = 0
 				reprieve := "granted you ONE more chance"
 				if slResp == StepLimitAllowMore {
 					reprieve = "let you continue"
@@ -1919,7 +2126,7 @@ func (e *Executor) checkRepeatIdenticalTool(
 				cw.AddStep(nudgeStep)
 				state.circuitBreakerTriggered = true
 			case StepLimitAllowAlways:
-				e.consecutiveRepeatCount = 0
+				track.count = 0
 				e.circuitBreaker.RepeatAbortThreshold = 1 << 30 // disable
 				nudgeStep := Step{
 					UserNudge: "[System] The user has overridden the circuit breaker. You may continue, " +
@@ -1935,7 +2142,7 @@ func (e *Executor) checkRepeatIdenticalTool(
 		if state.circuitBreakerTriggered {
 			return actionBreak, nil, nil
 		}
-		abortMsg := fmt.Sprintf("Aborted: tool '%s' called %d times consecutively with identical arguments", action.Name, e.consecutiveRepeatCount)
+		abortMsg := fmt.Sprintf("Aborted: tool '%s' called %d times consecutively with identical arguments", action.Name, track.count)
 		e.emitter.ToolResult(state.stepNum, callIdx, len(abortMsg), abortMsg, true)
 		return actionNone, &ExecutorResult{
 			Output:   abortMsg,
@@ -1944,12 +2151,15 @@ func (e *Executor) checkRepeatIdenticalTool(
 		}, nil
 	}
 
-	if nudgeThreshold > 0 && e.consecutiveRepeatCount >= nudgeThreshold {
+	if nudgeThreshold > 0 && track.count >= nudgeThreshold {
+		if emitToolCall != nil {
+			emitToolCall()
+		}
 		nudgeMsg := repeatNudgeMessage
-		if e.lastToolResultIsError {
+		if track.lastIsError {
 			nudgeMsg = repeatErrorNudgeMessage
 		}
-		e.emitter.ExecutorDiagnostic(state.stepNum, "repeated_tool_call_nudge", map[string]any{"tool": action.Name, "repeat_count": e.consecutiveRepeatCount})
+		e.emitter.ExecutorDiagnostic(state.stepNum, "repeated_tool_call_nudge", map[string]any{"tool": action.Name, "repeat_count": track.count})
 		e.emitter.ToolResult(state.stepNum, callIdx, len(nudgeMsg), nudgeMsg, true)
 		stepThought := ""
 		stepReasoning := ""
@@ -1984,6 +2194,87 @@ func (e *Executor) checkRepeatIdenticalTool(
 	}
 
 	return actionNone, nil, nil
+}
+
+// checkValidationErrors is the validation counterpart of checkParseErrors:
+// it counts consecutive tool results whose content is a schema-validation
+// rejection — the registry's pre-dispatch validator, the batch pre-flight
+// aggregate (which embeds the same rendered errors), or a registry-validated
+// batch sub-call — and applies the same ladder: threshold reached →
+// diagnostic → OnStepLimit reprieve → abort. Unlike parse errors the count is
+// NOT keyed per tool: the measured failure ("cannot produce schema-valid
+// input") is tool-agnostic, and per-tool keying would let a model rotate
+// tools while looping on invalid inputs indefinitely. Below the threshold the
+// observation gains the validation nudge (schema digest); the tracker resets
+// on the next successful (non-error) result.
+func (e *Executor) checkValidationErrors(
+	ctx context.Context,
+	action llm.ToolCall,
+	callIdx int,
+	observation string,
+	result tools.ToolResult,
+	state *runState,
+	cw ContextManager,
+) (string, loopAction, *ExecutorResult, error) {
+	if result.IsError && isValidationError(observation) {
+		e.consecutiveValidationErrorCount++
+
+		if e.circuitBreaker.ValidationErrorAbortThreshold > 0 && e.consecutiveValidationErrorCount >= e.circuitBreaker.ValidationErrorAbortThreshold {
+			e.emitter.ExecutorDiagnostic(state.stepNum, "validation_error_abort", map[string]any{"tool": action.Name, "consecutive_validation_errors": e.consecutiveValidationErrorCount})
+			e.emitter.ToolResult(state.stepNum, callIdx, len(observation), observation, true)
+			abortReason := fmt.Sprintf("Tool inputs failed schema validation %d times consecutively", e.consecutiveValidationErrorCount)
+			slResp, slErr := e.hitl.OnStepLimit(ctx, state.stepNum, state.effectiveMaxSteps, abortReason)
+			if slErr == nil {
+				switch slResp {
+				case StepLimitAllowOnce, StepLimitAllowMore:
+					e.consecutiveValidationErrorCount = 0
+					reprieve := "granted you ONE more chance"
+					if slResp == StepLimitAllowMore {
+						reprieve = "let you continue"
+					}
+					nudgeStep := Step{
+						UserNudge: "[System] The user acknowledged the validation circuit breaker and " + reprieve + ". " +
+							"You MUST fix your tool call arguments to satisfy each tool's input schema — " +
+							"required parameters present, correct names, correct JSON types.",
+					}
+					state.allSteps = append(state.allSteps, nudgeStep)
+					cw.AddStep(nudgeStep)
+					state.circuitBreakerTriggered = true
+				case StepLimitAllowAlways:
+					e.consecutiveValidationErrorCount = 0
+					e.circuitBreaker.ValidationErrorAbortThreshold = 1 << 30 // disable
+					nudgeStep := Step{
+						UserNudge: "[System] The user has overridden the validation circuit breaker. " +
+							"You may continue, but fix your tool call arguments to satisfy each tool's input schema.",
+					}
+					state.allSteps = append(state.allSteps, nudgeStep)
+					cw.AddStep(nudgeStep)
+					state.circuitBreakerTriggered = true
+				default:
+					// StepLimitDeny or empty — fall through to abort
+				}
+			}
+			if state.circuitBreakerTriggered {
+				return observation, actionBreak, nil, nil
+			}
+			return observation, actionNone, &ExecutorResult{
+				Output:   fmt.Sprintf("Aborted: tool inputs failed schema validation %d times consecutively", e.consecutiveValidationErrorCount),
+				Steps:    state.allSteps,
+				Finished: false,
+			}, nil
+		}
+
+		e.emitter.ExecutorDiagnostic(state.stepNum, "validation_error_nudge", map[string]any{
+			"tool":                          action.Name,
+			"consecutive_validation_errors": e.consecutiveValidationErrorCount,
+		})
+		observation += "\n\n" + fmt.Sprintf(validationErrorNudgeFmt, e.consecutiveValidationErrorCount)
+	} else if !result.IsError {
+		// Reset the tracker on successful execution
+		e.consecutiveValidationErrorCount = 0
+	}
+
+	return observation, actionNone, nil, nil
 }
 
 // checkFruitlessResult detects consecutive tool calls that return empty or

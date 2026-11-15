@@ -100,7 +100,8 @@ func newResponsesClient(apiKey, baseURL string, httpClient *http.Client, tokenSo
 
 // responsesAPICompletion performs a non-streaming Responses API call.
 // baseURL is the provider's configured base URL (empty = official OpenAI).
-// logger is used for debug-level diagnostics (nil = slog.Default()).
+// logger is used for debug-level diagnostics and the connection-level
+// transport WARN annotation (nil = slog.Default()).
 func responsesAPICompletion(ctx context.Context, client *oai.Client, providerName, baseURL string, req ChatRequest, logger *slog.Logger) (*ChatResponse, error) {
 	// Validate image blocks up front so a missing MediaType/ImageB64 yields a
 	// clear local error instead of an opaque API 400.
@@ -114,14 +115,14 @@ func responsesAPICompletion(ctx context.Context, client *oai.Client, providerNam
 
 	resp, err := client.Responses.New(ctx, params)
 	if err != nil {
-		return nil, wrapResponsesError(providerName, err)
+		return nil, annotateResponsesTransport(logger, providerName, wrapResponsesError(providerName, err), params)
 	}
 
 	converted, err := convertResponsesResponse(resp)
 	if err != nil {
 		return nil, err
 	}
-	logToolCallArguments(logger, providerName, converted.Message.ToolCalls)
+	finalizeToolCallArguments(logger, providerName, converted.Message.ToolCalls)
 	return converted, nil
 }
 
@@ -248,7 +249,7 @@ func responsesAPICompletionStream(ctx context.Context, client *oai.Client, provi
 		}
 	}
 	if err := stream.Err(); err != nil {
-		return nil, wrapResponsesError(providerName, err)
+		return nil, annotateResponsesTransport(logger, providerName, wrapResponsesError(providerName, err), params)
 	}
 	if terminal == nil {
 		return nil, WrapProviderError(providerName, 0,
@@ -260,7 +261,7 @@ func responsesAPICompletionStream(ctx context.Context, client *oai.Client, provi
 		return nil, err
 	}
 	applyStreamedOutputFallback(converted, textBuf.String(), refusalBuf.String(), reasoningBuf.String(), doneItems)
-	logToolCallArguments(logger, providerName, converted.Message.ToolCalls)
+	finalizeToolCallArguments(logger, providerName, converted.Message.ToolCalls)
 	return converted, nil
 }
 
@@ -774,4 +775,49 @@ func wrapResponsesError(providerName string, err error) error {
 		return WrapProviderError(providerName, apiErr.StatusCode, fmt.Errorf("responses API: %w", err))
 	}
 	return WrapProviderError(providerName, 0, fmt.Errorf("responses API: %w", err))
+}
+
+// annotateResponsesTransport decorates connection-level Responses API
+// failures (HTTP 0 — the SDK surfaced no HTTP response at all) with the
+// classified transport kind and the serialized request size, and logs the
+// same at WARN — the Responses-path parity of annotateChatTransport
+// (provider_openai.go). An "HTTP 0" failure otherwise reaches callers as an
+// opaque string, leaving upstream consumers unable to tell a timeout from a
+// mid-body reset from a payload-size-dependent gateway rejection — the
+// triage data they need when a failure reproduces on specific payloads
+// across runs. The suffix is appended OUTSIDE the *Error wrapper so
+// retryability classification (which inspects the error chain, not the
+// message) is untouched; HTTP-carrying failures, pre-call validation
+// failures and caller-initiated cancellation (errors.Is(err,
+// context.Canceled) — a routine host decision such as shutdown, pause, or a
+// step budget, not a connection-level provider failure) pass through
+// unchanged. err must already carry the provider's *Error wrapping
+// (wrapResponsesError) so the HTTP-0 probe sees the classified chain. The
+// size estimate is the marshaled request body (one marshal on the failure
+// path only), and -1 when marshaling fails, so the number is always
+// interpreted as approximate. The WARN attributes — provider, model,
+// transport, request_bytes, err — carry no tokens or credentials.
+func annotateResponsesTransport(logger *slog.Logger, providerName string, err error, params responses.ResponseNewParams) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) {
+		return err
+	}
+	var llmErr *Error
+	if !errors.As(err, &llmErr) || llmErr.StatusCode != 0 {
+		return err
+	}
+	kind := TransportKind(err)
+	if kind == "" {
+		kind = "other"
+	}
+	reqBytes := int64(-1)
+	if b, mErr := json.Marshal(params); mErr == nil {
+		reqBytes = int64(len(b))
+	}
+	loggerOrDefault(logger).Warn("openai: connection-level responses API failure",
+		"provider", providerName, "model", params.Model, "transport", kind,
+		"request_bytes", reqBytes, "err", err.Error())
+	return fmt.Errorf("%w (transport=%s, request_bytes=%d)", err, kind, reqBytes)
 }

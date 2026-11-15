@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -579,12 +580,12 @@ func TestCheckRepeatIdenticalTool_ErrorThenIdenticalCall_Nudges(t *testing.T) {
 	if result != nil {
 		t.Fatalf("first call must not produce a result, got %+v", result)
 	}
-	if exec.consecutiveRepeatCount != 1 {
-		t.Fatalf("consecutiveRepeatCount = %d after first call, want 1", exec.consecutiveRepeatCount)
+	if exec.repeat.count != 1 {
+		t.Fatalf("repeat.count = %d after first call, want 1", exec.repeat.count)
 	}
 
 	// The first call executed and FAILED — mirror the executor's post-result state.
-	exec.lastToolResultIsError = true
+	exec.repeat.lastIsError = true
 
 	// Second IDENTICAL call after the error must be intercepted by the nudge.
 	loopAct, result, err = exec.checkRepeatIdenticalTool(context.Background(), action, 0, "", resp, state, newMockContextManager())
@@ -2129,4 +2130,325 @@ func TestNonBatchPathsCarryReasoningItems(t *testing.T) {
 			})
 		}
 	})
+}
+
+// --- Batch pre-flight, whole-batch repeat detection, validation breaker ---
+
+// invalidValidationFor builds the *tools.InputValidationError a pre-flight
+// rejection carries, digest included — the shape a real registry rejection
+// renders (see the schema digest tests in the tools package).
+func invalidValidationFor(tool, reason string) error {
+	return &tools.InputValidationError{
+		Tool:         tool,
+		Reason:       reason,
+		ValidParams:  []string{"path"},
+		SchemaDigest: `Required parameters: path (string). Minimal example: {"path":"<string>"}`,
+	}
+}
+
+// bc is one batch sub-call fixture entry.
+type bc struct {
+	tool  string
+	input map[string]any
+}
+
+// batchCallJSON marshals a batch meta-call input from sub-call fixtures.
+func batchCallJSON(t *testing.T, calls ...bc) json.RawMessage {
+	t.Helper()
+	type batchCall struct {
+		Tool  string          `json:"tool"`
+		Input json.RawMessage `json:"input"`
+	}
+	arr := make([]batchCall, 0, len(calls))
+	for _, c := range calls {
+		in, err := json.Marshal(c.input)
+		if err != nil {
+			t.Fatalf("marshal sub-call input: %v", err)
+		}
+		arr = append(arr, batchCall{Tool: c.tool, Input: in})
+	}
+	b, err := json.Marshal(map[string][]batchCall{"calls": arr})
+	if err != nil {
+		t.Fatalf("marshal batch input: %v", err)
+	}
+	return b
+}
+
+// batchAction builds the batch meta-call and its response wrapper.
+func batchAction(id string, input json.RawMessage) (llm.ToolCall, *llm.ChatResponse) {
+	action := llm.ToolCall{ID: id, Name: "batch", Input: input}
+	resp := &llm.ChatResponse{
+		Message:    llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{action}},
+		Usage:      llm.TokenUsage{InputTokens: 100, OutputTokens: 50},
+		StopReason: "tool_use",
+	}
+	return action, resp
+}
+
+// TestProcessBatchTool_PreflightRejectsWholeBatch pins the pre-flight
+// contract: a batch carrying TWO invalid sub-calls executes NOTHING and
+// returns ONE aggregated rejection listing every offending index with its
+// reason and the schema digest (required parameters, types, minimal
+// example). The valid prefix must not run.
+func TestProcessBatchTool_PreflightRejectsWholeBatch(t *testing.T) {
+	mockTools := newMockToolExecutor()
+	mockTools.results["good_tool"] = tools.ToolResult{Content: "good result"}
+	mockTools.validationFailures["bad_a"] = invalidValidationFor("bad_a", `missing required parameter "path"`)
+	mockTools.validationFailures["bad_b"] = invalidValidationFor("bad_b", `parameter "path" must be of type string, got number`)
+
+	exec := newExecutorDefaultHITL(&mockLLMCaller{}, mockTools, &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+	exec.emitter = &NoopEvents{}
+
+	batchInput := batchCallJSON(t,
+		bc{tool: "good_tool", input: map[string]any{"query": "x"}},
+		bc{tool: "bad_a", input: map[string]any{}},
+		bc{tool: "good_tool", input: map[string]any{"query": "y"}},
+		bc{tool: "bad_b", input: map[string]any{"path": 42}},
+	)
+	action, resp := batchAction("batch_1", batchInput)
+	state := &runState{effectiveMaxSteps: 10}
+	cw := newMockContextManager()
+
+	result, act, err := exec.processSingleToolCall(context.Background(), action, 0, resp.Message.ToolCalls, resp, "thinking", state, cw)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != nil || act != actionNone {
+		t.Fatalf("rejection must return to the loop: result=%v act=%v", result, act)
+	}
+
+	// NOTHING executed — the valid sub-calls included.
+	if len(mockTools.calls) != 0 {
+		t.Fatalf("pre-flight rejection must execute nothing, got %d executed calls: %+v", len(mockTools.calls), mockTools.calls)
+	}
+
+	// ONE aggregated step, marked as an error.
+	if len(state.allSteps) != 1 {
+		t.Fatalf("expected exactly 1 rejection step, got %d", len(state.allSteps))
+	}
+	step := state.allSteps[0]
+	if !step.IsError {
+		t.Error("rejection step must be IsError")
+	}
+	obs := step.Observation
+	for _, want := range []string{
+		"batch rejected",
+		"no sub-call was executed",
+		`calls[1] ("bad_a")`,
+		`calls[3] ("bad_b")`,
+		`missing required parameter "path"`,
+		`parameter "path" must be of type string, got number`,
+		"Required parameters: path (string)",
+		`Minimal example: {"path":"<string>"}`,
+	} {
+		if !strings.Contains(obs, want) {
+			t.Errorf("aggregate rejection must contain %q:\n%s", want, obs)
+		}
+	}
+
+	// The rejection armed the validation breaker exactly once.
+	if exec.consecutiveValidationErrorCount != 1 {
+		t.Errorf("consecutiveValidationErrorCount = %d, want 1", exec.consecutiveValidationErrorCount)
+	}
+}
+
+// TestProcessBatchTool_IdenticalInvalidBatchesNudgeThenAbort pins the
+// whole-batch repeat ladder with lowered thresholds (nudge 3 / abort 5): the
+// THIRD identical invalid batch is nudged (and pre-flight does not even run),
+// the FIFTH hits the abort path — and not a single sub-call ever executes.
+func TestProcessBatchTool_IdenticalInvalidBatchesNudgeThenAbort(t *testing.T) {
+	mockTools := newMockToolExecutor()
+	mockTools.validationFailures["bad_a"] = invalidValidationFor("bad_a", `missing required parameter "path"`)
+
+	cfg := CircuitBreakerConfig{
+		RepeatNudgeThreshold: 3,
+		RepeatAbortThreshold: 5,
+		// Validation breaker disabled to isolate the whole-batch repeat ladder.
+		ValidationErrorAbortThreshold: 0,
+	}
+	exec := newExecutorDefaultHITL(&mockLLMCaller{}, mockTools, &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, cfg)
+	exec.emitter = &NoopEvents{}
+
+	batchInput := batchCallJSON(t, bc{tool: "bad_a", input: map[string]any{}})
+	action, resp := batchAction("batch_1", batchInput)
+	state := &runState{effectiveMaxSteps: 10}
+	cw := newMockContextManager()
+	run := func() (result *ExecutorResult, act loopAction) {
+		t.Helper()
+		// Mirror the per-wave reset the Run loop performs before each
+		// processSingleToolCall wave (response-group head): direct calls
+		// bypass it, and a stale flag would turn the batch-5 abort arm into
+		// a phantom reprieve.
+		state.circuitBreakerTriggered = false
+		var err error
+		result, act, err = exec.processSingleToolCall(context.Background(), action, 0, resp.Message.ToolCalls, resp, "thinking", state, cw)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		return result, act
+	}
+
+	// Batches 1-2: pre-flight rejection, no breaker interference yet.
+	for i := 0; i < 2; i++ {
+		if result, act := run(); result != nil || act != actionNone {
+			t.Fatalf("batch %d must pass through the aggregate rejection: result=%v act=%v", i+1, result, act)
+		}
+	}
+	if exec.batchRepeat.count != 2 {
+		t.Fatalf("batchRepeat.count = %d after two identical batches, want 2", exec.batchRepeat.count)
+	}
+	if exec.consecutiveValidationErrorCount != 2 {
+		t.Fatalf("validation count = %d after two rejections, want 2", exec.consecutiveValidationErrorCount)
+	}
+
+	// Batch 3: the whole-batch repeat nudge intercepts BEFORE pre-flight.
+	result, act := run()
+	if result != nil || act != actionBreak || !state.circuitBreakerTriggered {
+		t.Fatalf("third identical batch must trigger the nudge: result=%v act=%v triggered=%v", result, act, state.circuitBreakerTriggered)
+	}
+	nudgeStep := state.allSteps[len(state.allSteps)-1]
+	if nudgeStep.Observation != repeatNudgeMessage {
+		t.Errorf("nudge observation = %q, want the generic repeat nudge (the rejection was not an executed-call error, so thresholds stay unlowered)", nudgeStep.Observation)
+	}
+	// The nudge fired before pre-flight: the validation count froze at 2 and
+	// the repeat count was not reset.
+	if exec.consecutiveValidationErrorCount != 2 {
+		t.Errorf("validation count = %d after nudged batch 3, want 2 (pre-flight must not run)", exec.consecutiveValidationErrorCount)
+	}
+	if exec.batchRepeat.count != 3 {
+		t.Errorf("batchRepeat.count = %d after the nudge, want 3 (nudges do not reset)", exec.batchRepeat.count)
+	}
+
+	// Batch 4: nudge again (count 4 ≥ 3).
+	if result, act := run(); result != nil || act != actionBreak {
+		t.Fatalf("fourth identical batch must nudge again: result=%v act=%v", result, act)
+	}
+
+	// Batch 5: abort path (NoopHITL denies the reprieve).
+	result, act = run()
+	if act != actionNone || result == nil {
+		t.Fatalf("fifth identical batch must abort: result=%v act=%v", result, act)
+	}
+	if result.Finished {
+		t.Error("repeat abort is an unfinished stop, Finished must be false")
+	}
+	if !strings.Contains(result.Output, "Aborted: tool 'batch' called 5 times consecutively with identical arguments") {
+		t.Errorf("abort output mismatch: %q", result.Output)
+	}
+
+	// Not a single sub-call ever executed across the whole ladder.
+	if len(mockTools.calls) != 0 {
+		t.Errorf("no sub-call may execute across the nudge/abort ladder, got %+v", mockTools.calls)
+	}
+}
+
+// TestValidationBreaker_DifferentInvalidBatchesAbort pins the validation
+// circuit breaker on batches that are all DIFFERENT (so the whole-batch
+// repeat breaker never accumulates): the third consecutive schema rejection
+// trips the abort path with lowered threshold 3.
+func TestValidationBreaker_DifferentInvalidBatchesAbort(t *testing.T) {
+	mockTools := newMockToolExecutor()
+	mockTools.validationFailures["bad_a"] = invalidValidationFor("bad_a", `missing required parameter "path"`)
+
+	cfg := CircuitBreakerConfig{
+		// Repeat detection disabled to isolate the validation breaker.
+		RepeatNudgeThreshold:          0,
+		RepeatAbortThreshold:          0,
+		ValidationErrorAbortThreshold: 3,
+	}
+	exec := newExecutorDefaultHITL(&mockLLMCaller{}, mockTools, &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, cfg)
+	exec.emitter = &NoopEvents{}
+	state := &runState{effectiveMaxSteps: 10}
+	cw := newMockContextManager()
+
+	// Three batches with DIFFERENT inputs (different dedup keys).
+	for i, query := range []string{"v1", "v2", "v3"} {
+		batchInput := batchCallJSON(t, bc{tool: "bad_a", input: map[string]any{"q": query}})
+		action, resp := batchAction("batch_1", batchInput)
+		result, act, err := exec.processSingleToolCall(context.Background(), action, 0, resp.Message.ToolCalls, resp, "thinking", state, cw)
+		if err != nil {
+			t.Fatalf("batch %d: unexpected error: %v", i+1, err)
+		}
+		if i < 2 {
+			if result != nil || act != actionNone {
+				t.Fatalf("batch %d must pass through the rejection: result=%v act=%v", i+1, result, act)
+			}
+			continue
+		}
+		// Third consecutive validation failure: abort.
+		if act != actionNone || result == nil {
+			t.Fatalf("third invalid batch must abort: result=%v act=%v", result, act)
+		}
+		if result.Finished {
+			t.Error("validation abort is an unfinished stop, Finished must be false")
+		}
+		if !strings.Contains(result.Output, "Aborted: tool inputs failed schema validation 3 times consecutively") {
+			t.Errorf("abort output mismatch: %q", result.Output)
+		}
+	}
+	if len(mockTools.calls) != 0 {
+		t.Errorf("nothing may execute across rejected batches, got %+v", mockTools.calls)
+	}
+}
+
+// TestValidationBreaker_OnStepLimitReprieve pins the reprieve arm of the
+// validation ladder: StepLimitAllowOnce resets the count, appends the
+// acknowledgment nudge and breaks the loop without aborting. Driven through
+// checkValidationErrors directly — the single-call pipeline reaches a
+// registry rejection only through a real ToolRegistry, which this breaker
+// unit does not need.
+func TestValidationBreaker_OnStepLimitReprieve(t *testing.T) {
+	exec := newExecutorDefaultHITL(&mockLLMCaller{}, newMockToolExecutor(), &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, CircuitBreakerConfig{ValidationErrorAbortThreshold: 3})
+	exec.emitter = &NoopEvents{}
+	exec.SetHITLHandler(&testStepLimitAdapter{fn: func(ctx context.Context, stepNum, effectiveMaxSteps int, reason string) (StepLimitResponse, error) {
+		if !strings.Contains(reason, "schema validation") {
+			t.Errorf("reprieve reason must name the validation failure: %q", reason)
+		}
+		return StepLimitAllowOnce, nil
+	}})
+	state := &runState{effectiveMaxSteps: 10}
+	cw := newMockContextManager()
+	action := llm.ToolCall{ID: "call_1", Name: "bad_a", Input: json.RawMessage(`{}`)}
+	rejection := func(count int) (string, tools.ToolResult) {
+		obs := fmt.Sprintf("input for %q is invalid: missing required parameter \"path\"; valid parameters: path. Required parameters: path (string). Minimal example: {\"path\":\"<string>\"}", action.Name)
+		return obs, tools.ToolResult{Content: obs, IsError: true}
+	}
+
+	// Two rejections below the threshold: counted, nudged, pass through.
+	for i := 1; i <= 2; i++ {
+		obs, result := rejection(i)
+		got, act, execResult, err := exec.checkValidationErrors(context.Background(), action, 0, obs, result, state, cw)
+		if err != nil || execResult != nil || act != actionNone {
+			t.Fatalf("rejection %d must pass through: act=%v execResult=%v err=%v", i, act, execResult, err)
+		}
+		if !strings.Contains(got, "rejected by schema validation "+strconv.Itoa(i)) {
+			t.Errorf("rejection %d must append the nudge with the count: %q", i, got)
+		}
+	}
+
+	// Third rejection trips the threshold; the user grants ONE more chance.
+	obs, result := rejection(3)
+	_, act, execResult, err := exec.checkValidationErrors(context.Background(), action, 0, obs, result, state, cw)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if execResult != nil || act != actionBreak || !state.circuitBreakerTriggered {
+		t.Fatalf("reprieve must break the loop without aborting: act=%v execResult=%v triggered=%v", act, execResult, state.circuitBreakerTriggered)
+	}
+	if exec.consecutiveValidationErrorCount != 0 {
+		t.Errorf("count = %d after the reprieve, want 0 (reset)", exec.consecutiveValidationErrorCount)
+	}
+	last := state.allSteps[len(state.allSteps)-1]
+	if !strings.Contains(last.UserNudge, "validation circuit breaker") || !strings.Contains(last.UserNudge, "ONE more chance") {
+		t.Errorf("reprieve nudge mismatch: %q", last.UserNudge)
+	}
+
+	// A subsequent success resets the tracker (covered here for the direct
+	// contract): a non-error result clears the count.
+	if _, _, _, err := exec.checkValidationErrors(context.Background(), action, 0, "ok result", tools.ToolResult{Content: "ok"}, state, cw); err != nil {
+		t.Fatalf("unexpected error on success: %v", err)
+	}
+	if exec.consecutiveValidationErrorCount != 0 {
+		t.Errorf("count = %d after a success, want 0", exec.consecutiveValidationErrorCount)
+	}
 }

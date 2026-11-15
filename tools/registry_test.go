@@ -535,3 +535,54 @@ func TestIsToolUntrusted_MCPSource(t *testing.T) {
 		t.Error("expected true for MCP-sourced tool regardless of IsUntrusted()")
 	}
 }
+
+// TestRegistryValidateInput pins the batch pre-flight hook: ValidateInput
+// mirrors Execute's category-aware pre-dispatch validation without executing
+// anything, renders the same *InputValidationError (schema digest included),
+// and fails open for unknown tools and when validation is disabled — Execute
+// remains the authority on existence and the not-found result.
+func TestRegistryValidateInput(t *testing.T) {
+	reg := NewToolRegistry()
+	tool := newMockTool("strict", "strict schema tool")
+	tool.Schema = json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}`)
+	executions := 0
+	tool.execFn = func(context.Context, json.RawMessage) (ToolResult, error) {
+		executions++
+		return ToolResult{Content: "ok"}, nil
+	}
+	reg.Register(tool)
+
+	// Valid input passes without side effects.
+	if err := reg.ValidateInput("strict", json.RawMessage(`{"path":"a.go"}`)); err != nil {
+		t.Fatalf("valid input must pass: %v", err)
+	}
+	if executions != 0 {
+		t.Fatalf("ValidateInput must not execute, got %d executions", executions)
+	}
+
+	// Invalid input renders the typed rejection with the schema digest.
+	err := reg.ValidateInput("strict", json.RawMessage(`{}`))
+	var verr *InputValidationError
+	if !errors.As(err, &verr) {
+		t.Fatalf("invalid input must render *InputValidationError, got %T: %v", err, err)
+	}
+	if !strings.Contains(err.Error(), `missing required parameter "path"`) ||
+		!strings.Contains(err.Error(), "Required parameters: path (string)") ||
+		!strings.Contains(err.Error(), `Minimal example: {"path":"<string>"}`) {
+		t.Fatalf("rejection must carry reason and digest, got: %v", err)
+	}
+	if executions != 0 {
+		t.Fatalf("ValidateInput must not execute, got %d executions", executions)
+	}
+
+	// Unknown tools fail open — Execute owns the not-found rendering.
+	if err := reg.ValidateInput("missing_tool", json.RawMessage(`{}`)); err != nil {
+		t.Fatalf("unknown tool must fail open, got %v", err)
+	}
+
+	// Disabled validation fails open, mirroring Execute.
+	reg.SetInputValidationEnabled(false)
+	if err := reg.ValidateInput("strict", json.RawMessage(`{}`)); err != nil {
+		t.Fatalf("disabled validation must fail open, got %v", err)
+	}
+}

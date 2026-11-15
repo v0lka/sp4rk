@@ -326,3 +326,111 @@ func rawParent(candidate string) (string, bool) {
 	}
 	return candidate[:i], true
 }
+
+// CollapseDuplicateComponents repairs a path spelling whose components are
+// duplicated: either the leading component sequence appears twice in a row
+// (the classic doubled workspace prefix, "<root>/<root>/rest" — the result of
+// concatenating an absolute path onto a root that already contains it), or a
+// component immediately repeats ("<dir>/<dir>/file"). The function is PURE: it
+// never touches the filesystem and makes no judgement about whether the
+// collapse is semantically right — the caller decides when a repair is worth
+// attempting (e.g. only after the original spelling failed to open) and must
+// verify containment of the result before using it.
+//
+// The repair collapses at most one duplicated leading run plus adjacent
+// repeats in the remainder, in a single deterministic pass:
+//
+//	"/a/b/a/b/c" → "/a/b/c"  (doubled leading run "a/b")
+//	"/x/x/f.txt" → "/x/f.txt" (adjacent repeat)
+//	"/a/a/a"     → "/a"       (leading run first, then adjacent repeat)
+//	"/a/b/c"     → "/a/b/c"   (no duplication — spelling returned as-is)
+//
+// A spelling without duplication is returned byte-for-byte unchanged — no
+// separator normalization happens either — so callers can rely on comparing
+// the result to the input to detect "nothing to repair". Relative and
+// volume-relative spellings (e.g. Windows "C:foo") are returned unchanged:
+// rebuilding their components would change the meaning of the path, not just
+// its redundancy. The root separator and the volume prefix (including UNC
+// shares) are preserved.
+func CollapseDuplicateComponents(absPath string) string {
+	vol := filepath.VolumeName(absPath)
+	rest := absPath[len(vol):]
+	// Only a true absolute spelling (volume root or leading separator) has a
+	// reconstructable prefix. A relative or volume-relative spelling would
+	// silently change meaning if rebuilt from components, so it is returned
+	// untouched.
+	if rest == "" || !os.IsPathSeparator(rest[0]) {
+		return absPath
+	}
+	comps := SplitPathComponents(absPath)
+	if len(comps) == 0 {
+		return absPath // the root itself — nothing to collapse
+	}
+
+	// Longest duplicated leading run: comps[:k] == comps[k:2k]. Scanning from
+	// the largest candidate down collapses "/a/b/a/b/c" as one "a/b" run
+	// instead of two misleading single-component runs. A spelling containing
+	// traversal components ("." / "..") skips the prefix scan entirely: their
+	// positions are semantically load-bearing, never a redundant duplicate.
+	hasDot := false
+	for _, c := range comps {
+		if isDotComponent(c) {
+			hasDot = true
+			break
+		}
+	}
+	best := 0
+	if !hasDot {
+		for k := len(comps) / 2; k >= 1; k-- {
+			if equalComponents(comps[:k], comps[k:2*k]) {
+				best = k
+				break
+			}
+		}
+	}
+	if best > 0 {
+		comps = comps[best:] // drop the first copy; the second copy stays
+	}
+
+	// Collapse adjacent repeats in what remains — never "." or "..": each
+	// traversal component climbs one level, so a run of them is meaningful
+	// ("a/../../b"), not redundant. A fresh backing array is forced by the
+	// zero-cap slice so the input's array is never overwritten.
+	out := comps[:0:0]
+	for i, c := range comps {
+		if i > 0 && !isDotComponent(c) && c == comps[i-1] {
+			continue
+		}
+		out = append(out, c)
+	}
+	if best == 0 && len(out) == len(comps) {
+		return absPath // no duplication — keep the original spelling exactly
+	}
+
+	var b strings.Builder
+	b.WriteString(vol)
+	for _, c := range out {
+		b.WriteByte(filepath.Separator)
+		b.WriteString(c)
+	}
+	return b.String()
+}
+
+// isDotComponent reports whether c is a traversal component ("." or "..").
+// Traversal components never take part in duplicate collapsing.
+func isDotComponent(c string) bool {
+	return c == "." || c == ".."
+}
+
+// equalComponents reports element-wise equality of two component slices.
+func equalComponents(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

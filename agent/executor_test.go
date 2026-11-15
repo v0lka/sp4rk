@@ -3015,9 +3015,9 @@ func TestCheckRepeatIdenticalTool_ZeroThresholds(t *testing.T) {
 	cw := newMockContextManager()
 
 	// First call: set up as if previous call was the same and produced an error.
-	exec.lastToolKey = "bad_tool:" + compactJSON(action.Input)
-	exec.lastToolResultIsError = true
-	exec.consecutiveRepeatCount = 2
+	exec.repeat.lastKey = "bad_tool:" + compactJSON(action.Input)
+	exec.repeat.lastIsError = true
+	exec.repeat.count = 2
 
 	loopAct, result, err := exec.checkRepeatIdenticalTool(ctx, action, 1, "thought", nil, &runState{}, cw)
 	// Should not panic. With zero thresholds, the count (2) >= 0 (abortThreshold),

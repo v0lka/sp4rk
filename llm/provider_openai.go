@@ -518,7 +518,7 @@ func (p *OpenAIProvider) chatCompletionStream(ctx context.Context, req ChatReque
 		message.Content = refusal.String()
 		p.log().Warn("openai: assistant reply is a refusal", "provider", p.name)
 	}
-	logToolCallArguments(p.log(), p.name, message.ToolCalls)
+	finalizeToolCallArguments(p.log(), p.name, message.ToolCalls)
 
 	return &ChatResponse{
 		Message:    message,
@@ -1077,7 +1077,7 @@ func (p *OpenAIProvider) convertChatResponseMessage(msg oai.ChatCompletionMessag
 		}
 	}
 
-	logToolCallArguments(p.log(), p.name, result.ToolCalls)
+	finalizeToolCallArguments(p.log(), p.name, result.ToolCalls)
 
 	return result
 }

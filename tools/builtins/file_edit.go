@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/v0lka/sp4rk/safeio"
 	"github.com/v0lka/sp4rk/tools"
@@ -212,7 +213,11 @@ func (t *EditFileTool) Execute(ctx context.Context, input json.RawMessage) (tool
 	count := strings.Count(content, params.OldString)
 
 	if count == 0 {
-		return tools.ToolResult{Content: "old_string not found in file", IsError: true}, nil
+		msg := "old_string not found in file"
+		if hint := nearestMatchHint(content, params.OldString); hint != "" {
+			msg += "\n" + hint
+		}
+		return tools.ToolResult{Content: msg, IsError: true}, nil
 	}
 
 	if count > 1 {
@@ -230,4 +235,176 @@ func (t *EditFileTool) Execute(ctx context.Context, input json.RawMessage) (tool
 	}
 
 	return tools.ToolResult{Content: "successfully edited file", IsError: false}, nil
+}
+
+// Bounds for the nearest-match hint on an old_string-not-found error. Every
+// value exists to keep the hint a bounded, single-fragment suggestion — never
+// a full-file dump — regardless of how large the edited file is (the edit cap
+// allows tens of MiB).
+const (
+	hintAnchorMaxBytes   = 200  // cap on the anchor (first meaningful old_string line)
+	hintFragmentMaxBytes = 160  // cap on the rendered fragment
+	hintLineScanBytes    = 4096 // per-line examination cap during the scan
+	hintMaxTokens        = 16   // tokens considered per side
+	hintTokenMaxBytes    = 64   // per-token cap
+	hintMinScore         = 0.5  // minimum token overlap for a hint to be emitted
+)
+
+// nearestMatchHint builds a bounded nearest-match fragment hint for an
+// old_string-not-found error. The anchor is old_string's first meaningful
+// line, whitespace-normalized and capped; the file is scanned line by line
+// (each line capped at hintLineScanBytes) for the line whose whitespace-
+// normalized token set overlaps the anchor's the most. When the best overlap
+// reaches hintMinScore, the winning line — whitespace-collapsed and capped at
+// hintFragmentMaxBytes — is returned as a one-line hint naming its 1-based
+// line number. The failure mode this targets is a near miss: an indentation,
+// whitespace or small drift difference between the read text and the copied
+// old_string. A dissimilar old_string (score below the threshold) yields ""
+// and the error stays exactly as it was.
+//
+// The scan is O(file size): tokens are extracted into a reused scratch slice,
+// compared with a bounded nested loop, and no per-line string is materialized
+// except when the running best improves.
+func nearestMatchHint(content, oldString string) string {
+	anchor := truncateRunes(collapseASCIISpace(firstNonEmptyLine(oldString)), hintAnchorMaxBytes)
+	if anchor == "" {
+		return ""
+	}
+	anchorTokens := appendTokens(nil, anchor, hintMaxTokens, hintTokenMaxBytes)
+	if len(anchorTokens) == 0 {
+		return ""
+	}
+
+	bestScore := 0.0
+	bestLine := 0
+	bestFragment := ""
+	scratch := make([]string, 0, hintMaxTokens)
+	lineNum := 0
+	for line := range strings.Lines(content) {
+		lineNum++
+		capped := truncateRunes(line, hintLineScanBytes)
+		scratch = appendTokens(scratch[:0], capped, hintMaxTokens, hintTokenMaxBytes)
+		score := tokenOverlapScore(anchorTokens, scratch)
+		if score > bestScore {
+			bestScore = score
+			bestLine = lineNum
+			bestFragment = truncateRunes(collapseASCIISpace(capped), hintFragmentMaxBytes)
+		}
+	}
+	if bestLine == 0 {
+		return ""
+	}
+	return fmt.Sprintf("[nearest match: line %d: %q]", bestLine, bestFragment)
+}
+
+// firstNonEmptyLine returns the first line of s containing at least one
+// non-whitespace character (trimmed), or "" when there is none.
+func firstNonEmptyLine(s string) string {
+	for line := range strings.Lines(s) {
+		if trimmed := strings.TrimSpace(line); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+// collapseASCIISpace collapses every run of ASCII whitespace into a single
+// space and trims the ends. Non-ASCII bytes pass through untouched.
+func collapseASCIISpace(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	pendingSpace := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if isASCIISpaceByte(c) {
+			pendingSpace = true
+			continue
+		}
+		if pendingSpace && b.Len() > 0 {
+			b.WriteByte(' ')
+		}
+		pendingSpace = false
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
+// isASCIISpaceByte reports whether c is an ASCII whitespace byte.
+func isASCIISpaceByte(c byte) bool {
+	switch c {
+	case ' ', '\t', '\n', '\r', '\v', '\f':
+		return true
+	}
+	return false
+}
+
+// appendTokens appends up to max whitespace-separated tokens of s to dst,
+// each truncated to tokenMax bytes (a mid-token cut may split a UTF-8
+// sequence; tokens are only ever compared against equally capped tokens, so
+// the heuristic stays deterministic).
+func appendTokens(dst []string, s string, maxTokens, tokenMax int) []string {
+	for len(dst) < maxTokens {
+		i := 0
+		for i < len(s) && isASCIISpaceByte(s[i]) {
+			i++
+		}
+		s = s[i:]
+		if s == "" {
+			break
+		}
+		j := 0
+		for j < len(s) && !isASCIISpaceByte(s[j]) {
+			j++
+		}
+		tok := s[:j]
+		if len(tok) > tokenMax {
+			tok = tok[:tokenMax]
+		}
+		dst = append(dst, tok)
+		s = s[j:]
+	}
+	return dst
+}
+
+// tokenOverlapScore scores two token slices as their overlap fraction:
+// (tokens of a present in b) / (union size), 0..1. Duplicates are not
+// deduplicated — the heuristic only needs a stable ordering signal.
+func tokenOverlapScore(a, b []string) float64 {
+	if len(a) == 0 || len(b) == 0 {
+		return 0
+	}
+	inter := 0
+	for _, t := range a {
+		if containsToken(b, t) {
+			inter++
+		}
+	}
+	union := len(a) + len(b) - inter
+	if union == 0 {
+		return 0
+	}
+	return float64(inter) / float64(union)
+}
+
+// containsToken reports whether toks contains t.
+func containsToken(toks []string, t string) bool {
+	for _, x := range toks {
+		if x == t {
+			return true
+		}
+	}
+	return false
+}
+
+// truncateRunes cuts s to at most maxBytes without splitting a UTF-8
+// sequence: the cut point backs up to a rune boundary when needed.
+func truncateRunes(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := s[:maxBytes]
+	for cut != "" && !utf8.ValidString(cut) {
+		cut = cut[:len(cut)-1]
+	}
+	return cut
 }

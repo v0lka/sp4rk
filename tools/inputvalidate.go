@@ -53,6 +53,13 @@ type InputValidationError struct {
 	// ValidParams lists the declared property names of the violated schema
 	// level (sorted for determinism); empty when that level declares none.
 	ValidParams []string
+	// SchemaDigest summarizes the violated schema level for the model: the
+	// required parameter names with their declared types, plus a synthesized
+	// minimal example of a valid input for that level. Empty when the level
+	// declares no properties (nothing to summarize). Rendered by Error as a
+	// trailing sentence so a rejected call carries the schema's shape — what
+	// a correct call looks like — not just the reason this one was rejected.
+	SchemaDigest string
 }
 
 // Error renders the actionable validation message for the model.
@@ -69,6 +76,9 @@ func (e *InputValidationError) Error() string {
 	}
 	if len(e.ValidParams) > 0 {
 		msg += "; valid parameters: " + strings.Join(e.ValidParams, ", ")
+	}
+	if e.SchemaDigest != "" {
+		msg += ". " + e.SchemaDigest
 	}
 	return msg
 }
@@ -134,7 +144,7 @@ func validateToolInput(tool string, schema, input json.RawMessage, closedByDefau
 	if len(bytes.TrimSpace(input)) == 0 {
 		obj = map[string]json.RawMessage{}
 	} else if err := json.Unmarshal(input, &obj); err != nil {
-		return &InputValidationError{Tool: tool, Reason: "input must be a JSON object", ValidParams: propertyNames(node.Properties)}
+		return &InputValidationError{Tool: tool, Reason: "input must be a JSON object", ValidParams: propertyNames(node.Properties), SchemaDigest: schemaDigest(node)}
 	}
 	return validateSchemaObject(tool, "", node, obj, 0, closedByDefault)
 }
@@ -166,10 +176,11 @@ func validateSchemaObject(tool, path string, node schemaNode, obj map[string]jso
 	for _, req := range node.Required {
 		if _, ok := obj[req]; !ok {
 			return &InputValidationError{
-				Tool:        tool,
-				Path:        path,
-				Reason:      fmt.Sprintf("missing required parameter %q", req),
-				ValidParams: names,
+				Tool:         tool,
+				Path:         path,
+				Reason:       fmt.Sprintf("missing required parameter %q", req),
+				ValidParams:  names,
+				SchemaDigest: schemaDigest(node),
 			}
 		}
 	}
@@ -184,10 +195,11 @@ func validateSchemaObject(tool, path string, node schemaNode, obj map[string]jso
 	for _, k := range argNames {
 		if _, ok := nameSet[k]; !ok && !additionalAllowed {
 			return &InputValidationError{
-				Tool:        tool,
-				Path:        path,
-				Reason:      fmt.Sprintf("unknown parameter %q (not accepted by this tool; check the tool's parameter list)", k),
-				ValidParams: names,
+				Tool:         tool,
+				Path:         path,
+				Reason:       fmt.Sprintf("unknown parameter %q (not accepted by this tool; check the tool's parameter list)", k),
+				ValidParams:  names,
+				SchemaDigest: schemaDigest(node),
 			}
 		}
 	}
@@ -248,6 +260,9 @@ func validateSchemaValue(tool, name, path string, schemaRaw, value json.RawMessa
 				Path:        path,
 				Reason:      fmt.Sprintf("parameter %q must be of type %s, got %s", name, strings.Join(allowed, "|"), actual),
 				ValidParams: validParams,
+				// A scalar level (no declared properties) synthesizes no
+				// digest: the reason already names the expected type.
+				SchemaDigest: schemaDigest(node),
 			}
 		}
 	}
@@ -406,4 +421,135 @@ func propertyNames(props map[string]json.RawMessage) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// maxDigestDepth bounds how deep the synthesized minimal example recurses
+// into nested object/array schemas. Deeper levels degrade to "{}" / "[]"
+// placeholders instead of exploding the digest.
+const maxDigestDepth = 4
+
+// schemaDigest summarizes one schema level for a rejected call: its required
+// parameters with their declared types, plus a synthesized minimal example of
+// a valid input for that level. Returns "" when the level declares no
+// properties — a bare scalar or an undocumented level has no shape worth
+// summarizing, and the violation reason already carries the type.
+//
+// The output is deterministic (properties sorted; encoding/json marshals map
+// keys sorted), so the same schema always renders the same digest.
+func schemaDigest(node schemaNode) string {
+	if len(node.Properties) == 0 {
+		return ""
+	}
+	required := digestRequiredNames(node)
+	var digest string
+	if len(required) == 0 {
+		digest = "Required parameters: none"
+	} else {
+		parts := make([]string, 0, len(required))
+		for _, name := range required {
+			parts = append(parts, name+" ("+propertyType(node.Properties[name])+")")
+		}
+		digest = "Required parameters: " + strings.Join(parts, ", ")
+	}
+	return digest + ". Minimal example: " + minimalExample(node, 0)
+}
+
+// digestRequiredNames returns the level's required names that have a declared
+// property, sorted and deduplicated. Required names without a declared
+// property are schema junk (fail-open validation already ignores them) and
+// are skipped so the digest never promises a shape the schema does not model.
+func digestRequiredNames(node schemaNode) []string {
+	required := make([]string, 0, len(node.Required))
+	seen := make(map[string]struct{}, len(node.Required))
+	for _, r := range node.Required {
+		if _, declared := node.Properties[r]; !declared {
+			continue
+		}
+		if _, dup := seen[r]; dup {
+			continue
+		}
+		seen[r] = struct{}{}
+		required = append(required, r)
+	}
+	sort.Strings(required)
+	return required
+}
+
+// propertyType names the declared JSON type of one property schema: the
+// modeled types of its "type" keyword joined with "|" ("string|null"), or
+// "any" when the schema declares no type the validator models.
+func propertyType(propRaw json.RawMessage) string {
+	var node schemaNode
+	if err := json.Unmarshal(propRaw, &node); err != nil {
+		return "any"
+	}
+	allowed := decodeSchemaTypes(node.Type)
+	if len(allowed) == 0 {
+		return "any"
+	}
+	return strings.Join(allowed, "|")
+}
+
+// minimalExample synthesizes a minimal valid JSON input for one schema level:
+// its required properties only, each filled with a type-shaped placeholder
+// (objects recurse into their own required properties up to maxDigestDepth).
+// Keys marshal in sorted order, so the example is deterministic.
+func minimalExample(node schemaNode, depth int) string {
+	if depth >= maxDigestDepth {
+		return "{}"
+	}
+	required := digestRequiredNames(node)
+	if len(required) == 0 {
+		return "{}"
+	}
+	example := make(map[string]any, len(required))
+	for _, name := range required {
+		example[name] = placeholderValue(node.Properties[name], depth+1)
+	}
+	// encoding/json marshals map keys sorted (deterministic); the HTML
+	// encoder escape is off — "<string>" placeholders are prose for the
+	// model, not markup, and \u003c would only obscure them.
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(example); err != nil {
+		return "{}"
+	}
+	return strings.TrimRight(buf.String(), "\n")
+}
+
+// placeholderValue builds the digest's placeholder for one required property
+// value: a literal per declared type, a recursed minimal example for object
+// levels, and a one-element array showing the element shape for arrays.
+func placeholderValue(propRaw json.RawMessage, depth int) any {
+	var node schemaNode
+	if err := json.Unmarshal(propRaw, &node); err != nil {
+		return "<any>"
+	}
+	allowed := decodeSchemaTypes(node.Type)
+	want := ""
+	if len(allowed) > 0 {
+		want = allowed[0]
+	}
+	switch want {
+	case "string":
+		return "<string>"
+	case "integer", "number":
+		return 0
+	case "boolean":
+		return false
+	case "array":
+		if len(node.Items) == 0 || depth >= maxDigestDepth {
+			return []any{}
+		}
+		return []any{placeholderValue(node.Items, depth+1)}
+	case "object":
+		var nested any
+		if err := json.Unmarshal([]byte(minimalExample(node, depth)), &nested); err != nil {
+			return map[string]any{}
+		}
+		return nested
+	default:
+		return "<any>"
+	}
 }

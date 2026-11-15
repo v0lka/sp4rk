@@ -278,7 +278,7 @@ func googleCompletion(ctx context.Context, cfg googleCompletionConfig, req ChatR
 	if err != nil {
 		return nil, err
 	}
-	logToolCallArguments(cfg.Logger, providerName, converted.Message.ToolCalls)
+	finalizeToolCallArguments(cfg.Logger, providerName, converted.Message.ToolCalls)
 	return converted, nil
 }
 

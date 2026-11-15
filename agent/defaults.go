@@ -12,16 +12,17 @@ package agent
 // a stuck loop.
 func DefaultCircuitBreakerConfig() CircuitBreakerConfig {
 	return CircuitBreakerConfig{
-		RepeatNudgeThreshold:         3,
-		RepeatAbortThreshold:         5,
-		TruncationAbortThreshold:     3,
-		ParseErrorAbortThreshold:     3,
-		FruitlessNudgeThreshold:      5,
-		FruitlessAbortThreshold:      8,
-		FruitlessMaxResultLen:        48,
-		SameToolRepeatNudgeThreshold: 8,
-		SameToolRepeatAbortThreshold: 12,
-		SameToolResultSizeDelta:      128,
+		RepeatNudgeThreshold:          3,
+		RepeatAbortThreshold:          5,
+		TruncationAbortThreshold:      3,
+		ParseErrorAbortThreshold:      3,
+		ValidationErrorAbortThreshold: 3,
+		FruitlessNudgeThreshold:       5,
+		FruitlessAbortThreshold:       8,
+		FruitlessMaxResultLen:         48,
+		SameToolRepeatNudgeThreshold:  8,
+		SameToolRepeatAbortThreshold:  12,
+		SameToolResultSizeDelta:       128,
 	}
 }
 

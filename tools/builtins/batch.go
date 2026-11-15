@@ -8,12 +8,12 @@ import (
 	"github.com/v0lka/sp4rk/tools"
 )
 
-const batchDescription = `Purpose: execute multiple independent tool calls sequentially in a single round-trip.
-Use when: you already know several calls you want to make and none depends on another's output (e.g. read three files, check two paths). Calls run in order and all execute even if some fail — errors are captured per call and never abort the batch.
-Inputs: calls — an array of {"tool": name, "input": {...}} objects. Each tool must be the exact name from the available-tools catalog, e.g. "read_file", not "functions.read_file". Do not add a namespace such as "functions.".
-Outputs: one result per call, in order, including per-call errors.
+const batchDescription = `Purpose: execute multiple independent tool calls sequentially in one round-trip.
+Use when: the calls are known and none depends on another's output (e.g. read three files). Calls run in order; all execute even if some fail — per-call errors never abort the batch.
+Inputs: calls — array of {"tool": name, "input": {...}}. Use the exact name from the available-tools catalog, e.g. "read_file", not "functions.read_file" (no namespace prefix). Every sub-call input must satisfy that tool's schema: required parameters present, correct types. The batch is validated BEFORE anything executes — any invalid sub-call rejects it: NOTHING runs and one aggregated error lists each offending index, its reason and the expected schema. Empty {} is valid only for tools with no required parameters. Fix the listed calls and resend.
+Outputs: one result per call, in order, including errors.
 Example: {"calls":[{"tool":"read_file","input":{"path":"a.go"}},{"tool":"list_directory","input":{"path":"src/"}}]}
-Anti-example: not for dependent chains (read then edit must be separate turns — later calls cannot use earlier results); a single call does not need batch — invoke the tool directly.`
+Anti-example: not for dependent chains (later calls need earlier results); a single call needs no batch; {"calls":[{"tool":"read_file","input":{}}]} is rejected wholesale — read_file requires "path".`
 
 // BatchTool allows the LLM to batch multiple independent tool calls.
 // The actual batch logic is handled at the executor level; this tool

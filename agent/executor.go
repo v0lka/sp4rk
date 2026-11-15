@@ -370,6 +370,27 @@ var circuitBreakerExemptTools = map[string]struct{}{
 	"store_fact":       {},
 }
 
+// shortCircuitCacheableTools is the whitelist of pure, idempotent discovery
+// tools whose identical-input repeats the executor may serve from the
+// executor-level short-circuit cache (agent/executor_shortcircuit_cache.go)
+// instead of re-executing: an identical repeat returns the cached, fully
+// processed observation with an "[unchanged since turn N]" flag as long as NO
+// non-whitelisted tool has executed since the cached result. Every execution
+// of any other tool invalidates the whole cache (conservative staleness
+// mitigation — the whitelist stays narrow by design; adding a tool here is a
+// claim that the tool is a pure read with no observable side effects).
+//
+// This is an executor caching optimization, not a tool-policy construct: it
+// changes nothing about capability groups, security policies, or HITL
+// interception (which all still run on the ORIGINAL execution; a replay is
+// only ever served for an input that already executed and passed them).
+var shortCircuitCacheableTools = map[string]struct{}{
+	"list_projects":     {},
+	"list_step_outputs": {},
+	"read_step_output":  {},
+	"search_facts":      {},
+}
+
 // Circuit-breaker nudge messages. Kept as Go constants because they use fmt.Sprintf
 // with runtime values that would require a template engine if moved to markdown.
 const (
@@ -398,6 +419,11 @@ const (
 		"Respond with ONLY a valid JSON tool call — no prose before or after it, no markdown code fences. " +
 		"Try a completely different approach: reduce the size of your arguments, use a different tool, " +
 		"or break the operation into smaller steps."
+
+	validationErrorNudgeFmt = "[System] Tool input has been rejected by schema validation %d times in a row. " +
+		"Each rejection names the offending parameter, the required parameters with their types, and a minimal " +
+		"example of a valid call. Rebuild the call to match that schema exactly — required parameters present, " +
+		"correct names, correct JSON types, no invented parameters — or use a different tool."
 
 	executorFruitlessNudge = "[System] Your last %d tool calls returned empty or minimal results. Continuing to search with different parameters is unlikely to yield new information. Summarize what you have found so far and call the finish tool."
 
@@ -447,15 +473,34 @@ type Executor struct {
 	toolCache         *ToolResultCache
 	perToolTruncation map[string]ToolTruncationConfig
 
+	// shortCircuitCache memoizes the FINAL processed observations of
+	// successful whitelisted discovery tools (shortCircuitCacheableTools) for
+	// the duration of a Run, keyed by tool name + compacted input. An
+	// identical-input repeat is replayed with an "[unchanged since turn N]"
+	// flag instead of being re-executed; every non-whitelisted execution
+	// invalidates the whole map. Nil until the first whitelisted result is
+	// stored. Executor.Run is single-goroutine per instance, so no locking.
+	shortCircuitCache map[string]shortCircuitEntry
+
 	// nonCacheableTools is the set of tool names whose results are NOT cached.
 	// Initialized from defaultNonCacheableTools in NewExecutor; extended via
 	// AddNonCacheableTools by consumers that register additional meta-tools.
 	nonCacheableTools map[string]struct{}
 
-	// Circuit breaker: detect repeated identical tool calls
-	consecutiveRepeatCount int
-	lastToolKey            string // "name:" + compactJSON(input) for dedup
-	lastToolResultIsError  bool   // whether the last identical tool call returned an error
+	// Circuit breaker: detect repeated identical tool calls. Two namespaces
+	// of the same tracker: repeat covers standalone tool calls and batch
+	// sub-calls; batchRepeat covers WHOLE batch meta-calls (the batch call's
+	// own full input as the dedup key). Separate namespaces are load-bearing:
+	// the per-sub-call updates inside a batch would otherwise clobber the
+	// batch-level key every turn, resetting the batch-level count before two
+	// identical batches could ever accumulate.
+	repeat      repeatTracker // standalone calls + batch sub-calls
+	batchRepeat repeatTracker // whole batch meta-calls
+
+	// Validation error tracker: detect consecutive schema-validation
+	// rejections (registry pre-dispatch, batch pre-flight aggregate).
+	// Tool-agnostic by design — see CircuitBreakerConfig.
+	consecutiveValidationErrorCount int
 
 	// Truncation tracker: detect consecutive max_tokens responses with tool calls
 	consecutiveTruncationCount int
@@ -1664,6 +1709,16 @@ func (e *Executor) buildToolDefinitions(taskTools []tools.ToolDescriptor) []llm.
 	return defs
 }
 
+// repeatTracker holds the consecutive-identical-call state for one
+// repeat-detection namespace. The executor runs two (repeat for standalone
+// tool calls and batch sub-calls, batchRepeat for whole batch meta-calls);
+// see the field comments on Executor for why the split is load-bearing.
+type repeatTracker struct {
+	lastKey     string // "name:" + compactJSON(input) for dedup
+	count       int    // consecutive identical calls seen
+	lastIsError bool   // whether the last identical call returned an error
+}
+
 // compactJSON normalizes JSON by removing insignificant whitespace.
 // This ensures semantically identical JSON strings produce the same output
 // regardless of formatting differences from different LLM responses.
@@ -1697,6 +1752,17 @@ func formatPreCompactionNudge(fillPercent float64, vulnerable []VulnerableOutput
 // isParseError checks if a tool result content indicates a JSON parse failure.
 func isParseError(content string) bool {
 	return strings.Contains(content, "failed to parse input")
+}
+
+// isValidationError checks if a tool result content indicates a
+// schema-validation rejection. Every *tools.InputValidationError renders as
+// `input for "TOOL" is invalid…`, in exactly two joint forms (`is invalid: `
+// and `is invalid at `); the batch pre-flight's aggregated rejection embeds
+// the same rendered errors, so one check covers both. Matching the joint
+// forms rather than the bare words "is invalid" keeps unrelated error text —
+// external command output, provider messages — out of the tracker.
+func isValidationError(content string) bool {
+	return strings.Contains(content, "is invalid at ") || strings.Contains(content, "is invalid: ")
 }
 
 // isContextExceededError checks if an error indicates the context window was exceeded.

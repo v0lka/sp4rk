@@ -94,6 +94,113 @@ func TestValidateToolInput_MissingRequired(t *testing.T) {
 	}
 }
 
+// TestValidateToolInput_DigestOnMissingRequired pins the schema digest on the
+// missing-required error: the rendered message must carry the violated
+// level's required parameters WITH their declared types, plus a synthesized
+// minimal example whose placeholders match those types — everything the model
+// needs to rebuild the call without re-reading the tool catalog.
+func TestValidateToolInput_DigestOnMissingRequired(t *testing.T) {
+	err := ValidateToolInput("read_file", json.RawMessage(readFileTestSchema), json.RawMessage(`{}`))
+	if err == nil {
+		t.Fatalf("empty input against a required key must be rejected")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "Required parameters: path (string)") {
+		t.Errorf("digest must name required parameters with declared types: %q", msg)
+	}
+	if !strings.Contains(msg, `Minimal example: {"path":"<string>"}`) {
+		t.Errorf("digest must synthesize a minimal example: %q", msg)
+	}
+	// Determinism: the same schema renders the same digest byte-for-byte.
+	err2 := ValidateToolInput("read_file", json.RawMessage(readFileTestSchema), json.RawMessage(`{}`))
+	if err2 == nil || err2.Error() != msg {
+		t.Errorf("digest rendering must be deterministic:\nfirst:  %s\nsecond: %s", msg, err2.Error())
+	}
+}
+
+// TestValidateToolInput_DigestNestedObjectAndArrayTypes exercises the digest's
+// recursive example synthesis: a required object property recurses into its
+// own required properties, and a required array-of-objects property shows the
+// element shape. Also pins union types rendering ("string|null").
+func TestValidateToolInput_DigestNestedObjectAndArrayTypes(t *testing.T) {
+	schema := `{
+		"type": "object",
+		"properties": {
+			"note": {"type": "string"},
+			"target": {
+				"type": "object",
+				"properties": {
+					"id": {"type": "integer"},
+					"role": {"type": ["string", "null"]}
+				},
+				"required": ["id", "role"]
+			},
+			"tasks": {
+				"type": "array",
+				"items": {
+					"type": "object",
+					"properties": {"id": {"type": "string"}, "title": {"type": "string"}},
+					"required": ["id", "title"]
+				}
+			}
+		},
+		"required": ["tasks", "target"]
+	}`
+	err := ValidateToolInput("edit", json.RawMessage(schema), json.RawMessage(`{}`))
+	if err == nil {
+		t.Fatalf("empty input against required keys must be rejected")
+	}
+	msg := err.Error()
+	// Required parameters sorted by name; union type joined with "|".
+	if !strings.Contains(msg, "Required parameters: target (object), tasks (array)") {
+		t.Errorf("digest must list required parameters with types in sorted order: %q", msg)
+	}
+	// Minimal example: required-only, deterministic (encoding/json sorts map
+	// keys), objects recurse into their required properties, arrays show one
+	// element with the element's required shape.
+	wantExample := `Minimal example: {"target":{"id":0,"role":"<string>"},"tasks":[{"id":"<string>","title":"<string>"}]}`
+	if !strings.Contains(msg, wantExample) {
+		t.Errorf("digest example mismatch:\n got: %q\nwant: %q", msg, wantExample)
+	}
+}
+
+// TestValidateToolInput_DigestScalarTypeMismatchOmitted pins the digest's
+// omission rule: a type-mismatch on a scalar property (no declared nested
+// properties) adds no digest — the reason already names the expected type.
+func TestValidateToolInput_DigestScalarTypeMismatchOmitted(t *testing.T) {
+	err := ValidateToolInput("read_file", json.RawMessage(readFileTestSchema), json.RawMessage(`{"path":42}`))
+	if err == nil {
+		t.Fatalf("type mismatch must be rejected")
+	}
+	if strings.Contains(err.Error(), "Required parameters") || strings.Contains(err.Error(), "Minimal example") {
+		t.Errorf("scalar level must render no digest: %q", err.Error())
+	}
+}
+
+// TestValidateToolInput_DigestNoRequired pins the none-required digest form:
+// an all-optional schema renders "Required parameters: none" with an empty
+// object example.
+func TestValidateToolInput_DigestNoRequired(t *testing.T) {
+	schema := `{
+		"type": "object",
+		"properties": {
+			"a": {"type": "string"},
+			"b": {"type": "integer"}
+		}
+	}`
+	err := ValidateToolInput("opt", json.RawMessage(schema), json.RawMessage(`{"zzz":1}`))
+	if err == nil {
+		t.Fatalf("unknown parameter must be rejected on a closed schema")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "Required parameters: none") {
+		t.Errorf("all-optional level must render 'none': %q", msg)
+	}
+	if !strings.Contains(msg, "Minimal example: {}") {
+		t.Errorf("all-optional level must render an empty example: %q", msg)
+	}
+}
+
 func TestValidateToolInput_TypeMismatch(t *testing.T) {
 	err := ValidateToolInput("read_file", json.RawMessage(readFileTestSchema), json.RawMessage(`{"path":42}`))
 	if err == nil || !strings.Contains(err.Error(), `parameter "path" must be of type string, got number`) {

@@ -311,6 +311,30 @@ func (r *ToolRegistry) Execute(ctx context.Context, name string, input json.RawM
 	}
 }
 
+// ValidateInput checks raw input against a tool's declared input schema
+// without executing anything, applying the same category-aware key-admission
+// default Execute applies pre-dispatch (a closed property set for built-ins,
+// the JSON Schema spec default of an open set for MCP-proxied tools). It is
+// the pre-flight hook the executor's batch meta-tool uses to validate every
+// sub-call input BEFORE executing any of them, so one invalid sub-call
+// rejects the whole batch with an aggregated error instead of executing a
+// valid prefix whose results the model would lose on resend.
+//
+// Unknown tools and disabled validation return nil (fail-open): Execute
+// remains the authority on tool existence and renders its own not-found
+// result with suggestions.
+func (r *ToolRegistry) ValidateInput(name string, input json.RawMessage) error {
+	r.mu.RLock()
+	tool, ok := r.tools[name]
+	validationEnabled := r.inputValidationEnabled
+	closedByDefault := r.categoryForLocked(name) != SourceCategoryMCP
+	r.mu.RUnlock()
+	if !ok || !validationEnabled {
+		return nil
+	}
+	return validateToolInput(tool.Name(), tool.InputSchema(), input, closedByDefault)
+}
+
 // confirmAndExecute requests user confirmation before executing a tool.
 // The judge outcome supplies the escalation's reason prose, severity, and
 // reason code threaded into the ConfirmationRequest; plain PolicyUserConfirm

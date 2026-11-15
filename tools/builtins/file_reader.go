@@ -2,12 +2,17 @@ package builtins
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"strings"
+	"syscall"
 
+	"github.com/v0lka/sp4rk/pathutil"
 	"github.com/v0lka/sp4rk/safeio"
+	"github.com/v0lka/sp4rk/tools"
 )
 
 // FileReadParams controls a streaming line-range read from a file.
@@ -122,6 +127,62 @@ func ReadFileRange(params FileReadParams) (*FileReadResult, error) {
 		WindowCapped: windowCapped,
 		BytesRead:    builder.Len(),
 	}, nil
+}
+
+// isPathShapeError reports whether err is an open failure caused by the path
+// spelling itself rather than by permissions or file content: a missing target
+// (ENOENT) or a regular file used as a directory (ENOTDIR) — exactly the two
+// failures a duplicated-component spelling produces ("<root>/<root>/rest"
+// misses its target; "<file>/<file>/rest" walks through a regular file).
+// Permission errors (EACCES) and mid-read I/O failures are not shape errors:
+// a repair attempt cannot help them, so none is made.
+//
+// Portability note: on Windows the POSIX ENOTDIR value never matches the raw
+// Windows system codes (see tools.isInvalidPathError for the same caveat), so
+// there only the missing-target case is recognized — a deliberate, safe
+// degradation: the repair is skipped and the original error is returned.
+func isPathShapeError(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR)
+}
+
+// autoCorrectPath attempts ONE containment-safe repair of a path spelling with
+// duplicated components (via [pathutil.CollapseDuplicateComponents]): a
+// doubled workspace prefix ("<root>/<root>/rest", typically the result of a
+// model concatenating an absolute path onto the workspace root it already
+// contains) or a repeated directory ("<dir>/<dir>/file") fails to open, while
+// the de-duplicated spelling often addresses the intended file.
+//
+// The repair is containment-gated: every session root that contains the
+// ORIGINAL spelling must also contain the repaired one ([pathutil.IsWithinPath]
+// resolves symlinks on both sides, so a ".." climb whose buffer directory was
+// removed by the collapse, or a symlink re-resolution, cannot smuggle the
+// repair outside the root). A repair that would escape containment is
+// forbidden — the caller fails on the original error, exactly as before. A
+// path contained in no session root (an absolute path read with user
+// confirmation) is never auto-corrected either: re-pointing an explicitly
+// chosen outside path would be a silent authorization change. Only ONE repair
+// attempt is made per failed read; there is no iterative or cascading repair.
+func autoCorrectPath(ctx context.Context, original string) (string, bool) {
+	repaired := pathutil.CollapseDuplicateComponents(original)
+	if repaired == "" || repaired == original {
+		return "", false
+	}
+	contained := false
+	for _, root := range tools.SessionRoots(ctx) {
+		inOrig, err := pathutil.IsWithinPath(root, original)
+		if err != nil || !inOrig {
+			continue // not this root (or undecidable — skip, fail-safe)
+		}
+		inRep, err := pathutil.IsWithinPath(root, repaired)
+		if err != nil || !inRep {
+			return "", false // escape — forbidden, fail as before
+		}
+		contained = true
+	}
+	if !contained {
+		return "", false // outside every session root — never auto-corrected
+	}
+	return repaired, true
 }
 
 // boundedLine is one physical line as produced by readLineBounded: the

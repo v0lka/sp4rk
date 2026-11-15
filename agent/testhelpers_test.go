@@ -50,6 +50,11 @@ type mockToolExecutor struct {
 	results map[string]tools.ToolResult
 	errors  map[string]error
 	calls   []toolExecCall
+	// validationFailures maps tool name → the error ValidateInput reports for
+	// that tool, simulating registry schema rejections in batch pre-flight
+	// tests. Tools without an entry validate clean, so batch tests that do
+	// not opt in keep the pre-flight-skipped behavior of the plain mock.
+	validationFailures map[string]error
 }
 
 type toolExecCall struct {
@@ -59,8 +64,9 @@ type toolExecCall struct {
 
 func newMockToolExecutor() *mockToolExecutor {
 	return &mockToolExecutor{
-		results: make(map[string]tools.ToolResult),
-		errors:  make(map[string]error),
+		results:            make(map[string]tools.ToolResult),
+		errors:             make(map[string]error),
+		validationFailures: make(map[string]error),
 	}
 }
 
@@ -75,6 +81,14 @@ func (m *mockToolExecutor) Execute(_ context.Context, name string, input json.Ra
 		return r, nil
 	}
 	return tools.ToolResult{Content: "ok"}, nil
+}
+
+// ValidateInput implements the batchInputValidator capability for the mock:
+// it reports the configured per-tool failure, or nil when the tool has none.
+func (m *mockToolExecutor) ValidateInput(name string, _ json.RawMessage) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.validationFailures[name]
 }
 
 func (m *mockToolExecutor) GetToolSource(name string) string {

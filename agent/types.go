@@ -108,6 +108,12 @@ type CircuitBreakerConfig struct {
 	TruncationAbortThreshold int // consecutive truncated responses before abort
 	ParseErrorAbortThreshold int // consecutive parse errors on same tool before abort
 
+	// Schema-validation rejection detector: catches consecutive tool inputs
+	// rejected by schema validation (registry pre-dispatch, batch pre-flight).
+	// Not keyed per tool — the measured failure ("cannot produce schema-valid
+	// input") is tool-agnostic.
+	ValidationErrorAbortThreshold int // consecutive schema-validation rejections before abort
+
 	// Fruitless result detector: catches consecutive minimal-result calls
 	FruitlessNudgeThreshold int // consecutive minimal-result calls before nudge (default: 4)
 	FruitlessAbortThreshold int // consecutive minimal-result calls before abort (default: 6)
@@ -140,6 +146,17 @@ type ToolExecutor interface {
 	// or converted representation) is cached in memory instead of being streamed
 	// from the raw bytes on disk.
 	CacheStrategy(ctx context.Context, name string, input json.RawMessage) tools.CacheMode
+}
+
+// batchInputValidator is the optional ToolExecutor capability the batch
+// meta-tool's pre-flight uses: validate a tool input against its declared
+// schema without executing anything, mirroring exactly what the tool source's
+// Execute will enforce per call. *tools.ToolRegistry implements it; sources
+// without schema access (test fakes) simply omit the method and the batch
+// pre-flight is skipped fail-open — per-call validation remains the only
+// gate, exactly as before the pre-flight existed.
+type batchInputValidator interface {
+	ValidateInput(name string, input json.RawMessage) error
 }
 
 // CompactionStrategy defines an algorithm for compressing step history.

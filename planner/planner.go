@@ -71,10 +71,11 @@ const (
 
 // Circuit breaker defaults for the planner's exploration executor.
 const (
-	defaultRepeatNudgeThreshold     = 3
-	defaultRepeatAbortThreshold     = 5
-	defaultTruncationAbortThreshold = 3
-	defaultParseErrorAbortThreshold = 3
+	defaultRepeatNudgeThreshold          = 3
+	defaultRepeatAbortThreshold          = 5
+	defaultTruncationAbortThreshold      = 3
+	defaultParseErrorAbortThreshold      = 3
+	defaultValidationErrorAbortThreshold = 3
 )
 
 // errPlanZeroSteps is the parse-loop error for a syntactically valid plan
@@ -496,10 +497,11 @@ func (p *Planner) planWithExploration(
 		agent.WithSuppressAssistantEvents(true),
 		agent.WithToolResultBudget(agent.DefaultToolResultBudget()),
 		agent.WithCircuitBreaker(agent.CircuitBreakerConfig{
-			RepeatNudgeThreshold:     defaultRepeatNudgeThreshold,
-			RepeatAbortThreshold:     defaultRepeatAbortThreshold,
-			TruncationAbortThreshold: defaultTruncationAbortThreshold,
-			ParseErrorAbortThreshold: defaultParseErrorAbortThreshold,
+			RepeatNudgeThreshold:          defaultRepeatNudgeThreshold,
+			RepeatAbortThreshold:          defaultRepeatAbortThreshold,
+			TruncationAbortThreshold:      defaultTruncationAbortThreshold,
+			ParseErrorAbortThreshold:      defaultParseErrorAbortThreshold,
+			ValidationErrorAbortThreshold: defaultValidationErrorAbortThreshold,
 		}),
 	)
 	exec.SetReasoningEffort(p.Cfg.ReasoningEffort)

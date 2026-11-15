@@ -118,6 +118,40 @@ func (t *ReadFileTool) Execute(ctx context.Context, input json.RawMessage) (tool
 		MaxLineBytes:   t.limits.MaxLineBytes,
 		MaxWindowLines: t.limits.MaxWindowLines,
 	})
+	// ONE containment-safe auto-correction attempt on a path-shape open
+	// failure: if the spelling carries duplicated components (doubled
+	// workspace prefix, repeated directory) and the de-duplicated path opens,
+	// retry once and flag the correction in the result. A repair that escapes
+	// containment is refused inside autoCorrectPath and the original error
+	// surfaces unchanged below.
+	pathCorrection := ""
+	if err != nil && isPathShapeError(err) {
+		if repaired, ok := autoCorrectPath(ctx, params.Path); ok {
+			retry, retryErr := ReadFileRange(FileReadParams{
+				Path:           repaired,
+				StartLine:      params.StartLine,
+				EndLine:        params.EndLine,
+				DefaultLines:   t.limits.ReadDefaultLines,
+				MaxLineBytes:   t.limits.MaxLineBytes,
+				MaxWindowLines: t.limits.MaxWindowLines,
+			})
+			if retryErr == nil {
+				// Re-run the coherence check against the path actually read:
+				// the pre-repair check targeted the failed spelling, so its
+				// snapshot must not shadow the repaired file's state.
+				if checker := tools.CoherenceFrom(ctx); checker != nil {
+					checker.Lock(repaired)
+					if conflict := checker.CheckRead(ctx, repaired); conflict != nil {
+						coherenceWarning = formatReadConflict(conflict)
+					}
+					checker.Unlock(repaired)
+				}
+				pathCorrection = fmt.Sprintf("[path auto-corrected: %s → %s]", params.Path, repaired)
+				params.Path = repaired
+				result, err = retry, nil
+			}
+		}
+	}
 	if err != nil {
 		return tools.ToolResult{Content: fmt.Sprintf("failed to read file: %v", err), IsError: true}, nil
 	}
@@ -127,6 +161,9 @@ func (t *ReadFileTool) Execute(ctx context.Context, input json.RawMessage) (tool
 	// Handle empty file.
 	if result.TotalLines == 0 {
 		content := fmt.Sprintf("[File: %s | 0 lines | empty file]\n", filename)
+		if pathCorrection != "" {
+			content = pathCorrection + "\n" + content
+		}
 		if coherenceWarning != "" {
 			content = coherenceWarning + "\n" + content
 		}
@@ -159,6 +196,9 @@ func (t *ReadFileTool) Execute(ctx context.Context, input json.RawMessage) (tool
 
 	if coherenceWarning != "" {
 		content = coherenceWarning + "\n" + content
+	}
+	if pathCorrection != "" {
+		content = pathCorrection + "\n" + content
 	}
 
 	return tools.ToolResult{Content: content, IsError: false}, nil
