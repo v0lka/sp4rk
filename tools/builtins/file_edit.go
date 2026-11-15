@@ -291,7 +291,7 @@ func nearestMatchHint(content, oldString string) string {
 			bestFragment = truncateRunes(collapseASCIISpace(capped), hintFragmentMaxBytes)
 		}
 	}
-	if bestLine == 0 {
+	if bestLine == 0 || bestScore < hintMinScore {
 		return ""
 	}
 	return fmt.Sprintf("[nearest match: line %d: %q]", bestLine, bestFragment)

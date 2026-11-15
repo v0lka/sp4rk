@@ -375,10 +375,23 @@ var circuitBreakerExemptTools = map[string]struct{}{
 // executor-level short-circuit cache (agent/executor_shortcircuit_cache.go)
 // instead of re-executing: an identical repeat returns the cached, fully
 // processed observation with an "[unchanged since turn N]" flag as long as NO
-// non-whitelisted tool has executed since the cached result. Every execution
-// of any other tool invalidates the whole cache (conservative staleness
-// mitigation — the whitelist stays narrow by design; adding a tool here is a
-// claim that the tool is a pure read with no observable side effects).
+// non-whitelisted tool has executed since the cached result AND the repeat
+// happens within the SAME response — Run drops the whole cache at every turn
+// boundary (the top of each Run-loop iteration), so a repeat from a later
+// response always re-executes. Every execution of any other tool invalidates
+// the whole cache (conservative staleness mitigation — the whitelist stays
+// narrow by design; adding a tool here is a claim that the tool is a pure
+// read with no observable side effects).
+//
+// The same-response bound is load-bearing: these tools observe state that can
+// change WITHOUT any tool execution in this loop — a completing async
+// subagent writes its step output to the blackboard, a parallel subagent
+// stores facts, background indexing updates the project list. Across
+// responses such a change is invisible to the no-execution invalidation
+// rule, so a cross-response replay could serve a stale "[unchanged]"
+// observation asserting the opposite of reality. Within one response the
+// siblings execute back-to-back synchronously (no LLM call in between), which
+// is the window the cache deliberately keeps.
 //
 // This is an executor caching optimization, not a tool-policy construct: it
 // changes nothing about capability groups, security policies, or HITL
@@ -474,11 +487,14 @@ type Executor struct {
 	perToolTruncation map[string]ToolTruncationConfig
 
 	// shortCircuitCache memoizes the FINAL processed observations of
-	// successful whitelisted discovery tools (shortCircuitCacheableTools) for
-	// the duration of a Run, keyed by tool name + compacted input. An
-	// identical-input repeat is replayed with an "[unchanged since turn N]"
-	// flag instead of being re-executed; every non-whitelisted execution
-	// invalidates the whole map. Nil until the first whitelisted result is
+	// successful whitelisted discovery tools (shortCircuitCacheableTools)
+	// for the duration of the CURRENT response, keyed by tool name +
+	// compacted input. An identical-input repeat among the response's
+	// sibling calls is replayed with an "[unchanged since turn N]" flag
+	// instead of being re-executed; every non-whitelisted execution
+	// invalidates the whole map, and Run clears it at every turn boundary
+	// (so a repeat from a later response — and any fresh or resumed Run —
+	// always starts empty). Nil until the first whitelisted result is
 	// stored. Executor.Run is single-goroutine per instance, so no locking.
 	shortCircuitCache map[string]shortCircuitEntry
 
@@ -1523,6 +1539,19 @@ func (e *Executor) Run(ctx context.Context, taskTools []tools.ToolDescriptor, cw
 	defer e.finalizeAssistantStream(state)
 
 	for state.stepNum = startStep; state.unlimitedSteps || state.stepNum <= state.effectiveMaxSteps+1; state.stepNum++ {
+		// Turn-boundary invalidation of the executor short-circuit cache:
+		// entries live for ONE response. Replays are served only to identical
+		// repeats among the siblings of the current response; anything carried
+		// over from an earlier response — or from a previous Run on this
+		// instance, resumed or not — is dropped here. The whitelisted tools
+		// observe state that changes without any tool execution in between
+		// (a completing async subagent, a parallel store_fact, background
+		// indexing), so a cross-response replay could serve a stale
+		// "[unchanged]" observation; see shortCircuitCacheableTools. This
+		// also makes "a resumed run starts with an empty cache" structural:
+		// the first iteration of every Run clears it.
+		e.shortCircuitCache = nil
+
 		// Sync trajectory to the store so tools (e.g. reflect) can access it.
 		if ts := TrajectoryStoreFromContext(ctx); ts != nil {
 			ts.Sync(state.allSteps)
@@ -1758,11 +1787,18 @@ func isParseError(content string) bool {
 // schema-validation rejection. Every *tools.InputValidationError renders as
 // `input for "TOOL" is invalid…`, in exactly two joint forms (`is invalid: `
 // and `is invalid at `); the batch pre-flight's aggregated rejection embeds
-// the same rendered errors, so one check covers both. Matching the joint
-// forms rather than the bare words "is invalid" keeps unrelated error text —
-// external command output, provider messages — out of the tracker.
+// the same rendered errors, so one check covers both. The joint forms alone
+// are NOT enough: the tracker counts tool-agnostic consecutive rejections and
+// resets only on a successful result, so free untrusted text that happens to
+// contain the joint (an MCP server echoing `payload is invalid: …`, a CLI
+// printing `value is invalid: …` on stderr, web content quoted inside an
+// error) would fabricate validation failures and eventually abort the run
+// with a misleading "failed schema validation" summary. Requiring the
+// `input for "TOOL"` discriminator alongside the joint keeps only genuine
+// registry/pre-flight rejections in the tracker.
 func isValidationError(content string) bool {
-	return strings.Contains(content, "is invalid at ") || strings.Contains(content, "is invalid: ")
+	return strings.Contains(content, `input for "`) &&
+		(strings.Contains(content, "is invalid at ") || strings.Contains(content, "is invalid: "))
 }
 
 // isContextExceededError checks if an error indicates the context window was exceeded.

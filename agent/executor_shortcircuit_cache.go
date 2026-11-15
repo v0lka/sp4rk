@@ -50,9 +50,13 @@ func shortCircuitCacheKey(toolName string, input json.RawMessage) string {
 
 // lookupShortCircuitCache returns the cached entry for an identical-input
 // call to a whitelisted discovery tool. Only entries stored since the last
-// non-whitelisted execution are visible: every non-whitelisted execution
-// clears the whole map (shortCircuitNoteExecution), so a hit guarantees no
-// state-changing tool ran between the cached result and this call.
+// non-whitelisted execution AND within the current response are visible:
+// every non-whitelisted execution clears the whole map
+// (shortCircuitNoteExecution), and Run clears it at every turn boundary, so
+// a hit guarantees no state-changing tool ran between the cached result and
+// this call and that the result is from the current response's processing
+// (a sub-second, sibling-to-sibling window — see shortCircuitCacheableTools
+// for why the same-response bound matters).
 func (e *Executor) lookupShortCircuitCache(toolName string, input json.RawMessage) (shortCircuitEntry, bool) {
 	if e.shortCircuitCache == nil {
 		return shortCircuitEntry{}, false
@@ -110,10 +114,11 @@ func (e *Executor) shortCircuitStoreResult(toolName string, input json.RawMessag
 }
 
 // replayShortCircuitObservation serves an identical-input call to a
-// whitelisted discovery tool from the cache: it emits the replayed tool
-// result (cached observation + the "[unchanged since turn N]" flag), records
-// the step in the trajectory and context window, and reports whether a step
-// was materialized.
+// whitelisted discovery tool from the cache: it emits the replayed ToolResult
+// event (paired with the ToolCall the caller already emitted) carrying the
+// cached observation + the "[unchanged since turn N]" flag, records the step
+// in the trajectory and context window, and reports whether a step was
+// materialized.
 //
 // The replayed step mirrors the executed step in every field the pipeline
 // derives from the tool result: CacheHash reuses the original step's hash
@@ -139,6 +144,13 @@ func (e *Executor) replayShortCircuitObservation(
 ) loopAction {
 	observation := entry.observation + fmt.Sprintf(shortCircuitUnchangedFlagFmt, entry.turn)
 	e.repeat.lastIsError = false
+	// Event-pairing invariant: the caller emitted the ToolCall event before
+	// the cache lookup, so the replay MUST emit the matching ToolResult — a
+	// replay that skips it strands the call as an unpaired ToolCall in the
+	// event stream, leaving every UI consumer that matches results by call ID
+	// with a permanently open tool card. Mirrors the executed path's ToolResult
+	// emission and every other intercept path (HITL rejection, repeat breaker).
+	e.emitter.ToolResult(state.stepNum, callIdx, len(observation), observation, false)
 	e.emitter.ExecutorDiagnostic(state.stepNum, "short_circuit_cache_hit", map[string]any{
 		"tool":        action.Name,
 		"cached_turn": entry.turn,

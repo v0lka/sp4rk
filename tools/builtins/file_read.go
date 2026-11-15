@@ -138,7 +138,10 @@ func (t *ReadFileTool) Execute(ctx context.Context, input json.RawMessage) (tool
 			if retryErr == nil {
 				// Re-run the coherence check against the path actually read:
 				// the pre-repair check targeted the failed spelling, so its
-				// snapshot must not shadow the repaired file's state.
+				// snapshot must not shadow the repaired file's state — drop
+				// the stale warning first, then re-assign it only when the
+				// repaired path itself has a conflict.
+				coherenceWarning = ""
 				if checker := tools.CoherenceFrom(ctx); checker != nil {
 					checker.Lock(repaired)
 					if conflict := checker.CheckRead(ctx, repaired); conflict != nil {

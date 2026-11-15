@@ -81,6 +81,39 @@ func TestNearestMatchHint_PicksBestLine(t *testing.T) {
 	}
 }
 
+// TestNearestMatchHint_WeakOverlapYieldsNoHint pins the hintMinScore
+// threshold: an old_string with a small-but-NONZERO token overlap must not
+// produce a hint — the feature targets near misses, not noise. (The
+// dissimilar case with zero overlap is covered by
+// TestNearestMatchHint_DissimilarYieldsEmpty, which passed even before the
+// threshold was enforced.)
+func TestNearestMatchHint_WeakOverlapYieldsNoHint(t *testing.T) {
+	content := "the quick brown fox jumps over the lazy dog\n"
+	// The anchor shares exactly one token ("the") with the file line:
+	// score 1/11 ≈ 0.09, far below the 0.5 threshold, yet nonzero.
+	oldString := "the config file"
+
+	if hint := nearestMatchHint(content, oldString); hint != "" {
+		t.Errorf("expected no hint for a weak-overlap old_string, got: %s", hint)
+	}
+}
+
+// TestNearestMatchHint_OverlapAboveThresholdProducesHint is the complement of
+// the weak-overlap case: a partial match reaching the 0.5 threshold (3 of 5
+// union tokens here) still produces the hint.
+func TestNearestMatchHint_OverlapAboveThresholdProducesHint(t *testing.T) {
+	content := "alpha beta gamma epsilon\n"
+	oldString := "alpha beta gamma delta"
+
+	hint := nearestMatchHint(content, oldString)
+	if hint == "" {
+		t.Fatal("expected a hint for a 0.6-overlap old_string")
+	}
+	if !strings.Contains(hint, "[nearest match: line 1:") {
+		t.Errorf("expected the hint to name line 1, got: %s", hint)
+	}
+}
+
 // --- edit_file tool-level tests ---
 
 func TestEditFileTool_NotFoundHintIncludesNearestFragment(t *testing.T) {

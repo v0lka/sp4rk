@@ -345,6 +345,12 @@ func rawParent(candidate string) (string, bool) {
 //	"/a/a/a"     → "/a"       (leading run first, then adjacent repeat)
 //	"/a/b/c"     → "/a/b/c"   (no duplication — spelling returned as-is)
 //
+// A spelling containing ANY traversal component ("." / "..") is returned
+// unchanged: their positions are semantically load-bearing — each ".." climbs
+// a level — so removing any component (a duplicated leading run or an adjacent
+// repeat) would shift the level every later ".." climbs from and re-point the
+// spelling at a different path.
+//
 // A spelling without duplication is returned byte-for-byte unchanged — no
 // separator normalization happens either — so callers can rely on comparing
 // the result to the input to detect "nothing to repair". Relative and
@@ -392,13 +398,18 @@ func CollapseDuplicateComponents(absPath string) string {
 		comps = comps[best:] // drop the first copy; the second copy stays
 	}
 
-	// Collapse adjacent repeats in what remains — never "." or "..": each
-	// traversal component climbs one level, so a run of them is meaningful
-	// ("a/../../b"), not redundant. A fresh backing array is forced by the
-	// zero-cap slice so the input's array is never overwritten.
+	// Collapse adjacent repeats in what remains. The whole pass is disabled
+	// when any traversal component is present: removing even one non-dot
+	// component shifts the level every later ".." climbs from, silently
+	// re-pointing the spelling ("/a/a/../a" resolves to "/a/a", but the
+	// collapsed "/a/../a" resolves to "/a" — a different path, and one that
+	// may exist as a different real file). A dot-bearing spelling is therefore
+	// returned unchanged, mirroring the prefix scan above. A fresh backing
+	// array is forced by the zero-cap slice so the input's array is never
+	// overwritten.
 	out := comps[:0:0]
 	for i, c := range comps {
-		if i > 0 && !isDotComponent(c) && c == comps[i-1] {
+		if !hasDot && i > 0 && !isDotComponent(c) && c == comps[i-1] {
 			continue
 		}
 		out = append(out, c)

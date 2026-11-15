@@ -978,7 +978,11 @@ func (e *Executor) processSingleToolCall(
 	if err != nil {
 		// Every arm below abandons the tool: its detached goroutine may still
 		// be running, so treat the tool's side effects as having possibly
-		// occurred even though the run does not record its step.
+		// occurred even though the run does not record its step. The whole
+		// short-circuit cache is invalidated for the same reason: an abandoned
+		// execution must not leave a whitelisted observation replayable as
+		// "[unchanged]" (mirrors the non-whitelisted invalidation contract).
+		e.shortCircuitCache = nil
 		//
 		// Cooperative pause observed while the tool was in flight: the tool
 		// blocked long enough for the pause checker to trip at a watchdog
@@ -1780,7 +1784,9 @@ func (e *Executor) processBatchTool(
 			// Every returning arm below abandons the sub-call's tool: its
 			// detached goroutine may still be running, so treat the tool's side
 			// effects as having possibly occurred even though the run does not
-			// record its step.
+			// record its step. The whole short-circuit cache is invalidated for
+			// the same reason (mirrors the standalone path's abandon handling).
+			e.shortCircuitCache = nil
 			//
 			// Cooperative pause observed while the sub-call's tool was in
 			// flight: return the resumable, unfinished checkpoint (mirroring

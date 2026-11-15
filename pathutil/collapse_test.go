@@ -68,6 +68,21 @@ func TestCollapseDuplicateComponents(t *testing.T) {
 			in:   "/ws/project/project/src/main.go",
 			want: "/ws/project/src/main.go",
 		},
+		{
+			name: "dot-suppressed: adjacent repeat before a .. climb keeps spelling",
+			in:   "/a/a/../a",
+			want: "/a/a/../a",
+		},
+		{
+			name: "dot-suppressed: adjacent repeat after a .. climb keeps spelling",
+			in:   "/a/b/../b/b/f",
+			want: "/a/b/../b/b/f",
+		},
+		{
+			name: "dot-suppressed: single dot also suppresses collapsing",
+			in:   "/x/./x/x/f.txt",
+			want: "/x/./x/x/f.txt",
+		},
 	}
 
 	for _, tt := range tests {

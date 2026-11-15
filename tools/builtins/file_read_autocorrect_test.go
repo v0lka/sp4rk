@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/v0lka/sp4rk/pathutil"
@@ -197,5 +198,131 @@ func TestReadFileTool_AutoCorrectedRepairFailureKeepsOriginalError(t *testing.T)
 	}
 	if strings.Contains(result.Content, "auto-corrected") {
 		t.Errorf("expected no auto-correction flag on a failed repair, got: %s", result.Content)
+	}
+}
+
+// --- coherence interaction with the auto-corrected repair ---
+
+// scriptedCoherenceChecker answers CheckRead calls with pre-scripted
+// conflicts in order and records every path it was asked about, so a test can
+// stage a stale snapshot for the failed spelling and a clean (or conflicting)
+// state for the repaired one.
+type scriptedCoherenceChecker struct {
+	mu      sync.Mutex
+	answers []*tools.CoherenceConflict
+	asked   []string
+}
+
+func (c *scriptedCoherenceChecker) CheckRead(_ context.Context, path string) *tools.CoherenceConflict {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.asked = append(c.asked, path)
+	if len(c.answers) == 0 {
+		return nil
+	}
+	ans := c.answers[0]
+	c.answers = c.answers[1:]
+	return ans
+}
+
+func (c *scriptedCoherenceChecker) CheckWrite(_ context.Context, _ string) *tools.CoherenceConflict {
+	return nil
+}
+
+func (c *scriptedCoherenceChecker) RecordWrite(_ context.Context, _ string)  {}
+func (c *scriptedCoherenceChecker) RecordDelete(_ context.Context, _ string) {}
+func (c *scriptedCoherenceChecker) PurgeSession(_ string)                    {}
+func (c *scriptedCoherenceChecker) Lock(_ string)                            {}
+func (c *scriptedCoherenceChecker) Unlock(_ string)                          {}
+
+// TestReadFileTool_RepairDropsStaleCoherenceWarning pins the repair path's
+// coherence handling: the pre-repair check targeted the FAILED spelling, so
+// its conflict must not shadow a clean read of the repaired path — a
+// successful repair resets the warning before re-checking the new path.
+func TestReadFileTool_RepairDropsStaleCoherenceWarning(t *testing.T) {
+	tool := NewReadFileTool()
+	ws := t.TempDir()
+
+	srcDir := filepath.Join(ws, "src")
+	if err := os.MkdirAll(srcDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	testFile := filepath.Join(srcDir, "data.txt")
+	if err := os.WriteFile(testFile, []byte("clean repaired target"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// First CheckRead (the failed <ws>/src/src/data.txt spelling) reports a
+	// conflict — a stale snapshot left over for the non-existent spelling;
+	// second CheckRead (the repaired path) is clean.
+	checker := &scriptedCoherenceChecker{
+		answers: []*tools.CoherenceConflict{
+			{ModifiedBy: "stale snapshot session"},
+			nil,
+		},
+	}
+	ctx := tools.WithCoherence(tools.WithWorkspacePath(context.Background(), ws), checker)
+
+	doubled := filepath.Join(ws, "src", "src", "data.txt")
+	input, _ := json.Marshal(map[string]string{"path": doubled})
+	result, err := tool.Execute(ctx, input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("expected auto-corrected success, got error: %s", result.Content)
+	}
+	if !strings.Contains(result.Content, "[path auto-corrected:") {
+		t.Errorf("expected the auto-correction flag, got: %s", result.Content)
+	}
+	if len(checker.asked) != 2 {
+		t.Fatalf("CheckRead calls = %d (%v), want 2 (failed spelling + repaired path)", len(checker.asked), checker.asked)
+	}
+	if strings.Contains(result.Content, "modified by session") {
+		t.Errorf("the failed spelling's stale coherence warning leaked into the repaired read: %s", result.Content)
+	}
+	if !strings.Contains(result.Content, "clean repaired target") {
+		t.Errorf("expected the repaired file's content, got: %s", result.Content)
+	}
+}
+
+// TestReadFileTool_RepairReportsRepairedPathConflict is the complement case:
+// when the REPAIRED path itself has a coherence conflict, the warning must
+// still surface (resetting the stale snapshot must not suppress real ones).
+func TestReadFileTool_RepairReportsRepairedPathConflict(t *testing.T) {
+	tool := NewReadFileTool()
+	ws := t.TempDir()
+
+	srcDir := filepath.Join(ws, "src")
+	if err := os.MkdirAll(srcDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	testFile := filepath.Join(srcDir, "data.txt")
+	if err := os.WriteFile(testFile, []byte("conflicting repaired target"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	checker := &scriptedCoherenceChecker{
+		answers: []*tools.CoherenceConflict{
+			nil,
+			{ModifiedBy: "other session"},
+		},
+	}
+	ctx := tools.WithCoherence(tools.WithWorkspacePath(context.Background(), ws), checker)
+
+	doubled := filepath.Join(ws, "src", "src", "data.txt")
+	input, _ := json.Marshal(map[string]string{"path": doubled})
+	result, err := tool.Execute(ctx, input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("expected auto-corrected success, got error: %s", result.Content)
+	}
+	if !strings.Contains(result.Content, `[!] This file was modified by session "other session"`) {
+		t.Errorf("expected the repaired path's coherence warning, got: %s", result.Content)
+	}
+	if !strings.Contains(result.Content, "conflicting repaired target") {
+		t.Errorf("expected the repaired file's content, got: %s", result.Content)
 	}
 }

@@ -3366,3 +3366,68 @@ func TestExecutor_Run_ExplicitFinishClosesLiveStream(t *testing.T) {
 		t.Errorf("Run 2 left the stream open: pending = %q, want empty", got)
 	}
 }
+
+// TestIsValidationError_RequiresRegistryDiscriminator pins the classifier's
+// discriminator: every genuine *tools.InputValidationError renders as
+// `input for "TOOL" is invalid…` (two joint forms), and the batch pre-flight
+// aggregate embeds the same renders — so the tracker must require the
+// `input for "` discriminator alongside the joint. Free untrusted text that
+// happens to contain the joint (MCP echo, CLI stderr, web content quoted in
+// an error) must NOT advance the validation circuit breaker: three such
+// false matches would abort the run with a misleading
+// "failed schema validation" summary.
+func TestIsValidationError_RequiresRegistryDiscriminator(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{
+			name:    "top-level registry rejection (is invalid:)",
+			content: `input for "read_file" is invalid: missing required parameter "path"; valid parameters: path, start_line, end_line`,
+			want:    true,
+		},
+		{
+			name:    "nested registry rejection (is invalid at)",
+			content: `input for "edit_file" is invalid at old_string: parameter "old_string" must be of type string, got number`,
+			want:    true,
+		},
+		{
+			name:    "batch pre-flight aggregate embedding rendered rejections",
+			content: "batch rejected: no sub-call was executed because 1 of 2 sub-call inputs failed schema validation. Fix the calls listed below and resend the ENTIRE batch.\n- calls[0] (\"read_file\"): input for \"read_file\" is invalid: missing required parameter \"path\"",
+			want:    true,
+		},
+		{
+			name:    "MCP server echoing a validation-flavored error",
+			content: `{"error": "payload is invalid: missing id"}`,
+			want:    false,
+		},
+		{
+			name:    "CLI stderr with the joint but no discriminator",
+			content: "error: value is invalid: expected one of a, b, c",
+			want:    false,
+		},
+		{
+			name:    "web content quoting the joint inside a tool error",
+			content: `request failed: upstream page said "this field is invalid at line 42" (HTTP 400)`,
+			want:    false,
+		},
+		{
+			name:    "discriminator without the joint is not a rejection",
+			content: `input for "x" was rejected by the user`,
+			want:    false,
+		},
+		{
+			name:    "plain invalid wording",
+			content: "the configuration is invalid",
+			want:    false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isValidationError(tt.content); got != tt.want {
+				t.Errorf("isValidationError(%q) = %v, want %v", tt.content, got, tt.want)
+			}
+		})
+	}
+}
