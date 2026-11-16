@@ -1,13 +1,24 @@
 package pathutil
 
-import "testing"
+import (
+	"path/filepath"
+	"testing"
+)
+
+// collapseCase is one repair vector: the spelling in, the expected spelling out.
+type collapseCase struct {
+	name string
+	in   string
+	want string
+}
 
 func TestCollapseDuplicateComponents(t *testing.T) {
-	tests := []struct {
-		name string
-		in   string
-		want string
-	}{
+	// These vectors are written with "/" roots because the repair preserves
+	// the separator style it is given: on Windows a "/"-rooted spelling is a
+	// current-drive-rooted path, and its repair must come back "/"-rooted
+	// too. Windows-only spellings (drive letters, UNC shares, mixed
+	// separators) are covered in collapse_windows_test.go.
+	tests := []collapseCase{
 		{
 			name: "doubled leading run",
 			in:   "/a/b/a/b/c",
@@ -84,15 +95,46 @@ func TestCollapseDuplicateComponents(t *testing.T) {
 			want: "/x/./x/x/f.txt",
 		},
 	}
+	runCollapseCases(t, tests)
+}
 
+// TestCollapseDuplicateComponents_NativeSeparator repeats the headline shapes
+// with the OS's own separator, so the native spelling of a doubled prefix is
+// exercised everywhere rather than only on the leg whose separator happens to
+// be "/" (on Windows these are backslash paths; on unix they coincide with the
+// "/" vectors above).
+func TestCollapseDuplicateComponents_NativeSeparator(t *testing.T) {
+	sep := string(filepath.Separator)
+	tests := []collapseCase{
+		{
+			name: "doubled native prefix",
+			in:   sep + "a" + sep + "b" + sep + "a" + sep + "b" + sep + "c",
+			want: sep + "a" + sep + "b" + sep + "c",
+		},
+		{
+			name: "adjacent native repeat",
+			in:   sep + "ws" + sep + "project" + sep + "project" + sep + "main.go",
+			want: sep + "ws" + sep + "project" + sep + "main.go",
+		},
+		{
+			name: "native spelling without duplication unchanged",
+			in:   sep + "ws" + sep + "project" + sep + "main.go",
+			want: sep + "ws" + sep + "project" + sep + "main.go",
+		},
+	}
+	runCollapseCases(t, tests)
+}
+
+// runCollapseCases asserts each repair and its single-pass idempotence:
+// collapsing the result again must not change it further.
+func runCollapseCases(t *testing.T, tests []collapseCase) {
+	t.Helper()
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := CollapseDuplicateComponents(tt.in)
 			if got != tt.want {
 				t.Errorf("CollapseDuplicateComponents(%q) = %q, want %q", tt.in, got, tt.want)
 			}
-			// The repair is single-pass idempotent: collapsing the result
-			// again must not change it further.
 			if again := CollapseDuplicateComponents(got); again != got {
 				t.Errorf("repair not stable: CollapseDuplicateComponents(%q) = %q", got, again)
 			}

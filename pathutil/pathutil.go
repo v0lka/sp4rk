@@ -134,18 +134,35 @@ func isWithinPath(parent, child string, fold bool) (bool, error) {
 //	"/home/user/file.txt"           → ["home", "user", "file.txt"]
 //	"C:\Users\file.txt"             → ["Users", "file.txt"]   (Windows)
 //	"/"                             → []
+//
+// Splitting follows the platform's separator RULES rather than the native
+// separator alone: Windows accepts both "\" and "/" in a path, so a
+// forward-slash spelling ("C:/Users/file.txt", or a POSIX-style "/a/b" rooted
+// in the current drive) yields exactly the components its backslash form does.
+// On unix only "/" separates components — a backslash there is an ordinary
+// filename byte and stays inside its component.
 func SplitPathComponents(absPath string) []string {
 	// Strip the volume prefix (e.g. "C:" on Windows, "\\server\share" for a
 	// UNC path) so it is not mistaken for a path component. On Unix the volume
 	// is always empty, so this is a no-op there.
 	vol := filepath.VolumeName(absPath)
 	rest := absPath[len(vol):]
-	parts := strings.Split(rest, string(filepath.Separator))
+	// Scan for os.IsPathSeparator rather than strings.Split on
+	// filepath.Separator: the latter recognizes only the native separator and
+	// would leave a Windows forward-slash spelling as one giant component.
 	var result []string
-	for _, part := range parts {
-		if part != "" {
-			result = append(result, part)
+	start := 0
+	for i := 0; i < len(rest); i++ {
+		if !os.IsPathSeparator(rest[i]) {
+			continue
 		}
+		if i > start {
+			result = append(result, rest[start:i])
+		}
+		start = i + 1
+	}
+	if start < len(rest) {
+		result = append(result, rest[start:])
 	}
 	return result
 }
@@ -358,6 +375,13 @@ func rawParent(candidate string) (string, bool) {
 // rebuilding their components would change the meaning of the path, not just
 // its redundancy. The root separator and the volume prefix (including UNC
 // shares) are preserved.
+//
+// Duplication is detected with the platform's separator rules, not the native
+// separator alone: on Windows both "\" and "/" separate components, so the
+// forward-slash spelling of a doubled prefix ("D:/ws/D:/ws/rest", or the
+// current-drive-rooted "/a/b/a/b/c") repairs exactly like its backslash form,
+// and a repaired spelling keeps the separator style it was written with. On
+// unix a backslash is an ordinary filename byte, never a separator.
 func CollapseDuplicateComponents(absPath string) string {
 	vol := filepath.VolumeName(absPath)
 	rest := absPath[len(vol):]
@@ -418,10 +442,16 @@ func CollapseDuplicateComponents(absPath string) string {
 		return absPath // no duplication — keep the original spelling exactly
 	}
 
+	// Rebuild with the spelling's OWN root separator, not the native one: the
+	// repair removes duplicated components and changes nothing else about how
+	// the path is written. rest[0] is a separator here (guarded above), so a
+	// forward-slash spelling stays forward-slash — accepted by Windows, and
+	// the CWD-relative POSIX-style spellings are reproduced on every platform.
+	rootSep := rest[0]
 	var b strings.Builder
 	b.WriteString(vol)
 	for _, c := range out {
-		b.WriteByte(filepath.Separator)
+		b.WriteByte(rootSep)
 		b.WriteString(c)
 	}
 	return b.String()
