@@ -128,6 +128,23 @@ func isWithinPath(parent, child string, fold bool) (bool, error) {
 		strings.HasPrefix(childResolved, parentResolved), nil
 }
 
+// volumePrefix returns the volume prefix of p — the drive letter ("C:"), UNC
+// share ("\\server\share"), or device prefix — spelled EXACTLY as p spells it.
+//
+// filepath.VolumeName cannot be used for the value itself: it returns
+// FromSlash(path[:volumeNameLen(path)]), so on Windows a forward-slash UNC
+// spelling ("//server/share/x") comes back backslashed
+// ("\\server\share") — the standard library normalizes the prefix it hands
+// out. Callers here must not rewrite any part of the spelling they were given,
+// only remove duplicated components, so only the LENGTH is taken from
+// filepath.VolumeName and the characters are sliced from the caller's own
+// string. The two lengths are identical by construction: FromSlash maps one
+// separator byte to one separator byte. On unix the volume length is always 0,
+// so this returns "".
+func volumePrefix(p string) string {
+	return p[:len(filepath.VolumeName(p))]
+}
+
 // SplitPathComponents splits a cleaned absolute path into non-empty components,
 // stripping the root separator and any volume prefix. For example:
 //
@@ -145,7 +162,7 @@ func SplitPathComponents(absPath string) []string {
 	// Strip the volume prefix (e.g. "C:" on Windows, "\\server\share" for a
 	// UNC path) so it is not mistaken for a path component. On Unix the volume
 	// is always empty, so this is a no-op there.
-	vol := filepath.VolumeName(absPath)
+	vol := volumePrefix(absPath)
 	rest := absPath[len(vol):]
 	// Scan for os.IsPathSeparator rather than strings.Split on
 	// filepath.Separator: the latter recognizes only the native separator and
@@ -373,8 +390,11 @@ func rawParent(candidate string) (string, bool) {
 // the result to the input to detect "nothing to repair". Relative and
 // volume-relative spellings (e.g. Windows "C:foo") are returned unchanged:
 // rebuilding their components would change the meaning of the path, not just
-// its redundancy. The root separator and the volume prefix (including UNC
-// shares) are preserved.
+// its redundancy. The volume prefix and the root separator are preserved AS
+// WRITTEN — a forward-slash UNC spelling stays forward-slash ("//server/share"
+// is not rewritten to "\\server\share"), which is why the prefix is sliced
+// from the input rather than taken from filepath.VolumeName (see
+// volumePrefix).
 //
 // Duplication is detected with the platform's separator rules, not the native
 // separator alone: on Windows both "\" and "/" separate components, so the
@@ -383,7 +403,7 @@ func rawParent(candidate string) (string, bool) {
 // and a repaired spelling keeps the separator style it was written with. On
 // unix a backslash is an ordinary filename byte, never a separator.
 func CollapseDuplicateComponents(absPath string) string {
-	vol := filepath.VolumeName(absPath)
+	vol := volumePrefix(absPath)
 	rest := absPath[len(vol):]
 	// Only a true absolute spelling (volume root or leading separator) has a
 	// reconstructable prefix. A relative or volume-relative spelling would
