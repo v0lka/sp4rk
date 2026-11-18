@@ -5,8 +5,8 @@ import "strings"
 // openAIModelReasoningOptions keeps model restrictions ahead of family defaults.
 // In particular, minimal is a GPT-5 option, not a universal OpenAI floor.
 // Sources: developers.openai.com/api/docs/models/{gpt-5.1,gpt-5.2,
-// gpt-5.3-codex,gpt-5.4,gpt-5-pro,gpt-5.2-pro,gpt-5.6-luna} and
-// developers.openai.com/api/docs/guides/reasoning.
+// gpt-5.3-codex,gpt-5.4,gpt-5-pro,gpt-5.2-pro,gpt-5.6-luna,gpt-6.2-sol,
+// gpt-6.2-astra} and developers.openai.com/api/docs/guides/reasoning.
 func openAIModelReasoningOptions(model string) (options []string, preferred string, ok bool) {
 	bare := strings.ToLower(strings.TrimSpace(BareModel(model)))
 	variant := func(base string) bool {
@@ -30,9 +30,11 @@ func openAIModelReasoningOptions(model string) (options []string, preferred stri
 		return []string{"none", "low", "medium", "high", "xhigh"}, "xhigh", true
 	case variant("gpt-5.6"):
 		return []string{"none", "low", "medium", "high", "xhigh", "max"}, "max", true
-	case variant("gpt-6"), variant("gpt-6.1"):
+	case variant("gpt-6"), variant("gpt-6.1"), variant("gpt-6.2"):
 		// The GPT-6 reasoning contract rejects none (6.1 Sol also rejects
-		// minimal); low is the documented reasoning floor.
+		// minimal); low is the documented reasoning floor. GPT-6.2 follows
+		// the same contract (its catalog's "ultra" effort is a Codex-side
+		// delegation tier, not an API effort value).
 		return []string{"low", "medium", "high", "xhigh", "max"}, "max", true
 	case variant("o1"), variant("o3"), variant("o4"):
 		return []string{"low", "medium", "high"}, "high", true

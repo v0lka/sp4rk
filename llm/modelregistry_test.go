@@ -51,6 +51,9 @@ func TestModelRegistry_BuiltInResolution(t *testing.T) {
 	}{
 		// OpenAI models — verified July 2026 from platform.openai.com/docs/models
 		{"gpt-5.4", 1050000, 128000, "tiktoken/o200k_base"},
+		// OpenAI models — verified November 2026 from developers.openai.com/api/docs/models
+		{"gpt-6.2-sol", 1050000, 128000, "tiktoken/o200k_base"},
+		{"gpt-6.2-astra", 1050000, 128000, "tiktoken/o200k_base"},
 		// OpenAI models — verified October 2026 from developers.openai.com/api/docs/models
 		{"gpt-6-astra", 1050000, 128000, "tiktoken/o200k_base"},
 		{"gpt-6.1-sol", 1050000, 128000, "tiktoken/o200k_base"},
@@ -1618,6 +1621,8 @@ func TestResolveFamily_BuiltinModels(t *testing.T) {
 		expectedFamily string
 	}{
 		// OpenAI flagship models
+		{"gpt-6.2-sol", "openai_flagship"},
+		{"gpt-6.2-astra", "openai_flagship"},
 		{"gpt-6-astra", "openai_flagship"},
 		{"gpt-6.1-sol", "openai_flagship"},
 		{"gpt-6-sol", "openai_flagship"},
@@ -2994,6 +2999,8 @@ func TestResolveProtocol_BuiltinAndPattern(t *testing.T) {
 		// GPT-5 / GPT-6 / Codex → Responses (built-in)
 		{"gpt-5", ProtocolResponses},
 		{"gpt-5.6", ProtocolResponses},
+		{"gpt-6.2-sol", ProtocolResponses},
+		{"gpt-6.2-astra", ProtocolResponses},
 		{"gpt-6-astra", ProtocolResponses},
 		{"gpt-6.1-sol", ProtocolResponses},
 		{"codex-mini-latest", ProtocolResponses},

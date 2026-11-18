@@ -18,6 +18,8 @@ func TestOpenAIModelReasoningOptions(t *testing.T) {
 		{"gpt-5.4", []string{"none", "low", "medium", "high", "xhigh"}, "none", "low"},
 		{"gpt-5.6-luna", []string{"none", "low", "medium", "high", "xhigh", "max"}, "none", "low"},
 		{"gpt-6-astra", []string{"low", "medium", "high", "xhigh", "max"}, "low", "low"},
+		{"gpt-6.2-sol", []string{"low", "medium", "high", "xhigh", "max"}, "low", "low"},
+		{"gpt-6.2-astra", []string{"low", "medium", "high", "xhigh", "max"}, "low", "low"},
 		{"gpt-6.1-sol", []string{"low", "medium", "high", "xhigh", "max"}, "low", "low"},
 		{"gpt-5-pro", []string{"high"}, "high", "high"},
 		{"gpt-5.2-pro", []string{"medium", "high", "xhigh"}, "medium", "medium"},

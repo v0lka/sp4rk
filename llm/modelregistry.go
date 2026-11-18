@@ -1221,7 +1221,25 @@ func (r *ModelRegistry) fetchFromHuggingFace(ctx context.Context, model string) 
 func makeBuiltInRegistry() map[string]ModelMetadata {
 	return map[string]ModelMetadata{
 		// ── OpenAI models ───────────────────────────────────────────────
-		// GPT-6 / GPT-6.1 (current frontier, Sep 2026): Astra (flagship),
+		// GPT-6.2 (current frontier, Nov 2026): Sol and Astra share the
+		// family's 1.05M context and 128K max output; reasoning models (no
+		// temperature), Responses API. Verified against
+		// developers.openai.com/api/docs/models/{gpt-6.2-sol,gpt-6.2-astra}.
+		"gpt-6.2-sol": {
+			ContextWindow: 1050000,
+			OutputLimit:   128000,
+			TokenizerType: "tiktoken/o200k_base",
+			Family:        "openai_flagship",
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
+		},
+		"gpt-6.2-astra": {
+			ContextWindow: 1050000,
+			OutputLimit:   128000,
+			TokenizerType: "tiktoken/o200k_base",
+			Family:        "openai_flagship",
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, ToolCall: true},
+		},
+		// GPT-6 / GPT-6.1 (Sep 2026): Astra (flagship),
 		// Sol, and Luna share 1.05M context and 128K max output; GPT-6.1
 		// Sol is the refreshed Sol tier. Reasoning models (no temperature),
 		// Responses API.
