@@ -51,12 +51,22 @@ func benchChunks(kind string, count int) []string {
 	return docs
 }
 
-func newBenchEmbedder(tb testing.TB, batchSize int, lengthBuckets bool, telemetry *Telemetry) *Embedder {
+// benchMode is one row of the batch matrix: the SDK inference-strategy and
+// memory knobs a host can combine.
+type benchMode struct {
+	name     string
+	buckets  bool
+	noArena  bool
+	intraOps int
+}
+
+func newBenchEmbedder(tb testing.TB, batchSize int, mode benchMode, telemetry *Telemetry) *Embedder {
 	tb.Helper()
 	modelPath, tokenizerPath, libraryPath := benchAssets(tb)
 	e, err := NewEmbedder(EmbedderConfig{
 		ModelPath: modelPath, TokenizerPath: tokenizerPath, LibraryPath: libraryPath,
-		BatchSize: batchSize, EnableLengthBuckets: lengthBuckets, Telemetry: telemetry,
+		BatchSize: batchSize, EnableLengthBuckets: mode.buckets, Telemetry: telemetry,
+		DisableCPUMemArena: mode.noArena, IntraOpThreads: mode.intraOps,
 	})
 	if err != nil {
 		tb.Fatalf("NewEmbedder(batchSize=%d): %v", batchSize, err)
@@ -83,13 +93,19 @@ func reportBenchMetrics(b *testing.B, s, setup TelemetrySnapshot, docs int, elap
 	if peakAfter >= peakBefore {
 		b.ReportMetric(float64(peakAfter-peakBefore)/(1024*1024), "peak-RSS-delta-MiB")
 	}
+	// Peak alone hides what an idle long-lived host keeps paying for; the
+	// current RSS after the last call is the memory the embedder retains.
+	// Omitted when unmeasurable (0) so it is never read as a real value.
+	if retained := benchmarkCurrentRSSBytes(); retained > 0 {
+		b.ReportMetric(float64(retained)/(1024*1024), "retained-RSS-MiB")
+	}
 }
 
 func BenchmarkEmbedderPerItem(b *testing.B) {
 	for _, corpus := range []string{"short", "mixed"} {
 		b.Run("corpus="+corpus, func(b *testing.B) {
 			telemetry := &Telemetry{}
-			e := newBenchEmbedder(b, DefaultBatchSize, false, telemetry)
+			e := newBenchEmbedder(b, DefaultBatchSize, benchMode{name: "fixed"}, telemetry)
 			docs := benchChunks(corpus, benchDocCount)
 			ctx := context.Background()
 			if _, err := e.EmbedQuery(ctx, docs[0]); err != nil {
@@ -120,17 +136,16 @@ func BenchmarkEmbedderPerItem(b *testing.B) {
 }
 
 func BenchmarkEmbedderBatch(b *testing.B) {
-	for _, mode := range []struct {
-		name    string
-		buckets bool
-	}{
+	for _, mode := range []benchMode{
 		{name: "fixed"},
 		{name: "buckets", buckets: true},
+		{name: "fixed-noarena-t4", noArena: true, intraOps: 4},
+		{name: "buckets-noarena-t4", buckets: true, noArena: true, intraOps: 4},
 	} {
 		for _, corpus := range []string{"short", "mixed"} {
 			for _, size := range []int{8, 16, 32, 64} {
 				b.Run(fmt.Sprintf("mode=%s/corpus=%s/batch=%d", mode.name, corpus, size), func(b *testing.B) {
-					runBatchBenchmark(b, corpus, size, mode.buckets)
+					runBatchBenchmark(b, corpus, size, mode)
 				})
 			}
 		}
@@ -234,9 +249,9 @@ func BenchmarkEmbedderDynamicShape(b *testing.B) {
 	}
 }
 
-func runBatchBenchmark(b *testing.B, corpus string, batchSize int, lengthBuckets bool) {
+func runBatchBenchmark(b *testing.B, corpus string, batchSize int, mode benchMode) {
 	telemetry := &Telemetry{}
-	e := newBenchEmbedder(b, batchSize, lengthBuckets, telemetry)
+	e := newBenchEmbedder(b, batchSize, mode, telemetry)
 	docs := benchChunks(corpus, benchDocCount)
 	ctx := context.Background()
 	if _, err := e.EmbedDocuments(ctx, docs); err != nil {

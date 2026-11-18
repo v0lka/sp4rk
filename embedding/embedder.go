@@ -104,14 +104,25 @@ type EmbedderConfig struct {
 	EnableLengthBuckets bool
 
 	// IntraOpThreads limits the number of ONNX Runtime intra-op threads used
-	// during inference. A value of 0 (the default) preserves the legacy
-	// behavior of letting ONNX Runtime choose the thread count (the session is
-	// created with a nil *SessionOptions). A positive value N constrains
-	// intra-op parallelism to exactly N threads, which is useful for bounding
-	// CPU usage in resource-constrained environments such as the desktop app.
-	// Negative values are treated as 0 (legacy behavior) rather than rejected:
-	// the field is not validated, so callers should pass a non-negative value.
+	// during inference. A value of 0 (the default) lets ONNX Runtime choose
+	// the thread count (with DisableCPUMemArena false, the session is created
+	// with a nil *SessionOptions). A positive value N constrains intra-op
+	// parallelism to exactly N threads, which is useful for bounding CPU usage
+	// in resource-constrained environments such as the desktop app. Negative
+	// values are treated as 0 (the default) rather than rejected: the field is
+	// not validated, so callers should pass a non-negative value.
 	IntraOpThreads int
+
+	// DisableCPUMemArena turns off ONNX Runtime's CPU memory arena for every
+	// session this embedder creates. With the arena on (the default)
+	// inference buffers are pooled and reused across runs, which suits hosts
+	// that embed continuously, but they are never returned to the OS, so the
+	// process keeps the peak activation memory of the largest shape it ever
+	// ran — gigabytes for a 32x512 batch session. With it off, buffers are
+	// freed after each run at the cost of a per-run allocation. Hosts that
+	// embed only occasionally (background indexing in a desktop app) can
+	// enable it to release that memory between runs.
+	DisableCPUMemArena bool
 
 	// ExecutionProvider selects the ONNX Runtime execution provider used for
 	// inference: ExecutionProviderCPU ("cpu"), ExecutionProviderCUDA ("cuda"),
@@ -234,8 +245,9 @@ type Embedder struct {
 	// session options, so a later session-creation failure can rebuild them on
 	// the CPU provider or on the ladder's next rung (see degradeToCPU and
 	// advanceAutoLadderSession).
-	deviceID       int
-	intraOpThreads int
+	deviceID           int
+	intraOpThreads     int
+	disableCPUMemArena bool
 	// libraryPath retains the config NewEmbedder used, so a later session-
 	// creation failure can rebuild options for another hardware ladder rung:
 	// the OpenVINO provider locates its plugin beside it, while the CPU and
@@ -477,7 +489,7 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 			err  error
 		)
 		runOnORTThread(runner, func() {
-			opts, err = buildSessionOptions(provider, cfg.LibraryPath, cfg.DeviceID, cfg.IntraOpThreads)
+			opts, err = buildSessionOptions(provider, cfg.LibraryPath, cfg.DeviceID, cfg.IntraOpThreads, cfg.DisableCPUMemArena)
 		})
 		return opts, err
 	}
@@ -683,22 +695,23 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error) {
 	logger.Info("embedder initialized", initialized...)
 
 	e := &Embedder{
-		tokenizer:         tok,
-		modelPath:         cfg.ModelPath,
-		maxSeqLen:         maxSeqLen,
-		hiddenDim:         hiddenDim,
-		batchSize:         batchSize,
-		batchPipeline:     cfg.EnableBatchPipeline,
-		lengthBuckets:     cfg.EnableLengthBuckets,
-		logger:            logger,
-		telemetry:         cfg.Telemetry,
-		sess:              sess,
-		bucketSessions:    make(map[sessionKey]*onnxSession, 4),
-		sessOpts:          sessOpts,
-		executionProvider: effective,
-		deviceID:          cfg.DeviceID,
-		intraOpThreads:    cfg.IntraOpThreads,
-		libraryPath:       cfg.LibraryPath,
+		tokenizer:          tok,
+		modelPath:          cfg.ModelPath,
+		maxSeqLen:          maxSeqLen,
+		hiddenDim:          hiddenDim,
+		batchSize:          batchSize,
+		batchPipeline:      cfg.EnableBatchPipeline,
+		lengthBuckets:      cfg.EnableLengthBuckets,
+		logger:             logger,
+		telemetry:          cfg.Telemetry,
+		sess:               sess,
+		bucketSessions:     make(map[sessionKey]*onnxSession, 4),
+		sessOpts:           sessOpts,
+		executionProvider:  effective,
+		deviceID:           cfg.DeviceID,
+		intraOpThreads:     cfg.IntraOpThreads,
+		disableCPUMemArena: cfg.DisableCPUMemArena,
+		libraryPath:        cfg.LibraryPath,
 		// Only an auto request that is still (or again) on a hardware provider
 		// can degrade to the CPU from a later lazy session-creation failure. If
 		// the eager-session fallback above already ran, effective is CPU and
@@ -1012,7 +1025,7 @@ func (e *Embedder) retryOpenVINODeviceSession(batchSize, seqLen int) (*onnxSessi
 			optsErr error
 		)
 		e.onORTThread(func() {
-			opts, optsErr = buildSessionOptions(provider, e.libraryPath, e.deviceID, e.intraOpThreads)
+			opts, optsErr = buildSessionOptions(provider, e.libraryPath, e.deviceID, e.intraOpThreads, e.disableCPUMemArena)
 		})
 		return opts, optsErr
 	}
@@ -1065,7 +1078,7 @@ func (e *Embedder) newSessionWithFallback(batchSize, seqLen int) (*onnxSession, 
 			optsErr error
 		)
 		e.onORTThread(func() {
-			opts, optsErr = buildSessionOptions(provider, e.libraryPath, e.deviceID, e.intraOpThreads)
+			opts, optsErr = buildSessionOptions(provider, e.libraryPath, e.deviceID, e.intraOpThreads, e.disableCPUMemArena)
 		})
 		return opts, optsErr
 	}
@@ -1206,7 +1219,7 @@ func (e *Embedder) degradeToCPU(cause error) error {
 	// is empty because the CPU provider never reads it (no provider lookup
 	// happens on the CPU path).
 	e.onORTThread(func() {
-		opts, err = buildSessionOptions(ExecutionProviderCPU, "", e.deviceID, e.intraOpThreads)
+		opts, err = buildSessionOptions(ExecutionProviderCPU, "", e.deviceID, e.intraOpThreads, e.disableCPUMemArena)
 	})
 	if err != nil {
 		return fmt.Errorf("building ONNX session options: %w", err)

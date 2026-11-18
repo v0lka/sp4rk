@@ -378,7 +378,7 @@ func TestBuildSessionOptions_Zero(t *testing.T) {
 	// must not require the shared library to be initialized. The empty
 	// provider string is the zero value and a synonym for "cpu".
 	for _, provider := range []string{"", ExecutionProviderCPU} {
-		opts, err := buildSessionOptions(provider, "", 0, 0)
+		opts, err := buildSessionOptions(provider, "", 0, 0, false)
 		if err != nil {
 			t.Fatalf("buildSessionOptions(%q, \"\", 0, 0) error = %v, want nil", provider, err)
 		}
@@ -391,7 +391,7 @@ func TestBuildSessionOptions_Zero(t *testing.T) {
 func TestBuildSessionOptions_Negative(t *testing.T) {
 	// Negative values are treated like 0: return (nil, nil).
 	for _, n := range []int{-1, -42} {
-		opts, err := buildSessionOptions("", "", 0, n)
+		opts, err := buildSessionOptions("", "", 0, n, false)
 		if err != nil {
 			t.Fatalf("buildSessionOptions(\"\", \"\", 0, %d) error = %v, want nil", n, err)
 		}
@@ -408,7 +408,7 @@ func TestBuildSessionOptions_UnknownProvider(t *testing.T) {
 	// directive, not a constructible provider. Rejection happens before any
 	// ONNX call, so this test needs no shared library.
 	for _, provider := range []string{"CUDA", "gpu", "cuda11", "coreml", ExecutionProviderAuto} {
-		opts, err := buildSessionOptions(provider, "", 0, 0)
+		opts, err := buildSessionOptions(provider, "", 0, 0, false)
 		if err == nil {
 			t.Errorf("buildSessionOptions(%q, \"\", 0, 0) error = nil, want non-nil", provider)
 		}
@@ -1266,12 +1266,32 @@ func TestBuildSessionOptions_Positive(t *testing.T) {
 	// when EMBEDDING_TEST_LIBRARY_PATH is unset.
 	_ = testLibraryPath(t)
 
-	opts, err := buildSessionOptions("", "", 0, 4)
+	opts, err := buildSessionOptions("", "", 0, 4, false)
 	if err != nil {
 		t.Fatalf("buildSessionOptions(\"\", \"\", 0, 4) error = %v, want nil", err)
 	}
 	if opts == nil {
 		t.Fatal("buildSessionOptions(\"\", \"\", 0, 4) opts = nil, want non-nil")
+	}
+	t.Cleanup(func() {
+		if err := opts.Destroy(); err != nil {
+			t.Errorf("opts.Destroy() error = %v", err)
+		}
+	})
+}
+
+func TestBuildSessionOptions_DisableCPUMemArena(t *testing.T) {
+	// Disabling the arena on the CPU provider with no thread limit must still
+	// build real options: the nil shortcut would silently keep the
+	// arena on.
+	_ = testLibraryPath(t)
+
+	opts, err := buildSessionOptions(ExecutionProviderCPU, "", 0, 0, true)
+	if err != nil {
+		t.Fatalf("buildSessionOptions(cpu, \"\", 0, 0, true) error = %v, want nil", err)
+	}
+	if opts == nil {
+		t.Fatal("buildSessionOptions(cpu, \"\", 0, 0, true) opts = nil, want non-nil")
 	}
 	t.Cleanup(func() {
 		if err := opts.Destroy(); err != nil {

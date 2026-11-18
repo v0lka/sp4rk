@@ -41,12 +41,21 @@ type EmbedderConfig struct {
     // lazily creates one persistent ONNX session per used bucket. Opt-in.
     EnableLengthBuckets bool
     // IntraOpThreads limits ONNX Runtime intra-op threads during inference.
-    // 0 (the default) preserves legacy behavior: the session is created with a
-    // nil *SessionOptions, letting ONNX Runtime choose the thread count. A
-    // positive value N constrains intra-op parallelism to N threads, bounding
-    // CPU usage in resource-constrained environments. Negative values are
-    // treated as 0.
+    // 0 (the default) lets ONNX Runtime choose the thread count (with
+    // DisableCPUMemArena false, the session is created with a nil
+    // *SessionOptions). A positive value N constrains intra-op parallelism to
+    // N threads, bounding CPU usage in resource-constrained environments.
+    // Negative values are treated as 0.
     IntraOpThreads int
+    // DisableCPUMemArena turns off ONNX Runtime's CPU memory arena for every
+    // session the embedder creates. With the arena on (the default) inference
+    // buffers are pooled and reused across runs, which suits hosts that embed
+    // continuously, but they are never returned to the OS, so the process
+    // keeps the activation peak of the largest shape it ever ran. Hosts that
+    // embed only occasionally can enable this option to release them. On ARM
+    // it does not bound the per-thread KleidiAI GEMM buffers; see the
+    // Retained-Memory Decision in specs/domains/embedding.md.
+    DisableCPUMemArena bool
     // ExecutionProvider selects the ONNX Runtime execution provider:
     // "cpu" (also the empty-string default), "cuda", "openvino", or "auto"
     // (the ladder CUDA → OpenVINO → CPU with a WARN naming each failure).
@@ -113,7 +122,7 @@ func NewEmbedder(cfg EmbedderConfig) (*Embedder, error)
 The initialization sequence is:
 
 1. `initONNXRuntime(libraryPath)` — sets the shared library path and initializes the global ONNX Runtime environment.
-2. `buildSessionOptions(provider, ortLibraryPath, deviceID, intraOpThreads)` — builds `*ort.SessionOptions` that select the execution provider (CPU, CUDA, or OpenVINO; `deviceID` applies to the CUDA provider) and limit intra-op threads when `intraOpThreads` is positive; returns `nil` for the legacy CPU default (session created with nil options). Must run after `initONNXRuntime`.
+2. `buildSessionOptions(provider, ortLibraryPath, deviceID, intraOpThreads, disableCPUMemArena)` — builds `*ort.SessionOptions` that select the execution provider (CPU, CUDA, or OpenVINO; `deviceID` applies to the CUDA provider), limit intra-op threads when `intraOpThreads` is positive, and turn the CPU memory arena off when `disableCPUMemArena` is set; returns `nil` for the default CPU configuration (no thread limit, arena on — session created with nil options). Must run after `initONNXRuntime`.
 3. `NewTokenizer(tokenizerPath)` — loads the HuggingFace tokenizer.
 4. `newONNXSession(modelPath, batchSize, seqLen, hiddenDim, sessOpts, telemetry)` — creates a persistent ONNX session with pre-allocated tensors for the fast path.
 

@@ -136,16 +136,16 @@ func normalizeExecutionProvider(provider string) (string, error) {
 // requested execution provider, limiting intra-op parallelism to
 // intraOpThreads.
 //
-// It returns nil when the CPU provider is requested and intraOpThreads <= 0,
-// preserving the legacy behavior in which NewAdvancedSession is called with a
-// nil *SessionOptions (byte-identical to the pre-existing code path).
-// Otherwise a fresh *SessionOptions is allocated via ort.NewSessionOptions and
-// configured: SetIntraOpNumThreads for a positive intraOpThreads, an appended
-// CUDA execution provider for provider == ExecutionProviderCUDA, and an
-// appended OpenVINO execution provider for provider ==
-// ExecutionProviderOpenVINO. ortLibraryPath is the main ONNX Runtime shared
-// library path; only the OpenVINO provider reads it (to locate its plugin
-// beside the library) — the CPU and CUDA providers ignore it.
+// It returns nil when the CPU provider is requested, intraOpThreads <= 0 and
+// disableCPUMemArena is false: the default path, in which NewAdvancedSession
+// is called with a nil *SessionOptions. Otherwise a fresh *SessionOptions is
+// allocated via ort.NewSessionOptions and configured: SetCpuMemArena(false)
+// when disableCPUMemArena is set, SetIntraOpNumThreads for a positive
+// intraOpThreads, an appended CUDA execution provider for provider ==
+// ExecutionProviderCUDA, and an appended OpenVINO execution provider for
+// provider == ExecutionProviderOpenVINO. ortLibraryPath is the main ONNX
+// Runtime shared library path; only the OpenVINO provider reads it (to locate
+// its plugin beside the library) — the CPU and CUDA providers ignore it.
 //
 // ONNX Runtime never selects a GPU on its own: without an explicit
 // AppendExecutionProviderCUDA call it executes the graph on the CPU provider
@@ -160,7 +160,7 @@ func normalizeExecutionProvider(provider string) (string, error) {
 // in Embedder.Close). The provider-specific option objects are owned by this
 // function: the append calls copy what they need, so partial options are
 // destroyed before returning.
-func buildSessionOptions(provider, ortLibraryPath string, deviceID, intraOpThreads int) (*ort.SessionOptions, error) {
+func buildSessionOptions(provider, ortLibraryPath string, deviceID, intraOpThreads int, disableCPUMemArena bool) (*ort.SessionOptions, error) {
 	normalized, err := normalizeExecutionProvider(provider)
 	if err != nil {
 		return nil, err
@@ -171,13 +171,19 @@ func buildSessionOptions(provider, ortLibraryPath string, deviceID, intraOpThrea
 
 	cuda := normalized == ExecutionProviderCUDA
 	openvino := normalized == ExecutionProviderOpenVINO
-	if !cuda && !openvino && intraOpThreads <= 0 {
+	if !cuda && !openvino && intraOpThreads <= 0 && !disableCPUMemArena {
 		return nil, nil
 	}
 
 	opts, err := ort.NewSessionOptions()
 	if err != nil {
 		return nil, fmt.Errorf("creating ONNX session options: %w", err)
+	}
+	if disableCPUMemArena {
+		if err := opts.SetCpuMemArena(false); err != nil {
+			_ = opts.Destroy()
+			return nil, fmt.Errorf("disabling the CPU memory arena: %w", err)
+		}
 	}
 	if intraOpThreads > 0 {
 		if err := opts.SetIntraOpNumThreads(intraOpThreads); err != nil {
