@@ -133,11 +133,18 @@ func TestGlobTool_FindDirs(t *testing.T) {
 	}
 
 	content := result.Content
-	if !strings.Contains(content, "sub") {
-		t.Errorf("expected result to contain 'sub', got: %s", content)
+	// Directory entries carry the trailing "/" marker (the tool's contract
+	// for consumers that cannot open directories); the test asserts the
+	// exact marked shape, not a bare substring, so a silent marker drop
+	// fails here.
+	if !strings.Contains(content, "sub/") {
+		t.Errorf("expected dir entry 'sub/' with trailing slash, got: %s", content)
 	}
-	if !strings.Contains(content, "other") {
-		t.Errorf("expected result to contain 'other', got: %s", content)
+	if !strings.Contains(content, "other/deep/\n") {
+		t.Errorf("expected nested dir entry 'other/deep/' with trailing slash, got: %s", content)
+	}
+	if strings.Contains(content, "file.go") {
+		t.Errorf("type: dirs must not list files, got: %s", content)
 	}
 }
 
@@ -343,7 +350,7 @@ func TestGlobTool_SymlinkLoopTerminates(t *testing.T) {
 		// no `self/...` or `link/...` path is ever emitted.
 		{"self-loop **/*", selfRoot, "**/*", []string{"root.go", "self"}},
 		{"self-loop incident pattern", selfRoot, "**/flowsh@*", nil},
-		{"root-escape **/*", escapeRoot, "**/*", []string{"link", "sub", "sub/keep.go"}},
+		{"root-escape **/*", escapeRoot, "**/*", []string{"link", "sub/", "sub/keep.go"}},
 		{"root-escape incident pattern", escapeRoot, "**/flowsh@*", nil},
 	}
 
@@ -427,14 +434,19 @@ func TestGlobTool_LiteralSymlinkPrefixIsFollowed(t *testing.T) {
 		return res.Content
 	}
 
-	// `**/*` does not traverse the symlinked directory `alias`.
-	if diff := diffGlobResultSet(run("**/*"), []string{"alias", "top.go", "real", "real/keep.go"}); diff != "" {
+	// `**/*` does not traverse the symlinked directory `alias`. The `real`
+	// directory carries the trailing "/" marker; the `alias` symlink is
+	// listed bare (lstat semantics — the same d.IsDir() that drives the
+	// type filter decides the marker).
+	if diff := diffGlobResultSet(run("**/*"), []string{"alias", "top.go", "real/", "real/keep.go"}); diff != "" {
 		t.Errorf("`**/*` must not traverse the symlinked dir: %s", diff)
 	}
 	// The literal symlink prefix is followed by the walker, but every entry
 	// under it resolves inside the workspace, so the alias listing survives
-	// containment intact.
-	if diff := diffGlobResultSet(run("alias/**"), []string{"alias", "alias/keep.go"}); diff != "" {
+	// containment intact. Through the literal-prefix path the walker stats
+	// (not lstats) the alias, so it reports as a directory and carries the
+	// marker.
+	if diff := diffGlobResultSet(run("alias/**"), []string{"alias/", "alias/keep.go"}); diff != "" {
 		t.Errorf("`alias/**` must still list the in-root alias: %s", diff)
 	}
 }

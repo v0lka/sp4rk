@@ -17,7 +17,7 @@ import (
 const toolGlobDescription = `Purpose: find files and directories by name pattern — supports * within a level and ** across levels (e.g. **/*.go, src/**/*.ts, **/*.test.ts). Symlinked directories are not traversed, results outside the session roots are filtered out (a symlink escaping them is never listed), and a single walk is bounded by a result cap, an entry budget and a wall-clock timeout.
 Use when: you know the name/extension shape but not the exact path. For a single directory's contents use list_directory; to search file contents use ripgrep; to open a found path use read_file.
 Inputs: pattern (glob expression) — required, no default; optional path (base directory, defaults to the workspace); optional type filter (files | dirs | all; default files).
-Outputs: the list of matching paths.
+Outputs: matching paths; a trailing "/" marks a directory entry (type: dirs or all).
 Example: pattern "**/*.go" with path "core/" finds every Go file under core/.
 Anti-example: an empty {} call is invalid — pattern is required and has no default; not for content search (ripgrep matches what is inside files); not for listing one directory's entries (list_directory); '*' does not cross directory boundaries — use '**' for recursion.`
 
@@ -233,7 +233,17 @@ func (t *GlobTool) Execute(ctx context.Context, input json.RawMessage) (tools.To
 				}
 			}
 
-			results = append(results, p)
+			// Directory entries carry a trailing "/" so a consumer (the model
+			// and host frontends alike) can tell them from files without a
+			// stat: with type: dirs|all the output mixes both shapes, and a
+			// file-only consumer (a viewer that cannot open directories)
+			// relies on the marker to avoid dead links. io/fs paths always
+			// use "/" separators, so the suffix is GOOS-independent.
+			if d.IsDir() {
+				results = append(results, p+"/")
+			} else {
+				results = append(results, p)
+			}
 			if t.limits.MaxResults > 0 && len(results) >= t.limits.MaxResults {
 				return errGlobResultsLimited
 			}
