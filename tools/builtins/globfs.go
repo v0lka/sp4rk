@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"io/fs"
+	"slices"
+	"strings"
 )
 
 // Sentinel errors surfaced by boundedFS and the glob walk callback. The walk
@@ -143,6 +145,18 @@ func (b *boundedFS) ReadDir(name string) ([]fs.DirEntry, error) {
 		}
 		if err != nil {
 			if errors.Is(err, io.EOF) {
+				// Restore the fs.ReadDirFS contract ("entries sorted by
+				// filename"): ReadDirFile.ReadDir batches arrive in raw
+				// directory order — readdir(3) order, which is arbitrary on
+				// ext4, creation-like on APFS and name-sorted on NTFS. A
+				// ReadDirFS-aware walker delegates fs.ReadDir straight here
+				// (doublestar does; fs.ReadDir sorts only in its own
+				// non-ReadDirFS fallback), so without this sort the tree walk
+				// order — and therefore the tool's output order — would be
+				// platform-dependent.
+				slices.SortFunc(all, func(a, b fs.DirEntry) int {
+					return strings.Compare(a.Name(), b.Name())
+				})
 				return all, nil
 			}
 			return nil, err

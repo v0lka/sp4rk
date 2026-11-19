@@ -134,14 +134,18 @@ func TestGlobTool_FindDirs(t *testing.T) {
 
 	content := result.Content
 	// Directory entries carry the trailing "/" marker (the tool's contract
-	// for consumers that cannot open directories); the test asserts the
-	// exact marked shape, not a bare substring, so a silent marker drop
-	// fails here.
-	if !strings.Contains(content, "sub/") {
-		t.Errorf("expected dir entry 'sub/' with trailing slash, got: %s", content)
-	}
-	if !strings.Contains(content, "other/deep/\n") {
-		t.Errorf("expected nested dir entry 'other/deep/' with trailing slash, got: %s", content)
+	// for consumers that cannot open directories). The test asserts the exact
+	// result set — every entry marked, nothing extra — rather than substrings:
+	// substring checks with a trailing "\n" would break on whichever entry is
+	// output last (the join separator never adds a trailing newline), and the
+	// exact set also fails on a silent marker drop on any single entry.
+	if diff := diffGlobResultSet(content, []string{
+		"./",
+		"other/",
+		"other/deep/",
+		"sub/",
+	}); diff != "" {
+		t.Errorf("type: dirs must list all directories with the trailing-slash marker: %s", diff)
 	}
 	if strings.Contains(content, "file.go") {
 		t.Errorf("type: dirs must not list files, got: %s", content)
