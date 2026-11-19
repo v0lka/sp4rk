@@ -93,9 +93,11 @@ func reportBenchMetrics(b *testing.B, s, setup TelemetrySnapshot, docs int, elap
 	if peakAfter >= peakBefore {
 		b.ReportMetric(float64(peakAfter-peakBefore)/(1024*1024), "peak-RSS-delta-MiB")
 	}
-	// Peak alone hides what an idle long-lived host keeps paying for; the
-	// current RSS after the last call is the memory the embedder retains.
-	// Omitted when unmeasurable (0) so it is never read as a real value.
+	// Peak alone hides what an idle long-lived host keeps paying for. This is
+	// the whole process's RSS after the last call, so it is comparable across
+	// modes only when each case runs in an isolated process (see the
+	// Retained-Memory Decision in specs/domains/embedding.md). Omitted when
+	// unmeasurable (0) so it is never read as a real value.
 	if retained := benchmarkCurrentRSSBytes(); retained > 0 {
 		b.ReportMetric(float64(retained)/(1024*1024), "retained-RSS-MiB")
 	}
