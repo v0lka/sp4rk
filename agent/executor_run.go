@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/v0lka/sp4rk/llm"
 	"github.com/v0lka/sp4rk/strutil"
@@ -1473,6 +1474,30 @@ func (e *Executor) stopToolTermination(
 	return actionBreak
 }
 
+// maxBatchRejectionExcerpt bounds the verbatim input excerpt embedded per
+// sub-call in a batch pre-flight rejection. The excerpt shows the model its
+// own wrong arguments next to the schema digest so it can diff the two and
+// fix the resend; oversized payloads are cut on a UTF-8 rune boundary with
+// an explicit marker so a truncated value is never mistaken for the whole.
+const maxBatchRejectionExcerpt = 600
+
+// truncateBatchInputExcerpt renders a batch sub-call's raw input for a
+// pre-flight rejection observation: the verbatim payload, bounded to
+// maxBatchRejectionExcerpt bytes and cut back to a UTF-8 rune boundary
+// (tool arguments routinely carry non-ASCII text) with a "...(truncated)"
+// marker appended when the cut fires.
+func truncateBatchInputExcerpt(input json.RawMessage) string {
+	s := string(input)
+	if len(s) <= maxBatchRejectionExcerpt {
+		return s
+	}
+	end := maxBatchRejectionExcerpt
+	for end > 0 && !utf8.RuneStart(s[end]) {
+		end--
+	}
+	return s[:end] + "...(truncated)"
+}
+
 // processBatchTool handles the batch meta-tool by executing each sub-call
 // sequentially through the full tool execution pipeline.
 func (e *Executor) processBatchTool(
@@ -1560,9 +1585,11 @@ func (e *Executor) processBatchTool(
 	// A batch carrying structurally invalid sub-call input must not execute a
 	// valid prefix: the prefix's side effects would land, the model would
 	// never learn the invalid tail was skipped, and resending the batch would
-	// double-execute the prefix. Instead, ONE aggregated rejection lists every
-	// offending index with its rendered reason — each carrying the schema
-	// digest (required parameters, types, minimal example) — and nothing
+	// double-execute the prefix. Instead, ONE aggregated rejection lists
+	// every offending index with its rendered reason and a truncated
+	// verbatim excerpt of the model's own input (so it can diff its args
+	// against the schema digest) — each carrying the schema digest
+	// (required parameters, types, minimal example) — and nothing
 	// runs. Validation mirrors exactly what the registry's Execute enforces
 	// per sub-call (category-aware key admission), so a batch that passes
 	// pre-flight cannot fail validation later. When the tool source does not
@@ -1579,7 +1606,8 @@ func (e *Executor) processBatchTool(
 				continue
 			}
 			if err := validator.ValidateInput(sub.Tool, sub.Input); err != nil {
-				rejections = append(rejections, fmt.Sprintf("- calls[%d] (%q): %v", i, sub.Tool, err))
+				rejections = append(rejections, fmt.Sprintf("- calls[%d] (%q): %v\n  your input: %s",
+					i, sub.Tool, err, truncateBatchInputExcerpt(sub.Input)))
 			}
 		}
 		if len(rejections) > 0 {

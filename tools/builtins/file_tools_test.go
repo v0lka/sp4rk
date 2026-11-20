@@ -1485,6 +1485,39 @@ func TestFormatWriteConflict(t *testing.T) {
 	}
 }
 
+// TestFormatWriteConflict_SelfShellChangeHint pins the self-modification
+// hint: a conflict caused by the session's own shell work (build, formatter,
+// code generation) must tell the model the change is its own and that the
+// recovery is re-read + retry, so it does not mistake its own side effects
+// for another agent's edit and stall on the conflict.
+func TestFormatWriteConflict_SelfShellChangeHint(t *testing.T) {
+	now := time.Now()
+	c := &tools.CoherenceConflict{
+		Path: "/ws/file.go",
+		LastReadSig: tools.FileSig{
+			ModTime: now.Add(-1 * time.Hour),
+			Size:    1024,
+		},
+		CurrentSig: tools.FileSig{
+			ModTime: now,
+			Size:    2048,
+		},
+		ModifiedBy: "this-session",
+		ModifiedAt: now,
+	}
+	msg := formatWriteConflict(c)
+	for _, want := range []string{
+		"shell command YOU ran earlier in this session",
+		"your own change",
+		"not another agent's",
+		"re-read the file and retry the edit",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("expected self-shell hint %q in message, got: %s", want, msg)
+		}
+	}
+}
+
 func TestFormatReadConflict(t *testing.T) {
 	c := &tools.CoherenceConflict{
 		Path:       "/ws/file.go",

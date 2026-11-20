@@ -77,11 +77,15 @@ func sanitizeToolCallArguments(calls []ToolCall) *argSanitization {
 //  1. an unquoted duration-like scalar under a known duration key
 //     (`{"timeout": 120s}` → `{"timeout": "120s"}`) — some models emit
 //     shell-style durations where the JSON schema declares a string;
-//  2. a trailing comma before `}` / `]`.
+//  2. a trailing comma before `}` / `]`;
+//  3. a raw \n, \r or \t byte inside a JSON string value (`"a<NL>b"` →
+//     `"a\nb"`) — some models emit multi-line string values with literal
+//     newlines, which JSON forbids inside strings.
 //
-// The rewrite is deterministic and narrow: string tokens are copied verbatim,
-// only the exact shapes above fire, and the candidate is accepted only when it
-// parses as valid JSON — otherwise ok is false and the caller must dispatch
+// The rewrite is deterministic and narrow: string tokens are copied
+// verbatim except for the three raw control bytes above, only the exact
+// shapes above fire, and the candidate is accepted only when it parses as
+// valid JSON — otherwise ok is false and the caller must dispatch
 // the original bytes unchanged. Valid input is returned unrepaired.
 func repairToolCallInput(input []byte) ([]byte, bool) {
 	if json.Valid(input) {
@@ -92,27 +96,40 @@ func repairToolCallInput(input []byte) ([]byte, bool) {
 	for i < n {
 		switch c := input[i]; c {
 		case '"':
-			// Copy the string token verbatim (key or value).
-			start := i
+			start := i // token start in the ORIGINAL input (duration repair reads it)
+			// Copy the string token (key or value). Raw \n, \r and \t
+			// bytes inside the token are escaped (quirk 3); every other
+			// byte and every existing escape sequence is copied verbatim.
+			out = append(out, '"')
 			i++
 			for i < n {
 				if input[i] == '\\' {
 					if i+1 < n {
+						out = append(out, input[i:i+2]...)
 						i += 2
 						continue
 					}
-					i++ // lone trailing backslash: malformed, copy verbatim
+					out = append(out, '\\') // lone trailing backslash: malformed, copy verbatim
+					i++
 					continue
 				}
 				if input[i] == '"' {
+					out = append(out, '"')
+					i++
 					break
+				}
+				switch input[i] {
+				case '\n':
+					out = append(out, '\\', 'n')
+				case '\r':
+					out = append(out, '\\', 'r')
+				case '\t':
+					out = append(out, '\\', 't')
+				default:
+					out = append(out, input[i])
 				}
 				i++
 			}
-			if i < n {
-				i++ // closing quote
-			}
-			out = append(out, input[start:i]...)
 			// Duration repair: a known key directly followed by an unquoted
 			// duration-like scalar (`"timeout": 120s}`).
 			if i > start+2 && isDurationKey(input[start+1:i-1]) {

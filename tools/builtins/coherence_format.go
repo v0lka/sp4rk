@@ -14,7 +14,10 @@ func formatWriteConflict(c *tools.CoherenceConflict) string {
 		"File conflict: %s was modified since your last read.\n"+
 			"Modified by: session %q (%s ago).\n"+
 			"Your snapshot: mtime=%s, size=%d. Current: mtime=%s, size=%d.\n"+
-			"Action required: re-read the file with read_file before editing.",
+			"Action required: re-read the file with read_file before editing.\n"+
+			"Hint: if the modification was made by a shell command YOU ran earlier in this "+
+			"session (build, formatter, code generation), it is your own change, not another "+
+			"agent's — re-read the file and retry the edit.",
 		c.Path,
 		c.ModifiedBy,
 		age,

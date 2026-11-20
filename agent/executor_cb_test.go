@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/v0lka/sp4rk/llm"
 	"github.com/v0lka/sp4rk/tools"
@@ -2240,6 +2241,10 @@ func TestProcessBatchTool_PreflightRejectsWholeBatch(t *testing.T) {
 		`parameter "path" must be of type string, got number`,
 		"Required parameters: path (string)",
 		`Minimal example: {"path":"<string>"}`,
+		// Each rejection carries a truncated verbatim excerpt of the model's
+		// own wrong args so it can diff them against the schema digest.
+		"your input: {}",
+		`your input: {"path":42}`,
 	} {
 		if !strings.Contains(obs, want) {
 			t.Errorf("aggregate rejection must contain %q:\n%s", want, obs)
@@ -2249,6 +2254,81 @@ func TestProcessBatchTool_PreflightRejectsWholeBatch(t *testing.T) {
 	// The rejection armed the validation breaker exactly once.
 	if exec.consecutiveValidationErrorCount != 1 {
 		t.Errorf("consecutiveValidationErrorCount = %d, want 1", exec.consecutiveValidationErrorCount)
+	}
+}
+
+// TestProcessBatchTool_PreflightRejectionExcerptTruncatesOversizedInput pins
+// the excerpt side of the rejection render with a DeepSeek-shaped payload
+// from the 11-10 burst: a multi-line shell command emitted as the sub-call
+// input, far beyond the excerpt budget. The model must see its own raw args
+// (index + tool + its input) with the cut marked, never the whole payload.
+func TestProcessBatchTool_PreflightRejectionExcerptTruncatesOversizedInput(t *testing.T) {
+	mockTools := newMockToolExecutor()
+	mockTools.validationFailures["bash"] = invalidValidationFor("bash", `parameter "timeout_s" must be of type number, got string`)
+
+	exec := newExecutorDefaultHITL(&mockLLMCaller{}, mockTools, &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+	exec.emitter = &NoopEvents{}
+
+	// DeepSeek-shaped oversized payload: a multi-line shell command (newlines
+	// JSON-escaped — the batch envelope must stay valid JSON to reach
+	// pre-flight) that also exceeds the excerpt budget.
+	big := strings.Repeat(`echo line of output\n`, 60) // 1260 bytes as JSON
+	rawInput := `{"command": "` + big + `"}`
+	batchInput := json.RawMessage(`{"calls":[{"tool":"bash","input":` + rawInput + `}]}`)
+	action, resp := batchAction("batch_1", batchInput)
+	state := &runState{effectiveMaxSteps: 10}
+	cw := newMockContextManager()
+
+	if _, _, err := exec.processSingleToolCall(context.Background(), action, 0, resp.Message.ToolCalls, resp, "thinking", state, cw); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(state.allSteps) != 1 {
+		t.Fatalf("expected exactly 1 rejection step, got %d", len(state.allSteps))
+	}
+	obs := state.allSteps[0].Observation
+	for _, want := range []string{
+		`calls[0] ("bash")`,
+		`parameter "timeout_s" must be of type number, got string`,
+		`your input: {"command": "echo line of output`,
+		"...(truncated)",
+	} {
+		if !strings.Contains(obs, want) {
+			t.Errorf("rejection must contain %q:\n%s", want, obs)
+		}
+	}
+	// The excerpt must be a PREFIX of the payload, not the whole thing.
+	if strings.Contains(obs, big) {
+		t.Error("rejection embedded the whole oversized payload; excerpt must be truncated")
+	}
+	if n := strings.Count(obs, "echo line of output"); n >= 60 {
+		t.Errorf("excerpt carried %d of 60 payload lines; truncation did not fire", n)
+	}
+}
+
+// TestTruncateBatchInputExcerpt pins the excerpt bounds: short payloads pass
+// through verbatim, long ASCII payloads cut at the budget with the marker,
+// and a cut landing inside a multi-byte rune backs off to the rune boundary.
+func TestTruncateBatchInputExcerpt(t *testing.T) {
+	if got := truncateBatchInputExcerpt(json.RawMessage(`{"path":"x"}`)); got != `{"path":"x"}` {
+		t.Errorf("short excerpt = %q, want verbatim", got)
+	}
+	long := json.RawMessage(`{"command":"` + strings.Repeat("a", 1000) + `"}`)
+	got := truncateBatchInputExcerpt(long)
+	if len(got) != maxBatchRejectionExcerpt+len("...(truncated)") {
+		t.Errorf("excerpt len = %d, want %d (budget + marker)", len(got), maxBatchRejectionExcerpt+len("...(truncated)"))
+	}
+	if !strings.HasSuffix(got, "...(truncated)") {
+		t.Errorf("excerpt = %q, want the truncation marker suffix", got)
+	}
+	// Byte 600 of the payload below lands inside the é rune (bytes 599-600);
+	// the cut must back off to the rune start so the excerpt stays valid UTF-8.
+	multi := json.RawMessage(`{"note":"` + strings.Repeat("x", 590) + "é" + strings.Repeat("y", 40) + `"}`)
+	got = truncateBatchInputExcerpt(multi)
+	if !utf8.ValidString(got) {
+		t.Errorf("excerpt %q is not valid UTF-8; cut must back off to a rune boundary", got)
+	}
+	if want := `{"note":"` + strings.Repeat("x", 590) + "...(truncated)"; got != want {
+		t.Errorf("excerpt = %q, want the rune-straddling cut backed off to %q", got, want)
 	}
 }
 

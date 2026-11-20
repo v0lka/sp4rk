@@ -75,6 +75,18 @@ func TestRepairToolCallInput(t *testing.T) {
 		{"duration and trailing comma", `{"timeout": 30s,}`, `{"timeout": "30s"}`, true},
 		{"nested known key", `{"opts":{"timeout":5s}}`, `{"opts":{"timeout":"5s"}}`, true},
 		{"trailing comma after unitless number", `{"timeout": 120,}`, `{"timeout": 120}`, true},
+		// Quirk 3: raw \n, \r, \t bytes inside string values — DeepSeek-shaped
+		// multi-line command payloads from the 11-10 burst.
+		{"raw newline in string value", "{\"command\": \"echo a\necho b\"}", `{"command": "echo a\necho b"}`, true},
+		{"raw CRLF and tab in string value", "{\"command\": \"make test\r\n\tmake lint\"}", `{"command": "make test\r\n\tmake lint"}`, true},
+		{"raw newline plus trailing comma", "{\"content\": \"line1\nline2\",}", `{"content": "line1\nline2"}`, true},
+		{"raw newline plus unquoted duration", "{\"timeout\": 30s, \"note\": \"see\nbelow\"}", `{"timeout": "30s", "note": "see\nbelow"}`, true},
+		{"raw newline in string key", "{\"my\nkey\": 1}", `{"my\nkey": 1}`, true},
+		// Fail-closed boundaries for quirk 3.
+		{"raw newline outside strings is valid JSON", "{\"a\": 1,\n\"b\": 2}", "", false},
+		{"escaped newline untouched", `{"a": "x\ny"}`, "", false},
+		{"other raw control char stays unrepaired", "{\"a\": \"x\v y\"}", "", false},
+		{"unterminated string with raw newline stays unrepaired", "{\"a\": \"bc\n", "", false},
 		{"garbage stays unrepaired", "not json", "", false},
 		{"unclosed object stays unrepaired", `{"timeout": 120s`, "", false},
 		{"unclosed string stays unrepaired", `{"a": "bc`, "", false},
@@ -138,6 +150,40 @@ func TestSanitizeToolCallArguments(t *testing.T) {
 	}
 	if string(calls[2].Input) != `total garbage` {
 		t.Errorf("call_3 input changed: %q", calls[2].Input)
+	}
+}
+
+// TestSanitizeToolCallArguments_EscapesRawNewline pins the quirk-3 repair at
+// the sanitation step with a DeepSeek-shaped payload from the 11-10 burst: a
+// multi-line shell command emitted with a literal newline inside the string
+// value. The repaired payload must replace the raw one in the call, the
+// original must be recorded for the log, and a second call with the SAME
+// payload already escaped must dispatch untouched.
+func TestSanitizeToolCallArguments_EscapesRawNewline(t *testing.T) {
+	raw := []byte("{\"command\": \"echo a\necho b\"}")
+	calls := []ToolCall{
+		{ID: "call_1", Name: "bash", Input: json.RawMessage(append([]byte(nil), raw...))},
+		{ID: "call_2", Name: "bash", Input: json.RawMessage(`{"command": "echo a\necho b"}`)},
+	}
+	san := sanitizeToolCallArguments(calls)
+
+	if !san.repaired[0] {
+		t.Fatalf("raw-newline payload must be repaired, repaired=%v", san.repaired)
+	}
+	if string(calls[0].Input) != `{"command": "echo a\necho b"}` {
+		t.Errorf("call_1 input = %q, want the escaped payload", calls[0].Input)
+	}
+	if string(san.originals[0]) != string(raw) {
+		t.Errorf("call_1 original = %q, want the pre-repair payload %q", san.originals[0], raw)
+	}
+	if !json.Valid(calls[0].Input) {
+		t.Errorf("repaired call_1 input %q is not valid JSON", calls[0].Input)
+	}
+	if san.repaired[1] {
+		t.Errorf("already-escaped payload must not be flagged repaired")
+	}
+	if san.originals[1] != nil {
+		t.Errorf("call_2 original recorded: %q", san.originals[1])
 	}
 }
 
