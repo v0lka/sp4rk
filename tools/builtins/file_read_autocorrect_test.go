@@ -278,7 +278,7 @@ func TestReadFileTool_RepairDropsStaleCoherenceWarning(t *testing.T) {
 	if len(checker.asked) != 2 {
 		t.Fatalf("CheckRead calls = %d (%v), want 2 (failed spelling + repaired path)", len(checker.asked), checker.asked)
 	}
-	if strings.Contains(result.Content, "modified by session") {
+	if strings.Contains(result.Content, "was modified by") {
 		t.Errorf("the failed spelling's stale coherence warning leaked into the repaired read: %s", result.Content)
 	}
 	if !strings.Contains(result.Content, "clean repaired target") {
@@ -319,7 +319,7 @@ func TestReadFileTool_RepairReportsRepairedPathConflict(t *testing.T) {
 	if result.IsError {
 		t.Fatalf("expected auto-corrected success, got error: %s", result.Content)
 	}
-	if !strings.Contains(result.Content, `[!] This file was modified by session "other session"`) {
+	if !strings.Contains(result.Content, `[!] This file was modified by "other session"`) {
 		t.Errorf("expected the repaired path's coherence warning, got: %s", result.Content)
 	}
 	if !strings.Contains(result.Content, "conflicting repaired target") {

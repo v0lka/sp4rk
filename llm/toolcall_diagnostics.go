@@ -78,9 +78,9 @@ func sanitizeToolCallArguments(calls []ToolCall) *argSanitization {
 //     (`{"timeout": 120s}` → `{"timeout": "120s"}`) — some models emit
 //     shell-style durations where the JSON schema declares a string;
 //  2. a trailing comma before `}` / `]`;
-//  3. a raw \n, \r or \t byte inside a JSON string value (`"a<NL>b"` →
-//     `"a\nb"`) — some models emit multi-line string values with literal
-//     newlines, which JSON forbids inside strings.
+//  3. a raw \n, \r or \t byte inside a JSON string token, key or value
+//     (`"a<NL>b"` → `"a\nb"`) — some models emit multi-line string
+//     values with literal newlines, which JSON forbids inside strings.
 //
 // The rewrite is deterministic and narrow: string tokens are copied
 // verbatim except for the three raw control bytes above, only the exact

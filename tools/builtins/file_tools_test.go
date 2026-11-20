@@ -1483,13 +1483,24 @@ func TestFormatWriteConflict(t *testing.T) {
 	if !strings.Contains(msg, "re-read the file") {
 		t.Errorf("expected action required hint, got: %s", msg)
 	}
+	// The hint must cover foreign modifiers too: a conflict attributed to
+	// another session (or external) gets the reconcile branch and is never
+	// flatly told the change is its own.
+	if !strings.Contains(msg, "anything else made it") {
+		t.Errorf("expected foreign-modifier branch in message, got: %s", msg)
+	}
+	if strings.Contains(msg, "not another agent's") {
+		t.Errorf("foreign conflict must not be dismissed as a self-change, got: %s", msg)
+	}
 }
 
 // TestFormatWriteConflict_SelfShellChangeHint pins the self-modification
-// hint: a conflict caused by the session's own shell work (build, formatter,
-// code generation) must tell the model the change is its own and that the
-// recovery is re-read + retry, so it does not mistake its own side effects
-// for another agent's edit and stall on the conflict.
+// branch of the hint: a conflict plausibly caused by the session's own shell
+// work (build, formatter, code generation) must tell the model that this
+// branch is its own change and that the recovery is re-read + retry of the
+// whole operation (write, edit, or delete — not just an edit). The hint must
+// stay conditional: the same message serves foreign and external conflicts,
+// so it must not flatly deny another writer's involvement.
 func TestFormatWriteConflict_SelfShellChangeHint(t *testing.T) {
 	now := time.Now()
 	c := &tools.CoherenceConflict{
@@ -1508,12 +1519,19 @@ func TestFormatWriteConflict_SelfShellChangeHint(t *testing.T) {
 	msg := formatWriteConflict(c)
 	for _, want := range []string{
 		"shell command YOU ran earlier in this session",
-		"your own change",
-		"not another agent's",
-		"re-read the file and retry the edit",
+		"it is your own change",
+		"retry the operation",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("expected self-shell hint %q in message, got: %s", want, msg)
+		}
+	}
+	for _, banned := range []string{
+		"not another agent's",
+		"retry the edit",
+	} {
+		if strings.Contains(msg, banned) {
+			t.Errorf("hint must stay modifier- and operation-neutral, found %q in: %s", banned, msg)
 		}
 	}
 }
