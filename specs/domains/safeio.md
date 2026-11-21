@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Hardened, non-blocking filesystem I/O primitives: every open of a fixed, user- or workspace-controlled path is confirmed to be a regular file before — or while — it is used, so a FIFO, socket, or device planted at a path is refused instead of hanging the caller inside `open(2)`. The package also provides atomic file publication and real-directory creation that refuse symlink redirection where a real directory was required. It is consumed by the `skills` and `agents` discovery scanners, the `ignore` resolver, the `tools/builtins` file tools, and the orchestration step-dump tracker.
+Hardened, non-blocking filesystem I/O primitives: every open of a fixed, user- or workspace-controlled path is confirmed to be a regular file before — or while — it is used, so a FIFO, socket, or device planted at a path is refused instead of hanging the caller inside `open(2)`. The package also provides atomic file publication and real-directory creation that refuse symlink redirection where a real directory was required. It is consumed by the `skills` and `agents` discovery scanners, the `ignore` resolver, the `appendcodec` append-log codecs, and the `tools/builtins` file tools; the orchestration step-dump tracker consumes it indirectly, through `appendcodec.OpenAppend`'s `OpenFileNoFollow`-backed opens.
 
 ## Key Files
 

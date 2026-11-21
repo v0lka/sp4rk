@@ -103,7 +103,7 @@ type ModelMetadata struct {
 // Returns metadata and true if found, or zero value and false if not found.
 type ModelMetadataSource func(model string) (ModelMetadata, bool)
 
-// ModelRegistry provides a 5-tier resolution system for model metadata.
+// ModelRegistry provides a 7-tier resolution system for model metadata.
 type ModelRegistry struct {
 	builtIn        map[string]ModelMetadata
 	builtInIndex   map[string]ModelMetadata // normalized-ID -> metadata index for fuzzy built-in lookup

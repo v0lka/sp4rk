@@ -76,7 +76,7 @@ sp4rk is a reusable agent-execution engine. It is organized as a single Go modul
 | `tools/builtins/websearch` | `tools`, `tools/builtins` | `agent`, `orchestration`, `planner`, root |
 | `tools/mcp`      | `tools` (and through it, `llm`, `pathutil`), `sysproc`                                  | siblings via the agent/orchestration layer |
 | `skills` | `tools`, `pathutil`, `safeio` | `agent`, `orchestration`, root |
-| `prompt`, `agents`, `security`, `embedding`, `oneshot`, `safeio`, `pathutil`, `strutil`, `sysproc`, `ignore` | leaves / near-leaves only (see graph) | `tools`, `agent`, `orchestration`, root  |
+| `prompt`, `agents`, `appendcodec`, `security`, `embedding`, `oneshot`, `safeio`, `pathutil`, `strutil`, `sysproc`, `ignore` | leaves / near-leaves only (see graph) | `tools`, `agent`, `orchestration`, root  |
 
 > **Module boundary.** sp4rk is a standalone Go module. It cannot import any host-application package — an embedding application imports sp4rk, never the reverse. The import prohibitions on upward engine layers are enforced both by convention and by the import cycles they would otherwise create.
 

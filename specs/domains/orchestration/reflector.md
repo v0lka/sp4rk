@@ -87,7 +87,7 @@ Reflections persist on the `orchestration.Blackboard` (`AddReflection` appends; 
 
 ## Error Handling
 
-- Returns an error if the LLM call fails (transport errors are never retried here — transport retry, on the same active provider, is owned by the `llm.Router`, the LLM router; provider switching is an explicit `SetModel` operation, not automatic failover), returns nil, or stays unparseable after the one-shot client's repair loop: exactly two corrective nudges (assistant echo of the failed output + a `[System]` user message restating the required JSON schema — see [../oneshot.md](../oneshot.md)), then a final refusal wrapping the last parse error. The sanitize layer (below) is untouched by the repair loop.
+- Returns an error if the LLM call fails (transport errors are never retried here — transport retry, on the same active provider, is owned by the `llm.Router`, the LLM router; provider switching is an explicit `SetModel` operation, not automatic failover), returns nil, or stays unparseable after the one-shot client's repair loop: exactly two corrective nudges (assistant echo of the failed output + a `[System]` user message restating the required JSON schema — see [../oneshot.md](../oneshot.md)), then a final refusal wrapping the last parse error. The sanitize layer ([Response parsing](#response-parsing)) is untouched by the repair loop.
 - An unrecognised/empty `SuggestedAction` is normalized to `"retry"` rather than treated as an error.
 
 ## Invariants

@@ -66,8 +66,8 @@ A `SKILL.md` is YAML frontmatter (delimited by `---`) followed by a markdown bod
 | Field | Rule |
 | ----- | ---- |
 | `name` | Required. 1–64 chars, lowercase alphanumeric and hyphens, no leading/trailing hyphens (`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`); consecutive hyphens permitted. Must match the parent directory name. |
-| `description` | Required. At most 1024 characters. |
-| `compatibility` | At most 500 characters. |
+| `description` | Required. At most 1024 bytes (`len()`, so multibyte UTF-8 counts per byte). |
+| `compatibility` | At most 500 bytes (same byte-count rule as `description`). |
 
 A skill whose `name` does not match its parent directory name is rejected.
 
@@ -96,7 +96,7 @@ A skill whose `name` does not match its parent directory name is rejected.
 
 ## Configuration
 
-`NewSkillManager(dirs []string, logger)` takes discovery directories in priority order (highest first). The host wires the active skill set per task — the SDK's `SkillManager` only discovers/parses/serves; activation, system-prompt injection of skill bodies, and tool-policy overrides are host concerns (the router matches descriptors, the planner/exectuor consume activated skills via host-provided context functions).
+`NewSkillManager(dirs []string, logger)` takes discovery directories in priority order (highest first). The host wires the active skill set per task — the SDK's `SkillManager` only discovers/parses/serves; activation, system-prompt injection of skill bodies, and tool-policy overrides are host concerns (the router matches descriptors, the planner/executor consume activated skills via host-provided context functions).
 
 ## Extension Points
 

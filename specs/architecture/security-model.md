@@ -134,7 +134,7 @@ All three judges — advisory `Judge`, `JudgeStrict`, and the loop judge `JudgeS
 
 ### Strict ToolJudge mode
 
-`ToolJudge.JudgeStrict(ctx, StrictJudgeRequest)` is the conservative LLM primitive a host may invoke when deciding whether a soft confirmation escalation can be auto-resolved. `StrictJudgeRequest` supplies `ToolName`, raw `Input`, `TaskContext`, `ToolSource`, and optionally `AnalysisContext` (the one-line flowsh digest for shell tools — empty for non-shell tools, and the envelope field is omitted entirely); the judge adds compact environment information and the current `SessionRoots(ctx)`.
+`ToolJudge.JudgeStrict(ctx, StrictJudgeRequest)` is the conservative LLM primitive a host may invoke when deciding whether a soft confirmation escalation can be auto-resolved. `StrictJudgeRequest` supplies `ToolName`, raw `Input`, `TaskContext`, `ToolSource`, the host's deterministic escalation reason and its severity (`JudgeReasoning`/`JudgeSeverity`), and optionally `AnalysisContext` (the one-line flowsh digest for shell tools — empty for non-shell tools, and the envelope field is omitted entirely); the judge adds compact environment information and the current `SessionRoots(ctx)`.
 
 Strict mode differs from advisory `Judge` in three security-relevant ways:
 

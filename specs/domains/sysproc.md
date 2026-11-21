@@ -25,7 +25,7 @@ Cross-platform child-process containment helpers: console-window suppression on 
 
 - `AssignKillOnCloseJob` returns `ErrProcessNotStarted` (match via `errors.Is`) when `cmd.Process` is nil, and wraps job-creation or assignment failures otherwise. On any failure it closes the freshly created job handle — no kernel handle leaks — and returns a no-op cleanup so callers can `defer` it unconditionally alongside the error, falling back to their own termination strategy.
 - `KillTree` reports the taskkill error only when the direct-kill fallback also fails; a group-signal failure on unix degrades to the single-process kill.
-- Every non-Windows build of every function is a no-op with a nil error (`AssignKillOnCloseJob` returns `func(){}, nil`).
+- The Windows-mechanism helpers degrade to no-ops with a nil error on non-Windows builds (`HideConsole` does nothing; `AssignKillOnCloseJob` returns `func(){}, nil`); `SetProcessGroup` and `KillTree` are live on unix and no-ops on Windows.
 
 ## Invariants
 
