@@ -277,7 +277,7 @@ func TestConvertToResponsesInput(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			items := convertToResponsesInput(tt.messages, nil)
+			items := convertToResponsesInput(tt.messages, nil, nil)
 			if len(items) != tt.wantCount {
 				t.Fatalf("got %d items, want %d", len(items), tt.wantCount)
 			}
@@ -358,7 +358,7 @@ func TestConvertToResponsesTools(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := convertToResponsesTools(tt.tools)
+			result := convertToResponsesTools(tt.tools, nil)
 			if len(result) != tt.wantCount {
 				t.Fatalf("got %d tools, want %d", len(result), tt.wantCount)
 			}
@@ -456,7 +456,7 @@ func TestMapResponsesStopReason(t *testing.T) {
 
 func TestConvertResponsesResponse(t *testing.T) {
 	t.Run("nil response", func(t *testing.T) {
-		_, err := convertResponsesResponse(nil)
+		_, err := convertResponsesResponse(nil, nil)
 		if err == nil {
 			t.Fatal("expected error for nil response")
 		}
@@ -473,7 +473,7 @@ func TestConvertResponsesResponse(t *testing.T) {
 				OutputTokens: 50,
 			},
 		}
-		result, err := convertResponsesResponse(resp)
+		result, err := convertResponsesResponse(resp, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -502,7 +502,7 @@ func TestConvertResponsesResponse(t *testing.T) {
 				OutputTokens: 10,
 			},
 		}
-		result, err := convertResponsesResponse(resp)
+		result, err := convertResponsesResponse(resp, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -543,7 +543,7 @@ func TestConvertResponsesResponse(t *testing.T) {
 				OutputTokens: 80,
 			},
 		}
-		result, err := convertResponsesResponse(resp)
+		result, err := convertResponsesResponse(resp, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -591,7 +591,7 @@ func TestConvertResponsesResponse(t *testing.T) {
 				},
 			},
 		}
-		result, err := convertResponsesResponse(resp)
+		result, err := convertResponsesResponse(resp, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -618,7 +618,7 @@ func TestConvertResponsesResponse(t *testing.T) {
 				},
 			},
 		}
-		result, err := convertResponsesResponse(resp)
+		result, err := convertResponsesResponse(resp, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -687,7 +687,7 @@ func TestBuildResponsesParams_Store(t *testing.T) {
 	}
 
 	t.Run("official OpenAI sends store=false", func(t *testing.T) {
-		params := buildResponsesParams(req, "", nil)
+		params := buildResponsesParams(req, "", nil, nil)
 		if !params.Store.Valid() {
 			t.Fatal("expected Store to be set for official OpenAI endpoint")
 		}
@@ -697,7 +697,7 @@ func TestBuildResponsesParams_Store(t *testing.T) {
 	})
 
 	t.Run("compatible provider does not send store", func(t *testing.T) {
-		params := buildResponsesParams(req, "https://proxy.example.com/v1", nil)
+		params := buildResponsesParams(req, "https://proxy.example.com/v1", nil, nil)
 		if params.Store.Valid() {
 			t.Errorf("expected Store to be omitted for compatible provider, got %v", params.Store.Value)
 		}
@@ -720,7 +720,7 @@ func TestBuildResponsesParams_ReasoningEffort(t *testing.T) {
 				Messages:        messages,
 				ReasoningEffort: effort,
 			}
-			params := buildResponsesParams(req, "", nil)
+			params := buildResponsesParams(req, "", nil, nil)
 			if params.Reasoning.Effort == "" {
 				t.Errorf("expected reasoning.effort to be set for valid value %q", effort)
 			}
@@ -735,7 +735,7 @@ func TestBuildResponsesParams_ReasoningEffort(t *testing.T) {
 				Messages:        messages,
 				ReasoningEffort: effort,
 			}
-			params := buildResponsesParams(req, "", nil)
+			params := buildResponsesParams(req, "", nil, nil)
 			if params.Reasoning.Effort != "" {
 				t.Errorf("expected reasoning.effort to be omitted for invalid value %q, got %q", effort, params.Reasoning.Effort)
 			}
@@ -747,7 +747,7 @@ func TestBuildResponsesParams_ReasoningEffort(t *testing.T) {
 			Model:    "gpt-5.3-codex",
 			Messages: messages,
 		}
-		params := buildResponsesParams(req, "", nil)
+		params := buildResponsesParams(req, "", nil, nil)
 		if params.Reasoning.Effort != "" {
 			t.Errorf("expected reasoning to be omitted for empty effort, got %q", params.Reasoning.Effort)
 		}

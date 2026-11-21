@@ -408,7 +408,7 @@ func TestAnthropicProvider_ParseResponse_UsageCacheTokens(t *testing.T) {
 				CacheReadInputTokens:     7000,
 			},
 		}
-		out, err := p.parseResponse(resp, nil)
+		out, err := p.parseResponse(resp, nil, nil)
 		if err != nil {
 			t.Fatalf("parseResponse: %v", err)
 		}
@@ -423,7 +423,7 @@ func TestAnthropicProvider_ParseResponse_UsageCacheTokens(t *testing.T) {
 			StopReason: "end_turn",
 			Usage:      anthropic.MessagesUsage{InputTokens: 10, OutputTokens: 5},
 		}
-		out, err := p.parseResponse(resp, nil)
+		out, err := p.parseResponse(resp, nil, nil)
 		if err != nil {
 			t.Fatalf("parseResponse: %v", err)
 		}

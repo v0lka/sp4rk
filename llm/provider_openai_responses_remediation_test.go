@@ -25,7 +25,7 @@ func TestConvertToResponsesTools_EmptySchemaGetsDefaultParameters(t *testing.T) 
 		{Name: "empty_schema", Description: "declares an empty schema", InputSchema: json.RawMessage{}},
 		{Name: "real_schema", Description: "declares a real schema", InputSchema: json.RawMessage(`{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]}`)},
 	}
-	result := convertToResponsesTools(tools)
+	result := convertToResponsesTools(tools, nil)
 	if len(result) != len(tools) {
 		t.Fatalf("got %d tools, want %d", len(result), len(tools))
 	}

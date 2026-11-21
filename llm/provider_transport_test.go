@@ -295,7 +295,7 @@ func TestAnnotateResponsesTransport_RequestSizeEstimate(t *testing.T) {
 	silent := slog.New(slog.NewTextHandler(io.Discard, nil))
 	params := responses.ResponseNewParams{Model: "gpt-5.6"}
 	params.Input = responses.ResponseNewParamsInputUnion{
-		OfInputItemList: convertToResponsesInput([]Message{{Role: "user", Content: strings.Repeat("x", 1000)}}, nil),
+		OfInputItemList: convertToResponsesInput([]Message{{Role: "user", Content: strings.Repeat("x", 1000)}}, nil, nil),
 	}
 	inner := wrapResponsesError("p", errors.New("post \"https://api.example.com\": connection reset by peer"))
 	got := annotateResponsesTransport(silent, "p", inner, params)
@@ -319,7 +319,7 @@ func TestAnnotateResponsesTransport_WarnAttrsAreSecretFree(t *testing.T) {
 	var buf bytes.Buffer
 	params := responses.ResponseNewParams{Model: "gpt-5.6"}
 	params.Input = responses.ResponseNewParamsInputUnion{
-		OfInputItemList: convertToResponsesInput([]Message{{Role: "user", Content: "hi"}}, nil),
+		OfInputItemList: convertToResponsesInput([]Message{{Role: "user", Content: "hi"}}, nil, nil),
 	}
 	inner := wrapResponsesError("p", &url.Error{Op: "Post", URL: "https://api.example.com/v1/responses",
 		Err: &net.OpError{Op: "read", Err: syscall.ECONNRESET}})

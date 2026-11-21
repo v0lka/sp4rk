@@ -112,7 +112,7 @@ func TestOpenAIProvider_BuildChatParams_HoistsNonLeadingSystemMessage(t *testing
 		},
 	}
 
-	oaiReq := p.buildChatParams(req)
+	oaiReq := p.buildChatParams(req, nil)
 
 	jsonBytes, err := json.Marshal(oaiReq)
 	if err != nil {
@@ -176,7 +176,7 @@ func TestOpenAIProvider_BuildChatParams(t *testing.T) {
 		},
 	}
 
-	oaiReq := p.buildChatParams(req)
+	oaiReq := p.buildChatParams(req, nil)
 
 	if oaiReq.Model != "gpt-4o" {
 		t.Errorf("expected model 'gpt-4o', got %q", oaiReq.Model)
@@ -217,7 +217,7 @@ func TestOpenAIProvider_BuildChatParams_WithReasoningContent(t *testing.T) {
 		},
 	}
 
-	oaiReq := p.buildChatParams(req)
+	oaiReq := p.buildChatParams(req, nil)
 
 	if len(oaiReq.Messages) != 3 {
 		t.Fatalf("expected 3 messages, got %d", len(oaiReq.Messages))
@@ -253,7 +253,7 @@ func TestOpenAIProvider_BuildChatParams_NoTools(t *testing.T) {
 		Messages: []Message{{Role: "user", Content: "Hi"}},
 	}
 
-	oaiReq := p.buildChatParams(req)
+	oaiReq := p.buildChatParams(req, nil)
 
 	if len(oaiReq.Tools) != 0 {
 		t.Errorf("expected 0 tools, got %d", len(oaiReq.Tools))
@@ -302,7 +302,7 @@ func TestOpenAIProvider_ConvertRequestMessage(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := p.convertRequestMessage(tt.msg)
+			result := p.convertRequestMessage(tt.msg, nil)
 			// The result is a union type, we need to check the actual type
 			switch {
 			case result.OfUser != nil:
@@ -345,7 +345,7 @@ func TestOpenAIProvider_ConvertRequestMessage_WithToolCalls(t *testing.T) {
 		},
 	}
 
-	result := p.convertRequestMessage(msg)
+	result := p.convertRequestMessage(msg, nil)
 
 	// The result is a union type, check for assistant message with tool calls
 	if result.OfAssistant == nil {
@@ -375,7 +375,7 @@ func TestOpenAIProvider_ConvertRequestMessage_ReasoningContent(t *testing.T) {
 		ReasoningContent: "This is my internal reasoning.",
 	}
 
-	result := p.convertRequestMessage(msg)
+	result := p.convertRequestMessage(msg, nil)
 
 	if result.OfAssistant == nil {
 		t.Fatalf("expected assistant message, got nil")
@@ -425,7 +425,7 @@ func TestOpenAIProvider_ConvertRequestMessage_OmitReasoningHistory(t *testing.T)
 		},
 	}
 
-	result := p.convertRequestMessage(msg)
+	result := p.convertRequestMessage(msg, nil)
 
 	if result.OfAssistant == nil {
 		t.Fatalf("expected assistant message, got nil")
@@ -462,7 +462,7 @@ func TestOpenAIProvider_ConvertRequestMessage_ReasoningContentWithToolCalls(t *t
 		},
 	}
 
-	result := p.convertRequestMessage(msg)
+	result := p.convertRequestMessage(msg, nil)
 
 	if result.OfAssistant == nil {
 		t.Fatalf("expected assistant message, got nil")
@@ -501,7 +501,7 @@ func TestOpenAIProvider_ConvertRequestMessage_ReasoningContentEmptyContent(t *te
 		},
 	}
 
-	result := p.convertRequestMessage(msg)
+	result := p.convertRequestMessage(msg, nil)
 
 	if result.OfAssistant == nil {
 		t.Fatalf("expected assistant message, got nil")
@@ -535,7 +535,7 @@ func TestOpenAIProvider_ConvertRequestMessage_EmptyContentOmitted(t *testing.T) 
 		},
 	}
 
-	result := p.convertRequestMessage(msg)
+	result := p.convertRequestMessage(msg, nil)
 	if result.OfAssistant == nil {
 		t.Fatalf("expected assistant message, got nil")
 	}
@@ -561,7 +561,7 @@ func TestOpenAIProvider_ConvertRequestMessage_EmptyReasoningContentWithToolCalls
 		},
 	}
 
-	result := p.convertRequestMessage(msg)
+	result := p.convertRequestMessage(msg, nil)
 	if result.OfAssistant == nil {
 		t.Fatalf("expected assistant message, got nil")
 	}
@@ -597,7 +597,7 @@ func TestOpenAIProvider_ConvertRequestMessage_EmptyReasoningContentNoToolCalls(t
 		ToolCalls:        nil,
 	}
 
-	result := p.convertRequestMessage(msg)
+	result := p.convertRequestMessage(msg, nil)
 	if result.OfAssistant == nil {
 		t.Fatalf("expected assistant message, got nil")
 	}
@@ -630,7 +630,7 @@ func TestOpenAIProvider_ReasoningContentExtraFieldsPreserved(t *testing.T) {
 		ReasoningContent: "my reasoning",
 	}
 
-	union := p.convertRequestMessage(msg)
+	union := p.convertRequestMessage(msg, nil)
 	if union.OfAssistant == nil {
 		t.Fatal("expected assistant")
 	}
@@ -660,7 +660,7 @@ func TestOpenAIProvider_ConvertChatResponseMessage(t *testing.T) {
 			Role:    "assistant",
 			Content: "Hello!",
 		}
-		result := p.convertChatResponseMessage(oaiMsg)
+		result := p.convertChatResponseMessage(oaiMsg, nil)
 		if result.Role != "assistant" {
 			t.Errorf("role = %q, want 'assistant'", result.Role)
 		}
@@ -687,7 +687,7 @@ func TestOpenAIProvider_ConvertChatResponseMessage(t *testing.T) {
 				},
 			},
 		}
-		result := p.convertChatResponseMessage(oaiMsg)
+		result := p.convertChatResponseMessage(oaiMsg, nil)
 		if len(result.ToolCalls) != 1 {
 			t.Fatalf("expected 1 tool call, got %d", len(result.ToolCalls))
 		}
@@ -719,7 +719,7 @@ func TestConvertChatResponseMessage_WithReasoningContent(t *testing.T) {
 		t.Fatalf("RawJSON does not contain reasoning_content: %s", oaiMsg.RawJSON())
 	}
 
-	result := p.convertChatResponseMessage(oaiMsg)
+	result := p.convertChatResponseMessage(oaiMsg, nil)
 
 	if result.ReasoningContent != "I need to find the file." {
 		t.Errorf("ReasoningContent = %q, want 'I need to find the file.'", result.ReasoningContent)
@@ -1060,7 +1060,7 @@ func TestOpenAIProvider_EndToEnd_ReasoningContent(t *testing.T) {
 	}
 
 	// 1. Convert response message
-	msg := p.convertChatResponseMessage(oaiMsg)
+	msg := p.convertChatResponseMessage(oaiMsg, nil)
 	if msg.ReasoningContent != "I need to find the file." {
 		t.Fatalf("convertChatResponseMessage lost reasoning_content: %q", msg.ReasoningContent)
 	}
@@ -1076,7 +1076,7 @@ func TestOpenAIProvider_EndToEnd_ReasoningContent(t *testing.T) {
 	}
 
 	// 3. Build OpenAI params
-	params := p.buildChatParams(req)
+	params := p.buildChatParams(req, nil)
 
 	// 4. Marshal params to JSON
 	jsonBytes, err := json.Marshal(params)
@@ -1137,7 +1137,7 @@ func TestOpenAIProvider_FullChatCompletionResponse_ReasoningContent(t *testing.T
 		t.Fatalf("RawJSON does not contain reasoning_content: %s", msg.RawJSON())
 	}
 
-	result := p.convertChatResponseMessage(msg)
+	result := p.convertChatResponseMessage(msg, nil)
 	if result.ReasoningContent != "I need to find the file." {
 		t.Errorf("ReasoningContent = %q, want 'I need to find the file.'", result.ReasoningContent)
 	}
@@ -1383,7 +1383,7 @@ func TestOpenAIProvider_BuildChatParams_ReasoningEffort(t *testing.T) {
 				Messages:        []Message{{Role: "user", Content: "Hi"}},
 				ReasoningEffort: tt.effort,
 			}
-			params := p.buildChatParams(req)
+			params := p.buildChatParams(req, nil)
 			if params.Model != tt.model {
 				t.Errorf("expected model %q, got %q", tt.model, params.Model)
 			}
@@ -1398,7 +1398,7 @@ func TestOpenAIProvider_BuildChatParams_NoReasoningNoFamily(t *testing.T) {
 		Messages:        []Message{{Role: "user", Content: "Hi"}},
 		ReasoningEffort: "",
 	}
-	params := p.buildChatParams(req)
+	params := p.buildChatParams(req, nil)
 	// Verify no panic and model is correct
 	if params.Model != "gpt-4o" {
 		t.Errorf("expected model 'gpt-4o', got %q", params.Model)
@@ -1416,7 +1416,7 @@ func TestOpenAIProvider_BuildChatParams_GLMReasoning(t *testing.T) {
 			Messages:        []Message{{Role: "user", Content: "Hi"}},
 			ReasoningEffort: effort,
 		}
-		raw, err := json.Marshal(p.buildChatParams(req))
+		raw, err := json.Marshal(p.buildChatParams(req, nil))
 		if err != nil {
 			t.Fatalf("marshal params: %v", err)
 		}
@@ -1544,7 +1544,7 @@ func TestOpenAIProvider_BuildChatParams_DeepSeekReasoning(t *testing.T) {
 			Messages:        []Message{{Role: "user", Content: "Hi"}},
 			ReasoningEffort: effort,
 		}
-		raw, err := json.Marshal(p.buildChatParams(req))
+		raw, err := json.Marshal(p.buildChatParams(req, nil))
 		if err != nil {
 			t.Fatalf("marshal params: %v", err)
 		}
@@ -1656,7 +1656,7 @@ func TestOpenAIProvider_BuildChatParams_QwenReasoning(t *testing.T) {
 			Messages:        []Message{{Role: "user", Content: "Hi"}},
 			ReasoningEffort: effort,
 		}
-		raw, err := json.Marshal(p.buildChatParams(req))
+		raw, err := json.Marshal(p.buildChatParams(req, nil))
 		if err != nil {
 			t.Fatalf("marshal params: %v", err)
 		}
@@ -2270,13 +2270,13 @@ func TestOpenAIProvider_KimiReasoningSwitch(t *testing.T) {
 		Messages:        []Message{{Role: "user", Content: "hi"}},
 		ReasoningEffort: "low",
 	}
-	out := jsonMap(t, p.buildChatParams(req))
+	out := jsonMap(t, p.buildChatParams(req, nil))
 	if out["reasoning_effort"] != "low" {
 		t.Errorf("reasoning_effort = %v (%T), want \"low\"", out["reasoning_effort"], out["reasoning_effort"])
 	}
 
 	req.Model = "kimi-for-coding"
-	out = jsonMap(t, p.buildChatParams(req))
+	out = jsonMap(t, p.buildChatParams(req, nil))
 	if out["reasoning_effort"] != "low" {
 		t.Errorf("K2.8 reasoning_effort = %v (%T), want \"low\"", out["reasoning_effort"], out["reasoning_effort"])
 	}
@@ -2287,13 +2287,13 @@ func TestOpenAIProvider_KimiReasoningSwitch(t *testing.T) {
 		Messages:        []Message{{Role: "user", Content: "hi"}},
 		ReasoningEffort: "low",
 	}
-	out = jsonMap(t, p.buildChatParams(locked))
+	out = jsonMap(t, p.buildChatParams(locked, nil))
 	if _, present := out["reasoning_effort"]; present {
 		t.Errorf("reasoning_effort = %v, want no field for a thinking-locked kimi model", out["reasoning_effort"])
 	}
 
 	locked.Model = "kimi-for-coding-highspeed"
-	out = jsonMap(t, p.buildChatParams(locked))
+	out = jsonMap(t, p.buildChatParams(locked, nil))
 	if _, present := out["reasoning_effort"]; present {
 		t.Errorf("K2.7 Highspeed reasoning_effort = %v, want no field", out["reasoning_effort"])
 	}
@@ -2488,8 +2488,8 @@ func TestApplyQwenReasoning_VendorDefaultWireByteIdentical(t *testing.T) {
 		// order, so the raw bytes are not reproducible across two runs of the
 		// same code — compare the decoded bodies instead. (The extras-only
 		// golden strings above ARE byte-exact: encoding/json sorts map keys.)
-		gotZero := jsonMap(t, zero.buildChatParams(req))
-		gotExplicit := jsonMap(t, explicit.buildChatParams(req))
+		gotZero := jsonMap(t, zero.buildChatParams(req, nil))
+		gotExplicit := jsonMap(t, explicit.buildChatParams(req, nil))
 		if !reflect.DeepEqual(gotZero, gotExplicit) {
 			t.Errorf("vendor-default body differs from the zero-value body:\n zero     = %v\n explicit = %v", gotZero, gotExplicit)
 		}
@@ -2572,7 +2572,7 @@ func TestOpenAIProvider_ChatTemplateKwargsMergesWithSamplingExtras(t *testing.T)
 		TopK:              &topK,
 		RepetitionPenalty: floatPtr(1.05),
 	}
-	out := jsonMap(t, p.buildChatParams(req))
+	out := jsonMap(t, p.buildChatParams(req, nil))
 	kwargs, ok := out["chat_template_kwargs"].(map[string]any)
 	if !ok {
 		t.Fatalf("expected a chat_template_kwargs object in the body, got %v", out)

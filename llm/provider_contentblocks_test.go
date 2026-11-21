@@ -79,7 +79,7 @@ func TestAnthropicProvider_ConvertMessage_ContentBlocks(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := p.convertMessage(tt.msg)
+			result, err := p.convertMessage(tt.msg, nil)
 			if err != nil {
 				t.Fatalf("convertMessage(%+v) unexpected error: %v", tt.msg, err)
 			}
@@ -124,7 +124,7 @@ func TestAnthropicProvider_BuildRequest_ValidateImageBlocks(t *testing.T) {
 				}},
 			},
 		}
-		_, err := p.buildRequest(req)
+		_, err := p.buildRequest(req, nil)
 		if err == nil {
 			t.Error("buildRequest with missing media_type expected error, got nil")
 		}
@@ -139,7 +139,7 @@ func TestAnthropicProvider_BuildRequest_ValidateImageBlocks(t *testing.T) {
 				}},
 			},
 		}
-		_, err := p.buildRequest(req)
+		_, err := p.buildRequest(req, nil)
 		if err != nil {
 			t.Errorf("buildRequest with valid image blocks unexpected error: %v", err)
 		}
@@ -219,7 +219,7 @@ func TestOpenAIProvider_ConvertRequestMessage_ContentBlocks(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := p.convertRequestMessage(tt.msg)
+			result := p.convertRequestMessage(tt.msg, nil)
 			if result.OfUser == nil {
 				t.Fatalf("convertRequestMessage(%+v) expected user message, got nil", tt.msg)
 			}
@@ -323,7 +323,7 @@ func TestConvertToResponsesInput_ContentBlocks(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			items := convertToResponsesInput(tt.messages, nil)
+			items := convertToResponsesInput(tt.messages, nil, nil)
 			if len(items) != tt.wantItemCount {
 				t.Fatalf("convertToResponsesInput got %d items, want %d", len(items), tt.wantItemCount)
 			}

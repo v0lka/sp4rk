@@ -111,14 +111,20 @@ func responsesAPICompletion(ctx context.Context, client *oai.Client, providerNam
 		}
 	}
 
-	params := buildResponsesParams(req, baseURL, logger)
+	// Tool names are mapped per request (see toolname.go): the same
+	// wire-spelling adaptation the Chat Completions path applies, since the
+	// Responses API enforces the identical ^[a-zA-Z0-9_-]{1,64}$ name
+	// pattern on tool definitions, history function_call items and the
+	// model's output.
+	mapping := newToolNameMapping(req.Tools, defaultToolNamePolicy, logger)
+	params := buildResponsesParams(req, baseURL, logger, mapping)
 
 	resp, err := client.Responses.New(ctx, params)
 	if err != nil {
 		return nil, annotateResponsesTransport(logger, providerName, wrapResponsesError(providerName, err), params)
 	}
 
-	converted, err := convertResponsesResponse(resp)
+	converted, err := convertResponsesResponse(resp, mapping)
 	if err != nil {
 		return nil, err
 	}
@@ -168,7 +174,8 @@ func responsesAPICompletionStream(ctx context.Context, client *oai.Client, provi
 		}
 	}
 
-	params := buildResponsesParams(req, baseURL, logger)
+	mapping := newToolNameMapping(req.Tools, defaultToolNamePolicy, logger)
+	params := buildResponsesParams(req, baseURL, logger, mapping)
 	if requireStreaming {
 		params.Store = param.NewOpt(false)
 		params.Include = append(params.Include, responses.ResponseIncludableReasoningEncryptedContent)
@@ -256,11 +263,11 @@ func responsesAPICompletionStream(ctx context.Context, client *oai.Client, provi
 			fmt.Errorf("responses API (stream): stream ended without a terminal response event: %w", io.ErrUnexpectedEOF))
 	}
 
-	converted, err := convertResponsesResponse(terminal)
+	converted, err := convertResponsesResponse(terminal, mapping)
 	if err != nil {
 		return nil, err
 	}
-	applyStreamedOutputFallback(converted, textBuf.String(), refusalBuf.String(), reasoningBuf.String(), doneItems)
+	applyStreamedOutputFallback(converted, textBuf.String(), refusalBuf.String(), reasoningBuf.String(), doneItems, mapping)
 	finalizeToolCallArguments(logger, providerName, converted.Message.ToolCalls)
 	return converted, nil
 }
@@ -269,13 +276,15 @@ func responsesAPICompletionStream(ctx context.Context, client *oai.Client, provi
 // baseURL is the provider's configured base URL (empty = official OpenAI);
 // it controls whether OpenAI-specific fields like `store` are included.
 // logger is used for debug-level diagnostics (nil = slog.Default()).
-func buildResponsesParams(req ChatRequest, baseURL string, logger *slog.Logger) responses.ResponseNewParams {
+// mapping adapts tool names to the wire (see toolname.go); nil keeps every
+// legal name untouched.
+func buildResponsesParams(req ChatRequest, baseURL string, logger *slog.Logger, mapping *toolNameMapping) responses.ResponseNewParams {
 	systemPrompt, filteredMsgs := ExtractSystemPrompt(req.Messages)
 
 	params := responses.ResponseNewParams{
 		Model: req.Model,
 		Input: responses.ResponseNewParamsInputUnion{
-			OfInputItemList: convertToResponsesInput(filteredMsgs, logger),
+			OfInputItemList: convertToResponsesInput(filteredMsgs, logger, mapping),
 		},
 	}
 
@@ -316,7 +325,7 @@ func buildResponsesParams(req ChatRequest, baseURL string, logger *slog.Logger) 
 	}
 
 	if len(req.Tools) > 0 {
-		params.Tools = convertToResponsesTools(req.Tools)
+		params.Tools = convertToResponsesTools(req.Tools, mapping)
 	}
 
 	return params
@@ -348,7 +357,12 @@ func loggerOrDefault(l *slog.Logger) *slog.Logger {
 // convertToResponsesInput converts internal messages to Responses API input items.
 // logger is used for debug-level diagnostics when unknown block types are
 // encountered (nil = slog.Default()).
-func convertToResponsesInput(messages []Message, logger *slog.Logger) responses.ResponseInputParam {
+// mapping re-spells assistant-history function_call names with the same wire
+// mapping the tool definitions use; nil sanitizes directly (see
+// toolname.go — every history name stays endpoint-legal, so stale or
+// hallucinated history entries cannot poison the request with an
+// HTTP-400-rejected pattern).
+func convertToResponsesInput(messages []Message, logger *slog.Logger, mapping *toolNameMapping) responses.ResponseInputParam {
 	logger = loggerOrDefault(logger)
 	items := make(responses.ResponseInputParam, 0, len(messages))
 	for _, msg := range messages {
@@ -444,7 +458,7 @@ func convertToResponsesInput(messages []Message, logger *slog.Logger) responses.
 				items = append(items, responses.ResponseInputItemUnionParam{
 					OfFunctionCall: &responses.ResponseFunctionToolCallParam{
 						CallID:    tc.ID,
-						Name:      sanitizeResponsesFunctionName(tc.Name),
+						Name:      mapping.wireFor(tc.Name),
 						Arguments: string(tc.Input),
 					},
 				})
@@ -466,40 +480,12 @@ func convertToResponsesInput(messages []Message, logger *slog.Logger) responses.
 	return items
 }
 
-// sanitizeResponsesFunctionName rewrites a tool-call name so it always
-// satisfies the Responses API input pattern ^[a-zA-Z0-9_-]+$ and the 64-char
-// cap shared with tool definitions. Model-hallucinated names (observed in
-// production: "functions.get_me", "functions.list_projects") round-trip fine
-// as model output but are rejected with a retryable=false HTTP 400
-// "Invalid 'input[N].name': string does not match pattern" when the history
-// is re-sent as input — poisoning every subsequent request of the
-// conversation. Mapping offending runes to '_' keeps the wire valid; the
-// call_id ↔ function_call_output pairing, the only correlation the backend
-// and the host need, is untouched, and a sanitized name can never
-// accidentally match a registered tool (a registered tool's name already
-// satisfies the pattern, so sanitization is the identity for real calls).
-func sanitizeResponsesFunctionName(name string) string {
-	if len(name) > 64 {
-		name = name[:64]
-	}
-	var b strings.Builder
-	b.Grow(len(name))
-	for _, r := range name {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
-			b.WriteRune(r)
-		default:
-			b.WriteByte('_')
-		}
-	}
-	if b.Len() == 0 {
-		return "unknown"
-	}
-	return b.String()
-}
-
 // convertToResponsesTools converts internal tool definitions to Responses API tools.
-func convertToResponsesTools(tools []ToolDefinition) []responses.ToolUnionParam {
+//
+// mapping adapts each tool name to the endpoint-legal wire spelling (see
+// toolname.go): the Responses API enforces ^[a-zA-Z0-9_-]{1,64}$ on
+// tools[].name, and an MCP-provided dotted name would fail the whole request.
+func convertToResponsesTools(tools []ToolDefinition, mapping *toolNameMapping) []responses.ToolUnionParam {
 	result := make([]responses.ToolUnionParam, 0, len(tools))
 	for _, tool := range tools {
 		// Start from the default object schema (mirroring the Chat path's
@@ -518,7 +504,7 @@ func convertToResponsesTools(tools []ToolDefinition) []responses.ToolUnionParam 
 			}
 		}
 		result = append(result, responses.ToolParamOfFunction(
-			tool.Name,
+			mapping.wireFor(tool.Name),
 			params,
 			true,
 		))
@@ -557,7 +543,11 @@ func mapResponsesStopReason(resp *responses.Response) string {
 }
 
 // convertResponsesResponse converts a Responses API response to our ChatResponse.
-func convertResponsesResponse(resp *responses.Response) (*ChatResponse, error) {
+//
+// mapping reverses the wire function_call names back to the registered names
+// the executor dispatches by (see toolname.go); names outside the request's
+// catalog pass through unchanged.
+func convertResponsesResponse(resp *responses.Response, mapping *toolNameMapping) (*ChatResponse, error) {
 	if resp == nil {
 		return nil, errors.New("responses API: nil response")
 	}
@@ -593,7 +583,7 @@ func convertResponsesResponse(resp *responses.Response) (*ChatResponse, error) {
 		case "function_call":
 			message.ToolCalls = append(message.ToolCalls, ToolCall{
 				ID:    item.CallID,
-				Name:  item.Name,
+				Name:  mapping.realFor(item.Name),
 				Input: json.RawMessage(item.Arguments),
 			})
 		case "message":
@@ -662,7 +652,10 @@ func responsesReasoningSummary(item responses.ResponseOutputItemUnion) string {
 // emits both shapes does not double them. refusal carries the accumulated
 // response.refusal.delta payload: a refusal-only stream has no output_text
 // deltas, so without it the refusal would still assemble an empty Message.
-func applyStreamedOutputFallback(converted *ChatResponse, text, refusal, reasoning string, doneItems []responses.ResponseOutputItemUnion) {
+//
+// mapping reverses the wire names of merged function_call items back to the
+// registered names (see convertResponsesResponse / toolname.go).
+func applyStreamedOutputFallback(converted *ChatResponse, text, refusal, reasoning string, doneItems []responses.ResponseOutputItemUnion, mapping *toolNameMapping) {
 	if converted == nil {
 		return
 	}
@@ -752,7 +745,7 @@ func applyStreamedOutputFallback(converted *ChatResponse, text, refusal, reasoni
 			knownCalls[item.CallID] = true
 			converted.Message.ToolCalls = append(converted.Message.ToolCalls, ToolCall{
 				ID:    item.CallID,
-				Name:  item.Name,
+				Name:  mapping.realFor(item.Name),
 				Input: json.RawMessage(item.Arguments),
 			})
 		}

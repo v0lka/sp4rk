@@ -323,7 +323,15 @@ func (p *OpenAIProvider) ChatCompletion(ctx context.Context, req ChatRequest) (*
 		// Handled by the shared Chat Completions path below.
 	}
 
-	params := p.buildChatParams(req)
+	// Tool names are mapped per request (see toolname.go): MCP tools may
+	// carry names the Chat Completions wire rejects (a dotted "ps.list"
+	// fails the whole request with HTTP 400 on strict endpoints like
+	// api.deepseek.com). The mapping adapts the wire spelling of tool
+	// definitions and history tool calls, and reverses the model's tool
+	// calls back to the real names, so the executor dispatches by the
+	// registered names unchanged.
+	mapping := newToolNameMapping(req.Tools, defaultToolNamePolicy, p.logger)
+	params := p.buildChatParams(req, mapping)
 
 	// Opt-in streaming: a non-nil DeltaSink asks the provider to stream text /
 	// reasoning deltas as they arrive, then return the same assembled response.
@@ -337,12 +345,12 @@ func (p *OpenAIProvider) ChatCompletion(ctx context.Context, req ChatRequest) (*
 		// cannot duplicate deltas: a 400 is returned before the first chunk,
 		// so no delta reached the sink.
 		params.StreamOptions = oai.ChatCompletionStreamOptionsParam{IncludeUsage: param.NewOpt(true)}
-		resp, err := p.chatCompletionStream(ctx, req, params)
+		resp, err := p.chatCompletionStream(ctx, req, params, mapping)
 		if err != nil && isStreamOptionsUnsupported(err) {
 			p.log().Debug("openai: endpoint rejected stream_options; retrying stream without usage accounting",
 				"provider", p.name, "model", req.Model)
 			params.StreamOptions = oai.ChatCompletionStreamOptionsParam{}
-			return p.chatCompletionStream(ctx, req, params)
+			return p.chatCompletionStream(ctx, req, params, mapping)
 		}
 		return resp, err
 	}
@@ -369,7 +377,7 @@ func (p *OpenAIProvider) ChatCompletion(ctx context.Context, req ChatRequest) (*
 	}
 
 	choice := resp.Choices[0]
-	message := p.convertChatResponseMessage(choice.Message)
+	message := p.convertChatResponseMessage(choice.Message, mapping)
 	stopReason := MapStopReason(choice.FinishReason, openAIStopReasonMap)
 
 	return &ChatResponse{
@@ -390,9 +398,12 @@ func (p *OpenAIProvider) ChatCompletion(ctx context.Context, req ChatRequest) (*
 // params.StreamOptions has been configured by the caller (usage chunk on,
 // unless the endpoint rejected it).
 //
+// mapping reverses the wire tool-call names the stream reassembles back to
+// the registered names (see convertChatResponseMessage / toolname.go).
+//
 // A delta sink error aborts the stream immediately (host-side cancellation):
 // the stream is closed and the error is returned to the caller.
-func (p *OpenAIProvider) chatCompletionStream(ctx context.Context, req ChatRequest, params oai.ChatCompletionNewParams) (*ChatResponse, error) {
+func (p *OpenAIProvider) chatCompletionStream(ctx context.Context, req ChatRequest, params oai.ChatCompletionNewParams, mapping *toolNameMapping) (*ChatResponse, error) {
 	stream := p.client.Chat.Completions.NewStreaming(ctx, params)
 	defer func() { _ = stream.Close() }()
 
@@ -500,7 +511,7 @@ func (p *OpenAIProvider) chatCompletionStream(ctx context.Context, req ChatReque
 		acc := toolAcc[idx]
 		toolCalls = append(toolCalls, ToolCall{
 			ID:    acc.id,
-			Name:  acc.name,
+			Name:  mapping.realFor(acc.name),
 			Input: json.RawMessage(acc.args.String()),
 		})
 	}
@@ -536,7 +547,13 @@ type streamToolCall struct {
 }
 
 // buildChatParams converts our ChatRequest to OpenAI ChatCompletionNewParams.
-func (p *OpenAIProvider) buildChatParams(req ChatRequest) oai.ChatCompletionNewParams {
+//
+// mapping adapts tool names to the wire: tool definitions carry the mapped
+// spelling (wireFor) and assistant-history tool calls are re-spelled the
+// same way, so every name in the payload is endpoint-legal and consistent
+// with the catalog. A nil mapping (no tools in the request) keeps every
+// legal name untouched. See toolname.go.
+func (p *OpenAIProvider) buildChatParams(req ChatRequest, mapping *toolNameMapping) oai.ChatCompletionNewParams {
 	// Normalize system messages to a single leading system message.
 	//
 	// sp4rk's prompt assembly can emit system messages after a user/assistant/
@@ -555,7 +572,7 @@ func (p *OpenAIProvider) buildChatParams(req ChatRequest) oai.ChatCompletionNewP
 		messages = append(messages, oai.SystemMessage(systemPrompt))
 	}
 	for _, msg := range filtered {
-		messages = append(messages, p.convertRequestMessage(msg))
+		messages = append(messages, p.convertRequestMessage(msg, mapping))
 	}
 
 	params := oai.ChatCompletionNewParams{
@@ -625,7 +642,7 @@ func (p *OpenAIProvider) buildChatParams(req ChatRequest) oai.ChatCompletionNewP
 		for i, tool := range req.Tools {
 			tools[i] = oai.ChatCompletionToolParam{
 				Function: oai.FunctionDefinitionParam{
-					Name:        tool.Name,
+					Name:        mapping.wireFor(tool.Name),
 					Description: oai.String(tool.Description),
 					Parameters:  p.convertSchemaToMap(SanitizeSchemaForOpenAINonStrict(tool.InputSchema)),
 				},
@@ -957,7 +974,12 @@ func (p *OpenAIProvider) convertSchemaToMap(schema []byte) map[string]any {
 }
 
 // convertRequestMessage converts our Message to OpenAI's message format.
-func (p *OpenAIProvider) convertRequestMessage(msg Message) oai.ChatCompletionMessageParamUnion {
+//
+// mapping re-spells assistant-history tool-call names with the same wire
+// mapping the tool definitions use (see buildChatParams): a name the catalog
+// mapped is sent under its wire spelling, and any other name is sanitized
+// in place so stale history can never carry an endpoint-illegal name.
+func (p *OpenAIProvider) convertRequestMessage(msg Message, mapping *toolNameMapping) oai.ChatCompletionMessageParamUnion {
 	// Safety net: OpenAI API requires non-empty content for tool-role messages.
 	// The context layer should already guarantee this, but we keep this as a defensive measure.
 	content := msg.Content
@@ -1017,7 +1039,7 @@ func (p *OpenAIProvider) convertRequestMessage(msg Message) oai.ChatCompletionMe
 					ID:   tc.ID,
 					Type: "function",
 					Function: oai.ChatCompletionMessageToolCallFunctionParam{
-						Name:      tc.Name,
+						Name:      mapping.wireFor(tc.Name),
 						Arguments: string(tc.Input),
 					},
 				}
@@ -1047,7 +1069,11 @@ func (p *OpenAIProvider) convertRequestMessage(msg Message) oai.ChatCompletionMe
 }
 
 // convertChatResponseMessage converts OpenAI's message to our Message format.
-func (p *OpenAIProvider) convertChatResponseMessage(msg oai.ChatCompletionMessage) Message {
+//
+// mapping reverses the wire tool-call names back to the registered names the
+// executor dispatches by (see toolname.go); names outside the request's
+// catalog pass through unchanged.
+func (p *OpenAIProvider) convertChatResponseMessage(msg oai.ChatCompletionMessage, mapping *toolNameMapping) Message {
 	result := Message{
 		Role:    string(msg.Role),
 		Content: msg.Content,
@@ -1071,7 +1097,7 @@ func (p *OpenAIProvider) convertChatResponseMessage(msg oai.ChatCompletionMessag
 		for i, tc := range msg.ToolCalls {
 			result.ToolCalls[i] = ToolCall{
 				ID:    tc.ID,
-				Name:  tc.Function.Name,
+				Name:  mapping.realFor(tc.Function.Name),
 				Input: json.RawMessage(tc.Function.Arguments),
 			}
 		}

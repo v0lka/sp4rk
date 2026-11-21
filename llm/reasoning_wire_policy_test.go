@@ -30,7 +30,7 @@ func TestGLMAlwaysThinkingWire(t *testing.T) {
 			for _, effort := range efforts {
 				t.Run(effort.input, func(t *testing.T) {
 					req := ChatRequest{Model: model, ReasoningEffort: effort.input}
-					body := jsonMap(t, p.buildChatParams(req))
+					body := jsonMap(t, p.buildChatParams(req, nil))
 					thinking, ok := body["thinking"].(map[string]any)
 					if !ok || thinking["type"] != "enabled" {
 						t.Errorf("buildChatParams(%q, %q).thinking = %v, want type enabled", model, effort.input, body["thinking"])

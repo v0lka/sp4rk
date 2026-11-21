@@ -247,7 +247,7 @@ func TestAnthropicProvider_BuildRequest_ImageOnlyNotSkipped(t *testing.T) {
 			}},
 		},
 	}
-	anthropicReq, err := p.buildRequest(req)
+	anthropicReq, err := p.buildRequest(req, nil)
 	if err != nil {
 		t.Fatalf("buildRequest unexpected error: %v", err)
 	}
@@ -318,7 +318,7 @@ func TestUnknownBlockType_DebugLog(t *testing.T) {
 	t.Run("anthropic convertMessage", func(t *testing.T) {
 		buf.Reset()
 		p, _ := NewAnthropicProvider(AnthropicProviderConfig{APIKey: "k"})
-		if _, err := p.convertMessage(unknownMsg); err != nil {
+		if _, err := p.convertMessage(unknownMsg, nil); err != nil {
 			t.Fatalf("convertMessage unexpected error: %v", err)
 		}
 		if !strings.Contains(buf.String(), "skipping unknown content block type") {
@@ -332,7 +332,7 @@ func TestUnknownBlockType_DebugLog(t *testing.T) {
 	t.Run("openai convertRequestMessage", func(t *testing.T) {
 		buf.Reset()
 		p, _ := NewOpenAIProvider(OpenAIProviderConfig{Name: "openai", APIKey: "k"})
-		_ = p.convertRequestMessage(unknownMsg)
+		_ = p.convertRequestMessage(unknownMsg, nil)
 		if !strings.Contains(buf.String(), "skipping unknown content block type") {
 			t.Errorf("expected debug log for unknown block type, got: %s", buf.String())
 		}
@@ -340,7 +340,7 @@ func TestUnknownBlockType_DebugLog(t *testing.T) {
 
 	t.Run("openai responses convertToResponsesInput", func(t *testing.T) {
 		buf.Reset()
-		_ = convertToResponsesInput([]Message{unknownMsg}, nil)
+		_ = convertToResponsesInput([]Message{unknownMsg}, nil, nil)
 		if !strings.Contains(buf.String(), "skipping unknown content block type") {
 			t.Errorf("expected debug log for unknown block type, got: %s", buf.String())
 		}

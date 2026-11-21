@@ -287,7 +287,11 @@ func (p *AnthropicProvider) Name() string {
 
 // ChatCompletion sends a request and returns the full response.
 func (p *AnthropicProvider) ChatCompletion(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
-	anthropicReq, err := p.buildRequest(req)
+	// Tool names are mapped per request (see toolname.go): the Messages API
+	// documents ^[a-zA-Z0-9_-]{1,64}$ for tool names, and an MCP-provided
+	// dotted name would fail the whole request with HTTP 400.
+	mapping := newToolNameMapping(req.Tools, defaultToolNamePolicy, p.logger)
+	anthropicReq, err := p.buildRequest(req, mapping)
 	if err != nil {
 		return nil, fmt.Errorf("anthropic: failed to build request: %w", err)
 	}
@@ -303,7 +307,7 @@ func (p *AnthropicProvider) ChatCompletion(ctx context.Context, req ChatRequest)
 	// Opt-in streaming: a non-nil DeltaSink asks the provider to stream text /
 	// reasoning deltas as they arrive, then return the same assembled response.
 	if req.DeltaSink != nil {
-		return p.chatCompletionStream(ctx, req, anthropicReq, capture)
+		return p.chatCompletionStream(ctx, req, anthropicReq, capture, mapping)
 	}
 
 	resp, err := p.client.CreateMessages(ctx, *anthropicReq)
@@ -311,7 +315,7 @@ func (p *AnthropicProvider) ChatCompletion(ctx context.Context, req ChatRequest)
 		return nil, p.wrapError(fmt.Errorf("anthropic: API error: %w", err))
 	}
 
-	return p.parseResponse(resp, capture.bytes())
+	return p.parseResponse(resp, capture.bytes(), mapping)
 }
 
 // chatCompletionStream performs a streaming Messages call. The go-anthropic SDK
@@ -327,7 +331,7 @@ func (p *AnthropicProvider) ChatCompletion(ctx context.Context, req ChatRequest)
 // resulting transport error) is surfaced to the caller, matching the OpenAI
 // streaming path's observable contract: returning an error from DeltaSink
 // aborts the stream and the caller sees that error.
-func (p *AnthropicProvider) chatCompletionStream(ctx context.Context, req ChatRequest, base *anthropic.MessagesRequest, capture *capturedBody) (*ChatResponse, error) {
+func (p *AnthropicProvider) chatCompletionStream(ctx context.Context, req ChatRequest, base *anthropic.MessagesRequest, capture *capturedBody, mapping *toolNameMapping) (*ChatResponse, error) {
 	// Derive a per-call cancellation so a sink error stops the HTTP stream
 	// mid-flight (see above) instead of reading the endpoint's output to EOF.
 	ctx, cancel := context.WithCancel(ctx)
@@ -382,11 +386,15 @@ func (p *AnthropicProvider) chatCompletionStream(ctx context.Context, req ChatRe
 	if !messageStop {
 		return nil, p.wrapError(fmt.Errorf("anthropic: API error: %w", io.ErrUnexpectedEOF))
 	}
-	return p.parseResponse(resp, capture.bytes())
+	return p.parseResponse(resp, capture.bytes(), mapping)
 }
 
 // buildRequest converts ChatRequest to anthropic.MessagesRequest.
-func (p *AnthropicProvider) buildRequest(req ChatRequest) (*anthropic.MessagesRequest, error) {
+//
+// mapping adapts tool names to the endpoint-legal wire spelling: tool
+// definitions carry the mapped name and assistant-history tool_use blocks are
+// re-spelled the same way (see toolname.go).
+func (p *AnthropicProvider) buildRequest(req ChatRequest, mapping *toolNameMapping) (*anthropic.MessagesRequest, error) {
 	// Validate image blocks up front so a missing MediaType/ImageB64 yields a
 	// clear local error instead of an opaque API 400.
 	for _, msg := range req.Messages {
@@ -411,7 +419,7 @@ func (p *AnthropicProvider) buildRequest(req ChatRequest) (*anthropic.MessagesRe
 		if msg.Content == "" && len(msg.ContentBlocks) == 0 && len(msg.ToolCalls) == 0 && msg.ToolCallID == "" {
 			continue
 		}
-		anthropicMsg, err := p.convertMessage(msg)
+		anthropicMsg, err := p.convertMessage(msg, mapping)
 		if err != nil {
 			return nil, err
 		}
@@ -523,7 +531,7 @@ func (p *AnthropicProvider) buildRequest(req ChatRequest) (*anthropic.MessagesRe
 				inputSchema = defaultObjectSchema()
 			}
 			tools[i] = anthropic.ToolDefinition{
-				Name:        tool.Name,
+				Name:        mapping.wireFor(tool.Name),
 				Description: tool.Description,
 				InputSchema: inputSchema,
 			}
@@ -548,7 +556,11 @@ func historyHasAssistantToolUse(msgs []Message) bool {
 }
 
 // convertMessage converts a Message to anthropic.Message.
-func (p *AnthropicProvider) convertMessage(msg Message) (anthropic.Message, error) {
+//
+// mapping re-spells assistant-history tool_use names with the same wire
+// mapping the tool definitions use; the call IDs are already sanitized
+// independently (sanitizeAnthropicToolID).
+func (p *AnthropicProvider) convertMessage(msg Message, mapping *toolNameMapping) (anthropic.Message, error) {
 	switch msg.Role {
 	case "user":
 		// When ContentBlocks are present, render them as structured content
@@ -599,7 +611,7 @@ func (p *AnthropicProvider) convertMessage(msg Message) (anthropic.Message, erro
 
 		// Add tool use blocks for tool calls
 		for _, tc := range msg.ToolCalls {
-			content = append(content, anthropic.NewToolUseMessageContent(sanitizeAnthropicToolID(tc.ID), tc.Name, tc.Input))
+			content = append(content, anthropic.NewToolUseMessageContent(sanitizeAnthropicToolID(tc.ID), mapping.wireFor(tc.Name), tc.Input))
 		}
 
 		return anthropic.Message{
@@ -622,12 +634,16 @@ func (p *AnthropicProvider) convertMessage(msg Message) (anthropic.Message, erro
 
 // parseResponse converts anthropic.MessagesResponse to ChatResponse.
 //
+// mapping reverses the wire tool_use names back to the registered names the
+// executor dispatches by (see toolname.go); names outside the request's
+// catalog pass through unchanged.
+//
 // rawBody is the raw HTTP response body captured by the transport. It is used
 // only to enrich diagnostics when the endpoint returns a non-standard response
 // (e.g. an Anthropic-compatible endpoint that answers a 200 with an error
 // object or an empty body); a nil/empty value is fine for callers that capture
 // the response directly (tests).
-func (p *AnthropicProvider) parseResponse(resp anthropic.MessagesResponse, rawBody []byte) (*ChatResponse, error) {
+func (p *AnthropicProvider) parseResponse(resp anthropic.MessagesResponse, rawBody []byte, mapping *toolNameMapping) (*ChatResponse, error) {
 	// The go-anthropic SDK only treats non-2xx HTTP statuses as errors. Some
 	// Anthropic-compatible endpoints return an explicit {"type":"error",...}
 	// object WITH HTTP 200, which the SDK happily decodes into a zero-value
@@ -671,7 +687,7 @@ func (p *AnthropicProvider) parseResponse(resp anthropic.MessagesResponse, rawBo
 			if block.MessageContentToolUse != nil {
 				message.ToolCalls = append(message.ToolCalls, ToolCall{
 					ID:    block.ID,
-					Name:  block.Name,
+					Name:  mapping.realFor(block.Name),
 					Input: block.Input,
 				})
 			}

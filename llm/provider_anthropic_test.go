@@ -143,7 +143,7 @@ func TestAnthropicProvider_BuildRequest(t *testing.T) {
 		},
 	}
 
-	anthropicReq, err := p.buildRequest(req)
+	anthropicReq, err := p.buildRequest(req, nil)
 	if err != nil {
 		t.Fatalf("buildRequest failed: %v", err)
 	}
@@ -177,7 +177,7 @@ func TestAnthropicProvider_BuildRequest_NoSystemNoToolsNoTemp(t *testing.T) {
 		},
 	}
 
-	anthropicReq, err := p.buildRequest(req)
+	anthropicReq, err := p.buildRequest(req, nil)
 	if err != nil {
 		t.Fatalf("buildRequest failed: %v", err)
 	}
@@ -210,7 +210,7 @@ func TestAnthropicProvider_BuildRequest_DefaultMaxTokens(t *testing.T) {
 			},
 		}
 
-		anthropicReq, err := p.buildRequest(req)
+		anthropicReq, err := p.buildRequest(req, nil)
 		if err != nil {
 			t.Fatalf("buildRequest failed: %v", err)
 		}
@@ -229,7 +229,7 @@ func TestAnthropicProvider_BuildRequest_DefaultMaxTokens(t *testing.T) {
 			},
 		}
 
-		anthropicReq, err := p.buildRequest(req)
+		anthropicReq, err := p.buildRequest(req, nil)
 		if err != nil {
 			t.Fatalf("buildRequest failed: %v", err)
 		}
@@ -248,7 +248,7 @@ func TestAnthropicProvider_BuildRequest_DefaultMaxTokens(t *testing.T) {
 			},
 		}
 
-		anthropicReq, err := p.buildRequest(req)
+		anthropicReq, err := p.buildRequest(req, nil)
 		if err != nil {
 			t.Fatalf("buildRequest failed: %v", err)
 		}
@@ -292,7 +292,7 @@ func TestAnthropicProvider_ConvertMessage(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := p.convertMessage(tt.msg)
+			result, err := p.convertMessage(tt.msg, nil)
 			if tt.wantErr {
 				if err == nil {
 					t.Error("expected error")
@@ -320,7 +320,7 @@ func TestAnthropicProvider_ConvertMessage_AssistantWithToolCalls(t *testing.T) {
 		},
 	}
 
-	result, err := p.convertMessage(msg)
+	result, err := p.convertMessage(msg, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -341,7 +341,7 @@ func TestAnthropicProvider_ConvertMessage_AssistantEmptyContent(t *testing.T) {
 		},
 	}
 
-	result, err := p.convertMessage(msg)
+	result, err := p.convertMessage(msg, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -366,7 +366,7 @@ func TestAnthropicProvider_ParseResponse(t *testing.T) {
 			},
 		}
 
-		result, err := p.parseResponse(resp, nil)
+		result, err := p.parseResponse(resp, nil, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -399,7 +399,7 @@ func TestAnthropicProvider_ParseResponse(t *testing.T) {
 			StopReason: "tool_use",
 		}
 
-		result, err := p.parseResponse(resp, nil)
+		result, err := p.parseResponse(resp, nil, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -424,7 +424,7 @@ func TestAnthropicProvider_ParseResponse(t *testing.T) {
 			StopReason: "end_turn",
 		}
 
-		result, err := p.parseResponse(resp, nil)
+		result, err := p.parseResponse(resp, nil, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -448,7 +448,7 @@ func TestAnthropicProvider_ParseResponse(t *testing.T) {
 			StopReason: "end_turn",
 		}
 
-		result, err := p.parseResponse(resp, nil)
+		result, err := p.parseResponse(resp, nil, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -512,7 +512,7 @@ func TestAnthropicProvider_ParseResponse_Degenerate(t *testing.T) {
 			Content:    nil,
 		}
 		raw := []byte(`{"type":"message","content":[]}`)
-		_, err := p.parseResponse(resp, raw)
+		_, err := p.parseResponse(resp, raw, nil)
 		if err == nil {
 			t.Fatal("expected error for degenerate (empty content) response, got nil")
 		}
@@ -529,7 +529,7 @@ func TestAnthropicProvider_ParseResponse_Degenerate(t *testing.T) {
 			Type: anthropic.MessagesResponseTypeError,
 		}
 		raw := []byte(`{"type":"error","error":{"type":"invalid_request_error","message":"bad model"}}`)
-		_, err := p.parseResponse(resp, raw)
+		_, err := p.parseResponse(resp, raw, nil)
 		if err == nil {
 			t.Fatal("expected error for type=error response, got nil")
 		}
@@ -579,7 +579,7 @@ func TestAnthropicProvider_BuildRequest_MultiSystem(t *testing.T) {
 			},
 		}
 
-		anthropicReq, err := p.buildRequest(req)
+		anthropicReq, err := p.buildRequest(req, nil)
 		if err != nil {
 			t.Fatalf("buildRequest failed: %v", err)
 		}
@@ -603,7 +603,7 @@ func TestAnthropicProvider_BuildRequest_MultiSystem(t *testing.T) {
 			},
 		}
 
-		anthropicReq, err := p.buildRequest(req)
+		anthropicReq, err := p.buildRequest(req, nil)
 		if err != nil {
 			t.Fatalf("buildRequest failed: %v", err)
 		}
@@ -646,7 +646,7 @@ func TestAnthropicProvider_BuildRequest_MultiSystem(t *testing.T) {
 			},
 		}
 
-		anthropicReq, err := p.buildRequest(req)
+		anthropicReq, err := p.buildRequest(req, nil)
 		if err != nil {
 			t.Fatalf("buildRequest failed: %v", err)
 		}
@@ -676,7 +676,7 @@ func TestAnthropicProvider_BuildRequest_MultiSystem(t *testing.T) {
 			},
 		}
 
-		anthropicReq, err := p.buildRequest(req)
+		anthropicReq, err := p.buildRequest(req, nil)
 		if err != nil {
 			t.Fatalf("buildRequest failed: %v", err)
 		}

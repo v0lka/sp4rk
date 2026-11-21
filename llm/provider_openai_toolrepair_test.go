@@ -60,7 +60,7 @@ func TestOpenAIProvider_RepairedToolCallArgsFlowToDispatch(t *testing.T) {
 	p := newToolRepairTestProvider(&buf)
 
 	completion := chatCompletionWithToolArgs(t, `{"timeout": 120s}`)
-	result := p.convertChatResponseMessage(completion.Choices[0].Message)
+	result := p.convertChatResponseMessage(completion.Choices[0].Message, nil)
 
 	if len(result.ToolCalls) != 1 {
 		t.Fatalf("got %d tool calls, want 1", len(result.ToolCalls))
@@ -89,7 +89,7 @@ func TestOpenAIProvider_UnrepairableToolCallArgsFlowUnchanged(t *testing.T) {
 	p := newToolRepairTestProvider(&buf)
 
 	completion := chatCompletionWithToolArgs(t, `total garbage`)
-	result := p.convertChatResponseMessage(completion.Choices[0].Message)
+	result := p.convertChatResponseMessage(completion.Choices[0].Message, nil)
 
 	if len(result.ToolCalls) != 1 {
 		t.Fatalf("got %d tool calls, want 1", len(result.ToolCalls))
@@ -118,7 +118,7 @@ func TestOpenAIProvider_ValidToolCallArgsUntouched(t *testing.T) {
 	p := newToolRepairTestProvider(&buf)
 
 	completion := chatCompletionWithToolArgs(t, `{"timeout":"120s","cmd":"ls"}`)
-	result := p.convertChatResponseMessage(completion.Choices[0].Message)
+	result := p.convertChatResponseMessage(completion.Choices[0].Message, nil)
 
 	if len(result.ToolCalls) != 1 {
 		t.Fatalf("got %d tool calls, want 1", len(result.ToolCalls))

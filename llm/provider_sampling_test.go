@@ -129,7 +129,7 @@ func TestOpenAIChatSampling_StrictOfficialEndpointDropsNonSchemaParams(t *testin
 		t.Fatalf("expected empty baseURL for strict endpoint, got %q", p.baseURL)
 	}
 
-	params := p.buildChatParams(fullSamplingRequest())
+	params := p.buildChatParams(fullSamplingRequest(), nil)
 	payload := jsonMap(t, params)
 
 	wantNum(t, payload, "temperature", 0.6)
@@ -214,7 +214,7 @@ func TestOpenAIChatSampling_MergesWithReasoningEffortExtras(t *testing.T) {
 // The Responses API supports temperature and top_p only; penalties and top_k
 // are not part of its schema and must never be serialized.
 func TestResponsesSamplingParams_SerializedAndUnsupportedOmitted(t *testing.T) {
-	params := buildResponsesParams(fullSamplingRequest(), "https://api.openai.com/v1", nil)
+	params := buildResponsesParams(fullSamplingRequest(), "https://api.openai.com/v1", nil, nil)
 	payload := jsonMap(t, params)
 
 	wantNum(t, payload, "temperature", 0.6)
@@ -226,7 +226,7 @@ func TestResponsesSamplingParams_NilFieldsOmitted(t *testing.T) {
 	params := buildResponsesParams(ChatRequest{
 		Model:    "gpt-5.1",
 		Messages: []Message{{Role: "user", Content: "hi"}},
-	}, "https://api.openai.com/v1", nil)
+	}, "https://api.openai.com/v1", nil, nil)
 	payload := jsonMap(t, params)
 
 	wantAbsent(t, payload, "temperature", "top_p", "top_k", "repetition_penalty", "presence_penalty")
@@ -248,7 +248,7 @@ func anthropicProvider(t *testing.T) *AnthropicProvider {
 func TestAnthropicSamplingParams_SerializedAndUnsupportedOmitted(t *testing.T) {
 	req := fullSamplingRequest()
 	req.Model = "claude-sonnet-4-5"
-	anthropicReq, err := anthropicProvider(t).buildRequest(req)
+	anthropicReq, err := anthropicProvider(t).buildRequest(req, nil)
 	if err != nil {
 		t.Fatalf("buildRequest: %v", err)
 	}
@@ -267,7 +267,7 @@ func TestAnthropicSamplingParams_ThinkingDropsSampling(t *testing.T) {
 	req.Model = "claude-sonnet-4-5"
 	req.ReasoningEffort = "On"
 	req.MaxTokens = 8192 // thinking budget must fit (half of max tokens ≥ 1024)
-	anthropicReq, err := anthropicProvider(t).buildRequest(req)
+	anthropicReq, err := anthropicProvider(t).buildRequest(req, nil)
 	if err != nil {
 		t.Fatalf("buildRequest: %v", err)
 	}
@@ -280,7 +280,7 @@ func TestAnthropicSamplingParams_NilFieldsOmitted(t *testing.T) {
 	anthropicReq, err := anthropicProvider(t).buildRequest(ChatRequest{
 		Model:    "claude-sonnet-4-5",
 		Messages: []Message{{Role: "user", Content: "hi"}},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("buildRequest: %v", err)
 	}
@@ -296,7 +296,7 @@ func TestAnthropicSamplingParams_NilFieldsOmitted(t *testing.T) {
 func TestGoogleSamplingParams_SerializedAndUnsupportedOmitted(t *testing.T) {
 	req := fullSamplingRequest()
 	req.Model = "gemini-2.5-pro"
-	out := buildGoogleRequest(req)
+	out := buildGoogleRequest(req, nil)
 	if out.GenerationConfig == nil {
 		t.Fatal("expected generationConfig to be set")
 	}
@@ -312,7 +312,7 @@ func TestGoogleSamplingParams_NilFieldsOmitted(t *testing.T) {
 	out := buildGoogleRequest(ChatRequest{
 		Model:    "gemini-2.5-pro",
 		Messages: []Message{{Role: "user", Content: "hi"}},
-	})
+	}, nil)
 	if out.GenerationConfig != nil {
 		t.Fatalf("expected no generationConfig without sampling params/max tokens, got %v", out.GenerationConfig)
 	}

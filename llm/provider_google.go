@@ -192,7 +192,7 @@ func googleCompletion(ctx context.Context, cfg googleCompletionConfig, req ChatR
 		}
 	}
 
-	gReq := buildGoogleRequest(req)
+	gReq := buildGoogleRequest(req, newToolNameMapping(req.Tools, defaultToolNamePolicy, cfg.Logger))
 
 	body, err := json.Marshal(gReq)
 	if err != nil {
@@ -274,7 +274,7 @@ func googleCompletion(ctx context.Context, cfg googleCompletionConfig, req ChatR
 			providerName, err, truncateForError(respBody))
 	}
 
-	converted, err := parseGoogleResponse(req.Model, &genResp, respBody, providerName)
+	converted, err := parseGoogleResponse(req.Model, &genResp, respBody, providerName, newToolNameMapping(req.Tools, defaultToolNamePolicy, cfg.Logger))
 	if err != nil {
 		return nil, err
 	}
@@ -283,7 +283,13 @@ func googleCompletion(ctx context.Context, cfg googleCompletionConfig, req ChatR
 }
 
 // buildGoogleRequest converts a ChatRequest to the Google generateContent body.
-func buildGoogleRequest(req ChatRequest) *googleGenerateRequest {
+//
+// mapping adapts tool names to the endpoint-legal wire spelling (see
+// toolname.go). Every name Google correlates — the functionDeclaration, the
+// history functionCall parts AND the functionResponse parts — must carry the
+// SAME mapped spelling, because Google pairs a response with its call by
+// NAME, not by call ID.
+func buildGoogleRequest(req ChatRequest, mapping *toolNameMapping) *googleGenerateRequest {
 	// Extract the system prompt into systemInstruction.parts (Google has no
 	// system role in contents; system text lives under systemInstruction).
 	systemPrompt, filtered := ExtractSystemPrompt(req.Messages)
@@ -325,7 +331,7 @@ func buildGoogleRequest(req ChatRequest) *googleGenerateRequest {
 				if toolMsg.Content == "" && len(toolMsg.ContentBlocks) == 0 && toolMsg.ToolCallID == "" {
 					continue
 				}
-				parts = append(parts, googleFunctionResponsePart(toolMsg, callIDToName))
+				parts = append(parts, googleFunctionResponsePart(toolMsg, callIDToName, mapping))
 			}
 			if len(parts) > 0 {
 				out.Contents = append(out.Contents, googleContent{Role: "user", Parts: parts})
@@ -337,7 +343,7 @@ func buildGoogleRequest(req ChatRequest) *googleGenerateRequest {
 			i++
 			continue
 		}
-		out.Contents = append(out.Contents, convertGoogleMessage(msg, callIDToName))
+		out.Contents = append(out.Contents, convertGoogleMessage(msg, callIDToName, mapping))
 		i++
 	}
 
@@ -351,7 +357,7 @@ func buildGoogleRequest(req ChatRequest) *googleGenerateRequest {
 		decls := make([]googleFunctionDeclaration, len(req.Tools))
 		for i, tool := range req.Tools {
 			decls[i] = googleFunctionDeclaration{
-				Name:        tool.Name,
+				Name:        mapping.wireFor(tool.Name),
 				Description: tool.Description,
 				Parameters:  SanitizeSchemaForGoogle(tool.InputSchema),
 			}
@@ -381,12 +387,17 @@ func buildGoogleRequest(req ChatRequest) *googleGenerateRequest {
 // the name a tool result must report in functionResponse.name, since Google
 // correlates function responses by name rather than by call ID.
 //
+// mapping re-spells the functionCall names to the wire spelling the function
+// declarations carry; the same mapping is applied to the resolved
+// functionResponse names so a response stays paired with its call (see
+// googleFunctionResponsePart / toolname.go).
+//
 // Note on grouping: a multi-tool-call turn's function responses must reach the
 // API bundled in a single "user" Content; buildGoogleRequest merges each run
 // of consecutive tool messages into one turn via googleFunctionResponsePart.
 // This function (one tool message → one turn) remains for single-tool-result
 // calls and direct per-message conversion.
-func convertGoogleMessage(msg Message, callIDToName map[string]string) googleContent {
+func convertGoogleMessage(msg Message, callIDToName map[string]string, mapping *toolNameMapping) googleContent {
 	switch msg.Role {
 	case "user":
 		blocks := NormalizeContentBlocks(msg)
@@ -420,7 +431,7 @@ func convertGoogleMessage(msg Message, callIDToName map[string]string) googleCon
 			// are internal reasoning and Google's SDKs drop them when
 			// replaying history.
 			parts = append(parts, googlePart{
-				FunctionCall:     &googleFunctionCall{Name: tc.Name, Args: tc.Input},
+				FunctionCall:     &googleFunctionCall{Name: mapping.wireFor(tc.Name), Args: tc.Input},
 				ThoughtSignature: googleThoughtSignatureFromID(tc.ID),
 			})
 		}
@@ -431,7 +442,7 @@ func convertGoogleMessage(msg Message, callIDToName map[string]string) googleCon
 		// call ID (resolved in googleFunctionResponsePart).
 		return googleContent{
 			Role:  "user",
-			Parts: []googlePart{googleFunctionResponsePart(msg, callIDToName)},
+			Parts: []googlePart{googleFunctionResponsePart(msg, callIDToName, mapping)},
 		}
 
 	default:
@@ -445,17 +456,20 @@ func convertGoogleMessage(msg Message, callIDToName map[string]string) googleCon
 // not by call ID: the name is resolved from the preceding assistant turn's
 // tool call (indexed in callIDToName), falling back to the ToolCallID itself
 // when no match is found (best-effort for the single-call case, where
-// Google-sourced IDs already equal the function name). The response payload
-// must be a JSON object: the content is used verbatim when it is already a
-// JSON object, otherwise wrapped as {"result": ...}.
-func googleFunctionResponsePart(msg Message, callIDToName map[string]string) googlePart {
+// Google-sourced IDs already equal the function name). The resolved REAL name
+// is then mapped to the same wire spelling the functionCall part and the
+// function declarations carry — the pairing survives the mapping (see
+// toolname.go). The response payload must be a JSON object: the content is
+// used verbatim when it is already a JSON object, otherwise wrapped as
+// {"result": ...}.
+func googleFunctionResponsePart(msg Message, callIDToName map[string]string, mapping *toolNameMapping) googlePart {
 	name := msg.ToolCallID
 	if n, ok := callIDToName[msg.ToolCallID]; ok {
 		name = n
 	}
 	return googlePart{
 		FunctionResp: &googleFunctionResponse{
-			Name:     name,
+			Name:     mapping.wireFor(name),
 			Response: googleFunctionResponsePayload(msg.Content),
 		},
 	}
@@ -521,7 +535,11 @@ func googleFunctionResponsePayload(content string) json.RawMessage {
 // rawBody is the raw HTTP body, used only to enrich diagnostics when the response
 // is empty or malformed (e.g. a non-compliant gateway returning a 200 with no
 // candidates).
-func parseGoogleResponse(model string, resp *googleGenerateResponse, rawBody []byte, providerName string) (*ChatResponse, error) {
+//
+// mapping reverses the wire functionCall names back to the registered names
+// the executor dispatches by (see toolname.go); names outside the request's
+// catalog pass through unchanged.
+func parseGoogleResponse(model string, resp *googleGenerateResponse, rawBody []byte, providerName string, mapping *toolNameMapping) (*ChatResponse, error) {
 	if len(resp.Candidates) == 0 {
 		return nil, fmt.Errorf("%s: google response has no candidates (body: %s)",
 			providerName, truncateForError(rawBody))
@@ -555,9 +573,13 @@ func parseGoogleResponse(model string, resp *googleGenerateResponse, rawBody []b
 			// echoed back as the functionResponse name on the next turn). A
 			// Gemini 3 thought signature rides behind the name (see
 			// googleThoughtSigSep) so it survives to the next request.
+			// The wire name is reversed to the REGISTERED name before the ID is
+			// built from it, so the historical "ID equals the name" format
+			// holds for mapped MCP names too (see toolname.go).
+			name := mapping.realFor(part.FunctionCall.Name)
 			msg.ToolCalls = append(msg.ToolCalls, ToolCall{
-				ID:    googleThoughtSignatureID(part.FunctionCall.Name, part.ThoughtSignature),
-				Name:  part.FunctionCall.Name,
+				ID:    googleThoughtSignatureID(name, part.ThoughtSignature),
+				Name:  name,
 				Input: part.FunctionCall.Args,
 			})
 		}
