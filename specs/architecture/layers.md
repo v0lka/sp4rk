@@ -47,6 +47,7 @@ sp4rk is a reusable agent-execution engine. It is organized as a single Go modul
 │  prompt   Builder, SystemPromptBuilder                               │
 │  skills   SkillManager, parser, resource tool                        │
 │  agents   AgentManager, AGENT.md parser (Subagent Profiles)          │
+│  appendcodec append-safe compression codecs (over safeio)            │
 │  security untrusted-content wrapping (prompt-injection defense)      │
 │  embedding Embedder, chunker, ONNX runtime, tokenizer                │
 │  pathutil pure path algorithmic primitives                           │
@@ -63,7 +64,7 @@ sp4rk is a reusable agent-execution engine. It is organized as a single Go modul
 | Package                    | May Import                                                                                  | Must NOT Import                          |
 | -------------------------- | ------------------------------------------------------------------------------------------- | ---------------------------------------- |
 | root `sp4rk`               | `agent`, `agent/reflector`, `llm`, `memory`, `orchestration`, `planner`, `tools`, `tools/builtins`, `tools/mcp`, `skills`, `agents`, `embedding`, `prompt`, `security` | External libs only (no upward cycle)     |
-| `orchestration`            | `agent`, `llm`, `safeio`, `skills`, `strutil`, `tools` | `planner`, root, `backend`-equivalents   |
+| `orchestration`            | `agent`, `appendcodec`, `llm`, `skills`, `strutil`, `tools` | `planner`, root, `backend`-equivalents   |
 | `planner`                  | `agent`, `llm`, `oneshot`, `orchestration`, `prompt`, `skills`, `strutil`, `tools` | root                                     |
 | `agent`                    | `llm`, `strutil`, `tools` | `orchestration`, `planner`, root         |
 | `agent/reflector`          | `agent`, `llm`, `oneshot`, `orchestration`, `prompt`, `security`, `tools` | `planner`, root                          |
@@ -87,7 +88,7 @@ sp4rk is a reusable agent-execution engine. It is organized as a single Go modul
 
 ### Root — Entry Point & Shared Infrastructure
 
-The root package (`github.com/v0lka/sp4rk`) owns the `Framework`: a container that constructs and reuses shared infrastructure (the `llm.Router`, the `tools.ToolRegistry`, the MCP gateway, the tool-result cache) and produces per-task conductors. `Framework.Execute` is the convenience path that spins up a `Conductor` and a per-task blackboard (a `CheckpointedBlackboard` when a `Checkpointer` is configured, else a `MapBlackboard`); `Framework.NewConductor` builds a reusable conductor for repeated use. `Config` is the single point where a host application wires its callbacks (events emitter, confirm function, HITL handler, model selection). `RunF` is the fluent counterpart of `Framework.Execute` — a single ReAct loop configured declaratively through `RunBuilder` — and `TaskF`/`TaskBuilder` drive the Plan&Execute pipeline.
+The root package (`github.com/v0lka/sp4rk`) owns the `Framework`: a container that constructs and reuses shared infrastructure (the `llm.Router`, the `tools.ToolRegistry`, the MCP gateway, the tool-result cache) and produces per-task conductors. `Framework.Execute` is the convenience path that spins up a `Conductor` and a per-task blackboard (a `CheckpointedBlackboard` when a `Checkpointer` is configured, else a `MapBlackboard`); `Framework.NewConductor` builds a reusable conductor for repeated use. `Config` is the single point where a host application wires its callbacks (confirm function, HITL handler, model selection; lifecycle events are supplied per run, not through `Config`). `RunF` is the fluent counterpart of `Framework.Execute` — a single ReAct loop configured declaratively through `RunBuilder` — and `TaskF`/`TaskBuilder` drive the Plan&Execute pipeline.
 
 ### Orchestration Layer
 

@@ -189,7 +189,7 @@ Two whole-batch gates run before any sub-call executes:
 - abandons the WAIT — cancelling the tool's derived call context (a cooperative request, so an uninterruptible tool may still finish; treat its side effects as having possibly occurred) — when the ceiling fires, returning an error wrapping `ErrToolTimeout` (the dispatch site wraps it with the tool name: `tool "name": tool call timed out`);
 - polls the `PauseChecker` on the executor's `toolWatchdogInterval` ticker (default `defaultToolWatchdogInterval`, 250 ms) for as long as a tool is in flight, so a cooperative pause is observed *mid-call*.
 
-Zero (the default) disables the ceiling. `SetToolCallTimeoutExempt(names...)` names the interactive/long-running orchestration tools (e.g. `ask_user`, `declare_plan`, `delegate`, `execute_plan`) that block on a human or on sub-work by design and are therefore never bounded.
+Zero (the default) disables the ceiling; `DefaultToolCallTimeout` (5 minutes) is the SDK's recommended non-zero value for a class-wide guarantee. `SetToolCallTimeoutExempt(names...)` names the interactive/long-running orchestration tools (e.g. `ask_user`, `declare_plan`, `delegate`, `execute_plan`, `propose_goal` — the documented default is returned by `DefaultToolCallTimeoutExemptTools()`) that block on a human or on sub-work by design and are therefore never bounded.
 
 ## Error Handling
 

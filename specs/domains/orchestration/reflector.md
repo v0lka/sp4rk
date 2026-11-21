@@ -28,7 +28,7 @@ type Config struct {
 }
 ```
 
-The system prompt should instruct the model to return a JSON object matching the `Reflection` schema. The reflector runs the call through the one-shot client (see [../oneshot.md](../oneshot.md)) and extracts JSON from the response (tolerating surrounding prose or markdown fences) before unmarshalling it. The reasoning effort is resolved per call: an explicit `SetReasoningEffort` (or `Config.ReasoningEffort`) override wins; otherwise the service-call policy applies — reasoning tier Off, resolved to the serving model's native disable spelling via `llm.ReasoningForCall` from `Family`/`Model` (`""` — no field sent — when the identity is empty or unknown).
+The system prompt should instruct the model to return a JSON object matching the `Reflection` schema. The reflector runs the call through the one-shot client (see [../oneshot.md](../oneshot.md)) and extracts JSON from the response (tolerating surrounding prose or markdown fences) before unmarshalling it. The request carries `CallPurpose: llm.CallPurposeRouting` — the deterministic sampling profile, since the reflection is parsed as JSON. The reasoning effort is resolved per call: an explicit `SetReasoningEffort` (or `Config.ReasoningEffort`) override wins; otherwise the service-call policy applies — reasoning tier Off, resolved to the serving model's native disable spelling via `llm.ReasoningForCall` from `Family`/`Model` (`""` — no field sent — when the identity is empty or unknown).
 
 ### Reflect
 

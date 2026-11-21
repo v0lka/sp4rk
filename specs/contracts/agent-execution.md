@@ -10,7 +10,7 @@ The host application consumes the agent execution types from `github.com/v0lka/s
 
 | Interface / Type | Package | Implemented / Consumed By | Purpose |
 | --- | --- | --- | --- |
-| `Events` | agent | Implemented by host | Universal agent lifecycle callbacks (step start/complete, tool call/result, assistant streaming, context fill/compaction, sub-agent launch/complete, finishing, diagnostics) |
+| `Events` | agent | Implemented by host | Universal agent lifecycle callbacks (step start/complete, tool call/result, assistant streaming, context fill/compaction, sub-agent launch/complete/paused, finishing, diagnostics) |
 | `NoopEvents` | agent | Provided by SDK | No-op `Events` for struct embedding convenience |
 | `HITLHandler` | agent | Implemented by host | Human-in-the-loop hooks: `OnToolCall` (intercept/modify/reject) and `OnStepLimit` (extend/stop) |
 | `NoopHITLHandler` | agent | Provided by SDK | Default handler that allows all tool calls and denies step-limit extensions |
@@ -26,7 +26,7 @@ The host application consumes the agent execution types from `github.com/v0lka/s
 | `ExecutorResult` | agent | Consumed by host | Executor output: final string, the full `[]Step` trajectory, a `Finished` flag, an optional `AbortReason` (a short structured failure cause for a non-finished run whose `Output` is a meaningful answer rather than an abort message — e.g. the mutation gate), and an optional `Summary` (the model's own final text when the run terminated on a host-designated stop tool rather than the inline `finish` tool) |
 | `StepLimitResponse` | agent | Consumed by host | `allow_once` / `allow_more` / `allow_always` / `deny` returned from `OnStepLimit` |
 | `HITLToolDecision` | agent | Consumed by host | `{Allow bool; ModifiedInput json.RawMessage; Reason string}` returned from `OnToolCall` |
-| `CircuitBreakerConfig` | agent | Provided by host config | Circuit-breaker thresholds (repeat / same-tool-repeat / truncation / parse-error / fruitless abort) protecting the loop; same-tool-repeat detects one tool re-called with varied arguments but similar results via `SameToolRepeatNudgeThreshold`, `SameToolRepeatAbortThreshold`, and `SameToolResultSizeDelta` |
+| `CircuitBreakerConfig` | agent | Provided by host config | Circuit-breaker thresholds (repeat / validation / same-tool-repeat / truncation / parse-error / fruitless abort) protecting the loop; validation counts consecutive schema-validation rejections (tool-agnostic, `ValidationErrorAbortThreshold`); same-tool-repeat detects one tool re-called with varied arguments but similar results via `SameToolRepeatNudgeThreshold`, `SameToolRepeatAbortThreshold`, and `SameToolResultSizeDelta` |
 
 ## Initialization
 

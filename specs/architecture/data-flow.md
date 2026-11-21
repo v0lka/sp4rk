@@ -156,19 +156,19 @@ For complex tasks, the **root orchestration layer (`TaskBuilder`)** composes thr
 ```
 
 1. **Planner** — `Planner.Plan` generates a `Plan`: a DAG of `PlanStep` values, each with a summary, description, `DependsOn` dependencies, a parallelism hint, estimated tools, and an optional `AgentProfile`. The planner may run a short ReAct exploration loop first (informed-exploration mode) based on the router's domain/complexity decision.
-2. **Conductor** — the `TaskBuilder` runs each ready step by calling `Conductor.Run`, which builds one `Executor` and runs a single ReAct loop (one `Executor.Run`). Steps are dispatched in DAG order; steps with no unmet dependencies may be launched in parallel via `RunSubAgent` goroutines (see [Subagent Delegation Flow](#subagent-delegation-flow)). Results are written to the `Blackboard`.
+2. **Conductor** — the `TaskBuilder` runs each ready step by calling `Conductor.Run`, which builds one `Executor` and runs a single ReAct loop (one `Executor.Run`). Steps are dispatched in DAG order, and the shipped `TaskBuilder` runs its ready-step set **sequentially**; parallel dispatch is an engine capability (`agent.RunSubAgent`/`agent.RunSubAgentsParallel`) that a host wires itself (see [Subagent Delegation Flow](#subagent-delegation-flow)). Results are written to the `Blackboard`.
 3. **Reflector** — when a step fails, `Reflector.Reflect` examines the trajectory and prior reflections, then returns a `Reflection` with a root cause, hypotheses, and a suggested action: `"retry"`, `"replan"`, or `"abort"`.
-4. **Retry/replan** — the `TaskBuilder` consults the reflection. A retry re-runs the step (up to `ExecutionConfig.MaxRetries`). A replan asks the `Planner` to generate a new plan accounting for completed steps and the failure. An abort stops execution with `Status == "aborted"`.
+4. **Retry/replan** — the `TaskBuilder` consults the reflection. A retry re-runs the step (up to the `TaskBuilder`'s retry budget — `TaskBuilder.MaxRetries`, default `2`). A replan asks the `Planner` to generate a new plan accounting for completed steps and the failure (bounded by `TaskBuilder.MaxReplans`, default `3`). An abort stops execution with `Status == "aborted"`.
 
 ## Subagent Delegation Flow
 
-Parallelism within a plan is achieved by launching subagents rather than sharing a single executor:
+Parallelism within a plan is achieved by launching subagents rather than sharing a single executor. The dispatcher is **not** the shipped root `TaskBuilder` (which runs its ready-step set sequentially, one `Conductor.Run` at a time) — the fan-out below is the engine capability `agent.RunSubAgentsParallel(ctx, []agent.SubAgentTask, ...)`, which a host wires when it wants parallel steps:
 
 ```
-root orchestration layer (TaskBuilder) dispatches ready steps (no unmet DependsOn)
+parallel dispatcher (host wiring via agent.RunSubAgentsParallel) fans out ready steps
          │
          ▼
-for each step → agent.RunSubAgent(ctx, stepID, executor, cm, taskTools, taskDesc, model, emitter, todoUpdateFunc)
+per task → agent.RunSubAgent(ctx, stepID, executor, cm, taskTools, taskDesc, model, emitter, todoUpdateFunc)
          │  (takes a pre-built *Executor + ContextManager; separate goroutine)
          ▼
 events: SubAgentLaunch(step)   ← streamed to host
@@ -267,13 +267,17 @@ root TaskBuilder — a Plan&Execute run
   ├─ Stores the Plan on the Blackboard
   │
   ├─ Each step executor:
-  │   ├─ Reads dependency outputs:  bb.GetStepResult(depID)
+  │   ├─ Reads prior step outputs only through the read_step_output
+  │   │   tool adapter (NewStepOutputStore → bb.GetStepResult);
+  │   │   the engine never injects dependency outputs automatically
   │   ├─ Writes own result:        bb.SetStepResult(stepID, output, err, steps)
   │   └─ Stores facts:             bb.StoreFact(fact)
   │
-  ├─ Reflector reads: bb.GetAllStepResults(), bb.GetReflections()
+  ├─ Reflector reads: the failed attempt's trajectory, bb.GetPlan(),
+  │   and the reflections accumulated so far
   │
-  └─ Final: bb.SetFinalResult(output)
+  └─ Final: result returned via ExecutionResult (AggregateOutput);
+      the engine never calls bb.SetFinalResult in the run path
        → OnBlackboardChanged notifies the host (fires only on a
          CheckpointedBlackboard — a Checkpointer must be configured)
 ```
@@ -282,7 +286,7 @@ Steps communicate through the blackboard: one step can `StoreFact` with keywords
 
 ## Invariants
 
-- Every task enters the engine through `Framework.Execute`, `Framework.NewConductor`, or `RunF` — there is no back door into the `Executor`.
+- Every task enters the engine through `Framework.Execute`, `Framework.NewConductor`, `RunF`, or `TaskF` — there is no back door into the `Executor`.
 - The `Executor` consumes `llm` and `tools` only through the `LLMCaller`, `ToolExecutor`, and `ContextManager` interfaces.
 - Event emission is the host's responsibility; the engine never writes task state to a database.
 - A `Blackboard` is per-task, lifecycle-tied to a single run; it is never shared across tasks.
@@ -295,7 +299,7 @@ Steps communicate through the blackboard: one step can `StoreFact` with keywords
 
 ### ❌ Bypassing the engine entry points
 
-All tasks must go through `Framework.Execute` / `Framework.NewConductor` / `RunF`. Constructing an `Executor` directly and skipping the `Conductor` loses event emission, the blackboard, and Plan&Execute coordination.
+All tasks must go through `Framework.Execute` / `Framework.NewConductor` / `RunF` / `TaskF`. Constructing an `Executor` directly and skipping the `Conductor` loses event emission, the blackboard, and Plan&Execute coordination.
 
 ### ❌ Sharing a single Executor across parallel steps
 

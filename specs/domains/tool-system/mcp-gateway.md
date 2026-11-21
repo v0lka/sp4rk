@@ -87,7 +87,7 @@ After connecting, each server is queried with `tools/list`. Returned tools becom
 - `DefaultPolicy()` → `PolicyUserConfirm` (conservative default — remote, opaque tools).
 - `IsUntrusted()` → always `true` (output from external servers may be adversarial).
 - `Judge()` → always a zero `JudgeOutcome` ("no tool-specific concern"; the gateway cannot inspect remote semantics, so it offers no heuristic of its own).
-- `Execute()` → calls the MCP server's `tools/call`, extracts text content (joins it; marshals structured content to JSON when no text is present).
+- `Execute()` → calls the MCP server's `tools/call`; text content parts are joined verbatim, every other content type (image, audio, resource link, embedded resource) is JSON-marshalled into that join so the model receives parseable structure instead of a Go value dump, and structured content is marshalled to JSON when no text part is present.
 
 ### SchemaSanitizer
 

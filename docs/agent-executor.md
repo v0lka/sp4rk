@@ -316,6 +316,8 @@ type CircuitBreakerConfig struct {
     TruncationAbortThreshold int
     ParseErrorAbortThreshold int
 
+    ValidationErrorAbortThreshold int
+
     FruitlessNudgeThreshold int
     FruitlessAbortThreshold int
     FruitlessMaxResultLen   int
@@ -332,6 +334,7 @@ type CircuitBreakerConfig struct {
 | `RepeatAbortThreshold` | Consecutive identical tool calls before the loop aborts. |
 | `TruncationAbortThreshold` | Consecutive `max_tokens`-truncated responses containing tool calls before abort. |
 | `ParseErrorAbortThreshold` | Consecutive parse errors on the same tool before abort. |
+| `ValidationErrorAbortThreshold` | Consecutive schema-validation rejections (registry pre-dispatch or batch pre-flight) before abort. Not keyed per tool — the measured failure ("cannot produce schema-valid input") is tool-agnostic. |
 | `FruitlessNudgeThreshold` | Consecutive minimal-result calls before a nudge. |
 | `FruitlessAbortThreshold` | Consecutive minimal-result calls before abort. |
 | `FruitlessMaxResultLen` | Result length at or below which a call is considered "fruitless". |
@@ -344,7 +347,8 @@ Use the SDK defaults unless you have a specific reason to tune:
 ```go
 cfg := agent.DefaultCircuitBreakerConfig()
 // RepeatNudgeThreshold: 3, RepeatAbortThreshold: 5, TruncationAbortThreshold: 3,
-// ParseErrorAbortThreshold: 3, FruitlessNudgeThreshold: 5, FruitlessAbortThreshold: 8,
+// ParseErrorAbortThreshold: 3, ValidationErrorAbortThreshold: 3,
+// FruitlessNudgeThreshold: 5, FruitlessAbortThreshold: 8,
 // FruitlessMaxResultLen: 48, SameToolRepeatNudgeThreshold: 8,
 // SameToolRepeatAbortThreshold: 12, SameToolResultSizeDelta: 128
 ```

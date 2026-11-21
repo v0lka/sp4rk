@@ -81,6 +81,8 @@ type PendingDelegations interface {
 
 `Run` returns an error when the context factory or system-prompt factory is missing, when `ResumeSteps` is set but the `ContextManager` produced by the factory does not implement `StepSeedable`, or when the underlying executor returns an error. Only executor-loop errors are accompanied by a non-nil `*ExecutionResult` carrying best-effort output; the configuration fail-fast paths return a nil result with the error.
 
+When the run ends without an error and the registry still reports pending async delegations, `Run` appends a `[Note: N async delegation(s) still pending: …]` line to the result output — a visibility trail for background work the run left behind (for example after `finish` raced a just-launched delegation).
+
 ### Step-boundary signals (PauseChecker, UserMessageSource, ToolCallTimeout)
 
 Optional `ConductorConfig` fields installed on the executor let the host interact with a run at its step boundaries; `ToolCallTimeout` additionally installs the per-tool-call ceiling:

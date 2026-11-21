@@ -10,11 +10,11 @@ The delegated-execution primitive: goroutine-based wrappers around an `Executor`
 - `github.com/v0lka/sp4rk/agent` — `Executor`, `ContextManager`, `Events` (`SubAgentLaunch`/`SubAgentComplete` hooks), `NewModelProviderOverrideCaller` (provider+model pinning; the legacy `NewModelOverrideCaller` is its model-only form)
 - `github.com/v0lka/sp4rk/tools` — `ToolDescriptor`, `WithTaskContext`
 - `github.com/v0lka/sp4rk/orchestration` — `CompletedStep`, DAG utilities (`FindReadySteps`) used to select independent steps, `PlanStep.Agent` (names a Subagent Profile that should execute a step)
-- `github.com/v0lka/sp4rk/agents` — `AgentManager`, `Agent` profile discovery/parsing (resolves `PlanStep.Agent` to a profile)
+- `github.com/v0lka/sp4rk/agents` — `AgentManager`, `Agent` profile discovery/parsing (the layer `PlanStep.Agent` names resolve through)
 
 ## Behavior
 
-A plan is a DAG of steps. Steps with no dependencies between them can run in parallel to reduce total latency. The SDK achieves this by giving each independent step its own `Executor` (an `Executor` is not safe for concurrent use on a single instance) and launching it in a goroutine via `RunSubAgent`. Each subagent runs to completion and reports its result on a channel.
+A plan is a DAG of steps. Steps with no dependencies between them can run in parallel to reduce total latency. The SDK achieves this by giving each independent step its own `Executor` (an `Executor` is not safe for concurrent use on a single instance) and launching it in a goroutine via `RunSubAgent`. Each subagent runs to completion and reports its result on a channel. sp4rk's own fluent task loop (`TaskF`/`TaskBuilder.runPlanned`) dispatches ready steps sequentially; concurrent dispatch of independent steps is the host's call, made through these primitives.
 
 ### SubAgentTask
 
@@ -93,7 +93,9 @@ Runs multiple `SubAgentTask`s concurrently and collects all results. Results are
 ```go
 if success && (DetectToolCallSyntaxInContent(result.Output) || DetectToolCallSyntaxInContent(result.Summary)) {
     success = false
-    err = errors.New("model printed tool-call syntax as text instead of using tool_use blocks")
+    if err == nil {
+        err = errors.New("model printed tool-call syntax as text instead of using tool_use blocks")
+    }
 }
 ```
 

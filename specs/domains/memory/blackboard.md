@@ -107,7 +107,7 @@ type Checkpointer interface {
 }
 ```
 
-`CheckpointedBlackboard` wraps a `MapBlackboard` and persists every write through a `Checkpointer`. All persistence calls are **best-effort**: errors are logged but do not propagate, and operations run on a single background worker goroutine with a timeout and panic recovery, so a slow or panicking backend cannot hang the agent. `SetOnChanged(fn)` invokes a callback after successful writes; `SetPersistContext(ctx)` overrides the context used for background persistence calls (defaults to the context supplied at construction); `ID()` returns the checkpoint identifier; `Shutdown()` closes the persistence channel and waits for the worker (always call this to prevent goroutine leaks).
+`CheckpointedBlackboard` wraps a `MapBlackboard` and persists every write through a `Checkpointer`. All persistence calls are **best-effort**: errors are logged but do not propagate, and operations run on a single background worker goroutine with a timeout and panic recovery, so a slow or panicking backend cannot hang the agent. `SetOnChanged(fn)` invokes a callback after successful writes; `SetPersistContext(ctx)` overrides the context used for background persistence calls (defaults to `context.Background()`); `ID()` returns the checkpoint identifier; `Shutdown()` closes the persistence channel and waits for the worker (always call this to prevent goroutine leaks).
 
 `RestoreBlackboard(ctx, id, cp, logger, timeout, opts)` loads state from a `Checkpointer` and hydrates a fresh `CheckpointedBlackboard` (returns `nil, nil` when the checkpoint does not exist). When no `Checkpointer` is configured, persistence is disabled.
 

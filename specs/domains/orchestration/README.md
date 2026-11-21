@@ -185,6 +185,7 @@ The Conductor is the only top-level execution entry point this domain exposes. D
 - **Custom `Blackboard`** persistence via the `Checkpointer` interface and `CheckpointedBlackboard`.
 - **Custom `Events`** — embed `orchestration.NoopEvents` and override only the hooks you need (plan/step/reflection lifecycle).
 - **Delegation tools** — the host wires `delegate`/`declare_plan`/`reflect`/`cancel_delegation` as ordinary tools; the engine exposes the primitives (`RunSubAgent`, `PendingDelegations`, `Planner`, `Reflector`) they are built on.
+- **Own plan-and-execute loop** — hosts assembling results themselves use the DAG utilities: `BuildPlanExecutionSteps(completedList, plan)` converts completed plan steps into a reflector-facing `[]agent.Step` trajectory, using the real executor steps when a `CompletedStep` carries them and a summary step built from the completion output otherwise; `AggregateOutput(completedSteps, plan, preCompletedIDs)` joins the outputs of terminal steps (steps nothing depends on), falls back to all step outputs when no terminal outputs exist, and excludes `preCompletedIDs` so a continuation run returns only newly produced output. The SDK's own `TaskF` builds `ExecutionResult.Output` with `AggregateOutput`.
 - **Subagent Profiles** — a `PlanStep.Agent` names a profile from `agents.AgentManager` whose directive/tools/model/max-steps/redelegation policy are applied to the subagent executing that step (see [../agents.md](../agents.md) and [subagents.md](subagents.md)).
 
 ## Related Specs

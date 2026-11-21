@@ -1,6 +1,6 @@
 # Utilities
 
-The SDK ships small, dependency-light packages with reusable algorithms: `pathutil` for filesystem-path operations, `safeio` for hardened non-blocking file I/O, `strutil` for string helpers, `sysproc` for child-process console-window suppression, and `ignore` for multi-root `.gitignore`/`.aiignore` resolution.
+The SDK ships small, dependency-light packages with reusable algorithms: `pathutil` for filesystem-path operations, `safeio` for hardened non-blocking file I/O, `appendcodec` for append-safe compressed log appending, `strutil` for string helpers, `sysproc` for child-process containment (console-window suppression, process-group placement, tree kills), and `ignore` for multi-root `.gitignore`/`.aiignore` resolution.
 
 ## pathutil
 
@@ -269,6 +269,65 @@ func main() {
 	fmt.Println("missing is ErrNotExist:", errors.Is(err, fs.ErrNotExist))
 }
 ```
+
+## appendcodec
+
+```go
+import "github.com/v0lka/sp4rk/appendcodec"
+```
+
+The `appendcodec` package provides **append-safe compression codecs for rotation-style logs**: an `io.WriteCloser` that appends gzip or zstd streams to an existing file while guaranteeing that every completed `Write` is a decodable prefix — visible to any concurrent reader and recoverable by a decoder even when the writer died before `Close`. Nothing here fsyncs: the guarantee ends at process death, and surviving a power loss is the caller's concern. The codecs are deliberately limited to gzip and zstd — `xz` was rejected because `github.com/ulikunitz/xz` has no usable `Flush` and cannot honour the append contract (see [ADR-010](../specs/decisions/010-appendcodec-gzip-zstd-xz-rejected.md)).
+
+Every open is hardened through [`safeio`](#safeio): `DetectMagic` refuses to traverse a symlink at the final path component and refuses non-regular files instead of blocking on a planted FIFO, and `OpenAppend` verifies the existing magic on the SAME descriptor it appends through, so there is no Stat→Open window in which the file could be swapped for a differently-compressed target.
+
+### Codec
+
+```go
+type Codec int
+
+const (
+    CodecNone Codec = iota // plain bytes, no framing — the compatibility codec
+    CodecGzip              // RFC 1952 members; appends form a valid multi-member stream
+    CodecZstd              // zstd frames (klauspost/compress); appends form a valid multi-frame stream
+)
+
+func ParseCodec(name string) (Codec, error) // "none" | "gzip" | "zstd"; any other name wraps ErrUnknownCodec
+func (c Codec) String() string              // canonical lowercase codec name
+```
+
+### DetectMagic
+
+```go
+func DetectMagic(path string, log *slog.Logger) (Codec, error)
+```
+
+Sniffs the codec of an existing file from its first bytes. An empty file and any file whose leading bytes are text — JSON (`{`/`[` after an optional BOM), plain ASCII, or a high-byte prefix — report `CodecNone`; binary content carrying a control byte also reports `CodecNone` plus a single Warn record naming the unknown magic. Gzip and zstd files report their codecs. A file consisting of exactly the codec's magic bytes is refused for that codec's appends (`ErrMagicMismatch`) — a codec is recognised only with stream bytes beyond the magic.
+
+### OpenAppend
+
+```go
+func OpenAppend(path string, codec Codec, windowLog int) (io.WriteCloser, error)
+```
+
+`OpenAppend` returns a mutex-serialized writer that flushes after every `Write` and appends valid gzip multi-member / zstd multi-frame streams:
+
+- **Magic verification on the same descriptor.** The detected magic is checked against the requested codec; a mismatch fails with an error matching `ErrMagicMismatch` (`*MagicMismatchError`) instead of producing an undecodable file.
+- **Footer on `Close`.** `Close` writes the codec footer and is idempotent; a `Write` on a closed handle fails with `ErrClosed`.
+- **zstd window.** `windowLog` selects the zstd window (`1 << windowLog`), clamped to `[MinWindowLog, MaxWindowLog]` (10 — 1 KiB — through 29 — 512 MiB); values `<= 0` use the encoder default. The encoder always runs with `WithEncoderConcurrency(1)`; `CodecGzip` and `CodecNone` ignore the parameter, and gzip runs at the standard-library default level.
+- **One path, one encoder (compressed codecs).** `OpenAppend` holds an exclusive advisory lock for the lifetime of the underlying descriptor, so concurrent encoders — which would interleave frames and corrupt the stream — cannot exist. A second `OpenAppend` on the same path from the SAME process does not fail: it returns an independent handle that queues its records through the one live encoder, and handles are refcounted — the codec footer and the lock are released by the LAST `Close`. An open that cannot share the live stream fails with `ErrLocked` — usually another process, but also a same-process open whose path normalizes to a different registry key (symlinked parent, hardlink, Windows 8.3 short-name alias), so it is not a cross-process-only signal. A join matches by path string, not file identity: close all handles on a path before renaming or replacing the file under it, or the next `OpenAppend` joins the renamed inode while the new file stays empty. A compressed-codec handle dropped without `Close` keeps the descriptor, the lock, and its registry entry until process death — always `defer Close`.
+- **`CodecNone` is the compatibility codec.** No lock, no registry, no queue: opens return independent plain handles, and any number of writers — in this process or others — append side by side exactly as before this package existed. Only the sniff guard survives: appending plain bytes onto a gzip/zstd file fails with `ErrMagicMismatch` (best-effort — nothing serializes the check against concurrent opens), and no `ErrLocked` exists for a none-codec path.
+- **Crash truncation.** A file whose writer crashed mid-member (no `Close`, no footer) stays decodable up to the truncation point, but a later `OpenAppend` lands behind that point and sequential decoders stop at the truncation error without reaching the newer records — recovery (scan to the last decodable boundary and truncate) is the caller's job.
+
+### Errors
+
+| Sentinel | Typed error | Meaning |
+| --- | --- | --- |
+| `ErrMagicMismatch` | `*MagicMismatchError` | Existing content does not match the requested codec (or is magic-only) |
+| `ErrLocked` | — | The advisory lock could not be taken: another process holds it, or a path alias missed the sharing registry |
+| `ErrClosed` | — | `Write` on a handle whose underlying stream was already closed |
+| `ErrUnknownCodec` | — | `ParseCodec` received a name that is not `"none"`, `"gzip"`, or `"zstd"` |
+
+The advisory lock is assumed reliable: the one-encoder guarantee holds wherever advisory locks hold — local filesystems and network filesystems with a functioning lock manager. On NFS mounts without a working lock manager an `flock`/range lock may silently succeed for both processes; keep appendcodec logs on local volumes or properly locked shares.
 
 ## strutil
 

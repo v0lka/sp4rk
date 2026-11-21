@@ -10,7 +10,7 @@ Provides the tool abstraction for the agent: a single `Tool` interface, a thread
 - `github.com/v0lka/sp4rk/tools/group.go` — `ToolGroup` and the 8 declared groups (`execute`, `local_read`, `local_write`, `remote_read`, `remote_write`, `system`, `local_mcp`, `remote_mcp`), `AllToolGroups()`, `IsValidToolGroup()`, `MCPToolGroup(transport)`
 - `github.com/v0lka/sp4rk/tools` (registry) — `Register`/`RegisterWithSource`/`RegisterWithSourceCategory`, `Execute` (pre-dispatch input validation + fail-closed policy enforcement), `List`/`ListFiltered`, MCP shadowing protection
 - `github.com/v0lka/sp4rk/tools/inputvalidate.go` — `ValidateToolInput(tool, schema, input)` (always the strict built-in closed-set default), `ValidateToolInputForCategory(tool, schema, input, category)` (the same category-dependent default the registry applies — closed set for `SourceCategoryCore`, open set for `SourceCategoryMCP`), and `InputValidationError`: the recursive structural tool-input validator `Execute` enforces before any policy (see [Input Validation](#input-validation) below); `SetInputValidationEnabled` on the registry is the opt-out handle
-- `github.com/v0lka/sp4rk/tools` (context helpers) — `WithWorkspacePath`, `WithTempDir`, `WithAllowedRoots`, `SessionRoots`, `WithTaskContext`. `SessionRoots` returns the deduplicated union of workspace + temp + additional allowed roots consulted by every path-containment check.
+- `github.com/v0lka/sp4rk/tools` (context helpers) — `WithWorkspacePath`, `WithTempDir`, `WithAllowedRoots`, `SessionRoots`, `WithTaskContext`, `WithIgnoreChecker`, `WithCoherence`. `SessionRoots` returns the deduplicated union of workspace + temp + additional allowed roots consulted by every path-containment check; a nil ignore checker or coherence checker means no filtering / no coherence checking (the nil-safe defaults).
 - `github.com/v0lka/sp4rk/tools/builtins` — built-in tool catalog
 - `github.com/v0lka/sp4rk/tools/mcp` — MCP gateway (dynamic tool discovery/proxying)
 - `github.com/v0lka/sp4rk/security` — untrusted-content wrapping for tool output
@@ -72,7 +72,9 @@ type ToolDescriptor struct {
 ```
 ToolRegistry.Execute(ctx, name, input)
 │
-├─ 1. Look up the tool by name → not found ⇒ error ToolResult
+├─ 1. Look up the tool by name → not found ⇒ error ToolResult (a
+│     `functions.`-prefixed name gains a hint naming the exact catalog
+│     candidate when it is registered and inside the effective catalog scope)
 ├─ 2. Pre-dispatch input validation (category-aware — ValidateToolInputForCategory,
 │     closed sets for built-ins, open for MCP; fail-open catalog; see
 │     [Input Validation](#input-validation); opt out via

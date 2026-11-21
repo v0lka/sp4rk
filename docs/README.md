@@ -146,6 +146,7 @@ go run main.go
 | `…/security` | Prompt-injection defense: `WrapUntrustedContent`, `StripUntrustedTags` |
 | `…/embedding` | ONNX-based `Embedder`, `Tokenizer`, and chunker for local vector embeddings |
 | `…/safeio` | Hardened, non-blocking filesystem I/O: `Open`/`OpenFile`/`OpenFileNoFollow` refuse FIFOs/sockets/devices instead of hanging inside `open(2)`, `ReadFile`/`ReadFileLimited` cap read size, `WriteFile`/`WriteFileAtomic`/`MkdirAllReal` reject planted symlinks |
+| `…/appendcodec` | Append-safe compression codecs for rotation-style logs (`CodecNone`/`CodecGzip`/`CodecZstd`): `OpenAppend` verifies the existing file's magic, flushes every `Write`, and enforces one encoder per compressed path via an advisory file lock |
 | `…/pathutil` | Reusable filesystem-path algorithms: `IsWithinPath`, `SplitPathComponents`, `ResolveExistingPrefix` |
 | `…/strutil` | String helpers: `TruncateUTF8` and related utilities |
 | `…/ignore` | Multi-root `.gitignore`/`.aiignore` resolver: `Resolver`, `Options`, `Multi`, `IgnoreChecker` |

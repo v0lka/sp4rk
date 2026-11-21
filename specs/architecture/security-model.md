@@ -267,7 +267,7 @@ func WrapUntrustedContent(content, source string, metadata map[string]string) st
 func StripUntrustedTags(content string) string
 ```
 
-`WrapUntrustedContent` wraps content in `<untrusted-content>` tags with a `source` attribute (the producing tool's name) and optional metadata attributes. The content is **first sanitized** via `StripUntrustedTags` to prevent tag-breakout attacks.
+`WrapUntrustedContent` wraps content in `<untrusted-content>` tags with a `source` attribute (the producing tool's name) and optional metadata attributes. The content is **first sanitized** via `StripUntrustedTags` to prevent tag-breakout attacks. Attribute values are defended too: the `source` value and every metadata value are escaped for the XML metacharacters (`&`, `<`, `>`, `"`), so a hostile attribute value cannot forge a closing boundary tag, and metadata keys are whitelisted to valid XML attribute names (non-matching keys are silently dropped) in sorted key order.
 
 The wrapping is applied by `memory.ContextWindow.BuildPrompt` (when constructed with `InjectionDefenseEnabled: true`) — the last point before content reaches the LLM API. It runs **after** history mutation and pruning, so the defense always wraps the final content the model sees.
 

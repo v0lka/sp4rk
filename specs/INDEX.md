@@ -5,6 +5,7 @@
 | If your task involves...                                       | Read these specs                                                                |
 | ------------------------------------------------------------- | ------------------------------------------------------------------------------- |
 | sp4rk package layers, import rules                            | [architecture/layers.md](architecture/layers.md)                                |
+| Framework, classic Config, fluent NewF/RunF/TaskF builders, root-package lifecycle and defaults | [domains/framework.md](domains/framework.md), [architecture/data-flow.md](architecture/data-flow.md), [architecture/layers.md](architecture/layers.md) |
 | Request lifecycle inside the engine                           | [architecture/data-flow.md](architecture/data-flow.md)                          |
 | Tool policies, confirmations, judge                           | [architecture/security-model.md](architecture/security-model.md)                |
 | Tool capability groups, MCP group overrides, agent tool budgets | [contracts/tools.md](contracts/tools.md), [domains/tool-system/README.md](domains/tool-system/README.md), [domains/tool-system/mcp-gateway.md](domains/tool-system/mcp-gateway.md), [domains/agents.md](domains/agents.md) |
@@ -27,9 +28,11 @@
 | Adding/modifying built-in tools                               | [domains/tool-system/builtins.md](domains/tool-system/builtins.md)              |
 | Web search tool, provider backends (Brave, DuckDuckGo, Exa, SearXNG, Tavily) | [domains/tool-system/websearch.md](domains/tool-system/websearch.md), [domains/tool-system/builtins.md](domains/tool-system/builtins.md) |
 | Safe file reads/writes (regular-files-only, size caps, atomic publish) | [domains/safeio.md](domains/safeio.md)                                          |
-| Append-safe compressed logging (appendcodec: gzip/zstd, xz rejected) | [decisions/010-appendcodec-gzip-zstd-xz-rejected.md](decisions/010-appendcodec-gzip-zstd-xz-rejected.md) |
+| Append-safe compressed logging (appendcodec: gzip/zstd, xz rejected) | [domains/appendcodec.md](domains/appendcodec.md), [decisions/010-appendcodec-gzip-zstd-xz-rejected.md](decisions/010-appendcodec-gzip-zstd-xz-rejected.md) |
 | UTF-8 string helpers (truncation, invisible content)           | [domains/strutil.md](domains/strutil.md)                                        |
-| Ignore rules (.gitignore/.aiignore), glob & ripgrep filtering | [architecture/layers.md](architecture/layers.md), [contracts/tools.md](contracts/tools.md), [domains/tool-system/builtins.md](domains/tool-system/builtins.md) |
+| Path algorithms (symlink-aware containment, component splitting, case probing) | [domains/pathutil.md](domains/pathutil.md) |
+| Child-process containment (console suppression, process groups, tree kill, Job Objects) | [domains/sysproc.md](domains/sysproc.md) |
+| Ignore rules (.gitignore/.aiignore), glob & ripgrep filtering | [domains/ignore.md](domains/ignore.md), [architecture/layers.md](architecture/layers.md), [contracts/tools.md](contracts/tools.md), [domains/tool-system/builtins.md](domains/tool-system/builtins.md) |
 | MCP servers, dynamic tools                                    | [domains/tool-system/mcp-gateway.md](domains/tool-system/mcp-gateway.md)        |
 | Context window, compaction strategies                         | [domains/memory/compaction.md](domains/memory/compaction.md)                    |
 | Blackboard, shared state, facts, attachments                  | [domains/memory/blackboard.md](domains/memory/blackboard.md)                    |
@@ -63,7 +66,7 @@ per-task conductors, and imports every engine layer:
 
 Upper layers (import direction flows downward, never the reverse):
 
-    orchestration   → agent, appendcodec, llm, safeio, skills, strutil, tools
+    orchestration   → agent, appendcodec, llm, skills, strutil, tools
     planner         → agent, llm, oneshot, orchestration, prompt, skills, strutil, tools
     memory          → agent, llm, prompt, security, strutil
     agent           → llm, strutil, tools
@@ -139,6 +142,7 @@ See [META.md](META.md) for document templates, naming rules, and update protocol
 
 ### domains/ (single-file)
 
+- [framework.md](domains/framework.md) - Framework, Config, and the fluent NewF/RunF/TaskF builders (root-package lifecycle, defaults, budgets)
 - [llm-providers.md](domains/llm-providers.md) - Provider abstraction, router, model registry, token counting
 - [oneshot.md](domains/oneshot.md) - One-shot structured-output LLM client: the Do loop, failure policies, parser toolkit, call-site catalog
 - [skills.md](domains/skills.md) - Skill system, activation, resource access
@@ -146,6 +150,10 @@ See [META.md](META.md) for document templates, naming rules, and update protocol
 - [prompt-building.md](domains/prompt-building.md) - Prompt builder and system-prompt composition
 - [embedding.md](domains/embedding.md) - Embeddings, chunking, ONNX runtime
 - [safeio.md](domains/safeio.md) - Safe file-read/write primitives (regular-files-only reads, size caps, atomic publish)
+- [appendcodec.md](domains/appendcodec.md) - Append-safe compressed logging codecs (gzip/zstd; xz rejected), magic sniffing, exclusive locks, shared-stream joins
+- [ignore.md](domains/ignore.md) - Multi-root .gitignore/.aiignore resolver behind glob and ripgrep filtering
+- [pathutil.md](domains/pathutil.md) - Filesystem-path algorithms (symlink-aware containment, component splitting, case-insensitive probing)
+- [sysproc.md](domains/sysproc.md) - Child-process containment (console suppression, process groups, tree kill, Job Objects)
 - [strutil.md](domains/strutil.md) - UTF-8-safe string helpers (truncation, invisible content)
 
 ### contracts/
