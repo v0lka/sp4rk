@@ -384,10 +384,7 @@ func (p *OpenAIProvider) ChatCompletion(ctx context.Context, req ChatRequest) (*
 		Message:    message,
 		Reasoning:  message.ReasoningContent,
 		StopReason: stopReason,
-		Usage: TokenUsage{
-			InputTokens:  int(resp.Usage.PromptTokens),
-			OutputTokens: int(resp.Usage.CompletionTokens),
-		},
+		Usage:      chatCompletionUsage(resp.Usage),
 	}, nil
 }
 
@@ -420,10 +417,7 @@ func (p *OpenAIProvider) chatCompletionStream(ctx context.Context, req ChatReque
 		chunk := stream.Current()
 
 		if chunk.JSON.Usage.Valid() {
-			usage = TokenUsage{
-				InputTokens:  int(chunk.Usage.PromptTokens),
-				OutputTokens: int(chunk.Usage.CompletionTokens),
-			}
+			usage = chatCompletionUsage(chunk.Usage)
 		}
 
 		for _, choice := range chunk.Choices {
@@ -1121,6 +1115,47 @@ func extractReasoningContent(rawJSON string) string {
 		return ""
 	}
 	return payload.ReasoningContent
+}
+
+// chatCompletionUsage maps the Chat Completions usage object into TokenUsage.
+// Shared by the synchronous and streaming paths so both report identical
+// cache detail. prompt_tokens_details.cached_tokens is a subset of
+// prompt_tokens (the cached prefix is billed as prompt), so it populates
+// CachedInputTokens without changing InputTokens.
+func chatCompletionUsage(u oai.CompletionUsage) TokenUsage {
+	cached := int(u.PromptTokensDetails.CachedTokens)
+	if cached == 0 {
+		// DeepSeek-compatible endpoints report the cache-hit count under the
+		// non-standard prompt_cache_hit_tokens field (prompt_tokens = hit +
+		// miss) instead of prompt_tokens_details.cached_tokens, so the typed
+		// SDK field decodes 0 there; fall back to the usage object's raw
+		// JSON. An OpenAI endpoint that genuinely reports 0 cached tokens
+		// fails the lookup the same way and stays 0.
+		cached = extractPromptCacheHitTokens(u.RawJSON())
+	}
+	return TokenUsage{
+		InputTokens:       int(u.PromptTokens),
+		OutputTokens:      int(u.CompletionTokens),
+		CachedInputTokens: cached,
+	}
+}
+
+// extractPromptCacheHitTokens extracts DeepSeek's "prompt_cache_hit_tokens"
+// from a usage object's raw JSON, returning 0 when the field is absent or the
+// JSON is malformed (the caller then reports no cache detail). Mirrors
+// extractReasoningContent's tolerate-and-default handling of vendor extensions
+// the OpenAI SDK does not type.
+func extractPromptCacheHitTokens(rawJSON string) int {
+	if rawJSON == "" {
+		return 0
+	}
+	var payload struct {
+		PromptCacheHitTokens int `json:"prompt_cache_hit_tokens"`
+	}
+	if err := json.Unmarshal([]byte(rawJSON), &payload); err != nil {
+		return 0
+	}
+	return payload.PromptCacheHitTokens
 }
 
 // enrichOpenAIError extracts a human-readable message from an OpenAI SDK *oai.Error.

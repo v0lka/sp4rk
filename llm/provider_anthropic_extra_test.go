@@ -182,22 +182,78 @@ func TestAnthropicProvider_LargeBodyCapture(t *testing.T) {
 	})
 }
 
-// TestAnthropicProvider_ThinkingGateOnToolUseContinuation verifies review
-// finding #45: when reasoning is requested ("On") but the conversation
-// re-sends an assistant turn carrying tool_use blocks, the request must NOT
-// enable thinking. The Messages API requires such an assistant message to
-// start with a thinking (or redacted_thinking) block — which the provider
-// cannot re-emit, because parseResponse collapses it into
-// ChatResponse.Reasoning and llm.Message carries no thinking block — and
-// rejects the request with HTTP 400 otherwise, deterministically breaking the
-// first tool call of every reasoning-enabled run. A fresh conversation (no
-// prior assistant tool-use turn) and a text-only assistant history must still
-// enable thinking.
+// TestAnthropicProvider_ThinkingGateOnToolUseContinuation pins the
+// thinking-continuation contract. The Messages API requires a thinking-enabled
+// request whose history re-sends the final assistant turn to START that turn
+// with its original thinking (or redacted_thinking) block — HTTP 400
+// ("Expected `thinking` or `redacted_thinking`") otherwise. parseResponse now
+// captures the blocks onto llm.Message.ThinkingBlocks and convertMessage
+// re-emits them at the START of the assistant turn, so a tool-use
+// continuation that carries the blocks keeps thinking enabled and the wire
+// carries them. The fail-safe remains only for the genuinely unsupported
+// shape — a final assistant turn with NO thinking blocks (a foreign or
+// pre-carriage turn) — which falls back to a thinking-disabled request.
 func TestAnthropicProvider_ThinkingGateOnToolUseContinuation(t *testing.T) {
 	provider, lastBody := newAnthropicWireProvider(t, anthropicOKBodyText("ok", `{"input_tokens":1,"output_tokens":1}`))
 	ctx := context.Background()
 
-	t.Run("tool-use continuation disables thinking", func(t *testing.T) {
+	t.Run("tool-use continuation with thinking blocks keeps thinking enabled", func(t *testing.T) {
+		_, err := provider.ChatCompletion(ctx, ChatRequest{
+			Model:           "claude-3-haiku-20240307",
+			MaxTokens:       8192,
+			ReasoningEffort: "On",
+			Messages: []Message{
+				{Role: "user", Content: "run the tool"},
+				{Role: "assistant", ToolCalls: []ToolCall{
+					{ID: "tc_1", Name: "echo", Input: json.RawMessage(`{}`)},
+				}, ThinkingBlocks: []ThinkingBlock{
+					{Type: "thinking", Thinking: "I should call echo.", Signature: "sigABC"},
+				}},
+				{Role: "tool", ToolCallID: "tc_1", Content: "done"},
+			},
+		})
+		if err != nil {
+			t.Fatalf("ChatCompletion: %v", err)
+		}
+		m := decodeAnthropicRequest(t, lastBody())
+		th, ok := m["thinking"].(map[string]any)
+		if !ok {
+			t.Fatalf("thinking must stay enabled on a continuation that carries its thinking blocks, request was: %s", lastBody())
+		}
+		// budget = max_tokens/2 (8192/2), clamped down from the 32000 default.
+		if th["budget_tokens"] != float64(4096) {
+			t.Errorf("thinking.budget_tokens = %v, want 4096", th["budget_tokens"])
+		}
+		// The assistant turn must re-emit the thinking block FIRST, with its
+		// signature, ahead of the tool_use block.
+		msgs, _ := m["messages"].([]any)
+		var assistantContent []any
+		for _, mm := range msgs {
+			msg, _ := mm.(map[string]any)
+			if role, _ := msg["role"].(string); role == "assistant" {
+				assistantContent, _ = msg["content"].([]any)
+			}
+		}
+		if len(assistantContent) == 0 {
+			t.Fatalf("assistant turn missing from request: %s", lastBody())
+		}
+		first, _ := assistantContent[0].(map[string]any)
+		if first["type"] != "thinking" {
+			t.Errorf("assistant turn must START with the thinking block, got %v: %s", first["type"], lastBody())
+		}
+		if first["thinking"] != "I should call echo." || first["signature"] != "sigABC" {
+			t.Errorf("thinking block not round-tripped verbatim: %v", first)
+		}
+		var secondType any
+		if secondBlk, ok := assistantContent[1].(map[string]any); ok {
+			secondType = secondBlk["type"]
+		}
+		if len(assistantContent) < 2 || secondType != "tool_use" {
+			t.Errorf("tool_use block must follow the thinking block: %s", lastBody())
+		}
+	})
+
+	t.Run("tool-use continuation without thinking blocks disables thinking", func(t *testing.T) {
 		_, err := provider.ChatCompletion(ctx, ChatRequest{
 			Model:           "claude-3-haiku-20240307",
 			MaxTokens:       8192,
@@ -215,7 +271,7 @@ func TestAnthropicProvider_ThinkingGateOnToolUseContinuation(t *testing.T) {
 		}
 		m := decodeAnthropicRequest(t, lastBody())
 		if th, ok := m["thinking"]; ok {
-			t.Errorf("thinking must not be enabled on a tool-use continuation request, got %v in %s", th, lastBody())
+			t.Errorf("thinking must be disabled when the final assistant turn carries no thinking blocks (the API would reject the request), got %v in %s", th, lastBody())
 		}
 	})
 
@@ -243,7 +299,12 @@ func TestAnthropicProvider_ThinkingGateOnToolUseContinuation(t *testing.T) {
 		}
 	})
 
-	t.Run("text-only assistant history keeps thinking enabled", func(t *testing.T) {
+	t.Run("foreign text-only final assistant turn disables thinking", func(t *testing.T) {
+		// The API requires the FINAL assistant turn of a thinking-enabled
+		// request to start with a thinking block — including a plain-text
+		// turn. A text-only assistant turn without ThinkingBlocks (another
+		// provider, or a pre-carriage persisted session) cannot satisfy that,
+		// so the fail-safe disables thinking for the request.
 		_, err := provider.ChatCompletion(ctx, ChatRequest{
 			Model:           "claude-3-haiku-20240307",
 			MaxTokens:       8192,
@@ -258,8 +319,30 @@ func TestAnthropicProvider_ThinkingGateOnToolUseContinuation(t *testing.T) {
 			t.Fatalf("ChatCompletion: %v", err)
 		}
 		m := decodeAnthropicRequest(t, lastBody())
+		if th, ok := m["thinking"]; ok {
+			t.Errorf("thinking must be disabled when the final assistant turn is a foreign text-only turn without thinking blocks, got %v: %s", th, lastBody())
+		}
+	})
+
+	t.Run("carried text-only final assistant turn keeps thinking enabled", func(t *testing.T) {
+		_, err := provider.ChatCompletion(ctx, ChatRequest{
+			Model:           "claude-3-haiku-20240307",
+			MaxTokens:       8192,
+			ReasoningEffort: "On",
+			Messages: []Message{
+				{Role: "user", Content: "hello"},
+				{Role: "assistant", Content: "hi there", ThinkingBlocks: []ThinkingBlock{
+					{Type: "thinking", Thinking: "greeting.", Signature: "sigXYZ"},
+				}},
+				{Role: "user", Content: "continue"},
+			},
+		})
+		if err != nil {
+			t.Fatalf("ChatCompletion: %v", err)
+		}
+		m := decodeAnthropicRequest(t, lastBody())
 		if _, ok := m["thinking"]; !ok {
-			t.Errorf("thinking must stay enabled when the re-sent assistant turn carries no tool_use blocks: %s", lastBody())
+			t.Errorf("thinking must stay enabled when the final assistant turn carries its thinking blocks: %s", lastBody())
 		}
 	})
 }

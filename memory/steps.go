@@ -10,19 +10,22 @@ import (
 
 // assistantMsgFromStep renders a step's assistant message exactly as
 // ContextWindow.buildAssistantMsg does: Thought (trailing-invisible-trimmed)
-// as content, ReasoningContent and the Responses-API ReasoningItems carried
-// through untouched, and a "(proceeding)" placeholder only when the message
-// would otherwise be content-less AND tool-call-less (a message carrying
-// tool_calls is already valid for OpenAI-compatible APIs). Sharing one
-// renderer keeps the frozen compaction prefix identical to the live prompt
-// path — most importantly, the reasoning chain a Responses-API backend
-// requires on every subsequent request must round-trip through both.
-func assistantMsgFromStep(thought, reasoningContent string, reasoningItems []llm.ReasoningItem, toolCalls []llm.ToolCall) llm.Message {
+// as content, ReasoningContent, the Responses-API ReasoningItems and the
+// Anthropic ThinkingBlocks carried through untouched, and a "(proceeding)"
+// placeholder only when the message would otherwise be content-less AND
+// tool-call-less (a message carrying tool_calls is already valid for
+// OpenAI-compatible APIs). Sharing one renderer keeps the frozen compaction
+// prefix identical to the live prompt path — most importantly, the reasoning
+// chain a Responses-API backend requires on every subsequent request (and the
+// signed thinking blocks the Anthropic Messages API re-verifies) must
+// round-trip through both.
+func assistantMsgFromStep(thought, reasoningContent string, reasoningItems []llm.ReasoningItem, thinkingBlocks []llm.ThinkingBlock, toolCalls []llm.ToolCall) llm.Message {
 	msg := llm.Message{
 		Role:             "assistant",
 		Content:          strings.TrimRight(thought, strutil.InvisibleTrimSet),
 		ReasoningContent: reasoningContent,
 		ReasoningItems:   reasoningItems,
+		ThinkingBlocks:   thinkingBlocks,
 		ToolCalls:        toolCalls,
 	}
 	if msg.Content == "" && len(msg.ToolCalls) == 0 {
@@ -33,14 +36,15 @@ func assistantMsgFromStep(thought, reasoningContent string, reasoningItems []llm
 
 // isNudgeOnlyStep reports whether a step renders as nothing but its user
 // nudge: no (trimmed) thought, no reasoning content, no Responses-API
-// reasoning items, no tool call, and a visible nudge. Mirrors the nudgeOnly
-// test in ContextWindow.buildStandaloneMessages, so a nudge-carrying step
-// that carries reasoning still emits its assistant message after compaction
-// instead of being dropped with its reasoning chain.
-func isNudgeOnlyStep(thought, reasoningContent string, reasoningItems []llm.ReasoningItem, toolCalls []llm.ToolCall, nudge string) bool {
+// reasoning items, no Anthropic thinking blocks, no tool call, and a visible
+// nudge. Mirrors the nudgeOnly test in ContextWindow.buildStandaloneMessages,
+// so a nudge-carrying step that carries reasoning still emits its assistant
+// message after compaction instead of being dropped with its reasoning chain.
+func isNudgeOnlyStep(thought, reasoningContent string, reasoningItems []llm.ReasoningItem, thinkingBlocks []llm.ThinkingBlock, toolCalls []llm.ToolCall, nudge string) bool {
 	return strings.TrimRight(thought, strutil.InvisibleTrimSet) == "" &&
 		reasoningContent == "" &&
 		len(reasoningItems) == 0 &&
+		len(thinkingBlocks) == 0 &&
 		len(toolCalls) == 0 &&
 		nudge != ""
 }
@@ -76,11 +80,11 @@ func stepsToMessages(steps []sdkagent.Step) []llm.Message {
 					toolCalls = append(toolCalls, gs.Action)
 				}
 			}
-			assistantMsg := assistantMsgFromStep(groupSteps[0].Thought, groupSteps[0].ReasoningContent, groupSteps[0].ReasoningItems, toolCalls)
+			assistantMsg := assistantMsgFromStep(groupSteps[0].Thought, groupSteps[0].ReasoningContent, groupSteps[0].ReasoningItems, groupSteps[0].ThinkingBlocks, toolCalls)
 
 			// UserNudge only on last step of group (mirrors buildGroupedMessages)
 			nudge := strings.TrimRight(groupSteps[len(groupSteps)-1].UserNudge, strutil.InvisibleTrimSet)
-			if !isNudgeOnlyStep(groupSteps[0].Thought, groupSteps[0].ReasoningContent, groupSteps[0].ReasoningItems, toolCalls, nudge) {
+			if !isNudgeOnlyStep(groupSteps[0].Thought, groupSteps[0].ReasoningContent, groupSteps[0].ReasoningItems, groupSteps[0].ThinkingBlocks, toolCalls, nudge) {
 				messages = append(messages, assistantMsg)
 			}
 			// Nudge-only group: skip the empty assistant placeholder.
@@ -111,10 +115,10 @@ func stepsToMessages(steps []sdkagent.Step) []llm.Message {
 			if step.Action.ID != "" {
 				toolCalls = []llm.ToolCall{step.Action}
 			}
-			assistantMsg := assistantMsgFromStep(step.Thought, step.ReasoningContent, step.ReasoningItems, toolCalls)
+			assistantMsg := assistantMsgFromStep(step.Thought, step.ReasoningContent, step.ReasoningItems, step.ThinkingBlocks, toolCalls)
 
 			nudge := strings.TrimRight(step.UserNudge, strutil.InvisibleTrimSet)
-			if !isNudgeOnlyStep(step.Thought, step.ReasoningContent, step.ReasoningItems, toolCalls, nudge) {
+			if !isNudgeOnlyStep(step.Thought, step.ReasoningContent, step.ReasoningItems, step.ThinkingBlocks, toolCalls, nudge) {
 				messages = append(messages, assistantMsg)
 			}
 			// Nudge-only step: skip the empty assistant placeholder.

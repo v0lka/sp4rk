@@ -17,6 +17,14 @@ type Step struct {
 	// reasoning chain across ReAct iterations. Populated only by the Responses API
 	// provider; mirrors llm.Message.ReasoningItems so it survives the Step boundary.
 	ReasoningItems []llm.ReasoningItem `json:"reasoning_items,omitempty"`
+	// ThinkingBlocks carries the Anthropic extended-thinking blocks
+	// (thinking + redacted_thinking, with their signatures) the provider
+	// returned for this step. Mirrors llm.Message.ThinkingBlocks so they
+	// survive the Step boundary: the Anthropic Messages API rejects a
+	// thinking-enabled continuation whose assistant turns lack their original
+	// thinking blocks, so these must round-trip through BuildPrompt back onto
+	// the wire byte-for-byte (the signature covers the exact thinking text).
+	ThinkingBlocks []llm.ThinkingBlock `json:"thinking_blocks,omitempty"`
 	// Action is the tool call requested by the model in this step.
 	Action llm.ToolCall `json:"action"`
 	// Observation is the tool result (possibly truncated) fed back to the model.

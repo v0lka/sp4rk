@@ -28,6 +28,7 @@ type ContextWindowConfig struct {
     SafetyMarginPercent     int                       // default 5
     InjectionDefenseEnabled bool
     Pruning                 ToolOutputPruning
+    MutationCohortSize      int                       // seeds HistoryMutation.CohortSize; <= 1 = legacy per-step advance
 }
 
 type CompactionStrategy interface {
@@ -75,6 +76,7 @@ When `InjectionDefenseEnabled` is `true`, tool outputs from untrusted sources (f
 - The system prompt is always preserved (never compacted away); `BuildPrompt` splits it on `CacheBreakMarker` into multiple system messages for provider-level prompt caching.
 - Compaction is triggered proactively (before overflow, not after).
 - History mutation and pruning run first in message construction; outputs already replaced by a cache reference or step-status eviction text are not overwritten by the pruning placeholder.
+- The eviction and pruning boundaries advance only at cohort boundaries (`HistoryMutation.CohortSize`; `<= 1` = legacy per-step): between boundaries consecutive `BuildPrompt` calls keep the shared prefix byte-stable (only new steps are appended), and each boundary moves exactly one cohort of K steps together.
 - Entire response groups are protected if any step in the group is protected (prevents malformed assistant/tool message pairs).
 - Each step/subagent has its own `ContextManager` (no sharing between parallel steps).
 - `SeedSteps` wholesale-replaces the step history: it clears compaction state and recalculates the token-tracker delta for the batch, so fill accounting stays correct until the next `CorrectTokenCount`.
@@ -102,9 +104,10 @@ When `InjectionDefenseEnabled` is `true`, tool outputs from untrusted sources (f
 | `ToolResultEvictionStep` | Steps after which a tool result is replaced with a cache reference (`0` disables). |
 | `EvictStepStatus` | Immediately evict `update_checklist` (bookkeeping) results; the legacy `set_step_status` tool name matches too. |
 | `DedupRepeatedReads` | Replace duplicate file reads (same path + mtime → same cache hash) with a reference. |
+| `CohortSize` | Quantum of the eviction/pruning boundary advance: the age-eviction boundary and the pruning `KeepLastN` window start move in K-sized cohorts, keeping the request prefix byte-stable between boundaries (provider prompt-cache friendly). `<= 1` (unset) = legacy per-step advance; the host config layer defaults to `5` (seedable via `ContextWindowConfig.MutationCohortSize`). Same-build mechanisms (step-status eviction, dedup) are not quantized. |
 | `Logger` | Optional `*slog.Logger` for mutation diagnostics (`nil` = silent). |
 
-`ToolOutputPruning` (see defaults above) additionally carries `ProtectedTools`, `PlaceholderText` (the text substituted for a pruned tool output; defaulted in `NewContextWindow` when empty), and an optional `Logger`.
+`ToolOutputPruning` (see defaults above) additionally carries `ProtectedTools`, `PlaceholderText` (the text substituted for a pruned tool output; defaulted in `NewContextWindow` when empty), and an optional `Logger`. Its `KeepLastN` window start advances in the shared `HistoryMutation.CohortSize` cohorts.
 
 ## Extension Points
 

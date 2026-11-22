@@ -51,6 +51,21 @@ type HistoryMutation struct {
 	// DedupRepeatedReads replaces duplicate file-read results (same path +
 	// mtime) with a reference to the earlier result's cache hash.
 	DedupRepeatedReads bool
+	// CohortSize quantizes the boundary advance of age-based eviction (and
+	// of the pruning KeepLastN window, which shares this knob) into
+	// K-sized cohorts: steps cross the eviction/pruning threshold together
+	// in batches of K instead of one per BuildPrompt, so the request prefix
+	// stays byte-stable between cohort boundaries and provider auto
+	// prompt-caching is not invalidated on every turn. At each cohort
+	// boundary exactly K more steps cross together; their content remains
+	// recoverable via ToolResultCache (eviction) and mutation-before-pruning
+	// ordering and placeholder protection are unchanged. Same-build
+	// mechanisms (EvictStepStatus, DedupRepeatedReads) are not affected —
+	// they never age across builds. Values <= 1 (including the zero value,
+	// i.e. unset) preserve the legacy per-step boundary advance. The host
+	// config layer owns the production default (5); the package never
+	// defaults the zero value.
+	CohortSize int
 	// Logger is an optional logger for mutation diagnostics.
 	Logger *slog.Logger
 }
@@ -177,6 +192,13 @@ type ContextWindowConfig struct {
 	// Pruning configures tool-output pruning. Zero value leaves pruning
 	// disabled (ThresholdPercent 0) with a default placeholder text.
 	Pruning ToolOutputPruning
+
+	// MutationCohortSize seeds HistoryMutation.CohortSize — the K-sized
+	// cohort quantization of the eviction/pruning boundary advance (see
+	// HistoryMutation.CohortSize). Values <= 1 keep the legacy per-step
+	// advance. A later SetHistoryMutation call replaces the whole mutation
+	// struct, including this value.
+	MutationCohortSize int
 }
 
 // NewContextWindow creates a new ContextWindow from the given config.
@@ -228,6 +250,11 @@ func NewContextWindow(cfg ContextWindowConfig) *ContextWindow {
 	// Pruning.ThresholdPercent is left at zero-value (disabled) unless
 	// explicitly set. The config layer sets the default (e.g. 50%) via
 	// config.yaml.
+	// Seed the mutation cohort size from config so callers that build the
+	// window purely from ContextWindowConfig get the quantized boundary
+	// advance without a separate SetHistoryMutation call. A later
+	// SetHistoryMutation replaces the whole struct, including this value.
+	cw.mutation.CohortSize = cfg.MutationCohortSize
 	return cw
 }
 
@@ -640,7 +667,7 @@ func (cw *ContextWindow) buildGroupedMessages(groupStart int, protectedIndices m
 			toolCalls = append(toolCalls, gs.Action)
 		}
 	}
-	assistantMsg := cw.buildAssistantMsg(groupSteps[0].Thought, groupSteps[0].ReasoningContent, groupSteps[0].ReasoningItems, toolCalls)
+	assistantMsg := cw.buildAssistantMsg(groupSteps[0].Thought, groupSteps[0].ReasoningContent, groupSteps[0].ReasoningItems, groupSteps[0].ThinkingBlocks, toolCalls)
 
 	var out []llm.Message
 	out = append(out, assistantMsg)
@@ -668,7 +695,7 @@ func (cw *ContextWindow) buildStandaloneMessages(step sdkagent.Step, i int, prot
 	if step.Action.ID != "" {
 		toolCalls = []llm.ToolCall{step.Action}
 	}
-	assistantMsg := cw.buildAssistantMsg(step.Thought, step.ReasoningContent, step.ReasoningItems, toolCalls)
+	assistantMsg := cw.buildAssistantMsg(step.Thought, step.ReasoningContent, step.ReasoningItems, step.ThinkingBlocks, toolCalls)
 
 	var out []llm.Message
 
@@ -678,7 +705,7 @@ func (cw *ContextWindow) buildStandaloneMessages(step sdkagent.Step, i int, prot
 	// between the pending tool result and the user correction.
 	thought := strings.TrimRight(step.Thought, strutil.InvisibleTrimSet)
 	nudgeOnly := thought == "" && step.ReasoningContent == "" && len(step.ReasoningItems) == 0 &&
-		step.Action.ID == "" && strutil.HasVisibleContent(step.UserNudge)
+		len(step.ThinkingBlocks) == 0 && step.Action.ID == "" && strutil.HasVisibleContent(step.UserNudge)
 
 	if !nudgeOnly {
 		out = append(out, assistantMsg)
@@ -696,16 +723,18 @@ func (cw *ContextWindow) buildStandaloneMessages(step sdkagent.Step, i int, prot
 }
 
 // buildAssistantMsg creates a normalized assistant message from thought, reasoning,
-// and (for the Responses API) reasoning items. Empty content is replaced with a
-// "(proceeding)" placeholder only when there are also no tool calls — a message
-// carrying tool_calls is already valid for OpenAI-compatible APIs, and adding the
-// placeholder would pollute the visible history. This mirrors stepsToMessages.
-func (cw *ContextWindow) buildAssistantMsg(thought, reasoningContent string, reasoningItems []llm.ReasoningItem, toolCalls []llm.ToolCall) llm.Message {
+// the Responses-API reasoning items, the Anthropic thinking blocks, and tool calls.
+// Empty content is replaced with a "(proceeding)" placeholder only when there are
+// also no tool calls — a message carrying tool_calls is already valid for
+// OpenAI-compatible APIs, and adding the placeholder would pollute the visible
+// history. This mirrors stepsToMessages.
+func (cw *ContextWindow) buildAssistantMsg(thought, reasoningContent string, reasoningItems []llm.ReasoningItem, thinkingBlocks []llm.ThinkingBlock, toolCalls []llm.ToolCall) llm.Message {
 	msg := llm.Message{
 		Role:             "assistant",
 		Content:          strings.TrimRight(thought, strutil.InvisibleTrimSet),
 		ReasoningContent: reasoningContent,
 		ReasoningItems:   reasoningItems,
+		ThinkingBlocks:   thinkingBlocks,
 		ToolCalls:        toolCalls,
 	}
 	if msg.Content == "" && len(msg.ToolCalls) == 0 {
@@ -774,16 +803,16 @@ func (cw *ContextWindow) applyHistoryMutation(step sdkagent.Step, idx int, obser
 	}
 
 	// Age-based eviction: replace old tool results with cache reference.
-	if cw.mutation.ToolResultEvictionStep > 0 && step.CacheHash != "" {
-		age := len(cw.steps) - idx
-		if age > cw.mutation.ToolResultEvictionStep {
-			if cw.mutation.Logger != nil {
-				cw.mutation.Logger.Debug("tool result evicted to cache reference",
-					"stepIndex", idx, "age", age, "tool", toolName, "hash", step.CacheHash,
-				)
-			}
-			return evictionReferenceText(step.CacheHash)
+	// The boundary is cohort-quantized (see evictionBoundary): steps cross
+	// the threshold together in CohortSize-sized batches so the rendered
+	// prefix is byte-stable between cohort boundaries.
+	if cw.mutation.ToolResultEvictionStep > 0 && step.CacheHash != "" && idx < cw.evictionBoundary() {
+		if cw.mutation.Logger != nil {
+			cw.mutation.Logger.Debug("tool result evicted to cache reference",
+				"stepIndex", idx, "age", len(cw.steps)-idx, "tool", toolName, "hash", step.CacheHash,
+			)
 		}
+		return evictionReferenceText(step.CacheHash)
 	}
 
 	// Dedup repeated reads: if the same file (path+mtime) was read earlier,
@@ -800,6 +829,30 @@ func (cw *ContextWindow) applyHistoryMutation(step sdkagent.Step, idx int, obser
 	}
 
 	return observation
+}
+
+// evictionBoundary returns the step-index boundary for age-based eviction:
+// steps with a lower index are replaced with cache references. The legacy
+// boundary (len(steps) - ToolResultEvictionStep) advances one step per
+// BuildPrompt, invalidating the provider's prompt cache on every turn;
+// cohortBoundary quantizes that advance into HistoryMutation.CohortSize-sized
+// jumps so the rendered prefix stays byte-stable between cohort boundaries.
+func (cw *ContextWindow) evictionBoundary() int {
+	return cohortBoundary(len(cw.steps)-cw.mutation.ToolResultEvictionStep, cw.mutation.CohortSize)
+}
+
+// cohortBoundary quantizes a legacy boundary position into K-sized cohorts.
+// pos is the number of leading entries (in the boundary's own ordinal space)
+// that have crossed their threshold under the legacy per-step advance; the
+// returned boundary only advances when pos reaches the next multiple of k,
+// so exactly k entries cross together at each cohort boundary and the
+// request prefix is byte-stable in between. k <= 1 (unset or per-step)
+// returns pos unchanged — the legacy per-step advance.
+func cohortBoundary(pos, k int) int {
+	if k <= 1 || pos <= 0 {
+		return pos
+	}
+	return (pos / k) * k
 }
 
 // isProtectedTool checks if the tool name is in the pruning ProtectedTools list.
@@ -840,7 +893,8 @@ func (cw *ContextWindow) buildNudgeMsg(nudge string) (llm.Message, bool) {
 
 // computeProtectedIndices returns a set of step indices that should NOT be pruned.
 // Protected indices include:
-//   - The last KeepLastN steps that have tool results
+//   - The last KeepLastN steps that have tool results (the window start is
+//     cohort-quantized via cohortBoundary — see HistoryMutation.CohortSize)
 //   - Any step whose tool name is in ProtectedTools
 //   - All steps in a ResponseGroup if any step in the group is protected
 func (cw *ContextWindow) computeProtectedIndices() map[int]struct{} {
@@ -874,8 +928,12 @@ func (cw *ContextWindow) computeProtectedIndices() map[int]struct{} {
 		}
 	}
 
-	// Build protected set from last KeepLastN tool-result steps
-	start := len(toolResultIndices) - cw.pruning.KeepLastN
+	// Build protected set from last KeepLastN tool-result steps. The window
+	// start is cohort-quantized with the shared HistoryMutation.CohortSize
+	// so the pruning boundary advances in K-sized jumps instead of one tool
+	// result per build — the same prefix byte-stability contract as
+	// age-based eviction.
+	start := cohortBoundary(len(toolResultIndices)-cw.pruning.KeepLastN, cw.mutation.CohortSize)
 	if start < 0 {
 		start = 0
 	}

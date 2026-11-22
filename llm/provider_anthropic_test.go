@@ -148,8 +148,14 @@ func TestAnthropicProvider_BuildRequest(t *testing.T) {
 		t.Fatalf("buildRequest failed: %v", err)
 	}
 
-	if anthropicReq.System != "You are helpful." {
-		t.Errorf("expected system prompt 'You are helpful.', got %q", anthropicReq.System)
+	// The system prompt is always rendered as MultiSystem parts; with the
+	// cache armed (default/executor purpose) the single all-stable part
+	// carries the boundary cache_control breakpoint.
+	if len(anthropicReq.MultiSystem) != 1 || anthropicReq.MultiSystem[0].Text != "You are helpful." {
+		t.Fatalf("MultiSystem = %+v, want one part 'You are helpful.'", anthropicReq.MultiSystem)
+	}
+	if anthropicReq.MultiSystem[0].CacheControl == nil {
+		t.Error("MultiSystem[0].CacheControl should be set (stable system boundary)")
 	}
 	if anthropicReq.MaxTokens != 2048 {
 		t.Errorf("expected MaxTokens 2048, got %d", anthropicReq.MaxTokens)
@@ -569,7 +575,7 @@ func TestAnthropicProvider_NewNormalizesBaseURL(t *testing.T) {
 func TestAnthropicProvider_BuildRequest_MultiSystem(t *testing.T) {
 	p, _ := NewAnthropicProvider(AnthropicProviderConfig{APIKey: "test-key"})
 
-	t.Run("single system message uses scalar System field", func(t *testing.T) {
+	t.Run("single system message uses MultiSystem with boundary cache control", func(t *testing.T) {
 		req := ChatRequest{
 			Model:     "claude-3-sonnet",
 			MaxTokens: 1024,
@@ -584,11 +590,17 @@ func TestAnthropicProvider_BuildRequest_MultiSystem(t *testing.T) {
 			t.Fatalf("buildRequest failed: %v", err)
 		}
 
-		if anthropicReq.System != "You are helpful." {
-			t.Errorf("System = %q, want %q", anthropicReq.System, "You are helpful.")
+		// A single all-stable system part is rendered as a one-element
+		// MultiSystem (the wire accepts the array form interchangeably with
+		// the plain string) carrying the stable-system cache breakpoint.
+		if len(anthropicReq.MultiSystem) != 1 {
+			t.Fatalf("MultiSystem should have 1 part, got %d parts", len(anthropicReq.MultiSystem))
 		}
-		if len(anthropicReq.MultiSystem) != 0 {
-			t.Errorf("MultiSystem should be empty for single system message, got %d parts", len(anthropicReq.MultiSystem))
+		if anthropicReq.MultiSystem[0].Text != "You are helpful." {
+			t.Errorf("MultiSystem[0].Text = %q, want %q", anthropicReq.MultiSystem[0].Text, "You are helpful.")
+		}
+		if anthropicReq.MultiSystem[0].CacheControl == nil {
+			t.Error("MultiSystem[0].CacheControl should be set (stable system boundary)")
 		}
 	})
 
@@ -634,7 +646,7 @@ func TestAnthropicProvider_BuildRequest_MultiSystem(t *testing.T) {
 		}
 	})
 
-	t.Run("three system messages caches all but last", func(t *testing.T) {
+	t.Run("three system messages marks the stable boundary", func(t *testing.T) {
 		req := ChatRequest{
 			Model:     "claude-3-sonnet",
 			MaxTokens: 1024,
@@ -655,11 +667,14 @@ func TestAnthropicProvider_BuildRequest_MultiSystem(t *testing.T) {
 			t.Fatalf("MultiSystem should have 3 parts, got %d", len(anthropicReq.MultiSystem))
 		}
 
-		// Parts 0 and 1 should have cache control
-		for i := 0; i < 2; i++ {
-			if anthropicReq.MultiSystem[i].CacheControl == nil {
-				t.Errorf("MultiSystem[%d].CacheControl should be set", i)
-			}
+		// ONE breakpoint at the stable boundary: the second-to-last part
+		// caches parts 0..1 (the marker-separated stable prefix); the last
+		// (dynamic) part and the already-covered first part carry none.
+		if anthropicReq.MultiSystem[1].CacheControl == nil {
+			t.Error("MultiSystem[1].CacheControl should be set (stable boundary)")
+		}
+		if anthropicReq.MultiSystem[0].CacheControl != nil {
+			t.Error("MultiSystem[0].CacheControl should be nil (covered by the boundary breakpoint)")
 		}
 		// Part 2 (last) should NOT
 		if anthropicReq.MultiSystem[2].CacheControl != nil {

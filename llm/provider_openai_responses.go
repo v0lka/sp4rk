@@ -616,6 +616,11 @@ func convertResponsesResponse(resp *responses.Response, mapping *toolNameMapping
 		Usage: TokenUsage{
 			InputTokens:  int(resp.Usage.InputTokens),
 			OutputTokens: int(resp.Usage.OutputTokens),
+			// input_tokens_details.cached_tokens is the Responses-API
+			// spelling of the prompt-cache hit count; like the Chat
+			// Completions detail it is a subset of input_tokens, so
+			// InputTokens semantics stay unchanged.
+			CachedInputTokens: int(resp.Usage.InputTokensDetails.CachedTokens),
 		},
 	}
 	result.Reasoning = message.ReasoningContent

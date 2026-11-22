@@ -20,6 +20,32 @@ type Message struct {
 	// Each item has an ID (required for round-tripping to the API) and a Summary text.
 	// Populated only by the Responses API provider; other providers use ReasoningContent.
 	ReasoningItems []ReasoningItem `json:"reasoning_items,omitempty"`
+	// ThinkingBlocks carries Anthropic extended-thinking blocks (thinking and
+	// redacted_thinking) exactly as the Messages API returned them: the
+	// reasoning text plus its verification Signature (which the API re-verifies
+	// and rejects when altered), or the encrypted Data payload of a
+	// redacted_thinking block. Populated only by the Anthropic provider's
+	// parseResponse; the provider re-emits them at the START of the
+	// corresponding assistant turn on the next request, which the API requires
+	// whenever thinking is enabled (otherwise the request is rejected with
+	// HTTP 400 "Expected `thinking` or `redacted_thinking`"). They ride the
+	// same carriage as ReasoningItems — through agent.Step into the history —
+	// and must be passed back byte-for-byte: the thinking text is covered by
+	// the signature, so trimming or re-wrapping invalidates it.
+	ThinkingBlocks []ThinkingBlock `json:"thinking_blocks,omitempty"`
+}
+
+// ThinkingBlock is one Anthropic extended-thinking block carried on an
+// assistant Message. Type is "thinking" (Thinking + Signature carry the
+// reasoning and its verification signature) or "redacted_thinking" (Data
+// carries the opaque encrypted payload the API substitutes when it declines
+// to expose the reasoning; redacted blocks carry no signature and are also
+// mandatory to round-trip).
+type ThinkingBlock struct {
+	Type      string `json:"type"`                // "thinking" | "redacted_thinking"
+	Thinking  string `json:"thinking,omitempty"`  // reasoning text (Type == "thinking")
+	Signature string `json:"signature,omitempty"` // verification signature (Type == "thinking")
+	Data      string `json:"data,omitempty"`      // encrypted payload (Type == "redacted_thinking")
 }
 
 // ContentBlock represents a single structured content element within a Message.
@@ -227,6 +253,22 @@ type ChatResponse struct {
 type TokenUsage struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
+	// CachedInputTokens reports the prompt tokens the provider served from
+	// its prompt cache (cache hits). Wire spellings per provider: OpenAI Chat
+	// Completions prompt_tokens_details.cached_tokens, DeepSeek
+	// prompt_cache_hit_tokens, OpenAI Responses
+	// input_tokens_details.cached_tokens, Anthropic cache_read_input_tokens.
+	// It is a detail of InputTokens, never an addition to it: OpenAI-family
+	// prompt_tokens/input_tokens already include the cached tokens, and
+	// Anthropic InputTokens is the full sum including cache counters. Zero
+	// when the provider (or endpoint) reports no cache detail.
+	CachedInputTokens int `json:"cached_input_tokens,omitempty"`
+	// CacheWriteTokens reports the prompt tokens the provider wrote into its
+	// prompt cache on this request (Anthropic cache_creation_input_tokens;
+	// the OpenAI-family wire formats carry no cache-write counter and
+	// populate nothing here). Like CachedInputTokens it is a detail already
+	// included in InputTokens, not an addition. Zero when unreported.
+	CacheWriteTokens int `json:"cache_write_tokens,omitempty"`
 }
 
 // normalizeResponse trims trailing whitespace from content and reasoning fields.

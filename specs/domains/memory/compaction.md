@@ -84,7 +84,7 @@ A pure, no-LLM, no-mutation prediction of what a manual compaction would do, for
 
 `ToolOutputPruning` replaces individual tool-result bodies with a placeholder while keeping the surrounding assistant/tool message structure intact:
 
-- The last `KeepLastN` tool-result steps are always protected.
+- The last `KeepLastN` tool-result steps are always protected; the protected-window start advances in `HistoryMutation.CohortSize`-sized cohorts (shared with history mutation, below), so the boundary jumps once per cohort instead of shifting one tool result per build.
 - Any step whose tool name is in `ProtectedTools` is protected regardless of position.
 - When context fill is below `ThresholdPercent`, **all** tool outputs are preserved (pruning skipped).
 - Entire response groups are protected if any step in the group is protected.
@@ -95,11 +95,11 @@ This begins at the `Pruning.ThresholdPercent` floor (default `50`) and runs cont
 
 `HistoryMutation` runs on **every** `BuildPrompt` (not fill-triggered) to reduce O(n²) replay cost. Information is preserved — evicted content is recoverable via `agent.ToolResultCache`:
 
-- **Cache reference eviction**: a tool result older than `ToolResultEvictionStep` steps with a `CacheHash` is replaced with a cache-reference nudge (`tool_result_read(hash=…, …)`).
+- **Cache reference eviction**: a tool result older than `ToolResultEvictionStep` steps with a `CacheHash` is replaced with a cache-reference nudge (`tool_result_read(hash=…, …)`). The boundary advances in `CohortSize`-sized cohorts: steps cross the threshold together in batches of K, and between cohort boundaries consecutive `BuildPrompt` calls keep a byte-stable request prefix, so provider auto prompt-caching is not invalidated on every turn. Values `<= 1` (unset) keep the legacy per-step advance; the host config layer defaults to `5`.
 - **Step-status eviction**: `update_checklist` (bookkeeping) results are evicted immediately when `EvictStepStatus` is set.
 - **Dedup repeated reads**: if the same file (same path + mtime → same cache hash) was read earlier, the later result is replaced with a cache reference.
 
-Mutation runs **first** in message construction, before pruning and injection defense; pruning is skipped for outputs already replaced by a cache reference (overwriting the placeholder would destroy the cache hash and break recoverability).
+Step-status eviction and dedup are same-build semantics: they never age across builds, so cohort quantization does not apply to them. Mutation runs **first** in message construction, before pruning and injection defense; pruning is skipped for outputs already replaced by a cache reference (overwriting the placeholder would destroy the cache hash and break recoverability).
 
 ### Trigger thresholds
 
@@ -134,6 +134,7 @@ A step may override pruning config via `PruningOverride{KeepLastN, ProtectedTool
 - Tool-output pruning runs before strategy compaction.
 - Protected tools are never pruned regardless of `KeepLastN`.
 - Mutation runs before pruning; cache-reference placeholders are not overwritten.
+- The eviction and pruning boundaries advance only at cohort boundaries: between boundaries consecutive `BuildPrompt` calls keep the shared prefix byte-stable (only new steps are appended), and each boundary moves exactly one cohort of `CohortSize` steps together.
 - `Compact` recomputes fill from the compacted prefix (tracker synced via `Correct`) and returns the before/after percentages; the executor re-evaluates `CheckFill` on the next iteration and can still report `warning`/`emergency`/`reject` — the `reject` gate aborts the run instead of sending an over-limit request.
 
 ## Related Specs

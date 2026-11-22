@@ -584,6 +584,7 @@ func (e *Executor) handleImplicitFinish(ctx context.Context, resp *llm.ChatRespo
 				UserNudge:        executorToolCallSyntaxNudge,
 				ReasoningContent: resp.Message.ReasoningContent,
 				ReasoningItems:   resp.Message.ReasoningItems,
+				ThinkingBlocks:   resp.Message.ThinkingBlocks,
 				TokensUsed:       resp.Usage.InputTokens + resp.Usage.OutputTokens,
 			}
 			state.allSteps = append(state.allSteps, nudgeStep)
@@ -616,6 +617,7 @@ func (e *Executor) handleImplicitFinish(ctx context.Context, resp *llm.ChatRespo
 				UserNudge:        executorFinishNudge,
 				ReasoningContent: resp.Message.ReasoningContent,
 				ReasoningItems:   resp.Message.ReasoningItems,
+				ThinkingBlocks:   resp.Message.ThinkingBlocks,
 				TokensUsed:       resp.Usage.InputTokens + resp.Usage.OutputTokens,
 			}
 			state.allSteps = append(state.allSteps, nudgeStep)
@@ -628,6 +630,7 @@ func (e *Executor) handleImplicitFinish(ctx context.Context, resp *llm.ChatRespo
 			Thought:          thought,
 			ReasoningContent: resp.Message.ReasoningContent,
 			ReasoningItems:   resp.Message.ReasoningItems,
+			ThinkingBlocks:   resp.Message.ThinkingBlocks,
 			TokensUsed:       resp.Usage.InputTokens + resp.Usage.OutputTokens,
 		}
 		state.allSteps = append(state.allSteps, step)
@@ -659,6 +662,7 @@ func (e *Executor) handleImplicitFinish(ctx context.Context, resp *llm.ChatRespo
 			UserNudge:        executorNudge,
 			ReasoningContent: resp.Message.ReasoningContent,
 			ReasoningItems:   resp.Message.ReasoningItems,
+			ThinkingBlocks:   resp.Message.ThinkingBlocks,
 			TokensUsed:       resp.Usage.InputTokens + resp.Usage.OutputTokens,
 		}
 		state.allSteps = append(state.allSteps, nudgeStep)
@@ -676,6 +680,7 @@ func (e *Executor) handleImplicitFinish(ctx context.Context, resp *llm.ChatRespo
 			UserNudge:        executorFinishNudge,
 			ReasoningContent: resp.Message.ReasoningContent,
 			ReasoningItems:   resp.Message.ReasoningItems,
+			ThinkingBlocks:   resp.Message.ThinkingBlocks,
 			TokensUsed:       resp.Usage.InputTokens + resp.Usage.OutputTokens,
 		}
 		state.allSteps = append(state.allSteps, nudgeStep)
@@ -689,6 +694,7 @@ func (e *Executor) handleImplicitFinish(ctx context.Context, resp *llm.ChatRespo
 		Thought:          thought,
 		ReasoningContent: resp.Message.ReasoningContent,
 		ReasoningItems:   resp.Message.ReasoningItems,
+		ThinkingBlocks:   resp.Message.ThinkingBlocks,
 		TokensUsed:       resp.Usage.InputTokens + resp.Usage.OutputTokens,
 	}
 	state.allSteps = append(state.allSteps, step)
@@ -741,6 +747,7 @@ func (e *Executor) handleTruncationStopReason(ctx context.Context, resp *llm.Cha
 					// encrypted reasoning chain is lost for the truncated
 					// turn.
 					ReasoningItems:   resp.Message.ReasoningItems,
+					ThinkingBlocks:   resp.Message.ThinkingBlocks,
 					ReasoningContent: resp.Message.ReasoningContent,
 					UserNudge: "[System] The user acknowledged the truncation circuit breaker and " + reprieve + ". " +
 						"You MUST use smaller operations to avoid hitting the output token limit.",
@@ -757,6 +764,7 @@ func (e *Executor) handleTruncationStopReason(ctx context.Context, resp *llm.Cha
 				nudgeStep := Step{
 					Thought:          thought,
 					ReasoningItems:   resp.Message.ReasoningItems,
+					ThinkingBlocks:   resp.Message.ThinkingBlocks,
 					ReasoningContent: resp.Message.ReasoningContent,
 					UserNudge: "[System] The user has overridden the truncation circuit breaker. " +
 						"You may continue, but try to produce smaller outputs.",
@@ -789,6 +797,7 @@ func (e *Executor) handleTruncationStopReason(ctx context.Context, resp *llm.Cha
 		// ride it or the encrypted reasoning chain is silently lost for
 		// every max_tokens-truncated tool-call turn.
 		ReasoningItems:   resp.Message.ReasoningItems,
+		ThinkingBlocks:   resp.Message.ThinkingBlocks,
 		ReasoningContent: resp.Message.ReasoningContent,
 		Action:           truncAction,
 		Observation:      truncObs,
@@ -932,6 +941,7 @@ func (e *Executor) processSingleToolCall(
 			Thought:          thought,
 			ReasoningContent: rejectReasoning,
 			ReasoningItems:   rejectReasoningItems,
+			ThinkingBlocks:   resp.Message.ThinkingBlocks,
 			Action:           action,
 			Observation:      obs,
 			IsError:          true,
@@ -1147,6 +1157,7 @@ func (e *Executor) processSingleToolCall(
 		Thought:          stepThought,
 		ReasoningContent: stepReasoning,
 		ReasoningItems:   stepReasoningItems,
+		ThinkingBlocks:   resp.Message.ThinkingBlocks,
 		Action:           action,
 		Observation:      observation,
 		IsUntrusted:      isUntrusted,
@@ -1225,15 +1236,18 @@ func (e *Executor) handleFinishCall(
 			// them, and a copy here would duplicate the assistant turn and
 			// re-emit the same reasoning-item IDs to the backend.
 			var nudgeItems []llm.ReasoningItem
+			var nudgeThinkingBlocks []llm.ThinkingBlock
 			nudgeThought := ""
 			if firstMaterialized {
 				nudgeItems = resp.Message.ReasoningItems
+				nudgeThinkingBlocks = resp.Message.ThinkingBlocks
 				nudgeThought = thought
 			}
 			nudgeStep := Step{
 				Thought:        nudgeThought,
 				UserNudge:      guardErr.Error(),
 				ReasoningItems: nudgeItems,
+				ThinkingBlocks: nudgeThinkingBlocks,
 				TokensUsed:     resp.Usage.InputTokens + resp.Usage.OutputTokens,
 			}
 			state.allSteps = append(state.allSteps, nudgeStep)
@@ -1264,15 +1278,18 @@ func (e *Executor) handleFinishCall(
 		e.mutationNudgeAttempted = true
 		// Same first-materialized-carry rule as the finish-guard nudge above.
 		var nudgeItems []llm.ReasoningItem
+		var nudgeThinkingBlocks []llm.ThinkingBlock
 		nudgeThought := ""
 		if firstMaterialized {
 			nudgeItems = resp.Message.ReasoningItems
+			nudgeThinkingBlocks = resp.Message.ThinkingBlocks
 			nudgeThought = thought
 		}
 		nudgeStep := Step{
 			Thought:        nudgeThought,
 			UserNudge:      executorMutationNudge,
 			ReasoningItems: nudgeItems,
+			ThinkingBlocks: nudgeThinkingBlocks,
 			TokensUsed:     resp.Usage.InputTokens + resp.Usage.OutputTokens,
 		}
 		state.allSteps = append(state.allSteps, nudgeStep)
@@ -1294,15 +1311,18 @@ func (e *Executor) handleFinishCall(
 		e.checklistMissingNudgeAttempted = true
 		// Same first-materialized-carry rule as the finish-guard nudge above.
 		var nudgeItems []llm.ReasoningItem
+		var nudgeThinkingBlocks []llm.ThinkingBlock
 		nudgeThought := ""
 		if firstMaterialized {
 			nudgeItems = resp.Message.ReasoningItems
+			nudgeThinkingBlocks = resp.Message.ThinkingBlocks
 			nudgeThought = thought
 		}
 		nudgeStep := Step{
 			Thought:        nudgeThought,
 			UserNudge:      executorChecklistMissingNudge,
 			ReasoningItems: nudgeItems,
+			ThinkingBlocks: nudgeThinkingBlocks,
 			TokensUsed:     resp.Usage.InputTokens + resp.Usage.OutputTokens,
 		}
 		state.allSteps = append(state.allSteps, nudgeStep)
@@ -1321,15 +1341,18 @@ func (e *Executor) handleFinishCall(
 			e.checklistUncheckedNudgeAttempted = true
 			// Same first-materialized-carry rule as the finish-guard nudge above.
 			var nudgeItems []llm.ReasoningItem
+			var nudgeThinkingBlocks []llm.ThinkingBlock
 			nudgeThought := ""
 			if firstMaterialized {
 				nudgeItems = resp.Message.ReasoningItems
+				nudgeThinkingBlocks = resp.Message.ThinkingBlocks
 				nudgeThought = thought
 			}
 			nudgeStep := Step{
 				Thought:        nudgeThought,
 				UserNudge:      fmt.Sprintf(executorChecklistUncheckedNudge, unchecked),
 				ReasoningItems: nudgeItems,
+				ThinkingBlocks: nudgeThinkingBlocks,
 				TokensUsed:     resp.Usage.InputTokens + resp.Usage.OutputTokens,
 			}
 			state.allSteps = append(state.allSteps, nudgeStep)
@@ -1354,6 +1377,7 @@ func (e *Executor) handleFinishCall(
 		Thought:          stepThought,
 		ReasoningContent: stepReasoning,
 		ReasoningItems:   stepReasoningItems,
+		ThinkingBlocks:   resp.Message.ThinkingBlocks,
 		Action:           action,
 		TokensUsed:       resp.Usage.InputTokens + resp.Usage.OutputTokens,
 		ResponseGroup:    responseGroup,
@@ -1533,6 +1557,7 @@ func (e *Executor) processBatchTool(
 			Thought:          thought,
 			ReasoningContent: resp.Message.ReasoningContent,
 			ReasoningItems:   resp.Message.ReasoningItems,
+			ThinkingBlocks:   resp.Message.ThinkingBlocks,
 			Action:           action,
 			Observation:      obs,
 			IsError:          true,
@@ -1556,6 +1581,7 @@ func (e *Executor) processBatchTool(
 			Thought:          thought,
 			ReasoningContent: resp.Message.ReasoningContent,
 			ReasoningItems:   resp.Message.ReasoningItems,
+			ThinkingBlocks:   resp.Message.ThinkingBlocks,
 			Action:           action,
 			Observation:      obs,
 			IsError:          true,
@@ -1639,6 +1665,7 @@ func (e *Executor) processBatchTool(
 				Thought:          thought,
 				ReasoningContent: resp.Message.ReasoningContent,
 				ReasoningItems:   resp.Message.ReasoningItems,
+				ThinkingBlocks:   resp.Message.ThinkingBlocks,
 				Action:           action,
 				Observation:      obs,
 				IsError:          true,
@@ -1689,17 +1716,20 @@ func (e *Executor) processBatchTool(
 			// sub-call step renders standalone, so an ungated copy here
 			// would emit the response's thought twice.
 			var guardReasoningItems []llm.ReasoningItem
+			var guardThinkingBlocks []llm.ThinkingBlock
 			guardReasoning := ""
 			guardThought := ""
 			if subIdx == 0 && callIdx == 0 {
 				guardReasoning = resp.Message.ReasoningContent
 				guardReasoningItems = resp.Message.ReasoningItems
 				guardThought = thought
+				guardThinkingBlocks = resp.Message.ThinkingBlocks
 			}
 			step := Step{
 				Thought:          guardThought,
 				ReasoningContent: guardReasoning,
 				ReasoningItems:   guardReasoningItems,
+				ThinkingBlocks:   guardThinkingBlocks,
 				Action:           subCall,
 				Observation:      obs,
 				IsUntrusted:      false,
@@ -1772,17 +1802,20 @@ func (e *Executor) processBatchTool(
 				// so an ungated copy here would emit the response's thought
 				// twice.
 				var rejectReasoningItems []llm.ReasoningItem
+				var guardThinkingBlocks []llm.ThinkingBlock
 				rejectReasoning := ""
 				rejectThought := ""
 				if subIdx == 0 && callIdx == 0 {
 					rejectReasoning = resp.Message.ReasoningContent
 					rejectReasoningItems = resp.Message.ReasoningItems
 					rejectThought = thought
+					guardThinkingBlocks = resp.Message.ThinkingBlocks
 				}
 				step := Step{
 					Thought:          rejectThought,
 					ReasoningContent: rejectReasoning,
 					ReasoningItems:   rejectReasoningItems,
+					ThinkingBlocks:   guardThinkingBlocks,
 					Action:           subCall,
 					Observation:      obs,
 					IsUntrusted:      false,
@@ -1940,6 +1973,7 @@ func (e *Executor) processBatchTool(
 			Thought:          stepThought,
 			ReasoningContent: stepReasoning,
 			ReasoningItems:   stepReasoningItems,
+			ThinkingBlocks:   resp.Message.ThinkingBlocks,
 			Action:           subCall,
 			Observation:      observation,
 			IsUntrusted:      isUntrusted,
@@ -2211,6 +2245,7 @@ func (e *Executor) checkRepeatIdenticalTracked(
 			Thought:          stepThought,
 			ReasoningContent: stepReasoning,
 			ReasoningItems:   stepReasoningItems,
+			ThinkingBlocks:   resp.Message.ThinkingBlocks,
 			Action:           action,
 			Observation:      nudgeMsg,
 			// IsError marks this as a non-result: the tool call was NOT executed

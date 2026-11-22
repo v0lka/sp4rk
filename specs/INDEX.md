@@ -42,6 +42,7 @@
 | Adding a new structured service call (router/planner/reflector/judge-style) | [domains/oneshot.md](domains/oneshot.md), [contracts/llm-providers.md](contracts/llm-providers.md) |
 | Purpose-aware sampling and provider parameter filtering       | [contracts/llm-providers.md](contracts/llm-providers.md), [domains/llm-providers.md](domains/llm-providers.md), [domains/prompt-building.md](domains/prompt-building.md) |
 | Multi-protocol routing (Responses/Anthropic/Google/Chat), multimodal content blocks | [domains/llm-providers.md](domains/llm-providers.md)                            |
+| Anthropic prompt caching (cache_control breakpoints) and thinking-block round-trip | [domains/llm-providers.md](domains/llm-providers.md), [decisions/013-anthropic-prompt-caching-thinking-carriage.md](decisions/013-anthropic-prompt-caching-thinking-carriage.md) |
 | Skill system, activation, resources                           | [domains/skills.md](domains/skills.md)                                          |
 | Subagent Profiles, AGENT.md discovery, per-agent model/tools  | [domains/agents.md](domains/agents.md)                                          |
 | Prompt builder, system-prompt composition                     | [domains/prompt-building.md](domains/prompt-building.md)                        |
@@ -177,3 +178,4 @@ See [META.md](META.md) for document templates, naming rules, and update protocol
 - [010-appendcodec-gzip-zstd-xz-rejected.md](decisions/010-appendcodec-gzip-zstd-xz-rejected.md) - Append-safe codec writers: gzip and zstd, xz rejected
 - [011-runtime-hardware-cpu-degradation.md](decisions/011-runtime-hardware-cpu-degradation.md) - One-shot auto hardware→CPU degradation after consecutive inference failures
 - [012-per-request-provider-override.md](decisions/012-per-request-provider-override.md) - Per-request provider override on ChatRequest
+- [013-anthropic-prompt-caching-thinking-carriage.md](decisions/013-anthropic-prompt-caching-thinking-carriage.md) - Anthropic cache-control breakpoints and thinking-block carriage on llm.Message

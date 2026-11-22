@@ -441,19 +441,45 @@ func (p *AnthropicProvider) buildRequest(req ChatRequest, mapping *toolNameMappi
 		anthropicReq.MaxTokens = defaultAnthropicMaxTokens
 	}
 
-	// Set system prompt: use MultiSystem with cache control when multiple parts exist
-	if len(systemParts) > 1 {
+	// Cache breakpoints (provider-level prompt caching) are armed only on
+	// loop-shaped calls: executor requests (and undeclared ones, which the
+	// sampling policy already treats as executor) replay a stable, growing
+	// prefix every turn, so each breakpoint's 1.25× cache-write premium is
+	// repaid by 0.1× reads on the following turns. Routing / compaction /
+	// summarization calls are one-shot structured requests — a cache write
+	// there is pure premium with no reuse — so their wire shape is left
+	// exactly as before (string system, no cache_control).
+	cacheEnabled := !req.CallPurpose.Deterministic()
+
+	// Set system prompt: cache-armed requests always render MultiSystem parts
+	// (the wire accepts the array form interchangeably with the plain string),
+	// with ONE cache_control breakpoint at the END OF THE STABLE SYSTEM — the
+	// boundary the planner's CacheBreakMarker produced (stable prefix first,
+	// dynamic suffix last). A breakpoint marks the longest prefix ending at
+	// its block, so a single breakpoint on the boundary part caches the whole
+	// stable prefix; marking several parts would only spend nested breakpoints
+	// from the shared 4-per-request budget (system + tools + history).
+	// Non-cached (deterministic-purpose) requests keep the legacy wire shape:
+	// MultiSystem only when several parts exist, a plain string system for a
+	// single part, and no cache_control anywhere.
+	if len(systemParts) > 0 && (cacheEnabled || len(systemParts) > 1) {
 		multiSystem := make([]anthropic.MessageSystemPart, len(systemParts))
 		for i, part := range systemParts {
 			multiSystem[i] = anthropic.MessageSystemPart{
 				Type: "text",
 				Text: part,
 			}
-			// Mark all parts except the last as cacheable (stable content)
-			if i < len(systemParts)-1 {
-				multiSystem[i].CacheControl = &anthropic.MessageCacheControl{
-					Type: anthropic.CacheControlTypeEphemeral,
-				}
+		}
+		if cacheEnabled {
+			// With a dynamic suffix (marker present, 2+ parts) the boundary is
+			// the second-to-last part; a single all-stable part is its own
+			// boundary.
+			boundary := len(systemParts) - 1
+			if len(systemParts) > 1 {
+				boundary = len(systemParts) - 2
+			}
+			multiSystem[boundary].CacheControl = &anthropic.MessageCacheControl{
+				Type: anthropic.CacheControlTypeEphemeral,
 			}
 		}
 		anthropicReq.MultiSystem = multiSystem
@@ -483,19 +509,17 @@ func (p *AnthropicProvider) buildRequest(req ChatRequest, mapping *toolNameMappi
 	// the budget for small max_tokens values (e.g. the 8192 fallback) and
 	// skip thinking entirely when no valid budget fits.
 	//
-	// Thinking is also skipped when the request re-sends an assistant turn
-	// carrying tool_use blocks (a tool-use continuation). The Messages API
-	// requires such an assistant message to START with a thinking (or
-	// redacted_thinking) block when thinking is enabled; parseResponse
-	// collapses the thinking block into ChatResponse.Reasoning and never
-	// re-emits it on the wire (llm.Message carries no thinking block), so a
-	// continuation request sent with thinking enabled is rejected with
-	// HTTP 400 ("Expected `thinking` or `redacted_thinking`, but found
-	// `tool_use`") — deterministically breaking every tool call of a
-	// reasoning-enabled run. Disabling thinking for the continuation request
-	// is the documented fail-safe: the request is accepted, at the cost of
-	// extended thinking on that turn.
-	if req.ReasoningEffort == "On" && !historyHasAssistantToolUse(filteredMsgs) {
+	// Thinking stays ENABLED across tool-use continuations: parseResponse now
+	// captures every thinking/redacted_thinking block onto the assistant
+	// Message (llm.Message.ThinkingBlocks) and convertMessage re-emits them at
+	// the START of the corresponding assistant turn, which is exactly what the
+	// Messages API requires of a thinking-enabled continuation ("Expected
+	// `thinking` or `redacted_thinking`"). The fail-safe remains only for the
+	// genuinely unsupported shape: a history whose final assistant turn
+	// carries NO thinking blocks (a foreign or pre-carriage turn) would be
+	// rejected with HTTP 400 under thinking, so thinking is disabled for that
+	// request — at the cost of extended thinking on that turn only.
+	if req.ReasoningEffort == "On" && !assistantHistoryMissingLeadingThinking(filteredMsgs) {
 		budget := 32000
 		if anthropicReq.MaxTokens <= budget {
 			budget = anthropicReq.MaxTokens / 2
@@ -536,21 +560,68 @@ func (p *AnthropicProvider) buildRequest(req ChatRequest, mapping *toolNameMappi
 				InputSchema: inputSchema,
 			}
 		}
+		if cacheEnabled {
+			// One breakpoint on the LAST tool definition: a breakpoint marks
+			// the longest prefix ending at its block, and tools precede the
+			// system in the caching hierarchy, so this caches the entire
+			// tool-definitions prefix. Tool definitions are static across a
+			// session's turns, so the write premium is repaid every turn.
+			tools[len(tools)-1].CacheControl = &anthropic.MessageCacheControl{
+				Type: anthropic.CacheControlTypeEphemeral,
+			}
+		}
 		anthropicReq.Tools = tools
+	}
+
+	// Stable history boundary: mark the last block of the last rendered
+	// message so the ENTIRE prompt up to this request becomes the cached
+	// prefix. The agent loop only ever APPENDS to the history between
+	// boundaries (compaction advances it in K-step cohorts), so the next
+	// request's prefix is byte-identical up to this block and reads the
+	// cache back before writing the extended prefix — the incremental
+	// pattern that keeps per-turn uncached input at one turn's worth of
+	// tokens instead of the full prefill.
+	if cacheEnabled && len(messages) > 0 {
+		armHistoryCacheBreakpoint(&messages[len(messages)-1])
 	}
 
 	return anthropicReq, nil
 }
 
-// historyHasAssistantToolUse reports whether the outgoing message history
-// re-sends at least one assistant turn that carries tool_use blocks — the
-// shape the Anthropic Messages API rejects with HTTP 400 when thinking is
-// enabled and the turn does not start with a (redacted_)thinking block.
-func historyHasAssistantToolUse(msgs []Message) bool {
-	for _, msg := range msgs {
-		if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
-			return true
+// armHistoryCacheBreakpoint marks the last cacheable content block of msg
+// with an ephemeral cache_control breakpoint. Thinking and redacted_thinking
+// blocks are skipped (they are never valid cache_control carriers); the
+// terminal block of a rendered history message is a text or tool_result
+// block, so in practice the walk stops at the first backward step.
+func armHistoryCacheBreakpoint(msg *anthropic.Message) {
+	for i := len(msg.Content) - 1; i >= 0; i-- {
+		t := msg.Content[i].Type
+		if t == anthropic.MessagesContentTypeThinking || t == anthropic.MessagesContentTypeRedactedThinking {
+			continue
 		}
+		msg.Content[i].CacheControl = &anthropic.MessageCacheControl{
+			Type: anthropic.CacheControlTypeEphemeral,
+		}
+		return
+	}
+}
+
+// assistantHistoryMissingLeadingThinking reports whether the FINAL assistant
+// turn in the outgoing history lacks its original thinking blocks — the one
+// shape the Messages API rejects with HTTP 400 when thinking is enabled
+// ("a final assistant message must start with a thinking block"). Turns the
+// Anthropic provider produced now always carry ThinkingBlocks (parseResponse),
+// so this fires only for foreign histories (other providers, pre-carriage
+// persisted sessions) — which keep the legacy behavior of a thinking-disabled
+// request. An assistant turn that renders to nothing (the empty-message skip
+// in buildRequest) never reaches the wire, so it imposes no requirement and
+// produces no fail-safe here.
+func assistantHistoryMissingLeadingThinking(msgs []Message) bool {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role != "assistant" {
+			continue
+		}
+		return len(msgs[i].ThinkingBlocks) == 0
 	}
 	return false
 }
@@ -603,6 +674,43 @@ func (p *AnthropicProvider) convertMessage(msg Message, mapping *toolNameMapping
 
 	case "assistant":
 		var content []anthropic.MessageContent
+
+		// Re-emit carried thinking blocks FIRST, in their original order and
+		// byte-for-byte: the Messages API requires an assistant turn to START
+		// with its (redacted_)thinking block whenever thinking is enabled, and
+		// verifies each block's signature. Blocks with neither payload are
+		// skipped defensively (they would render as empty blocks).
+		for _, tb := range msg.ThinkingBlocks {
+			switch tb.Type {
+			case "thinking":
+				if tb.Thinking == "" {
+					continue
+				}
+				content = append(content, anthropic.MessageContent{
+					Type: anthropic.MessagesContentTypeThinking,
+					MessageContentThinking: &anthropic.MessageContentThinking{
+						Thinking:  tb.Thinking,
+						Signature: tb.Signature,
+					},
+				})
+			case "redacted_thinking":
+				if tb.Data == "" {
+					continue
+				}
+				content = append(content, anthropic.MessageContent{
+					Type: anthropic.MessagesContentTypeRedactedThinking,
+					MessageContentRedactedThinking: &anthropic.MessageContentRedactedThinking{
+						Data: tb.Data,
+					},
+				})
+			default:
+				// Unknown thinking-block type: skip rather than corrupt the
+				// turn shape; log at debug so misconfigured callers can
+				// diagnose silently dropped content.
+				p.log().Debug("anthropic: skipping unknown thinking block type",
+					"block_type", tb.Type, "provider", p.name)
+			}
+		}
 
 		// Add text content if present
 		if msg.Content != "" {
@@ -665,6 +773,15 @@ func (p *AnthropicProvider) parseResponse(resp anthropic.MessagesResponse, rawBo
 
 	var reasoning string
 
+	// Thinking blocks are captured verbatim (text, signature, redacted payload)
+	// onto the returned assistant Message so the next request can re-emit them —
+	// the Messages API rejects a thinking-enabled continuation whose assistant
+	// turns lack their original thinking blocks (see buildRequest). The plain
+	// reasoning summary for ChatResponse.Reasoning is still accumulated from
+	// thinking blocks only: redacted_thinking blocks carry an encrypted payload,
+	// not readable reasoning, so they add nothing to it.
+	var thinkingBlocks []ThinkingBlock
+
 	// Process content blocks
 	for _, block := range resp.Content {
 		switch block.Type {
@@ -675,12 +792,34 @@ func (p *AnthropicProvider) parseResponse(resp anthropic.MessagesResponse, rawBo
 			message.Content += block.GetText()
 
 		case anthropic.MessagesContentTypeThinking:
-			// Extended thinking content block
+			// Extended thinking content block: accumulate the readable
+			// reasoning for ChatResponse.Reasoning and keep the block —
+			// text AND signature, both verbatim (the signature covers the
+			// exact thinking text; any alteration invalidates it) — for the
+			// wire round-trip.
 			if block.MessageContentThinking != nil {
 				if reasoning != "" {
 					reasoning += "\n"
 				}
 				reasoning += block.Thinking
+				thinkingBlocks = append(thinkingBlocks, ThinkingBlock{
+					Type:      "thinking",
+					Thinking:  block.Thinking,
+					Signature: block.Signature,
+				})
+			}
+
+		case anthropic.MessagesContentTypeRedactedThinking:
+			// Redacted thinking: the API replaced the reasoning with an
+			// encrypted payload. It carries no readable text (nothing to add
+			// to Reasoning) but MUST round-trip like a thinking block — the
+			// API treats it as satisfying the leading-thinking-block
+			// requirement on its assistant turn.
+			if block.MessageContentRedactedThinking != nil {
+				thinkingBlocks = append(thinkingBlocks, ThinkingBlock{
+					Type: "redacted_thinking",
+					Data: block.Data,
+				})
 			}
 
 		case anthropic.MessagesContentTypeToolUse:
@@ -693,6 +832,8 @@ func (p *AnthropicProvider) parseResponse(resp anthropic.MessagesResponse, rawBo
 			}
 		}
 	}
+
+	message.ThinkingBlocks = thinkingBlocks
 
 	finalizeToolCallArguments(p.log(), p.name, message.ToolCalls)
 
@@ -729,6 +870,12 @@ func (p *AnthropicProvider) parseResponse(resp anthropic.MessagesResponse, rawBo
 			// prompts, so the cache counters are routinely populated).
 			InputTokens:  resp.Usage.InputTokens + resp.Usage.CacheCreationInputTokens + resp.Usage.CacheReadInputTokens,
 			OutputTokens: resp.Usage.OutputTokens,
+			// The cache split rides alongside the unchanged sum:
+			// cache_read_input_tokens are the hits served from the cache,
+			// cache_creation_input_tokens the tokens written into it by this
+			// request. Both are already included in InputTokens above.
+			CachedInputTokens: resp.Usage.CacheReadInputTokens,
+			CacheWriteTokens:  resp.Usage.CacheCreationInputTokens,
 		},
 	}, nil
 }
