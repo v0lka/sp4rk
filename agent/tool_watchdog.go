@@ -66,7 +66,10 @@ type toolCallOutcome struct {
 //
 //   - the tool completing normally — its result (and error) are returned as-is;
 //   - ctx.Done() — the run's context was cancelled or its deadline elapsed
-//     (shutdown/cancel), returning ctx.Err();
+//     (shutdown/cancel), returning ctx.Err(); a CANCELED death with a tripped
+//     pause signal is the exception — it is the pause manifesting through an
+//     abandoned ancestor context and returns ErrPaused instead
+//     (pauseManifestedAsCancel);
 //   - the cooperative pause checker tripping (polled every
 //     toolWatchdogInterval) — returning ErrPaused so the caller can emit a
 //     resumable checkpoint. c0wrk pause does NOT cancel ctx, so this poll is
@@ -127,6 +130,12 @@ func (e *Executor) executeToolCall(ctx context.Context, name string, input json.
 	// finished tool's real result would be discarded (see drainToolResult, used
 	// here and inside every blocking arm below).
 	if res, ok, err := drainToolResult(done); ok {
+		if ctx.Err() != nil {
+			// The caller arrived with (or the launch raced) a dead context:
+			// classify the drained outcome exactly like the dead-context arms
+			// below, so a tripped-signal echo checkpoints instead of failing.
+			return e.resolveAbandonedDrain(ctx, res, err)
+		}
 		return res, err
 	}
 
@@ -161,24 +170,51 @@ func (e *Executor) executeToolCall(ctx context.Context, name string, input json.
 	for {
 		select {
 		case out := <-done:
+			// A completion landing while the run context is already dead is
+			// classified by the same helper as the dead-context arms below:
+			// select picks uniformly at random among ready cases, so a
+			// context-error echo arriving at the same instant as ctx.Done()
+			// would otherwise return the raw cancellation half the time. A
+			// real outcome still wins untouched; direct callers (and
+			// executeToolCall's contract) see one uniform outcome regardless
+			// of which ready case wins the selection.
+			if ctx.Err() != nil {
+				return e.resolveAbandonedDrain(ctx, out.result, out.err)
+			}
 			return out.result, out.err
 		case <-ctx.Done():
 			// A tool that completed at the same instant must still win: its
 			// result is real, and cancelling must not discard completed work.
 			if res, ok, err := drainToolResult(done); ok {
-				return res, err
+				return e.resolveAbandonedDrain(ctx, res, err)
+			}
+			// A cancellation whose pause signal is tripped is the pause
+			// manifesting through an abandoned ancestor context (a host
+			// dismissed a blocking tool on pause — e.g. a delegate wave), so it
+			// checkpoints as the cooperative pause instead of failing with a
+			// bare "context canceled". An untripped checker keeps cancellation
+			// authoritative (a genuine stop reports cancellation).
+			if e.pauseManifestedAsCancel(ctx) {
+				return tools.ToolResult{}, ErrPaused
 			}
 			return tools.ToolResult{}, ctx.Err()
 		case <-tickCh:
-			// Mirror the step-boundary precedence (executor.go): a cancelled
-			// or deadline-exceeded run must report cancellation, never pause,
-			// even when the pause ticker fires on the same selection. Without
-			// this check, ctx.Done() and a tripping pause ready at once select
-			// uniformly at random, so an already-cancelled run could surface as
-			// a resumable pause instead of the cancellation it actually is.
+			// Mirror the step-boundary precedence (executor.go): resolve a
+			// dead context BEFORE the tick acts on the raw checker. The
+			// ctx-first classification keeps a deadline-exceeded run reporting
+			// its deadline (a budget death stays loud — pauseManifestedAsCancel
+			// deliberately excludes DeadlineExceeded) and keeps a completed
+			// tool result winning over the tick; a CANCELED death with a
+			// tripped signal resolves to ErrPaused through the same helper as
+			// the ctx.Done() arm. Without this check the raw checker cannot
+			// tell a manifested pause from a live one, so a tripped tick would
+			// report a plain pause even for a deadline-exceeded run.
 			if err := ctx.Err(); err != nil {
 				if res, ok, dErr := drainToolResult(done); ok {
-					return res, dErr
+					return e.resolveAbandonedDrain(ctx, res, dErr)
+				}
+				if e.pauseManifestedAsCancel(ctx) {
+					return tools.ToolResult{}, ErrPaused
 				}
 				return tools.ToolResult{}, err
 			}
@@ -196,11 +232,16 @@ func (e *Executor) executeToolCall(ctx context.Context, name string, input json.
 		case <-timeoutCh:
 			// Mirror the pause-tick arm: a cancelled/deadline run must report
 			// cancellation, not a timeout, when the ceiling and ctx.Done() are
-			// ready in the same selection. Otherwise a Cancel or quit that
-			// coincides with the ceiling could be misreported as a failed run.
+			// ready in the same selection — except the cancellation-is-pause
+			// manifestation (pauseManifestedAsCancel), which checkpoints
+			// instead of failing. Otherwise a Cancel or quit that coincides
+			// with the ceiling could be misreported as a failed run.
 			if err := ctx.Err(); err != nil {
 				if res, ok, dErr := drainToolResult(done); ok {
-					return res, dErr
+					return e.resolveAbandonedDrain(ctx, res, dErr)
+				}
+				if e.pauseManifestedAsCancel(ctx) {
+					return tools.ToolResult{}, ErrPaused
 				}
 				return tools.ToolResult{}, err
 			}
@@ -232,6 +273,29 @@ func drainToolResult(done <-chan toolCallOutcome) (tools.ToolResult, bool, error
 	default:
 		return tools.ToolResult{}, false, nil
 	}
+}
+
+// resolveAbandonedDrain classifies a tool outcome drained after the run
+// context died. A completed REAL outcome — no error, or a non-cancellation
+// error — still wins untouched (completed work must not be discarded). A
+// context.Canceled outcome, though, is the abandonment echoing through the
+// tool's own context-respecting exit (the tool returned its context's error
+// because the derived call context died with the run's), so with a tripped
+// pause signal it checkpoints as ErrPaused instead of surfacing a bare
+// "context canceled" as the tool's result — the same manifestation rule the
+// ctx.Done arm applies when nothing was drained. Only a cancellation
+// classifies: the derived call context dies with the run's, so an abandonment
+// always echoes Canceled, while a tool reporting its own internal deadline
+// keeps its real failure (and a deadline-exceeded run context never
+// manifests as a pause anyway).
+func (e *Executor) resolveAbandonedDrain(ctx context.Context, res tools.ToolResult, err error) (tools.ToolResult, error) {
+	if err == nil || !errors.Is(err, context.Canceled) {
+		return res, err
+	}
+	if e.pauseManifestedAsCancel(ctx) {
+		return tools.ToolResult{}, ErrPaused
+	}
+	return res, err
 }
 
 // isPauseError reports whether err is the cooperative-pause sentinel.

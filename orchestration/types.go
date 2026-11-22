@@ -99,7 +99,10 @@ const (
 	// cooperative pause signal tripped (agent.ErrPaused). The trajectory so far
 	// is preserved in the result's Steps; execution may be resumed. Distinct
 	// from cancelled (user/interrupt) and partial (budget exhausted): a pause is
-	// an explicit, recoverable checkpoint requested mid-run.
+	// an explicit, recoverable checkpoint requested mid-run. A cancellation
+	// observed while the signal is tripped surfaces as paused too — the pause
+	// manifesting through an abandoned ancestor context (agent.ErrPaused via
+	// pauseManifestedAsCancel); a deadline death stays cancelled.
 	ExecutionStatusPaused ExecutionStatus = "paused"
 )
 

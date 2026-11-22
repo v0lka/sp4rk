@@ -273,6 +273,45 @@ func (h *rejectingLastCallHITL) OnToolCall(_ context.Context, toolName string, _
 	return nil, nil
 }
 
+// TestExecutor_CheckpointAsPause_FlushesPendingVerificationWithDeadContext
+// pins checkpointAsPause's flush contract directly: a pause checkpoint built
+// while the run context is already dead — the shape every
+// abandonment-manifestation arm runs on — must still flush a verification
+// left pending by an abandoned response group. The runner is invoked once
+// (bounded by the checkpoint budget), the note lands in the checkpoint
+// trajectory, and the pending flag clears, so a resumed run never silently
+// skips verifying the edit.
+func TestExecutor_CheckpointAsPause_FlushesPendingVerificationWithDeadContext(t *testing.T) {
+	exec, _, calls := newVerifyTestExecutor(t, nil, func(context.Context) EditVerifyResult {
+		return EditVerifyResult{Output: "PASS", ExitCode: 0}
+	}, 0)
+
+	state := &runState{pendingVerifyEdit: true}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the manifestation arms run on an already-dead context
+
+	result, err := exec.checkpointAsPause(ctx, state)
+	if !errors.Is(err, ErrPaused) {
+		t.Fatalf("expected ErrPaused, got %v", err)
+	}
+	if result == nil || result.Finished {
+		t.Fatalf("checkpoint = %#v, want an unfinished pause result", result)
+	}
+	if *calls != 1 {
+		t.Errorf("verify runner calls = %d, want 1 (pending verification flushed)", *calls)
+	}
+	if state.pendingVerifyEdit {
+		t.Error("pendingVerifyEdit must clear once the checkpoint flushed it")
+	}
+	if len(state.allSteps) == 0 {
+		t.Fatal("expected the verify note appended to the checkpoint trajectory")
+	}
+	last := state.allSteps[len(state.allSteps)-1]
+	if !strings.Contains(last.UserNudge, "[verify_on_edit]") {
+		t.Errorf("last checkpoint step = %#v, want a [verify_on_edit] nudge", last)
+	}
+}
+
 // TestExecutor_VerifyOnEdit_RejectedLastSiblingFlushesBeforePause verifies the
 // response-group boundary directly: a successful edit followed by a rejected
 // final sibling must run verification before the next boundary can pause the

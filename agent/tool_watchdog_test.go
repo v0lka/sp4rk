@@ -229,20 +229,26 @@ func TestExecutor_ExecuteToolCall_ContextCancellationUnblocks(t *testing.T) {
 }
 
 // TestExecutor_ExecuteToolCall_CancelWinsOverPauseTick pins the watchdog's
-// cancellation precedence: when a tool is in flight and BOTH the context is
-// cancelled AND the pause checker trips on the same tick, the run must report
-// the cancellation (mirroring the step-boundary check), never a resumable
-// pause. Without the ctx-first ordering in the tick arm, the two ready select
-// cases are chosen uniformly at random, so an already-cancelled run could be
-// misreported as a pause.
+// cancellation outcome for an UNTRIPPED pause signal: when a tool is in
+// flight and the context is cancelled while the checker stays false (a
+// genuine stop), the run must report the cancellation, never a resumable
+// pause — mirroring the step-boundary check. Every select outcome converges
+// on it: the dead-context classification consults the checker, and an
+// untripped checker never translates. (A CANCELED context with a TRIPPED
+// signal is the opposite case: the pause's abandonment manifestation, covered
+// by TestExecutor_ExecuteToolCall_CanceledWhilePauseTripped. A DEADLINE death
+// with a tripped signal — the remaining load-bearing case of the tick arm's
+// ctx-first check — is pinned by
+// TestExecutor_ExecuteToolCall_DeadlineBeatsTrippedPauseTick.)
 func TestExecutor_ExecuteToolCall_CancelWinsOverPauseTick(t *testing.T) {
 	blocking := newBlockingToolExecutor()
 	t.Cleanup(func() { close(blocking.release) })
 
 	exec := NewExecutor(&mockLLMCaller{}, blocking, 10, withToolWatchdogInterval(2*time.Millisecond))
-	// A checker that always trips: the pause tick is permanently ready, so the
-	// ctx-first check is the only thing that keeps cancellation authoritative.
-	exec.SetPauseChecker(func(context.Context) bool { return true })
+	// A checker installed but never tripped: the pause tick is armed (the
+	// ticker runs) yet the signal stays false, so cancellation keeps its
+	// authority through every arm.
+	exec.SetPauseChecker(func(context.Context) bool { return false })
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -253,8 +259,129 @@ func TestExecutor_ExecuteToolCall_CancelWinsOverPauseTick(t *testing.T) {
 
 	_, err := exec.executeToolCall(ctx, "block_tool", json.RawMessage(`{}`))
 	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("cancellation must win over a simultaneously-ready pause tick: got %v, want context.Canceled", err)
+		t.Fatalf("cancellation must win over an untripped pause tick: got %v, want context.Canceled", err)
 	}
+}
+
+// TestExecutor_ExecuteToolCall_DeadlineBeatsTrippedPauseTick pins the tick
+// arm's remaining load-bearing ctx-first case: a deadline-exceeded run
+// context is a budget death that stays loud even when the pause checker is
+// tripped — the tripped tick must never mask it as a resumable pause. (A
+// CANCELED death with a tripped signal is the opposite case: the abandonment
+// manifestation, checkpointing as ErrPaused.) Every select outcome converges
+// on this result: the ctx.Done arm and the tick arm's ctx-first check resolve
+// through pauseManifestedAsCancel, which deliberately excludes
+// DeadlineExceeded, and a deadline echo passes through resolveAbandonedDrain's
+// Canceled-only gate untouched.
+func TestExecutor_ExecuteToolCall_DeadlineBeatsTrippedPauseTick(t *testing.T) {
+	blocking := newBlockingToolExecutor()
+	t.Cleanup(func() { close(blocking.release) })
+
+	exec := NewExecutor(&mockLLMCaller{}, blocking, 10, withToolWatchdogInterval(time.Millisecond))
+	// A checker installed and always tripped: without the ctx-first check in
+	// the tick arm this deadline-exceeded run would be reported as a plain
+	// ErrPaused — the exact regression this test guards.
+	exec.SetPauseChecker(func(context.Context) bool { return true })
+
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+
+	_, err := exec.executeToolCall(ctx, "block_tool", json.RawMessage(`{}`))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("a deadline-exceeded run must stay loud even with a tripped pause signal: got %v, want context.DeadlineExceeded", err)
+	}
+	if errors.Is(err, ErrPaused) {
+		t.Fatalf("the tripped tick must never mask a budget death as a pause: %v", err)
+	}
+}
+
+// TestExecutor_ExecuteToolCall_CanceledWhilePauseTripped_CheckpointsAsPause
+// pins the abandonment manifestation: a CANCELED context while the pause
+// signal is tripped is the pause reaching this executor through an abandoned
+// ancestor context (a host dismissed a blocking tool on pause — e.g. a
+// delegate wave), so executeToolCall reports the cooperative ErrPaused instead
+// of the bare cancellation that would fail the subagent with "context
+// canceled". The tool is deliberately context-oblivious (like a stuck syscall
+// or the blocking delegate wave itself): a context-respecting tool would echo
+// the cancellation through its own exit and be classified instead by
+// resolveAbandonedDrain.
+func TestExecutor_ExecuteToolCall_CanceledWhilePauseTripped_CheckpointsAsPause(t *testing.T) {
+	oblivious := &ctxObliviousBlockingTool{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	t.Cleanup(func() { close(oblivious.release) })
+
+	exec := NewExecutor(&mockLLMCaller{}, oblivious, 10)
+	exec.SetPauseChecker(func(context.Context) bool { return true })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-oblivious.started
+		cancel()
+	}()
+
+	_, err := exec.executeToolCall(ctx, "block_tool", json.RawMessage(`{}`))
+	if !errors.Is(err, ErrPaused) {
+		t.Fatalf("a canceled context with a tripped pause signal must checkpoint as ErrPaused, got %v", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("the abandonment manifestation must surface as ErrPaused, not the bare cancellation: %v", err)
+	}
+}
+
+// TestExecutor_ExecuteToolCall_ContextRespectingToolEcho_CheckpointsAsPause
+// pins the drained-outcome classification: a tool that respects its context
+// returns the cancellation through its own exit, and that drained outcome is
+// the abandonment echo — with a tripped pause signal it must checkpoint as
+// ErrPaused, not surface the bare "context canceled" as the tool result.
+func TestExecutor_ExecuteToolCall_ContextRespectingToolEcho_CheckpointsAsPause(t *testing.T) {
+	blocking := newBlockingToolExecutor()
+	t.Cleanup(func() { close(blocking.release) })
+
+	exec := NewExecutor(&mockLLMCaller{}, blocking, 10)
+	exec.SetPauseChecker(func(context.Context) bool { return true })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-blocking.started
+		cancel()
+	}()
+
+	_, err := exec.executeToolCall(ctx, "block_tool", json.RawMessage(`{}`))
+	if !errors.Is(err, ErrPaused) {
+		t.Fatalf("the abandonment echo of a context-respecting tool must checkpoint as ErrPaused, got %v", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("the abandonment echo must surface as ErrPaused, not the bare cancellation: %v", err)
+	}
+}
+
+// ctxObliviousBlockingTool blocks until release regardless of context
+// cancellation — the stand-in for a stuck syscall or a blocking delegate wave
+// that cannot observe its derived context dying.
+type ctxObliviousBlockingTool struct {
+	started   chan struct{}
+	release   chan struct{}
+	onceStart sync.Once
+	runs      atomic.Int32
+}
+
+func (b *ctxObliviousBlockingTool) Execute(_ context.Context, _ string, _ json.RawMessage) (tools.ToolResult, error) {
+	b.runs.Add(1)
+	b.onceStart.Do(func() { close(b.started) })
+	<-b.release
+	return tools.ToolResult{Content: "released"}, nil
+}
+
+func (b *ctxObliviousBlockingTool) GetToolSource(string) string { return "core" }
+
+func (b *ctxObliviousBlockingTool) IsToolUntrusted(string) bool { return false }
+
+func (b *ctxObliviousBlockingTool) CacheStrategy(context.Context, string, json.RawMessage) tools.CacheMode {
+	return tools.CacheModeDefault
 }
 
 // TestExecutor_ExecuteToolCall_CancelWinsOverTimeoutArm pins the timeout arm's
@@ -267,9 +394,12 @@ func TestExecutor_ExecuteToolCall_CancelWinsOverTimeoutArm(t *testing.T) {
 
 	exec := NewExecutor(&mockLLMCaller{}, blocking, 10, withToolWatchdogInterval(time.Millisecond))
 	exec.SetToolCallTimeout(time.Millisecond)
-	// A checker that always trips, so the pause tick is permanently ready too:
-	// every arm must agree on the cancellation.
-	exec.SetPauseChecker(func(context.Context) bool { return true })
+	// A checker installed but never tripped: the pause tick is armed yet the
+	// signal stays false, so the cancellation keeps its authority over the
+	// timeout arm. (A tripped signal with a canceled context is the pause's
+	// abandonment manifestation and checkpoints as ErrPaused instead — that
+	// precedence is pinned separately.)
+	exec.SetPauseChecker(func(context.Context) bool { return false })
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/v0lka/sp4rk/llm"
 	"github.com/v0lka/sp4rk/tools"
@@ -348,6 +349,195 @@ func TestExecutor_Run_PauseCheckerViaOption(t *testing.T) {
 	}
 	if len(result.Steps) != 0 {
 		t.Errorf("len(Steps) = %d, want 0 (paused before any tool call)", len(result.Steps))
+	}
+}
+
+// sideEffectCaller runs fn on every Call and returns its result — the scripted
+// hook for the mid-LLM-call cancellation tests, where the run context must die
+// and the pause signal must flip WHILE the call is in flight (the exact shape
+// a pause abandonment takes through an inherited context).
+type sideEffectCaller struct {
+	fn func(ctx context.Context) (*llm.ChatResponse, error)
+}
+
+func (c *sideEffectCaller) Call(ctx context.Context, _ llm.ChatRequest) (*llm.ChatResponse, error) {
+	return c.fn(ctx)
+}
+
+// TestExecutor_Run_CanceledWhilePauseTripped_CheckpointsAtStepBoundary pins
+// the step-boundary abandonment manifestation: a run whose context is already
+// canceled while the pause signal is tripped must return the resumable
+// ErrPaused checkpoint (with the trajectory so far), not the bare
+// cancellation. This is what lets a host's delegate wave settle a dismissed
+// subagent as a cooperative pause instead of a "context canceled" failure.
+func TestExecutor_Run_CanceledWhilePauseTripped_CheckpointsAtStepBoundary(t *testing.T) {
+	cm := newMockContextManager()
+	exec := newExecutorDefaultHITL(&mockLLMCaller{}, newMockToolExecutor(), &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+	exec.SetPauseChecker(func(context.Context) bool { return true })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // canceled before the first boundary
+
+	result, err := exec.Run(ctx, nil, cm)
+	if !errors.Is(err, ErrPaused) {
+		t.Fatalf("expected ErrPaused for a canceled context with a tripped pause signal, got %v", err)
+	}
+	if result == nil {
+		t.Fatal("expected non-nil checkpoint result")
+	}
+	if result.Finished {
+		t.Error("expected Finished=false for the abandonment checkpoint")
+	}
+	if len(result.Steps) != 0 {
+		t.Errorf("len(Steps) = %d, want 0 (canceled before any step)", len(result.Steps))
+	}
+}
+
+// TestExecutor_Run_CanceledMidLLMCall_WhilePauseTripped_Checkpoints pins the
+// LLM-call error path: the boundary checks pass with the context alive, the
+// call dies canceled mid-flight, and the pause signal trips — Run must
+// checkpoint as ErrPaused instead of failing the subagent with a bare
+// "context canceled".
+func TestExecutor_Run_CanceledMidLLMCall_WhilePauseTripped_Checkpoints(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	caller := &sideEffectCaller{fn: func(context.Context) (*llm.ChatResponse, error) {
+		cancel() // the abandonment lands while the call is in flight
+		return nil, context.Canceled
+	}}
+	cm := newMockContextManager()
+	exec := newExecutorDefaultHITL(caller, newMockToolExecutor(), &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+	exec.SetPauseChecker(func(context.Context) bool { return ctx.Err() != nil })
+
+	result, err := exec.Run(ctx, nil, cm)
+	if !errors.Is(err, ErrPaused) {
+		t.Fatalf("expected ErrPaused for a mid-call cancellation with a tripped pause signal, got %v", err)
+	}
+	if result == nil {
+		t.Fatal("expected non-nil checkpoint result")
+	}
+	if result.Finished {
+		t.Error("expected Finished=false for the abandonment checkpoint")
+	}
+}
+
+// cancelThenFailToolExecutor cancels the captured run context and fails with
+// a REAL (non-context) error — the deterministic stand-in for a tool failing
+// for its own reasons exactly as the host's abandonment cancellation lands.
+// Because the error is not a context error, no watchdog arm classifies it;
+// the raw failure must reach Run's toolErr manifested arm, which checkpoints
+// it as the cooperative pause.
+type cancelThenFailToolExecutor struct {
+	cancel context.CancelFunc
+}
+
+func (c *cancelThenFailToolExecutor) Execute(_ context.Context, _ string, _ json.RawMessage) (tools.ToolResult, error) {
+	c.cancel()
+	return tools.ToolResult{}, errors.New("boom")
+}
+
+func (c *cancelThenFailToolExecutor) GetToolSource(string) string { return "core" }
+
+func (c *cancelThenFailToolExecutor) IsToolUntrusted(string) bool { return false }
+
+func (c *cancelThenFailToolExecutor) CacheStrategy(context.Context, string, json.RawMessage) tools.CacheMode {
+	return tools.CacheModeDefault
+}
+
+// TestExecutor_Run_ToolErrorWhilePauseManifested_Checkpoints pins the toolErr
+// manifested arm — the abandonment output whose classification no watchdog
+// arm can do: a tool failing with a real (non-context) error exactly as the
+// host's abandonment cancellation lands reaches Run unclassified (the
+// standalone dispatch returns raw errors), and Run must checkpoint it as the
+// cooperative pause instead of failing the subagent with the raw error.
+func TestExecutor_Run_ToolErrorWhilePauseManifested_Checkpoints(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cm := newMockContextManager()
+	exec := newExecutorDefaultHITL(&mockLLMCaller{responses: []*llm.ChatResponse{
+		llmResponseWithToolCall("calling", "failing_tool", json.RawMessage(`{}`)),
+	}}, &cancelThenFailToolExecutor{cancel: cancel}, &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+	exec.SetPauseChecker(func(context.Context) bool { return ctx.Err() != nil })
+
+	result, err := exec.Run(ctx, []tools.ToolDescriptor{
+		{Name: "failing_tool", Description: "fails", Source: "core"},
+	}, cm)
+	if !errors.Is(err, ErrPaused) {
+		t.Fatalf("expected ErrPaused for a real tool failure coinciding with the abandonment cancellation, got %v", err)
+	}
+	if result == nil || result.Finished {
+		t.Fatalf("checkpoint = %#v, want an unfinished pause result", result)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("the abandonment must surface as ErrPaused, not the bare cancellation: %v", err)
+	}
+}
+
+// TestExecutor_Run_SpuriousCanceledWithTrippedPause_NotTranslated pins the
+// discriminator's other half: a provider returning a canceled error while the
+// run context is ALIVE must stay a raw failure even when the pause signal
+// trips afterwards — the translation requires the context to have actually
+// died. The checker stays untripped on the FIRST boundary (so the run reaches
+// the LLM call) and trips only afterwards, mimicking a pause clicked while the
+// call was already failing for its own reasons.
+func TestExecutor_Run_SpuriousCanceledWithTrippedPause_NotTranslated(t *testing.T) {
+	caller := &sideEffectCaller{fn: func(context.Context) (*llm.ChatResponse, error) {
+		return nil, context.Canceled
+	}}
+	cm := newMockContextManager()
+	exec := newExecutorDefaultHITL(caller, newMockToolExecutor(), &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+	boundaries := 0
+	exec.SetPauseChecker(func(context.Context) bool {
+		boundaries++
+		return boundaries > 1
+	})
+
+	_, err := exec.Run(context.Background(), nil, cm)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected the raw context.Canceled to propagate, got %v", err)
+	}
+	if errors.Is(err, ErrPaused) {
+		t.Fatalf("a spurious provider cancellation must never surface as a pause, got %v", err)
+	}
+}
+
+// TestExecutor_PauseManifestedAsCancel_Discriminator unit-pins the helper's
+// narrowness: canceled + tripped translates; DeadlineExceeded + tripped does
+// NOT (budget deaths stay loud); no checker or an untripped checker never
+// translates; a live context never translates.
+func TestExecutor_PauseManifestedAsCancel_Discriminator(t *testing.T) {
+	tripped := func(context.Context) bool { return true }
+	untripped := func(context.Context) bool { return false }
+
+	newPausedExecutor := func(fn func(context.Context) bool) *Executor {
+		exec := newExecutorDefaultHITL(&mockLLMCaller{}, newMockToolExecutor(), &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+		exec.SetPauseChecker(fn)
+		return exec
+	}
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	deadlined, cancelDeadline := context.WithDeadline(context.Background(), time.Unix(0, 0)) // already past
+	defer cancelDeadline()
+
+	exec := newPausedExecutor(tripped)
+	if !exec.pauseManifestedAsCancel(canceled) {
+		t.Error("canceled context + tripped checker must translate to a manifested pause")
+	}
+	if exec.pauseManifestedAsCancel(deadlined) {
+		t.Error("DeadlineExceeded must never translate to a pause (budget deaths stay loud)")
+	}
+	if exec.pauseManifestedAsCancel(context.Background()) {
+		t.Error("a live context must never translate")
+	}
+	if newPausedExecutor(untripped).pauseManifestedAsCancel(canceled) {
+		t.Error("an untripped checker must keep cancellation authoritative")
+	}
+	noChecker := newExecutorDefaultHITL(&mockLLMCaller{}, newMockToolExecutor(), &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+	if noChecker.pauseManifestedAsCancel(canceled) {
+		t.Error("no checker installed — cancellation must stay authoritative")
 	}
 }
 

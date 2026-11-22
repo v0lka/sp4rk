@@ -800,7 +800,10 @@ func (o pauseCheckerOption) apply(opts *executorOptions) { opts.pauseChecker = o
 // behavior). The checker must be safe to call from the Run goroutine and
 // should be cheap and idempotent; it is invoked once per step boundary AND,
 // while a tool call is in flight, polled on the toolWatchdogInterval ticker
-// (see executeToolCall).
+// (see executeToolCall). It is also consulted on a mid-run context.Canceled:
+// a cancellation with a tripped signal is the pause manifesting through an
+// abandoned ancestor context and checkpoints as ErrPaused instead of failing
+// (see pauseManifestedAsCancel).
 func WithPauseChecker(checker func(context.Context) bool) Option {
 	return pauseCheckerOption{Checker: checker}
 }
@@ -958,7 +961,9 @@ func (e *Executor) SetStopTools(names ...string) {
 // boundary in Run (immediately after the context-cancellation check). When the
 // checker returns true, Run returns the trajectory so far together with the
 // ErrPaused sentinel. Pass nil to clear a previously installed checker and
-// restore the default non-pausing behavior. Must be called before Run.
+// restore the default non-pausing behavior. Must be called before Run. A
+// canceled context with a tripped checker checkpoints as ErrPaused too — the
+// pause's abandonment manifestation (see pauseManifestedAsCancel).
 func (e *Executor) SetPauseChecker(fn func(context.Context) bool) { e.pauseChecker = fn }
 
 // SetToolCallTimeout installs the per-tool-call ceiling. When positive,
@@ -1430,6 +1435,44 @@ func isPathWithinWorkspace(ctx context.Context, path, workspaceRoot string) bool
 	return tools.IsWithinRoot(ctx, workspaceRoot, path)
 }
 
+// pauseManifestedAsCancel reports whether the run's context died from a
+// cancellation while the cooperative pause signal is tripped. A host that
+// pauses mid-tool dismisses the in-flight blocking tool (a delegate wave, a
+// plan wave) by cancelling that tool's derived context, and the cancellation
+// reaches every subagent inheriting it. Reporting it as a bare cancellation
+// would fail those subagents with "context canceled" instead of checkpointing
+// them as the cooperative pause the host asked for, so the cancellation sites
+// translate it into ErrPaused (see the step-boundary check in Run and the
+// executeToolCall arms). Deliberately narrow: only context.Canceled — never
+// context.DeadlineExceeded, so a genuine budget/timeout death stays loud even
+// when a pause is simultaneously pending. An untripped checker (or none
+// installed — the default) keeps cancellation fully authoritative: a genuine
+// Stop reports cancellation, exactly as before.
+func (e *Executor) pauseManifestedAsCancel(ctx context.Context) bool {
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		return false
+	}
+	return e.pauseChecker != nil && e.pauseChecker(ctx)
+}
+
+// checkpointAsPause builds the cooperative-pause checkpoint every pause exit
+// of Run returns — the regular step-boundary pause, and the cancellation
+// sites where the pause manifested through an abandoned ancestor context
+// (see pauseManifestedAsCancel). It first flushes a verification left pending
+// by an abandoned response group: a group cut short by a circuit-breaker
+// continue or a detector's early return never reaches the last-call hook, so
+// state.pendingVerifyEdit can still be set at any pause exit (Run's boundary,
+// its LLM-call error arm and its tool-call error arm alike). Without the
+// flush a resumed run would never verify that edit. On a live context the
+// runner is bounded by the checkpoint budget; on an already-dead context (the
+// manifestation arms) a honoring runner reports immediately that the command
+// could not run, the budget timer still caps a cancellation-ignoring one, and
+// the edit stays marked unverified either way.
+func (e *Executor) checkpointAsPause(ctx context.Context, state *runState) (*ExecutorResult, error) {
+	e.flushPendingVerifyOnEditAtCheckpoint(ctx, state)
+	return &ExecutorResult{Steps: state.allSteps, Finished: false}, ErrPaused
+}
+
 // ErrPaused is returned by Executor.Run when a cooperative pause signal trips
 // at a step boundary (or, since the tool-call watchdog, while a tool call is in
 // flight). It accompanies a non-nil *ExecutorResult whose Steps hold the
@@ -1437,6 +1480,12 @@ func isPathWithinWorkspace(ctx context.Context, path, workspaceRoot string) bool
 // Finished is false. Callers should errors.Is-check for ErrPaused to distinguish
 // a recoverable checkpoint from cancellation (context.Canceled) or a genuine
 // failure, and may resume the run via WithResumeSteps using the returned Steps.
+//
+// A cancellation that reaches the run while the pause signal is tripped also
+// surfaces as ErrPaused rather than context.Canceled: it is the pause
+// manifesting through an abandoned ancestor context (a host dismissed a
+// blocking tool on pause), and the run checkpoints cooperatively instead of
+// failing. See pauseManifestedAsCancel.
 var ErrPaused = errors.New("executor paused at step boundary")
 
 // ErrToolTimeout is returned by Executor.Run when a single tool call does not
@@ -1568,19 +1617,32 @@ func (e *Executor) Run(ctx context.Context, taskTools []tools.ToolDescriptor, cw
 		e.emitter.StepStart(state.stepNum)
 		state.stepStartTime = time.Now()
 
-		// Check context cancellation
+		// Check context cancellation. A cancellation whose pause signal is
+		// tripped is the pause manifesting through an abandoned ancestor
+		// context (a host dismissed a blocking tool on pause — e.g. a delegate
+		// wave), so it checkpoints as the cooperative pause instead of failing
+		// with a bare "context canceled". An untripped checker keeps
+		// cancellation authoritative.
 		if err := ctx.Err(); err != nil {
+			if e.pauseManifestedAsCancel(ctx) {
+				return e.checkpointAsPause(ctx, state)
+			}
 			return nil, err
 		}
 
 		// Cooperative pause check (step boundary). Trips after the context
-		// check so an already-cancelled run reports cancellation, not pause.
+		// check so a cancelled run with an UNTRIPPED pause signal reports
+		// cancellation, not pause (a tripped signal with a dead context is
+		// handled above as the pause's abandonment manifestation).
 		// state.allSteps holds every completed step — including the most
 		// recent tool result — so the returned trajectory is a resumable
 		// checkpoint. With no checker installed this is a no-op and the loop
 		// behaves exactly as before.
 		if e.pauseChecker != nil && e.pauseChecker(ctx) {
-			return &ExecutorResult{Steps: state.allSteps, Finished: false}, ErrPaused
+			// checkpointAsPause flushes a verification left pending by an
+			// abandoned response group (see its doc) — the spec's blanket
+			// "flushed before the checkpoint is returned" contract.
+			return e.checkpointAsPause(ctx, state)
 		}
 
 		// Live user message (step boundary). Polled after the pause check so a
@@ -1607,6 +1669,13 @@ func (e *Executor) Run(ctx context.Context, taskTools []tools.ToolDescriptor, cw
 		// Call LLM with reactive compaction on context-exceeded
 		resp, action, err := e.callLLMWithReactiveCompaction(ctx, state, cw, toolDefs)
 		if err != nil {
+			// A mid-call cancellation with the pause signal tripped is the
+			// pause manifesting through an abandoned ancestor context (see the
+			// step-boundary check above): checkpoint cooperatively instead of
+			// failing with a bare "context canceled".
+			if e.pauseManifestedAsCancel(ctx) {
+				return e.checkpointAsPause(ctx, state)
+			}
 			return nil, err
 		}
 		if action == actionContinue {
@@ -1647,9 +1716,19 @@ func (e *Executor) Run(ctx context.Context, taskTools []tools.ToolDescriptor, cw
 			// A cooperative pause observed while a tool call was in flight
 			// carries a resumable, unfinished checkpoint in result; preserve
 			// it exactly as the step-boundary pause does. Every other error
-			// keeps the historical nil-result shape.
+			// keeps the historical nil-result shape — except a cancellation
+			// that carries a tripped pause signal: that is the pause's
+			// abandonment manifestation (see pauseManifestedAsCancel), so it
+			// checkpoints too instead of failing the run with a bare
+			// "context canceled".
 			if errors.Is(toolErr, ErrPaused) {
 				return result, toolErr
+			}
+			if e.pauseManifestedAsCancel(ctx) {
+				// See checkpointAsPause: the checkpoint must not drop a
+				// verification still pending from the abandoned response
+				// group.
+				return e.checkpointAsPause(ctx, state)
 			}
 			return nil, toolErr
 		} else if result != nil {
