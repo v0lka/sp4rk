@@ -205,6 +205,29 @@ type ExecutionConfig struct {
 	// the provider, instead of a single chunk at finalization. Opt-in; the
 	// default (false) preserves the non-streaming behavior exactly.
 	Streaming bool
+
+	// ToolResultEvictionStep enables regular history mutation: a tool result
+	// older than this many steps (and carrying a ToolResultCache hash) is
+	// replaced with a tool_result_read cache reference at BuildPrompt time,
+	// keeping the information recoverable while shrinking replayed history.
+	// 0 (default) disables eviction — full results are kept indefinitely
+	// (subject to pruning/compaction). Enabling it is also what keeps the
+	// request prefix stable for Anthropic extended thinking: the eviction
+	// boundary advances in MutationCohortSize-sized cohorts, so thinking
+	// blocks stay valid between cohort boundaries instead of being stripped
+	// on every build.
+	ToolResultEvictionStep int
+
+	// MutationCohortSize quantizes the eviction/pruning boundary advance into
+	// K-sized cohorts: steps cross the eviction threshold and the pruning
+	// KeepLastN window together in batches of K instead of one per build, so
+	// consecutive request prefixes stay byte-stable between cohort
+	// boundaries (provider prompt-cache friendly, and it keeps Anthropic
+	// thinking-block signature bindings valid between boundaries). 0 means
+	// use the default (5); negative means the legacy per-step advance
+	// (explicitly unset). Values <= 1 behave like the legacy per-step
+	// advance.
+	MutationCohortSize int
 }
 
 // CompactionConfig configures context window compaction.
@@ -293,6 +316,11 @@ func New(cfg Config) (*Framework, error) {
 	if cfg.Compaction.Strategy == "" {
 		cfg.Compaction.Strategy = "sliding_window"
 	}
+	// The host config layer defaults the mutation cohort to 5 (ADR-013 /
+	// specs/domains/memory): the eviction/pruning boundary advances in
+	// 5-step cohorts so request prefixes stay byte-stable between cohort
+	// boundaries. Negative restores the legacy per-step advance.
+	cfg.Execution.MutationCohortSize = resolveIntSentinel(cfg.Execution.MutationCohortSize, 5)
 
 	// Parse retry durations. Sentinel values (0 → default, negative →
 	// explicitly 0/disabled) are resolved by llm.NewRouter — pass through.
@@ -454,7 +482,12 @@ func (fw *Framework) buildContextWindow(sysPrompt string, meta llm.ModelMetadata
 		}
 	}
 
-	return sdkmemory.NewContextWindow(sdkmemory.ContextWindowConfig{
+	// Seed the history-mutation knobs from the Framework config so the
+	// prefix-stability contract (ADR-013) is reachable on the Framework
+	// path: MutationCohortSize quantizes the eviction/pruning boundary
+	// advance; ToolResultEvictionStep > 0 additionally enables age-based
+	// eviction to cache references.
+	cw := sdkmemory.NewContextWindow(sdkmemory.ContextWindowConfig{
 		SystemPrompt:        sysPrompt,
 		ModelMeta:           meta,
 		Tracker:             tracker,
@@ -462,7 +495,15 @@ func (fw *Framework) buildContextWindow(sysPrompt string, meta llm.ModelMetadata
 		Strategy:            strategy,
 		SafetyMarginPercent: fw.cfg.Execution.SafetyMarginPercent,
 		Pruning:             pruning,
+		MutationCohortSize:  fw.cfg.Execution.MutationCohortSize,
 	})
+	if fw.cfg.Execution.ToolResultEvictionStep > 0 {
+		cw.SetHistoryMutation(sdkmemory.HistoryMutation{
+			ToolResultEvictionStep: fw.cfg.Execution.ToolResultEvictionStep,
+			CohortSize:             fw.cfg.Execution.MutationCohortSize,
+		})
+	}
+	return cw
 }
 
 // Execute is a convenience method that creates a Conductor and executes a

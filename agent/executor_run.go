@@ -929,19 +929,25 @@ func (e *Executor) processSingleToolCall(
 		e.emitter.ToolResult(state.stepNum, callIdx, len(obs), obs, true)
 		// The rejected first call's step materializes as groupSteps[0]: the
 		// response's reasoning (content and items — the encrypted chain a
-		// stateless Responses backend re-emits) must ride it, exactly as the
-		// executed path would carry them.
+		// stateless Responses backend re-emits) and its signed thinking
+		// blocks must ride it, exactly as the executed path would carry
+		// them. Gated like the reasoning fields: a rejected callIdx >= 1
+		// must not duplicate the first materialized step's signature-bearing
+		// blocks (the renderer reads groupSteps[0] only, but the step — and
+		// any persistence built from it — would carry a duplicate).
 		var rejectReasoningItems []llm.ReasoningItem
 		rejectReasoning := ""
+		var rejectThinkingBlocks []llm.ThinkingBlock
 		if callIdx == 0 {
 			rejectReasoning = resp.Message.ReasoningContent
 			rejectReasoningItems = resp.Message.ReasoningItems
+			rejectThinkingBlocks = resp.Message.ThinkingBlocks
 		}
 		step := Step{
 			Thought:          thought,
 			ReasoningContent: rejectReasoning,
 			ReasoningItems:   rejectReasoningItems,
-			ThinkingBlocks:   resp.Message.ThinkingBlocks,
+			ThinkingBlocks:   rejectThinkingBlocks,
 			Action:           action,
 			Observation:      obs,
 			IsError:          true,
@@ -1148,16 +1154,23 @@ func (e *Executor) processSingleToolCall(
 	stepThought := ""
 	stepReasoning := ""
 	var stepReasoningItems []llm.ReasoningItem
+	var stepThinkingBlocks []llm.ThinkingBlock
 	if callIdx == 0 {
 		stepThought = thought
 		stepReasoning = resp.Message.ReasoningContent
 		stepReasoningItems = resp.Message.ReasoningItems
+		// Same gate as the reasoning fields: the signed thinking blocks are
+		// carried by the group's first materialized step only — a later
+		// sibling copying them would persist duplicate signature-bearing
+		// blocks (the renderer reads groupSteps[0] only; a lone multi-block
+		// step renders standalone and would emit the same signed pair twice).
+		stepThinkingBlocks = resp.Message.ThinkingBlocks
 	}
 	step := Step{
 		Thought:          stepThought,
 		ReasoningContent: stepReasoning,
 		ReasoningItems:   stepReasoningItems,
-		ThinkingBlocks:   resp.Message.ThinkingBlocks,
+		ThinkingBlocks:   stepThinkingBlocks,
 		Action:           action,
 		Observation:      observation,
 		IsUntrusted:      isUntrusted,
@@ -1368,16 +1381,21 @@ func (e *Executor) handleFinishCall(
 	stepThought := ""
 	stepReasoning := ""
 	var stepReasoningItems []llm.ReasoningItem
+	var stepThinkingBlocks []llm.ThinkingBlock
 	if firstMaterialized {
 		stepThought = thought
 		stepReasoning = resp.Message.ReasoningContent
 		stepReasoningItems = resp.Message.ReasoningItems
+		// Same gate as the reasoning fields (see the executed path in
+		// processSingleToolCall): blocks ride the response's first
+		// materialized step only.
+		stepThinkingBlocks = resp.Message.ThinkingBlocks
 	}
 	step := Step{
 		Thought:          stepThought,
 		ReasoningContent: stepReasoning,
 		ReasoningItems:   stepReasoningItems,
-		ThinkingBlocks:   resp.Message.ThinkingBlocks,
+		ThinkingBlocks:   stepThinkingBlocks,
 		Action:           action,
 		TokensUsed:       resp.Usage.InputTokens + resp.Usage.OutputTokens,
 		ResponseGroup:    responseGroup,
@@ -1957,6 +1975,7 @@ func (e *Executor) processBatchTool(
 		stepThought := ""
 		stepReasoning := ""
 		var stepReasoningItems []llm.ReasoningItem
+		var stepThinkingBlocks []llm.ThinkingBlock
 		if subIdx == 0 && callIdx == 0 {
 			stepThought = thought
 			stepReasoning = resp.Message.ReasoningContent
@@ -1966,14 +1985,19 @@ func (e *Executor) processBatchTool(
 			// of the batch group, so the next BuildPrompt re-emits them via
 			// the assistant message and convertToResponsesInput round-trips
 			// the encrypted payload. Dropping them here would silently lose
-			// the reasoning chain for every batched turn.
+			// the reasoning chain for every batched turn. The signed
+			// thinking blocks ride the same gate — in particular a lone
+			// batch (ResponseGroup 0) renders every sub-call step
+			// standalone, so an ungated copy would put the same signed pair
+			// on the wire twice.
 			stepReasoningItems = resp.Message.ReasoningItems
+			stepThinkingBlocks = resp.Message.ThinkingBlocks
 		}
 		step := Step{
 			Thought:          stepThought,
 			ReasoningContent: stepReasoning,
 			ReasoningItems:   stepReasoningItems,
-			ThinkingBlocks:   resp.Message.ThinkingBlocks,
+			ThinkingBlocks:   stepThinkingBlocks,
 			Action:           subCall,
 			Observation:      observation,
 			IsUntrusted:      isUntrusted,
@@ -2232,20 +2256,24 @@ func (e *Executor) checkRepeatIdenticalTracked(
 		stepThought := ""
 		stepReasoning := ""
 		var stepReasoningItems []llm.ReasoningItem
+		var stepThinkingBlocks []llm.ThinkingBlock
 		if callIdx == 0 {
 			stepThought = thought
 			stepReasoning = resp.Message.ReasoningContent
 			// The intercepted first call's step materializes as groupSteps[0]:
 			// the response's reasoning items (the encrypted chain a stateless
 			// Responses backend re-emits) must ride it, exactly as the executed
-			// path would carry them.
+			// path would carry them. The signed thinking blocks ride the same
+			// gate (a callIdx >= 1 intercept must not duplicate the first
+			// materialized step's blocks).
 			stepReasoningItems = resp.Message.ReasoningItems
+			stepThinkingBlocks = resp.Message.ThinkingBlocks
 		}
 		step := Step{
 			Thought:          stepThought,
 			ReasoningContent: stepReasoning,
 			ReasoningItems:   stepReasoningItems,
-			ThinkingBlocks:   resp.Message.ThinkingBlocks,
+			ThinkingBlocks:   stepThinkingBlocks,
 			Action:           action,
 			Observation:      nudgeMsg,
 			// IsError marks this as a non-result: the tool call was NOT executed

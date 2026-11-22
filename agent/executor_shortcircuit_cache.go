@@ -161,15 +161,25 @@ func (e *Executor) replayShortCircuitObservation(
 	stepThought := ""
 	stepReasoning := ""
 	var stepReasoningItems []llm.ReasoningItem
+	var stepThinkingBlocks []llm.ThinkingBlock
 	if callIdx == 0 {
 		stepThought = thought
 		stepReasoning = resp.Message.ReasoningContent
 		stepReasoningItems = resp.Message.ReasoningItems
+		// Symmetry with the other Step-forming sites: when the replay IS the
+		// response's first materialized step, its signed thinking blocks ride
+		// it exactly like the reasoning fields — an assistant turn whose
+		// reasoning is carried without its thinking blocks breaks the
+		// round-trip contract (the API rejects or the fail-safe disables
+		// thinking). With callIdx >= 1 the executed/replayed first step of
+		// the group already carries them; a copy here would duplicate them.
+		stepThinkingBlocks = resp.Message.ThinkingBlocks
 	}
 	step := Step{
 		Thought:          stepThought,
 		ReasoningContent: stepReasoning,
 		ReasoningItems:   stepReasoningItems,
+		ThinkingBlocks:   stepThinkingBlocks,
 		Action:           action,
 		Observation:      observation,
 		IsUntrusted:      isUntrusted,

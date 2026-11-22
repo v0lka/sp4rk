@@ -145,6 +145,28 @@ type ContextWindow struct {
 	// LLM response, so it survives a reactive-compaction retry without
 	// duplicating across subsequent steps.
 	pendingUserInterjection string
+
+	// mutationEpoch counts prefix-invalidating history rewrites. It is bumped
+	// when compaction freezes the prefix (Compact) and whenever the
+	// eviction/pruning boundary moves between builds (advanceMutationEpoch).
+	// Steps are stamped with the current epoch on AddStep/SeedSteps, and
+	// buildAssistantMsg carriage renders ThinkingBlocks only for steps whose
+	// epoch matches: a replayed thinking block's signature is bound to the
+	// exact prefix it was generated against, so a block whose prefix was
+	// mutated after generation must not go back on the wire.
+	mutationEpoch int
+
+	// lastEvictBoundary/lastPruneActive/lastPruneStart snapshot the
+	// eviction/pruning boundary state observed by the previous BuildPrompt.
+	// A change in any of the three means the rendered tool-result prefix
+	// differs from the one the model last saw — mutationEpoch is bumped
+	// before the new prefix is rendered. boundarySnapshotSet is false until
+	// the first BuildPrompt (and reset by SeedSteps) so re-baselining after
+	// a wholesale history replacement does not count as a mutation.
+	lastEvictBoundary   int
+	lastPruneActive     bool
+	lastPruneStart      int
+	boundarySnapshotSet bool
 }
 
 // noopCounter is a zero-cost TokenCounter used when no tracker is provided.
@@ -469,6 +491,11 @@ func (cw *ContextWindow) ConsumePendingUserInterjection() {
 // ContextTokenTracker.Correct() method compensates by adjusting delta based
 // on actual API-reported token usage, so estimates converge over time.
 func (cw *ContextWindow) AddStep(step sdkagent.Step) {
+	// Stamp the step with the current mutation epoch: its thinking blocks (if
+	// any) are bound to the prefix as rendered by the last BuildPrompt — the
+	// next build renders them only while the epoch still matches (see
+	// thinkingBlocksForStep).
+	step.MutationEpoch = cw.mutationEpoch
 	cw.steps = append(cw.steps, step)
 	// NOTE: compactedMessages is intentionally left untouched here. It holds a
 	// frozen prefix from the last Compact() call; buildStepMessages appends
@@ -498,9 +525,22 @@ func (cw *ContextWindow) AddStep(step sdkagent.Step) {
 //
 // Passing nil or an empty slice clears any existing step history.
 func (cw *ContextWindow) SeedSteps(steps []sdkagent.Step) {
+	// Stamp the seeded history with the current epoch. SeedSteps replaces the
+	// window contents wholesale — the rebuilt prefix is exactly the history
+	// these steps were rendered in (faithful resume), so their thinking
+	// blocks stay valid. Compaction state is reset below, so the frozen
+	// prefix cannot contradict the seeded blocks either.
+	for i := range steps {
+		steps[i].MutationEpoch = cw.mutationEpoch
+	}
 	cw.steps = steps
 	cw.compactedMessages = nil
 	cw.compactedThroughIndex = 0
+	// Re-baseline the mutation-boundary snapshot without counting the
+	// wholesale replacement as a mutation: the seeded history restarts the
+	// boundary timeline, so the first post-seed build must not strip the
+	// seeded blocks.
+	cw.boundarySnapshotSet = false
 	// Reset the tracker so the wholesale replacement is reflected in fill
 	// accounting. Without Reset the seeded steps' token delta would pile on
 	// top of whatever the tracker already held, inflating FillPercent and
@@ -596,6 +636,62 @@ func (cw *ContextWindow) BuildPrompt() []llm.Message {
 	return messages
 }
 
+// advanceMutationEpoch bumps cw.mutationEpoch when the eviction/pruning
+// boundary state changed since the previous build. A moved boundary means the
+// rendered tool-result prefix differs from the prefix the model generated the
+// current steps' thinking blocks against — replaying those blocks would bind
+// signatures to a prefix they were never signed over. Called by
+// buildStepMessages BEFORE any message is rendered, so the same build that
+// crosses the boundary already drops stale blocks. The compaction path bumps
+// the epoch separately (Compact replaces the prefix wholesale).
+func (cw *ContextWindow) advanceMutationEpoch() {
+	evictBoundary := 0
+	if cw.mutation.ToolResultEvictionStep > 0 {
+		evictBoundary = cw.evictionBoundary()
+	}
+	pruneActive := false
+	pruneStart := 0
+	if cw.pruning.KeepLastN > 0 {
+		// Mirror computeProtectedIndices: ThresholdPercent <= 0 means pruning
+		// is always active (no fill gate), otherwise it activates at/above
+		// the threshold.
+		pruneActive = cw.pruning.ThresholdPercent <= 0 || cw.FillPercent() >= cw.pruning.ThresholdPercent
+	}
+	if pruneActive {
+		var toolResultCount int
+		for i := range cw.steps {
+			if cw.steps[i].Action.ID != "" {
+				toolResultCount++
+			}
+		}
+		pruneStart = cohortBoundary(toolResultCount-cw.pruning.KeepLastN, cw.mutation.CohortSize)
+		if pruneStart < 0 {
+			pruneStart = 0
+		}
+	}
+
+	if cw.boundarySnapshotSet &&
+		(evictBoundary != cw.lastEvictBoundary || pruneActive != cw.lastPruneActive || pruneStart != cw.lastPruneStart) {
+		cw.mutationEpoch++
+	}
+	cw.lastEvictBoundary = evictBoundary
+	cw.lastPruneActive = pruneActive
+	cw.lastPruneStart = pruneStart
+	cw.boundarySnapshotSet = true
+}
+
+// thinkingBlocksForStep returns the blocks to render for step: the step's
+// own ThinkingBlocks when the step was created in the current mutation epoch
+// (its blocks are still bound to the prefix as last rendered), or nil when a
+// history rewrite since creation invalidated the binding — the Anthropic
+// contract is to strip the thinking blocks from the edited turn on.
+func (cw *ContextWindow) thinkingBlocksForStep(step sdkagent.Step) []llm.ThinkingBlock {
+	if step.MutationEpoch != cw.mutationEpoch {
+		return nil
+	}
+	return step.ThinkingBlocks
+}
+
 // buildStepMessages returns messages for the step history.
 // If compaction has occurred, the frozen compactedMessages prefix is combined
 // with freshly-built messages for the tail (steps[compactedThroughIndex:]) —
@@ -608,6 +704,12 @@ func (cw *ContextWindow) buildStepMessages() []llm.Message {
 		messages = append(messages, cw.compactedMessages...)
 		startIdx = cw.compactedThroughIndex
 	}
+
+	// Bump the mutation epoch when the eviction/pruning boundaries moved since
+	// the previous build — every block-carrying step rendered below is checked
+	// against the post-bump epoch, so the very build that mutates the prefix
+	// already strips the blocks bound to the pre-mutation prefix.
+	cw.advanceMutationEpoch()
 
 	// Determine which step indices have tool results and should be pruned
 	protectedIndices := cw.computeProtectedIndices()
@@ -667,7 +769,11 @@ func (cw *ContextWindow) buildGroupedMessages(groupStart int, protectedIndices m
 			toolCalls = append(toolCalls, gs.Action)
 		}
 	}
-	assistantMsg := cw.buildAssistantMsg(groupSteps[0].Thought, groupSteps[0].ReasoningContent, groupSteps[0].ReasoningItems, groupSteps[0].ThinkingBlocks, toolCalls)
+	// Carriage gate: groupSteps[0] is the response's first materialized step;
+	// its thinking blocks ride the group's assistant turn only while no
+	// history mutation has invalidated their prefix binding (see
+	// thinkingBlocksForStep).
+	assistantMsg := cw.buildAssistantMsg(groupSteps[0].Thought, groupSteps[0].ReasoningContent, groupSteps[0].ReasoningItems, cw.thinkingBlocksForStep(groupSteps[0]), toolCalls)
 
 	var out []llm.Message
 	out = append(out, assistantMsg)
@@ -695,17 +801,22 @@ func (cw *ContextWindow) buildStandaloneMessages(step sdkagent.Step, i int, prot
 	if step.Action.ID != "" {
 		toolCalls = []llm.ToolCall{step.Action}
 	}
-	assistantMsg := cw.buildAssistantMsg(step.Thought, step.ReasoningContent, step.ReasoningItems, step.ThinkingBlocks, toolCalls)
+	// Carriage gate: blocks ride the standalone assistant turn only while
+	// their prefix binding is intact (see thinkingBlocksForStep).
+	thinkingBlocks := cw.thinkingBlocksForStep(step)
+	assistantMsg := cw.buildAssistantMsg(step.Thought, step.ReasoningContent, step.ReasoningItems, thinkingBlocks, toolCalls)
 
 	var out []llm.Message
 
 	// Nudge-only steps (no thought, no reasoning, no action, non-empty nudge)
 	// emit only the user message — mirroring stepsToMessages. Without this the
 	// empty assistant slot would render as a spurious "(proceeding)" placeholder
-	// between the pending tool result and the user correction.
+	// between the pending tool result and the user correction. Blocks whose
+	// carriage was gated off do not count: they render to nothing, so a
+	// stale-epoch nudge-only step stays nudge-only.
 	thought := strings.TrimRight(step.Thought, strutil.InvisibleTrimSet)
 	nudgeOnly := thought == "" && step.ReasoningContent == "" && len(step.ReasoningItems) == 0 &&
-		len(step.ThinkingBlocks) == 0 && step.Action.ID == "" && strutil.HasVisibleContent(step.UserNudge)
+		len(thinkingBlocks) == 0 && step.Action.ID == "" && strutil.HasVisibleContent(step.UserNudge)
 
 	if !nudgeOnly {
 		out = append(out, assistantMsg)
@@ -837,8 +948,19 @@ func (cw *ContextWindow) applyHistoryMutation(step sdkagent.Step, idx int, obser
 // BuildPrompt, invalidating the provider's prompt cache on every turn;
 // cohortBoundary quantizes that advance into HistoryMutation.CohortSize-sized
 // jumps so the rendered prefix stays byte-stable between cohort boundaries.
+// During warm-up (fewer steps than ToolResultEvictionStep) the legacy
+// position is negative while nothing can be evicted; it is clamped to 0 —
+// the same clamp the pruning boundary applies in advanceMutationEpoch — so
+// the boundary is byte-stable across warm-up builds. Returned raw, the
+// negative position would advance on every warm-up build and bump the
+// mutation epoch despite a byte-identical render, stripping thinking blocks
+// that are still bound to an unmutated prefix.
 func (cw *ContextWindow) evictionBoundary() int {
-	return cohortBoundary(len(cw.steps)-cw.mutation.ToolResultEvictionStep, cw.mutation.CohortSize)
+	boundary := cohortBoundary(len(cw.steps)-cw.mutation.ToolResultEvictionStep, cw.mutation.CohortSize)
+	if boundary < 0 {
+		return 0
+	}
+	return boundary
 }
 
 // cohortBoundary quantizes a legacy boundary position into K-sized cohorts.
@@ -1068,6 +1190,22 @@ func (cw *ContextWindow) Compact(ctx context.Context) *CompactionResult {
 	// subsequent step.
 	cw.compactedMessages = cw.strategy.Compact(ctx, cw.steps, budgetTokens)
 	cw.compactedThroughIndex = len(cw.steps)
+
+	// Strip the thinking blocks from the frozen prefix and bump the mutation
+	// epoch. Compaction rewrites history: a thinking block's signature is
+	// bound to the exact prefix it was generated against, so NO surviving
+	// block — not the ones the strategies carried into the frozen prefix, and
+	// not the ones on the still-live tail steps — is valid against the
+	// compacted prefix ("strip the thinking blocks from the edited turn on").
+	// The epoch bump makes every pre-compaction step stale for the carriage
+	// gate (thinkingBlocksForStep); steps added afterwards are stamped with
+	// the new epoch and keep carrying (valid) blocks. With no block on the
+	// final assistant turn, the provider's fail-safe disables thinking for
+	// the next request — degraded output instead of a guaranteed HTTP 400.
+	for i := range cw.compactedMessages {
+		cw.compactedMessages[i].ThinkingBlocks = nil
+	}
+	cw.mutationEpoch++
 
 	// Re-apply the prompt-injection boundary to untrusted tool messages in
 	// the frozen prefix. The strategies build verbatim tool messages via

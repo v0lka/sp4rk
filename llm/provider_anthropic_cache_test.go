@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/liushuangls/go-anthropic/v2"
 )
 
 // countCacheControl walks a decoded Anthropic wire request and counts every
@@ -205,7 +207,140 @@ func TestAnthropicProvider_CacheBreakpoints_DeterministicPurpose(t *testing.T) {
 	}
 }
 
-// TestAnthropicProvider_ThinkingRoundTrip pins the full carriage loop:
+// TestAnthropicProvider_ThinkingRoundTripEmptyBlocks pins the verbatim
+// round-trip contract for blocks with EMPTY payloads: the API documents that
+// it may return thinking blocks with an empty thinking field (e.g. generation
+// cut off at max_tokens) and redacted_thinking blocks with an empty data
+// payload, and requires them passed back unmodified and in original order.
+// convertMessage must therefore render every captured block — skipping an
+// empty one makes the replayed assistant turn differ from the API's own
+// response (HTTP 400 "cannot be modified") and silently breaks the
+// leading-thinking invariant the fail-safe keys on. parseResponse, in turn,
+// must capture a block even when its SDK union payload did not decode, so the
+// captured set matches the block set the API returned.
+func TestAnthropicProvider_ThinkingRoundTripEmptyBlocks(t *testing.T) {
+	body := `{"id":"msg_e","type":"message","role":"assistant",` +
+		`"model":"claude-3-haiku-20240307",` +
+		`"content":[` +
+		`{"type":"thinking","thinking":"","signature":"SIGEMPTY"},` +
+		`{"type":"redacted_thinking","data":""},` +
+		`{"type":"text","text":"partial answer"}` +
+		`],"stop_reason":"end_turn","stop_sequence":null,` +
+		`"usage":{"input_tokens":10,"output_tokens":5}}`
+	provider, lastBody := newAnthropicWireProvider(t, body)
+	ctx := t.Context()
+
+	resp, err := provider.ChatCompletion(ctx, ChatRequest{
+		Model:           "claude-3-haiku-20240307",
+		MaxTokens:       8192,
+		ReasoningEffort: "On",
+		Messages:        []Message{{Role: "user", Content: "think briefly"}},
+	})
+	if err != nil {
+		t.Fatalf("first ChatCompletion: %v", err)
+	}
+
+	// parseResponse captures BOTH empty-payload blocks.
+	blocks := resp.Message.ThinkingBlocks
+	if len(blocks) != 2 {
+		t.Fatalf("ThinkingBlocks = %+v, want 2 blocks (empty thinking + empty redacted_thinking)", blocks)
+	}
+	if blocks[0].Type != "thinking" || blocks[0].Thinking != "" || blocks[0].Signature != "SIGEMPTY" {
+		t.Errorf("empty thinking block not captured verbatim: %+v", blocks[0])
+	}
+	if blocks[1].Type != "redacted_thinking" || blocks[1].Data != "" {
+		t.Errorf("empty redacted_thinking block not captured verbatim: %+v", blocks[1])
+	}
+
+	// The continuation re-emits the assistant turn: every captured block must
+	// be on the wire (in order, ahead of text), and thinking must stay enabled
+	// — the fail-safe must not fire for a turn whose blocks are all empty.
+	cont := ChatRequest{
+		Model:           "claude-3-haiku-20240307",
+		MaxTokens:       8192,
+		ReasoningEffort: "On",
+		Messages: []Message{
+			{Role: "user", Content: "think briefly"},
+			resp.Message,
+			{Role: "user", Content: "continue"},
+		},
+	}
+	if _, err := provider.ChatCompletion(ctx, cont); err != nil {
+		t.Fatalf("continuation ChatCompletion: %v", err)
+	}
+	m := decodeAnthropicRequest(t, lastBody())
+	if _, ok := m["thinking"]; !ok {
+		t.Errorf("thinking must stay enabled when the last assistant turn carries (empty) thinking blocks: %s", lastBody())
+	}
+	msgs, _ := m["messages"].([]any)
+	var assistantContent []any
+	for _, mm := range msgs {
+		msg, _ := mm.(map[string]any)
+		if role, _ := msg["role"].(string); role == "assistant" {
+			assistantContent, _ = msg["content"].([]any)
+		}
+	}
+	if len(assistantContent) != 3 {
+		t.Fatalf("assistant turn should re-emit empty thinking + empty redacted_thinking + text, got %d blocks: %s", len(assistantContent), lastBody())
+	}
+	first, _ := assistantContent[0].(map[string]any)
+	if first["type"] != "thinking" || first["signature"] != "SIGEMPTY" {
+		t.Errorf("assistant turn must START with the (empty) thinking block carrying its signature, got %v", first)
+	}
+	second, _ := assistantContent[1].(map[string]any)
+	if second["type"] != "redacted_thinking" {
+		t.Errorf("empty redacted_thinking block must follow verbatim, got %v", second)
+	}
+	third, _ := assistantContent[2].(map[string]any)
+	if third["type"] != "text" {
+		t.Errorf("text block must follow the thinking blocks, got %v", third)
+	}
+}
+
+// TestAnthropicProvider_ThinkingCaptureUnionMiss pins the capture-completeness
+// contract: a thinking-typed block whose SDK union payload did not decode
+// (MessageContentThinking == nil) still lands in ThinkingBlocks, and so does
+// a redacted_thinking block without its payload — the captured set must match
+// the block set the API returned even when the SDK hands the provider an
+// untyped block.
+func TestAnthropicProvider_ThinkingCaptureUnionMiss(t *testing.T) {
+	provider, _ := newAnthropicWireProvider(t, `{}`)
+	text := "done"
+	resp := anthropic.MessagesResponse{
+		ID:   "msg_u",
+		Type: anthropic.MessagesResponseTypeMessage,
+		Content: []anthropic.MessageContent{
+			// Thinking-typed block with the union payload left nil — the
+			// defensive arm for an SDK decode miss.
+			{Type: anthropic.MessagesContentTypeThinking},
+			{Type: anthropic.MessagesContentTypeRedactedThinking},
+			{Type: anthropic.MessagesContentTypeText, Text: &text},
+		},
+		StopReason: anthropic.MessagesStopReasonEndTurn,
+		Usage: anthropic.MessagesUsage{
+			InputTokens:  10,
+			OutputTokens: 5,
+		},
+	}
+	out, err := provider.parseResponse(resp, nil, nil)
+	if err != nil {
+		t.Fatalf("parseResponse: %v", err)
+	}
+	blocks := out.Message.ThinkingBlocks
+	if len(blocks) != 2 {
+		t.Fatalf("ThinkingBlocks = %+v, want both payload-less blocks captured", blocks)
+	}
+	if blocks[0].Type != "thinking" {
+		t.Errorf("blocks[0].Type = %q, want \"thinking\"", blocks[0].Type)
+	}
+	if blocks[1].Type != "redacted_thinking" {
+		t.Errorf("blocks[1].Type = %q, want \"redacted_thinking\"", blocks[1].Type)
+	}
+	if out.Reasoning != "" {
+		t.Errorf("Reasoning = %q, want empty when no readable thinking text exists", out.Reasoning)
+	}
+}
+
 // parseResponse captures thinking AND redacted_thinking blocks verbatim onto
 // ChatResponse.Message, and the next buildRequest re-emits them at the START
 // of the assistant turn on the wire, ahead of the text/tool_use blocks —

@@ -678,14 +678,19 @@ func (p *AnthropicProvider) convertMessage(msg Message, mapping *toolNameMapping
 		// Re-emit carried thinking blocks FIRST, in their original order and
 		// byte-for-byte: the Messages API requires an assistant turn to START
 		// with its (redacted_)thinking block whenever thinking is enabled, and
-		// verifies each block's signature. Blocks with neither payload are
-		// skipped defensively (they would render as empty blocks).
+		// verifies each block's signature. Every captured block is rendered —
+		// including blocks whose thinking text or redacted payload is empty:
+		// the API documents that it may return such blocks (e.g. generation
+		// cut off at max_tokens) and requires them passed back unmodified, in
+		// original order. Dropping one would both make the replayed turn
+		// differ from the API's own response (HTTP 400 "cannot be modified")
+		// and break the leading-thinking invariant the fail-safe below
+		// (assistantHistoryMissingLeadingThinking) relies on. (The SDK's
+		// omitempty drops an empty thinking/data string from the wire JSON;
+		// the block itself — type + signature — still round-trips.)
 		for _, tb := range msg.ThinkingBlocks {
 			switch tb.Type {
 			case "thinking":
-				if tb.Thinking == "" {
-					continue
-				}
 				content = append(content, anthropic.MessageContent{
 					Type: anthropic.MessagesContentTypeThinking,
 					MessageContentThinking: &anthropic.MessageContentThinking{
@@ -694,9 +699,6 @@ func (p *AnthropicProvider) convertMessage(msg Message, mapping *toolNameMapping
 					},
 				})
 			case "redacted_thinking":
-				if tb.Data == "" {
-					continue
-				}
 				content = append(content, anthropic.MessageContent{
 					Type: anthropic.MessagesContentTypeRedactedThinking,
 					MessageContentRedactedThinking: &anthropic.MessageContentRedactedThinking{
@@ -807,6 +809,17 @@ func (p *AnthropicProvider) parseResponse(resp anthropic.MessagesResponse, rawBo
 					Thinking:  block.Thinking,
 					Signature: block.Signature,
 				})
+			} else {
+				// The block type says thinking but the SDK union payload did
+				// not decode. Capture a placeholder anyway so the captured
+				// set matches the block set the API returned — the Messages
+				// API requires EVERY returned thinking block to be passed
+				// back (including blocks with an empty thinking field), and
+				// the fail-safe (assistantHistoryMissingLeadingThinking)
+				// keys on ThinkingBlocks being non-empty.
+				thinkingBlocks = append(thinkingBlocks, ThinkingBlock{
+					Type: "thinking",
+				})
 			}
 
 		case anthropic.MessagesContentTypeRedactedThinking:
@@ -819,6 +832,14 @@ func (p *AnthropicProvider) parseResponse(resp anthropic.MessagesResponse, rawBo
 				thinkingBlocks = append(thinkingBlocks, ThinkingBlock{
 					Type: "redacted_thinking",
 					Data: block.Data,
+				})
+			} else {
+				// Same capture-completeness contract as the thinking case
+				// above: the API returned a redacted_thinking block, so the
+				// replayed turn must carry one even when the SDK payload did
+				// not decode.
+				thinkingBlocks = append(thinkingBlocks, ThinkingBlock{
+					Type: "redacted_thinking",
 				})
 			}
 

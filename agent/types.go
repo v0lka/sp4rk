@@ -52,6 +52,21 @@ type Step struct {
 	// is disabled. Used by ContextWindow to replace old tool results with a
 	// cache reference (regular history mutation), reducing O(n²) replay cost.
 	CacheHash string `json:"cache_hash,omitempty"`
+	// MutationEpoch records the ContextWindow history-mutation epoch the step
+	// was created in. The window bumps its epoch counter whenever a history
+	// rewrite invalidates the request prefix (tool-result eviction or output
+	// pruning crossing a new boundary, or compaction freezing the prefix), and
+	// BuildPrompt renders ThinkingBlocks only for steps whose epoch matches
+	// the current one: an Anthropic thinking block's signature is bound to the
+	// exact prefix it was generated against, so replaying it over a mutated
+	// prefix is rejected by the API (or silently dropped). Steps created after
+	// the mutation keep carrying (valid) blocks; steps created before it stop
+	// — the "strip the thinking blocks from the edited turn on" contract.
+	// Stamped by the ContextWindow on AddStep/SeedSteps; hosts that rebuild
+	// history from their own persistence leave the zero value, which renders
+	// blocks against a fresh window's epoch 0 (faithful rebuilds keep them
+	// valid).
+	MutationEpoch int `json:"mutation_epoch,omitempty"`
 }
 
 // ExecutorResult — result of Executor.Run.
