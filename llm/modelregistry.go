@@ -1955,14 +1955,47 @@ func makeBuiltInRegistry() map[string]ModelMetadata {
 
 		// ── GLM models (Zhipu AI) ───────────────────────────────────────
 		// Source: https://docs.z.ai + https://docs.bigmodel.cn
-		// GLM 5.x: 1M/200K context, 128K max output.
+		// GLM 5.x: 1M/200K context; max output 128K (5.2–5.3), 131K (5.4).
 		// GLM 4.7: 200K context, 128K max output.
+		// GLM-5.4 (released 2026-11-23): flagship successor to GLM-5.3, 1M
+		// context and 131,072 max output with tools/reasoning/temperature;
+		// multimodal input (image/video/PDF) per models.dev (zhipuai/glm-5.4)
+		// — note that models.dev conveys modality through the input column,
+		// not through its capabilities field.
+		"glm-5.4": {
+			ContextWindow: 1000000,
+			OutputLimit:   131072,
+			TokenizerType: "approximate",
+			Family:        "glm",
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
 		"glm-5.3": {
 			ContextWindow: 1000000,
 			OutputLimit:   128000,
 			TokenizerType: "approximate",
 			Family:        "glm",
 			Capabilities:  &ModelCapabilities{Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		// GLM-5.3-FlashX: the high-throughput serving tier of the multimodal
+		// GLM-5.3-Flash (~200 tokens/s). Text parameters are consistent with
+		// GLM-5.3: 1M context, 128K max output; image/video/file input;
+		// always-on thinking (cannot be disabled); function calling.
+		// Source: https://docs.z.ai/guides/vlm/glm-5.3-flash
+		"glm-5.3-flashx": {
+			ContextWindow: 1000000,
+			OutputLimit:   128000,
+			TokenizerType: "approximate",
+			Family:        "glm",
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
+		},
+		// GLM-5.3-FlashX-Legal: the legal-domain variant of GLM-5.3-FlashX —
+		// same text parameters and modalities, tuned for legal workloads.
+		"glm-5.3-flashx-legal": {
+			ContextWindow: 1000000,
+			OutputLimit:   128000,
+			TokenizerType: "approximate",
+			Family:        "glm",
+			Capabilities:  &ModelCapabilities{Attachment: true, Reasoning: true, Temperature: true, ToolCall: true},
 		},
 		"glm-5.2": {
 			ContextWindow: 1000000,

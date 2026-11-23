@@ -11,7 +11,7 @@ func TestGLMAlwaysThinkingWire(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewOpenAIProvider(compatible) error = %v, want nil", err)
 	}
-	models := []string{"glm-5.3", "glm-5.3-flash", "Z-ai-API/GLM-5.3", "zai-org/glm-5.3-flash"}
+	models := []string{"glm-5.3", "glm-5.3-flash", "glm-5.3-flashx", "glm-5.3-flashx-legal", "glm-5.4", "Z-ai-API/GLM-5.3", "zai-org/glm-5.3-flash"}
 	efforts := []struct {
 		input string
 		want  string

@@ -102,7 +102,11 @@ func TestModelRegistry_BuiltInResolution(t *testing.T) {
 		{"grok-4.20", 1000000, 32768, "approximate"},
 		{"grok-3-mini", 131072, 32768, "approximate"},
 
-		// GLM models (Zhipu AI) — verified from docs.z.ai
+		// GLM models (Zhipu AI) — verified from docs.z.ai (FlashX/FlashX-Legal)
+		// and models.dev zhipuai/glm-5.4
+		{"glm-5.4", 1000000, 131072, "approximate"},
+		{"glm-5.3-flashx", 1000000, 128000, "approximate"},
+		{"glm-5.3-flashx-legal", 1000000, 128000, "approximate"},
 		{"glm-5.2", 1000000, 128000, "approximate"},
 		{"glm-5.1", 200000, 128000, "approximate"},
 		{"glm-5", 200000, 128000, "approximate"},
