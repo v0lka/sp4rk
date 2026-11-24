@@ -2,6 +2,7 @@ package llm
 
 import (
 	"encoding/json"
+	"slices"
 	"sort"
 )
 
@@ -38,7 +39,7 @@ func getTypes(typeVal any) []string {
 //   - Resolves $ref references against $defs/definitions
 //   - Filters out forbidden JSON Schema keywords ($schema, $id, $comment, $defs, definitions, default, examples)
 //   - Infers "type": "object" when properties or required are present but type is missing
-//   - Adds "additionalProperties": false to all object-type schemas (recursively)
+//   - Closes objects and object members of type unions recursively with "additionalProperties": false
 //   - Ensures the required array contains ALL property names from properties
 //   - Removes required entries that reference non-existent properties
 func SanitizeSchemaForOpenAI(raw json.RawMessage) json.RawMessage {
@@ -493,8 +494,8 @@ func sanitizeOpenAISchemaWithDefs(schema, defs map[string]any, strict bool) map[
 
 	isObjectType := len(types) == 1 && types[0] == "object"
 
-	// For object types, enforce strict mode constraints
-	if isObjectType {
+	// Strict Responses also applies object constraints to nullable objects and other type unions.
+	if isObjectType || (strict && slices.Contains(types, "object")) {
 		// ALWAYS force additionalProperties to false
 		result["additionalProperties"] = false
 
