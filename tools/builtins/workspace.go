@@ -62,7 +62,7 @@ func (t *ReadStepOutputTool) Execute(ctx context.Context, input json.RawMessage)
 	}
 
 	if params.StepID == "" {
-		return tools.ToolResult{Content: "validation error: step_id is required", IsError: true}, nil
+		return tools.InvalidCallResult("validation error: step_id is required"), nil
 	}
 
 	store := agent.StepOutputStoreFromContext(ctx)

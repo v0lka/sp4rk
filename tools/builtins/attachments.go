@@ -63,7 +63,7 @@ func (t *ReadAttachmentTool) Execute(ctx context.Context, input json.RawMessage)
 	}
 
 	if strings.TrimSpace(params.AttachmentID) == "" {
-		return tools.ToolResult{Content: "validation error: attachment_id is required", IsError: true}, nil
+		return tools.InvalidCallResult("validation error: attachment_id is required"), nil
 	}
 
 	store := agent.AttachmentStoreFromContext(ctx)

@@ -236,12 +236,14 @@ func TestCheckFruitlessResult_ExemptToolsNotCounted(t *testing.T) {
 		SameToolResultSizeDelta:      64,
 	}
 	// Each exempt tool produces a short successful result (e.g. edit_file
-	// returns "successfully edited file" = 24 bytes). None should increment
-	// the fruitless counter, even when called many times in a row.
+	// returns "successfully edited file" = 24 bytes; a wait tool's "still
+	// pending"). None should increment the fruitless counter, even when called
+	// many times in a row.
 	exemptTools := []string{
 		"edit_file", "write_file", "create_directory",
 		"delete_file", "delete_directory",
 		"update_checklist", "set_step_status", "store_fact",
+		"wait", "wait_for_one", "wait_for_all",
 	}
 	for _, toolName := range exemptTools {
 		t.Run(toolName, func(t *testing.T) {
@@ -325,12 +327,13 @@ func TestCheckSameToolRepetition_ExemptToolsNotCounted(t *testing.T) {
 	}
 	// Mutating tools and meta-tools legitimately produce bursts of short,
 	// similarly-sized successful results (e.g. batch edit_file calls each
-	// returning "successfully edited file" = 24 bytes). They must not trigger
-	// the same-tool-repeat detector.
+	// returning "successfully edited file" = 24 bytes; a wait tool polled on
+	// the same ids). They must not trigger the same-tool-repeat detector.
 	exemptTools := []string{
 		"edit_file", "write_file", "create_directory",
 		"delete_file", "delete_directory",
 		"update_checklist", "set_step_status", "store_fact",
+		"wait", "wait_for_one", "wait_for_all",
 	}
 	for _, toolName := range exemptTools {
 		t.Run(toolName, func(t *testing.T) {
@@ -1531,6 +1534,98 @@ func TestProcessBatchTool_InterceptedPathsCarryReasoningItems(t *testing.T) {
 	})
 }
 
+// failingHITLHandler fails every OnToolCall with a Go error — the HITL
+// backend itself broke, which is neither an allow nor a denial.
+type failingHITLHandler struct{}
+
+func (h *failingHITLHandler) OnToolCall(_ context.Context, _ string, _ json.RawMessage) (*HITLToolDecision, error) {
+	return nil, errors.New("hitl backend unavailable")
+}
+
+func (h *failingHITLHandler) OnStepLimit(_ context.Context, _, _ int, _ string) (StepLimitResponse, error) {
+	return StepLimitDeny, nil
+}
+
+// TestProcessBatchTool_SynthesisedSubCallErrorsCarryExecutionKind pins the
+// typed error class on the batch path's two executor-synthesised failures
+// (specs/contracts/tools.md): a sub-call whose HITL handler itself errored
+// and a sub-call whose tool returned a Go error both materialize an error
+// step carrying ErrorKind == ToolErrorExecution — the arguments were
+// acceptable and the environment failed — never the zero kind and never
+// invalid_call. The batch path builds these result literals itself (it does
+// not go through the registry's constructors), so each site needs its own
+// pin next to the standalone path's.
+func TestProcessBatchTool_SynthesisedSubCallErrorsCarryExecutionKind(t *testing.T) {
+	type batchCall struct {
+		Tool  string          `json:"tool"`
+		Input json.RawMessage `json:"input"`
+	}
+	subInput, _ := json.Marshal(map[string]string{"query": "test"})
+	batchInput, _ := json.Marshal(map[string][]batchCall{
+		"calls": {
+			{Tool: "search", Input: subInput},
+		},
+	})
+	newResp := func() *llm.ChatResponse {
+		return &llm.ChatResponse{
+			Message: llm.Message{
+				Role: "assistant",
+				ToolCalls: []llm.ToolCall{
+					{ID: "batch_1", Name: "batch", Input: batchInput},
+				},
+			},
+			Usage:      llm.TokenUsage{InputTokens: 100, OutputTokens: 50},
+			StopReason: "tool_use",
+		}
+	}
+	run := func(t *testing.T, exec *Executor) Step {
+		t.Helper()
+		action := llm.ToolCall{ID: "batch_1", Name: "batch", Input: batchInput}
+		state := &runState{effectiveMaxSteps: 10}
+		if _, _, err := exec.processSingleToolCall(context.Background(), action, 0, []llm.ToolCall{action}, newResp(), "thinking", state, newMockContextManager()); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(state.allSteps) != 1 {
+			t.Fatalf("steps = %d, want exactly the one intercepted sub-call step", len(state.allSteps))
+		}
+		return state.allSteps[0]
+	}
+	assertExecutionStep := func(t *testing.T, step Step, wantSubstring string) {
+		t.Helper()
+		if !step.IsError {
+			t.Fatal("IsError = false, want true")
+		}
+		if step.ErrorKind != tools.ToolErrorExecution {
+			t.Errorf("ErrorKind = %q, want %q (an executor-synthesised failure is execution class)", step.ErrorKind, tools.ToolErrorExecution)
+		}
+		if !strings.Contains(step.Observation, wantSubstring) {
+			t.Errorf("Observation = %q, want it to contain %q", step.Observation, wantSubstring)
+		}
+	}
+
+	t.Run("HITL handler error", func(t *testing.T) {
+		mockTools := newMockToolExecutor()
+		exec := NewExecutor(&mockLLMCaller{}, mockTools, 10,
+			WithTokenCounter(&mockTokenCounter{}),
+			WithCircuitBreaker(defaultCircuitBreakerConfig),
+			WithHITL(&failingHITLHandler{}),
+		)
+		exec.emitter = &NoopEvents{}
+		assertExecutionStep(t, run(t, exec), `HITL handler error for tool "search"`)
+		if len(mockTools.calls) != 0 {
+			t.Errorf("tool executions = %d, want none (a failed HITL handler must not reach the tool)", len(mockTools.calls))
+		}
+	})
+
+	t.Run("tool executor Go error", func(t *testing.T) {
+		mockTools := newMockToolExecutor()
+		mockTools.errors["search"] = errors.New("executor backend unavailable")
+		exec := newExecutorDefaultHITL(&mockLLMCaller{}, mockTools, &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, defaultCircuitBreakerConfig)
+		exec.emitter = &NoopEvents{}
+		assertExecutionStep(t, run(t, exec), `error executing "search": executor backend unavailable`)
+	})
+}
+
 // batchRegistryProbe records real-registry dispatch for batch integration tests.
 type batchRegistryProbe struct {
 	tools.BaseTool
@@ -2419,6 +2514,68 @@ func TestProcessBatchTool_IdenticalInvalidBatchesNudgeThenAbort(t *testing.T) {
 	// Not a single sub-call ever executed across the whole ladder.
 	if len(mockTools.calls) != 0 {
 		t.Errorf("no sub-call may execute across the nudge/abort ladder, got %+v", mockTools.calls)
+	}
+}
+
+// TestProcessBatchTool_IdenticalWaitPollBatchesExemptFromRepeatBreaker pins
+// the whole-batch extension of the repeat exemption: a WHOLE batch whose
+// every sub-call is a wait poller, re-issued byte-identically (the
+// multi-delegation join poll), never accumulates in the batch namespace —
+// the mock's short "ok" sub-call results would otherwise look like an
+// identical resend and nudge at 3 / abort at 5. A batch mixing a wait
+// poller with a non-exempt tool stays breaker-armed: identical re-issues
+// still accumulate and the third trips the nudge.
+func TestProcessBatchTool_IdenticalWaitPollBatchesExemptFromRepeatBreaker(t *testing.T) {
+	mockTools := newMockToolExecutor()
+	mockTools.validationFailures["bad_a"] = invalidValidationFor("bad_a", `missing required parameter "path"`)
+
+	cfg := CircuitBreakerConfig{
+		RepeatNudgeThreshold: 3,
+		RepeatAbortThreshold: 5,
+		// Validation breaker disabled to isolate the repeat exemption.
+		ValidationErrorAbortThreshold: 0,
+	}
+	exec := newExecutorDefaultHITL(&mockLLMCaller{}, mockTools, &mockTokenCounter{}, 10, nil, false, ToolResultBudget{}, cfg)
+	exec.emitter = &NoopEvents{}
+	state := &runState{effectiveMaxSteps: 10}
+	cw := newMockContextManager()
+
+	// The join poll: two wait_for_one sub-calls, identical batch input,
+	// re-issued past both thresholds.
+	pollInput := batchCallJSON(t,
+		bc{tool: "wait_for_one", input: map[string]any{"delegate_id": "del_1"}},
+		bc{tool: "wait_for_one", input: map[string]any{"delegate_id": "del_2"}},
+	)
+	pollAction, pollResp := batchAction("batch_poll", pollInput)
+	for i := 0; i < 6; i++ {
+		state.circuitBreakerTriggered = false
+		if _, act, err := exec.processSingleToolCall(context.Background(), pollAction, 0, pollResp.Message.ToolCalls, pollResp, "thinking", state, cw); err != nil || act != actionNone || state.circuitBreakerTriggered {
+			t.Fatalf("poll batch %d tripped the repeat breaker: act=%v triggered=%v err=%v (a healthy join poll must never nudge/abort)", i+1, act, state.circuitBreakerTriggered, err)
+		}
+		if exec.batchRepeat.count != 0 {
+			t.Fatalf("batchRepeat.count = %d after poll batch %d, want 0 (a whole-batch wait poll is exempt)", exec.batchRepeat.count, i+1)
+		}
+	}
+
+	// Control: a batch mixing the poller with a non-exempt tool stays armed —
+	// identical re-issues accumulate and the third trips the nudge.
+	mixedInput := batchCallJSON(t,
+		bc{tool: "wait_for_one", input: map[string]any{"delegate_id": "del_1"}},
+		bc{tool: "bad_a", input: map[string]any{}},
+	)
+	mixedAction, mixedResp := batchAction("batch_mixed", mixedInput)
+	for i := 0; i < 2; i++ {
+		state.circuitBreakerTriggered = false
+		if _, act, err := exec.processSingleToolCall(context.Background(), mixedAction, 0, mixedResp.Message.ToolCalls, mixedResp, "thinking", state, cw); err != nil || act != actionNone {
+			t.Fatalf("mixed batch %d must pass through the aggregate rejection: act=%v err=%v", i+1, act, err)
+		}
+		if exec.batchRepeat.count != i+1 {
+			t.Fatalf("batchRepeat.count = %d after mixed batch %d, want %d", exec.batchRepeat.count, i+1, i+1)
+		}
+	}
+	state.circuitBreakerTriggered = false
+	if _, act, err := exec.processSingleToolCall(context.Background(), mixedAction, 0, mixedResp.Message.ToolCalls, mixedResp, "thinking", state, cw); err != nil || act != actionBreak || !state.circuitBreakerTriggered {
+		t.Fatalf("third identical mixed batch must trip the repeat nudge: act=%v triggered=%v err=%v", act, state.circuitBreakerTriggered, err)
 	}
 }
 

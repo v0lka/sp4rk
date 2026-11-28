@@ -61,10 +61,50 @@ func ToolGroupOf(t Tool) ToolGroup {
 	return ""
 }
 
+// ToolErrorKind classifies an error ToolResult (IsError=true) by what the
+// MODEL must do about it, so emitters and hosts can distinguish "the call
+// itself was wrong — fix the arguments" from "the call was fine and the work
+// failed" without parsing prose. The zero value ("") means unspecified — the
+// legacy behaviour of ErrorResult and of any ToolResult built before the
+// field existed.
+type ToolErrorKind string
+
+const (
+	// ToolErrorInvalidCall marks a result whose call violated its argument
+	// contract, so the fix is on the caller's side — correct the arguments
+	// and retry: a schema violation caught by the registry's pre-dispatch
+	// validator or the batch pre-flight, an input the tool could not parse
+	// (ParseInputError), a name that resolved to no tool (ToolNotFoundResult),
+	// or a builtin's own contract check (InvalidCallResult), which may follow
+	// a cheap look at the argument's referent (a path of the wrong kind for
+	// the tool, an old_string that does not match the file). What makes a
+	// result invalid_call is that remedy, not whether a syscall ran first;
+	// an environmental failure after the arguments were accepted is
+	// execution, never invalid_call.
+	ToolErrorInvalidCall ToolErrorKind = "invalid_call"
+	// ToolErrorExecution marks a result whose arguments were acceptable but
+	// whose work failed: a tool that ran (or was dispatched) and reported an
+	// error (a missing path or URL, permission denied, a timeout, a failed
+	// write), or an executor-synthesised error that is not a call-shape
+	// problem (a truncation interception, a HITL rejection, a user denial, a
+	// repeat-circuit-breaker interception, or the batch path's
+	// infrastructure-error conversion). The validation/parse breaker aborts
+	// are call-shape problems and stamp invalid_call instead; a non-error
+	// breaker nudge (the fruitless breaker) carries no class.
+	ToolErrorExecution ToolErrorKind = "execution"
+)
+
 // ToolResult is the result of tool execution.
 type ToolResult struct {
 	Content string
 	IsError bool
+	// ErrorKind classifies the error when IsError is true (see
+	// [ToolErrorKind]). The zero value is the legacy "unspecified" class:
+	// [ErrorResult] keeps it, so a plain error result is indistinguishable
+	// from a pre-field result by design. Only constructors that know the
+	// failure stage ([InvalidCallResult], [ParseInputError],
+	// [ToolNotFoundResult]) stamp it.
+	ErrorKind ToolErrorKind
 }
 
 // ToolSourceCategory classifies a tool's origin for routing and display.
@@ -105,14 +145,33 @@ func ParseToolPolicy(s string) ToolPolicy {
 	}
 }
 
-// ErrorResult creates a ToolResult with IsError=true.
+// ErrorResult creates a ToolResult with IsError=true and the UNSPECIFIED
+// (zero) ErrorKind — the legacy class for a call whose arguments were
+// acceptable but whose work failed (rendered as execution). Use
+// [InvalidCallResult] instead when the failure is a call the model must
+// correct rather than retry.
 func ErrorResult(format string, args ...any) ToolResult {
 	return ToolResult{Content: fmt.Sprintf(format, args...), IsError: true}
 }
 
-// ParseInputError returns a standard parse-error ToolResult.
+// InvalidCallResult creates a ToolResult with IsError=true and
+// ErrorKind=ToolErrorInvalidCall: the call violated the tool's argument
+// contract (a contract/validation check the tool enforces on its input,
+// possibly after a cheap look at the argument's referent — a path of the
+// wrong kind, a non-matching old_string), so the model must fix the
+// arguments rather than retry the same call. Builtins use it for their own
+// argument checks; the registry, ParseInputError and ToolNotFoundResult
+// produce the same class for schema, parse and lookup failures. An
+// environmental failure (I/O error, permission denied, timeout) is never
+// invalid_call — use ErrorResult for those.
+func InvalidCallResult(format string, args ...any) ToolResult {
+	return ToolResult{Content: fmt.Sprintf(format, args...), IsError: true, ErrorKind: ToolErrorInvalidCall}
+}
+
+// ParseInputError returns a standard parse-error ToolResult, classified as
+// an invalid call: the input JSON did not decode into the tool's parameters.
 func ParseInputError(err error) (ToolResult, error) {
-	return ErrorResult("failed to parse input: %v", err), nil
+	return InvalidCallResult("failed to parse input: %v", err), nil
 }
 
 // BaseTool provides default implementations of Name, Description, InputSchema,

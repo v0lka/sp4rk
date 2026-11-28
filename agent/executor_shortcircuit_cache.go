@@ -150,7 +150,8 @@ func (e *Executor) replayShortCircuitObservation(
 	// event stream, leaving every UI consumer that matches results by call ID
 	// with a permanently open tool card. Mirrors the executed path's ToolResult
 	// emission and every other intercept path (HITL rejection, repeat breaker).
-	e.emitter.ToolResult(state.stepNum, callIdx, len(observation), observation, false)
+	// A replayed result is always a success, so it carries no error class.
+	emitToolResultWithKind(e.emitter, state.stepNum, callIdx, len(observation), observation, false, "")
 	e.emitter.ExecutorDiagnostic(state.stepNum, "short_circuit_cache_hit", map[string]any{
 		"tool":        action.Name,
 		"cached_turn": entry.turn,

@@ -150,10 +150,10 @@ func (t *EditFileTool) Execute(ctx context.Context, input json.RawMessage) (tool
 	}
 
 	if params.Path == "" {
-		return tools.ToolResult{Content: "validation error: path is required", IsError: true}, nil
+		return tools.InvalidCallResult("validation error: path is required"), nil
 	}
 	if params.OldString == "" {
-		return tools.ToolResult{Content: "validation error: old_string is required and must not be empty", IsError: true}, nil
+		return tools.InvalidCallResult("validation error: old_string is required and must not be empty"), nil
 	}
 
 	params.Path = resolvePath(ctx, params.Path)
@@ -176,6 +176,9 @@ func (t *EditFileTool) Execute(ctx context.Context, input json.RawMessage) (tool
 		checker.Lock(writePath)
 		if conflict := checker.CheckWrite(ctx, writePath); conflict != nil {
 			checker.Unlock(writePath)
+			// Coherence conflict: the world moved since the session's last
+			// read; the remedy (re-read, retry with unchanged arguments) is
+			// not a reshaped call — zero class by the remedy rule.
 			return tools.ToolResult{Content: formatWriteConflict(conflict), IsError: true}, nil
 		}
 		defer checker.Unlock(writePath)
@@ -190,6 +193,9 @@ func (t *EditFileTool) Execute(ctx context.Context, input json.RawMessage) (tool
 	var readErr error
 	if t.limits.MaxEditFileBytes > 0 {
 		if info, statErr := os.Stat(writePath); statErr == nil && info.Size() > int64(t.limits.MaxEditFileBytes) {
+			// Over-limit target: the remedy is a different tool or chunked
+			// reading, not reshaped arguments — zero class, recorded decision
+			// (c0wrk ADR-137; see specs/domains/tool-system/builtins.md).
 			return tools.ToolResult{
 				Content: fmt.Sprintf("refusing to edit: file is %d bytes, exceeding the %d byte edit limit: %s",
 					info.Size(), t.limits.MaxEditFileBytes, writePath),
@@ -213,15 +219,18 @@ func (t *EditFileTool) Execute(ctx context.Context, input json.RawMessage) (tool
 	count := strings.Count(content, params.OldString)
 
 	if count == 0 {
-		msg := "old_string not found in file"
+		// The model's own argument mistake (a stale or hallucinated
+		// old_string), exactly like the non-unique case below: the fix is to
+		// re-read the file and correct the arguments, so it is an invalid
+		// call — not an execution failure.
 		if hint := nearestMatchHint(content, params.OldString); hint != "" {
-			msg += "\n" + hint
+			return tools.InvalidCallResult("old_string not found in file\n%s", hint), nil
 		}
-		return tools.ToolResult{Content: msg, IsError: true}, nil
+		return tools.InvalidCallResult("old_string not found in file"), nil
 	}
 
 	if count > 1 {
-		return tools.ToolResult{Content: fmt.Sprintf("old_string is not unique, found %d occurrences", count), IsError: true}, nil
+		return tools.InvalidCallResult("old_string is not unique, found %d occurrences", count), nil
 	}
 
 	newContent := strings.Replace(content, params.OldString, params.NewString, 1)

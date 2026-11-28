@@ -36,6 +36,28 @@ func TestErrorResult(t *testing.T) {
 	if res.Content != "something failed: 42" {
 		t.Fatalf("unexpected content: %s", res.Content)
 	}
+	// ErrorResult keeps the UNSPECIFIED zero kind: a plain execution failure
+	// is indistinguishable from a pre-field result by design.
+	if res.ErrorKind != "" {
+		t.Fatalf("ErrorResult must keep the zero ErrorKind, got %q", res.ErrorKind)
+	}
+}
+
+func TestInvalidCallResult(t *testing.T) {
+	res := InvalidCallResult("validation error: %s is required, got %d", "path", 7)
+	if !res.IsError {
+		t.Fatal("expected IsError=true")
+	}
+	if res.Content != "validation error: path is required, got 7" {
+		t.Fatalf("unexpected content: %s", res.Content)
+	}
+	if res.ErrorKind != ToolErrorInvalidCall {
+		t.Fatalf("ErrorKind = %q, want %q", res.ErrorKind, ToolErrorInvalidCall)
+	}
+	// No-args form renders the format verbatim (fmt.Sprintf semantics).
+	if got := InvalidCallResult("validation error: path is required").Content; got != "validation error: path is required" {
+		t.Fatalf("no-args content = %q", got)
+	}
 }
 
 func TestParseInputError(t *testing.T) {
@@ -49,6 +71,10 @@ func TestParseInputError(t *testing.T) {
 	}
 	if res.Content == "" {
 		t.Fatal("expected non-empty content")
+	}
+	// A parse failure is an invalid call: the model must fix its arguments.
+	if res.ErrorKind != ToolErrorInvalidCall {
+		t.Fatalf("ErrorKind = %q, want %q", res.ErrorKind, ToolErrorInvalidCall)
 	}
 }
 

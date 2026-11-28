@@ -124,7 +124,7 @@ func (t *Tool) Execute(ctx context.Context, input json.RawMessage) (tools.ToolRe
 
 	// Validate query parameter
 	if query == "" {
-		return tools.ToolResult{Content: "query parameter is required", IsError: true}, nil
+		return tools.InvalidCallResult("query parameter is required"), nil
 	}
 
 	// Set default max_results if not provided

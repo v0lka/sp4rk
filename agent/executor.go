@@ -359,6 +359,13 @@ var mutatingTools = map[string]struct{}{
 //
 // store_fact is already handled separately in checkSameToolRepetition and is
 // included here for symmetry so checkFruitlessResult also skips it.
+//
+// The wait tools (wait, wait_for_one, wait_for_all) are exempt because a
+// polling wait on a long-running delegation legitimately returns the same
+// short "still pending" observation many times in a row until the awaited
+// work completes — that is the tool doing its job, not a loop. They are also
+// exempt from the identical-repeat detector (repeatExemptTools), since the
+// SAME call (same ids) is exactly how a model polls.
 var circuitBreakerExemptTools = map[string]struct{}{
 	"write_file":       {},
 	"edit_file":        {},
@@ -368,6 +375,30 @@ var circuitBreakerExemptTools = map[string]struct{}{
 	"update_checklist": {},
 	"set_step_status":  {},
 	"store_fact":       {},
+	"wait":             {},
+	"wait_for_one":     {},
+	"wait_for_all":     {},
+}
+
+// repeatExemptTools are excluded from the identical-repeat detector
+// (checkRepeatIdenticalTracked). For these tools, re-issuing the exact same
+// call is the intended usage pattern, not a stuck loop: the wait tools are
+// polled with the same ids until the awaited delegations complete, so the
+// repeat breaker would otherwise nudge/abort a healthy poll. The exemption
+// extends to a WHOLE batch meta-call whose every sub-call targets one of
+// these tools (wholeBatchRepeatExempt in executor_run.go): an identical
+// batch-of-waits re-issue is the multi-delegation join poll, and the batch
+// namespace keys whole batches on their own input, which the per-name check
+// cannot see; a batch mixing an exempt tool with a non-exempt one stays
+// armed. The tracker is RESET on an exempt call (like the same-tool
+// exemption in checkSameToolRepetition) so a following non-exempt identical
+// call starts from a fresh count instead of inheriting the poll's. Like
+// circuitBreakerExemptTools this set is a fixed engine policy, not a host
+// knob.
+var repeatExemptTools = map[string]struct{}{
+	"wait":         {},
+	"wait_for_one": {},
+	"wait_for_all": {},
 }
 
 // shortCircuitCacheableTools is the whitelist of pure, idempotent discovery
@@ -1878,6 +1909,18 @@ func isParseError(content string) bool {
 func isValidationError(content string) bool {
 	return strings.Contains(content, `input for "`) &&
 		(strings.Contains(content, "is invalid at ") || strings.Contains(content, "is invalid: "))
+}
+
+// synthesizedErrorKind returns the class an executor-SYNTHESISED tool-result
+// emission carries (a breaker interception or a user denial — there is no
+// ToolResult to read ErrorKind from): kind when the payload is an error, the
+// unspecified zero class when it is not. A non-error payload has no error to
+// classify, so a host never observes an error class on isError=false.
+func synthesizedErrorKind(isError bool, kind tools.ToolErrorKind) tools.ToolErrorKind {
+	if isError {
+		return kind
+	}
+	return ""
 }
 
 // isContextExceededError checks if an error indicates the context window was exceeded.

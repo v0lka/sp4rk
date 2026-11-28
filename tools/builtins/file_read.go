@@ -83,16 +83,16 @@ func (t *ReadFileTool) Execute(ctx context.Context, input json.RawMessage) (tool
 	}
 
 	if params.Path == "" {
-		return tools.ToolResult{Content: "validation error: path is required", IsError: true}, nil
+		return tools.InvalidCallResult("validation error: path is required"), nil
 	}
 	if params.StartLine < 0 {
-		return tools.ToolResult{Content: fmt.Sprintf("validation error: start_line must be >= 1, got %d", params.StartLine), IsError: true}, nil
+		return tools.InvalidCallResult("validation error: start_line must be >= 1, got %d", params.StartLine), nil
 	}
 	if params.EndLine < 0 {
-		return tools.ToolResult{Content: fmt.Sprintf("validation error: end_line must be >= 1, got %d", params.EndLine), IsError: true}, nil
+		return tools.InvalidCallResult("validation error: end_line must be >= 1, got %d", params.EndLine), nil
 	}
 	if params.StartLine > 0 && params.EndLine > 0 && params.StartLine > params.EndLine {
-		return tools.ToolResult{Content: fmt.Sprintf("validation error: start_line (%d) must not exceed end_line (%d)", params.StartLine, params.EndLine), IsError: true}, nil
+		return tools.InvalidCallResult("validation error: start_line (%d) must not exceed end_line (%d)", params.StartLine, params.EndLine), nil
 	}
 
 	params.Path = resolvePath(ctx, params.Path)

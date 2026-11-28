@@ -35,6 +35,13 @@ type Tool interface {
 type ToolResult struct {
     Content string
     IsError bool
+    // ErrorKind classifies the error when IsError is true: "invalid_call"
+    // (the call violated its argument contract — schema/parse/lookup or the
+    // tool's own check, possibly after a cheap look at the argument's
+    // referent; the model must fix the arguments) or "execution" (the
+    // arguments were fine and the work failed). "" = unspecified (ErrorResult
+    // keeps it).
+    ErrorKind ToolErrorKind
 }
 
 type ToolPolicy int
@@ -74,17 +81,21 @@ ToolRegistry.Execute(ctx, name, input)
 │
 ├─ 1. Look up the tool by name → not found ⇒ error ToolResult (a
 │     `functions.`-prefixed name gains a hint naming the exact catalog
-│     candidate when it is registered and inside the effective catalog scope)
+│     candidate when it is registered and inside the effective catalog scope);
+│     class ErrorKind=invalid_call (ToolNotFoundResult)
 ├─ 2. Pre-dispatch input validation (category-aware — ValidateToolInputForCategory,
 │     closed sets for built-ins, open for MCP; fail-open catalog; see
 │     [Input Validation](#input-validation); opt out via
 │     SetInputValidationEnabled(false)) → structurally invalid ⇒ error
-│     ToolResult naming the offending path and the valid parameters
+│     ToolResult naming the offending path and the valid parameters;
+│     class ErrorKind=invalid_call (InvalidCallResult)
 └─ 3. Resolve effective policy (per-tool override, else the tool's DefaultPolicy):
       ├─ PolicyAlwaysAllow  → execute (escalate to confirmation if a ToolJudger flags it)
-      ├─ PolicyAlwaysDeny   → reject with an error result
+      ├─ PolicyAlwaysDeny   → reject with an error result (unspecified class)
       └─ PolicyUserConfirm  → consult ConfirmFunc; DENIED (fail-closed) if none configured
 ```
+
+**Result class at the pre-execution gates (1–2).** Both gates reject the call before the tool's own logic runs, and both stamp `ToolResult.ErrorKind == ToolErrorInvalidCall` so the executor, its emitters and `Step.ErrorKind` can tell a *fix-your-arguments* failure from a genuine execution failure without parsing the prose. The same class is stamped by `ParseInputError` (the tool could not decode its input), by the executor's batch pre-flight aggregate and nested-batch guard, and by every builtin's own argument-contract check (`InvalidCallResult("validation error: …")`). `ErrorResult` is the one constructor that keeps the zero kind: it is the documented "unspecified" class for a tool that ran and failed.
 
 The executor calls the registry through the narrow `ToolExecutor` interface (`Execute`, `GetToolSource`, `IsToolUntrusted`, `CacheStrategy`). `GetToolSource` returns `"core"` or the MCP server name; `IsToolUntrusted` reports whether a tool's output is from an untrusted source (`tool.IsUntrusted()` true **or** MCP source category) — driving the `<untrusted-content>` wrapping of observations. `CacheStrategy(ctx, name, input)` reports the cache mode the executor should use for a tool's result; a read tool opts into content-backed caching by implementing the optional `ContentBackedReader` interface, otherwise `CacheModeDefault` keeps the existing file-backed heuristic.
 
@@ -100,7 +111,7 @@ The validator (`ValidateToolInput`) is deliberately lightweight — no external 
 
 - **What it checks** — the input is a JSON object; every `required` key is present; declared property types match (JSON type names; `integer` accepts only numbers with a zero fractional part — `1`, `1.0` and `2e3` qualify, `1.5` does not — since `encoding/json` reports every number as one `number` kind and the literal's textual form decides; an array-typed `["string","null"]` accepts either member); unknown keys are rejected against the declared property set; recursion descends into nested object properties and array `items`, with error paths like `tasks[2].id` naming the offending value. Depth is capped (`maxValidationDepth` = 16).
 - **Closed-set semantics** — a schema level without `additionalProperties` (or with an explicit JSON `null`, which counts as absent) is a **closed set** for built-in tools: keys not declared in `properties` are rejected. MCP-proxied tools use the JSON Schema spec default of an **open** set instead (an absent keyword admits extra keys), because an external server schema frequently omits it while still accepting extra arguments. `additionalProperties: true` (or the object form, a schema for extra keys) reopens that level in either case.
-- **Fail-open rules** — anything the validator does not model never blocks a call: an unparseable schema or input at a level, `$ref` subtrees (no resolver by design), levels without a `properties` object, unmodeled type forms (`oneOf`/`anyOf`, an explicit `null`/empty `type`, non-string junk), and values nested deeper than the depth cap. A violation is returned as an `InputValidationError` rendered into an error `ToolResult` (`IsError: true`, nil Go error) that lists the valid parameters and the violated level's schema digest (`Required parameters: <name> (<type>)` plus a synthesized minimal example, deterministic; a scalar level renders no digest), so the model can fix the arguments and retry without ever reaching the tool or the confirmation flow.
+- **Fail-open rules** — anything the validator does not model never blocks a call: an unparseable schema or input at a level, `$ref` subtrees (no resolver by design), levels without a `properties` object, unmodeled type forms (`oneOf`/`anyOf`, an explicit `null`/empty `type`, non-string junk), and values nested deeper than the depth cap. A violation is returned as an `InputValidationError` rendered into an error `ToolResult` (`IsError: true`, `ErrorKind: invalid_call`, nil Go error) that lists the valid parameters and the violated level's schema digest (`Required parameters: <name> (<type>)` plus a synthesized minimal example, deterministic; a scalar level renders no digest), so the model can fix the arguments and retry without ever reaching the tool or the confirmation flow.
 - **Disable handle** — `SetInputValidationEnabled(false)` restores the pre-validation behavior (inputs are handed to the tool untouched, before any policy is consulted). Validation is enabled by default (`NewToolRegistry`).
 
 This is defense-in-depth (OWASP ASI02-R2), not a policy gate: it complements, never replaces, per-tool validation and host security gates.
@@ -116,6 +127,7 @@ This is defense-in-depth (OWASP ASI02-R2), not a policy gate: it complements, ne
 - An MCP tool may **not** shadow an already-registered non-MCP tool of the same name — `RegisterWithSource` and `RegisterWithSourceCategory` both return an error on shadowing; the log-and-skip lives at the MCP gateway call site (`RegisterTools`/`Reconfigure` log "MCP tool registration rejected" and continue). A built-in tool can always replace an MCP tool; an MCP server re-registering its own tools is allowed.
 - MCP tools default to `PolicyUserConfirm` and always report `IsUntrusted() == true`.
 - Built-in untrusted tools set `Untrusted: true` on their `BaseTool`.
+- Every error `ToolResult` the engine produces is **typed**: a call that violated its argument contract carries `ErrorKind == ToolErrorInvalidCall` — whether the registry caught it before dispatch (lookup, pre-dispatch validation, parse, batch pre-flight aggregate, nested-batch guard) or the builtin caught it on its first look at the call (a required field, a cross-field rule, a path that exists but is the wrong kind for the tool, an `old_string` that does not match the file exactly once) — because in both cases the remedy is the model's: correct the arguments (re-reading the target if needed) and retry. `ErrorResult` keeps the unspecified zero kind (rendered as `execution`) for a call whose arguments were acceptable but whose work failed: a path or URL that does not exist, permission denied, a timeout, a write that failed. The invariant is about the REMEDY, not about whether a syscall ran — no code path stamps `invalid_call` on a result that failed for an environmental reason once the argument contract was satisfied, and none stamps `execution` on a result the model fixes by changing its arguments.
 
 ## Configuration
 

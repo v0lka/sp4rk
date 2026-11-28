@@ -221,7 +221,7 @@ func TestEmbedder_LengthBuckets_ConcurrentClose(t *testing.T) {
 	}()
 	<-started
 	closeSessionOnly(e) // serializes with any in-flight call before destroying sessions
-	<-done              // the raced call may finish or observe the closed state; both are safe
+	<-done              //nolint:errcheck // reap only: the raced call may finish or observe the closed state — both are safe, so its error is informational
 	if _, err := e.EmbedDocuments(context.Background(), []string{"after close"}); err == nil {
 		t.Fatal("use after concurrent close succeeded")
 	}

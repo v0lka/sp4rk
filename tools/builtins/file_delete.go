@@ -82,7 +82,7 @@ func (t *DeleteFileTool) Execute(ctx context.Context, input json.RawMessage) (to
 	}
 
 	if params.Path == "" {
-		return tools.ToolResult{Content: "validation error: path is required", IsError: true}, nil
+		return tools.InvalidCallResult("validation error: path is required"), nil
 	}
 
 	params.Path = resolvePathUnresolved(ctx, params.Path)
@@ -96,6 +96,9 @@ func (t *DeleteFileTool) Execute(ctx context.Context, input json.RawMessage) (to
 		checker.Lock(params.Path)
 		if conflict := checker.CheckWrite(ctx, params.Path); conflict != nil {
 			checker.Unlock(params.Path)
+			// Coherence conflict: the world moved since the session's last
+			// read; the remedy (re-read, retry with unchanged arguments) is
+			// not a reshaped call — zero class by the remedy rule.
 			return tools.ToolResult{Content: formatWriteConflict(conflict), IsError: true}, nil
 		}
 		defer checker.Unlock(params.Path)
@@ -122,13 +125,14 @@ func (t *DeleteFileTool) Execute(ctx context.Context, input json.RawMessage) (to
 	}
 
 	if info.IsDir() {
-		return tools.ToolResult{Content: "path is a directory, use delete_directory instead", IsError: true}, nil
+		return tools.InvalidCallResult("path is a directory, use delete_directory instead"), nil
 	}
 	if !info.Mode().IsRegular() {
-		return tools.ToolResult{
-			Content: "refusing to delete: path exists but is not a regular file (device node, FIFO, or socket): " + params.Path,
-			IsError: true,
-		}, nil
+		// The target EXISTS but is the wrong kind for this tool — the model
+		// must correct its call (pick delete_directory or address the node
+		// directly), so this is the invalid_call class, same as the
+		// directory case above.
+		return tools.InvalidCallResult("refusing to delete: path exists but is not a regular file (device node, FIFO, or socket): %s", params.Path), nil
 	}
 
 	if err := os.Remove(params.Path); err != nil {

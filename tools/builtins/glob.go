@@ -133,13 +133,13 @@ func (t *GlobTool) Execute(ctx context.Context, input json.RawMessage) (tools.To
 	}
 
 	if params.Pattern == "" {
-		return tools.ToolResult{Content: "validation error: pattern is required", IsError: true}, nil
+		return tools.InvalidCallResult("validation error: pattern is required"), nil
 	}
 
 	if params.Path == "" {
 		params.Path = tools.WorkspacePathFrom(ctx)
 		if params.Path == "" {
-			return tools.ToolResult{Content: "path is required when no workspace is available", IsError: true}, nil
+			return tools.InvalidCallResult("path is required when no workspace is available"), nil
 		}
 	} else {
 		params.Path = resolvePath(ctx, params.Path)
@@ -159,7 +159,7 @@ func (t *GlobTool) Execute(ctx context.Context, input json.RawMessage) (tools.To
 		return tools.ToolResult{Content: fmt.Sprintf("path error: %v", err), IsError: true}, nil
 	}
 	if !info.IsDir() {
-		return tools.ToolResult{Content: "path is not a directory: " + params.Path, IsError: true}, nil
+		return tools.InvalidCallResult("path is not a directory: %s", params.Path), nil
 	}
 
 	// Bound the walk. A wall-clock timeout plus the entry/result budgets

@@ -898,7 +898,7 @@ func (s *Server) initializeClientWithStartCtx(ctx, startCtx context.Context, cli
 		// context is cancelled first, so the just-started stream is dead on
 		// arrival and Connect's caller closes it on this failure path.
 		raceCancel()
-		<-startDone
+		<-startDone //nolint:errcheck // reap only: raceCtx is already cancelled, so Start's error is a cancellation artifact; the receive exists so Close never overlaps a running Start
 		return ctx.Err()
 	case <-startTimer.C:
 		// Cancel first (unblocks a stalled Start in milliseconds through the
@@ -916,7 +916,7 @@ func (s *Server) initializeClientWithStartCtx(ctx, startCtx context.Context, cli
 		// reported — the microscopic window favors honoring the advertised
 		// bound; the caller's error path closes the transport and may retry.
 		raceCancel()
-		<-startDone
+		<-startDone //nolint:errcheck // reap only: raceCtx is already cancelled, so Start's error is a cancellation artifact; the receive exists so Close never overlaps a running Start
 		return &TimeoutError{Server: s.name, Op: "initialize", Timeout: s.timeout}
 	}
 

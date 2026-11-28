@@ -6,7 +6,9 @@ import (
 	"strings"
 )
 
-// ToolNotFoundResult builds an error result for a name that failed exact lookup.
+// ToolNotFoundResult builds an error result for a name that failed exact lookup,
+// classified as an invalid call (ToolErrorInvalidCall): the model named a tool
+// that is not in the catalog, which it must correct rather than retry.
 // It suggests removing only the functions. prefix, and only when the candidate
 // is BOTH confirmed available by the available predicate AND within the
 // effective catalog scope attached to ctx (see WithCatalogScope). It never
@@ -14,7 +16,7 @@ import (
 // this helper. Without a scope attached (an unrestricted caller), availability
 // alone decides.
 func ToolNotFoundResult(ctx context.Context, name string, available func(string) bool) ToolResult {
-	result := ToolResult{Content: "tool not found: " + name, IsError: true}
+	result := InvalidCallResult("tool not found: %s", name)
 	candidate, prefixed := strings.CutPrefix(name, "functions.")
 	if prefixed && candidate != "" && available != nil && catalogContains(ctx, candidate) && available(candidate) {
 		result.Content += fmt.Sprintf("; use the exact catalog name %q in batch.calls[].tool or as the direct tool call name, without adding the functions. namespace", candidate)

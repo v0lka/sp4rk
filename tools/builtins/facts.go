@@ -128,13 +128,13 @@ func (t *StoreFactTool) Execute(ctx context.Context, input json.RawMessage) (too
 	}
 
 	if len(params.Keywords) < 3 {
-		return tools.ToolResult{Content: fmt.Sprintf("validation error: keywords must have at least 3 items, got %d", len(params.Keywords)), IsError: true}, nil
+		return tools.InvalidCallResult("validation error: keywords must have at least 3 items, got %d", len(params.Keywords)), nil
 	}
 	if len(params.Keywords) > 10 {
-		return tools.ToolResult{Content: fmt.Sprintf("validation error: keywords must have at most 10 items, got %d", len(params.Keywords)), IsError: true}, nil
+		return tools.InvalidCallResult("validation error: keywords must have at most 10 items, got %d", len(params.Keywords)), nil
 	}
 	if strings.TrimSpace(params.Content) == "" {
-		return tools.ToolResult{Content: "validation error: content is required", IsError: true}, nil
+		return tools.InvalidCallResult("validation error: content is required"), nil
 	}
 
 	// ASI06-R8/R10: refuse to persist content that looks like a secret/credential.
@@ -144,11 +144,8 @@ func (t *StoreFactTool) Execute(ctx context.Context, input json.RawMessage) (too
 	// Both content and keywords are scanned: a careless agent could stash a
 	// credential in a keyword tag, bypassing a content-only check.
 	if hit := firstSecretHit(params.Content, params.Keywords); hit != "" {
-		return tools.ToolResult{
-			Content: "refused: input appears to contain a secret (" + hit + "). " +
-				"Secrets must not be stored in agent memory. Store only the non-secret fact.",
-			IsError: true,
-		}, nil
+		return tools.InvalidCallResult("refused: input appears to contain a secret (%s). "+
+			"Secrets must not be stored in agent memory. Store only the non-secret fact.", hit), nil
 	}
 
 	fs := agent.FactStoreFromContext(ctx)
@@ -220,7 +217,7 @@ func (t *SearchFactsTool) Execute(ctx context.Context, input json.RawMessage) (t
 	}
 
 	if len(params.Keywords) == 0 {
-		return tools.ToolResult{Content: "validation error: keywords must have at least 1 item", IsError: true}, nil
+		return tools.InvalidCallResult("validation error: keywords must have at least 1 item"), nil
 	}
 
 	fs := agent.FactStoreFromContext(ctx)

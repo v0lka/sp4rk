@@ -276,7 +276,7 @@ func (r *ToolRegistry) Execute(ctx context.Context, name string, input json.RawM
 	r.mu.RUnlock()
 	if validationEnabled {
 		if err := validateToolInput(tool.Name(), tool.InputSchema(), input, closedByDefault); err != nil {
-			return ErrorResult("%v", err), nil
+			return InvalidCallResult("%v", err), nil
 		}
 	}
 

@@ -78,7 +78,7 @@ func (t *ToolResultReadTool) Execute(ctx context.Context, input json.RawMessage)
 	}
 
 	if params.Hash == "" {
-		return tools.ToolResult{Content: "validation error: hash is required", IsError: true}, nil
+		return tools.InvalidCallResult("validation error: hash is required"), nil
 	}
 
 	cache := agent.ToolResultCacheFromContext(ctx)

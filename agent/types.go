@@ -32,8 +32,16 @@ type Step struct {
 	// IsError is true when the tool execution returned an error result
 	// (ToolResult.IsError). Used by the mutation gate to avoid counting failed
 	// mutating tools (e.g. a write_file that errored) as successful mutations.
-	IsError    bool `json:"is_error,omitempty"`
-	TokensUsed int  `json:"tokens_used"`
+	IsError bool `json:"is_error,omitempty"`
+	// ErrorKind classifies the error when IsError is true, carrying the typed
+	// class of the ToolResult the step was built from (tools.ToolErrorInvalidCall
+	// for a malformed call — schema/parse/lookup rejection; execution for a
+	// tool that ran and failed or an executor-synthesised error) so hosts can
+	// tell a fix-your-arguments failure from a genuine execution failure
+	// without parsing Observation. "" when the step is not an error or the
+	// producing result was unclassified (ErrorResult keeps the zero kind).
+	ErrorKind  tools.ToolErrorKind `json:"error_kind,omitempty"`
+	TokensUsed int                 `json:"tokens_used"`
 	// UserNudge is an optional user message injected into the context (e.g., step limit nudges).
 	// When set, this is added as a user message after the step's normal messages.
 	UserNudge string `json:"user_nudge,omitempty"`

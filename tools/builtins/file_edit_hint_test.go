@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/v0lka/sp4rk/tools"
 )
 
 // --- nearestMatchHint unit tests ---
@@ -140,6 +142,11 @@ func TestEditFileTool_NotFoundHintIncludesNearestFragment(t *testing.T) {
 	if !result.IsError {
 		t.Fatal("expected IsError=true")
 	}
+	// A stale/hallucinated old_string is the model's own argument mistake —
+	// the same class as the non-unique case, never an execution failure.
+	if result.ErrorKind != tools.ToolErrorInvalidCall {
+		t.Errorf("ErrorKind = %q, want invalid_call (a wrong old_string is an argument contract failure)", result.ErrorKind)
+	}
 	if !strings.Contains(result.Content, "old_string not found in file") {
 		t.Errorf("expected the original error first, got: %s", result.Content)
 	}
@@ -178,6 +185,9 @@ func TestEditFileTool_NotFoundNoHintForDissimilar(t *testing.T) {
 	}
 	if !result.IsError {
 		t.Fatal("expected IsError=true")
+	}
+	if result.ErrorKind != tools.ToolErrorInvalidCall {
+		t.Errorf("ErrorKind = %q, want invalid_call", result.ErrorKind)
 	}
 	if result.Content != "old_string not found in file" {
 		t.Errorf("error message must stay exactly as before when no fragment is similar enough, got: %q", result.Content)

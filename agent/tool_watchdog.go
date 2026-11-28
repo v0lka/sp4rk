@@ -22,11 +22,12 @@ const defaultToolWatchdogInterval = 250 * time.Millisecond
 // per-tool-call ceiling. They are the reserved GroupSystem orchestration tools
 // whose Execute blocks by design — on a human (an ask_user prompt, a plan or
 // goal awaiting approval) or on sub-work (a blocking delegate running its
-// subagents, a synchronously executed plan) — so bounding them by a raw wall
-// clock would fail a perfectly healthy run at the ceiling. A host that raises
-// its OWN human prompt inside Execute (e.g. c0wrk's per-tool confirmation gate)
-// does not rely on this set: it bounds that wait just under the ceiling itself
-// and yields a clean denial, so a slow answer lets the run continue instead of
+// subagents, a synchronously executed plan, a wait tool parked on the
+// delegations it awaits) — so bounding them by a raw wall clock would fail a
+// perfectly healthy run at the ceiling. A host that raises its OWN human
+// prompt inside Execute (e.g. c0wrk's per-tool confirmation gate) does not
+// rely on this set: it bounds that wait just under the ceiling itself and
+// yields a clean denial, so a slow answer lets the run continue instead of
 // aborting it. Hosts extend or replace the set via SetToolCallTimeoutExempt.
 var defaultToolCallTimeoutExemptTools = map[string]struct{}{
 	"ask_user":     {},
@@ -34,6 +35,9 @@ var defaultToolCallTimeoutExemptTools = map[string]struct{}{
 	"propose_goal": {},
 	"delegate":     {},
 	"execute_plan": {},
+	"wait":         {},
+	"wait_for_one": {},
+	"wait_for_all": {},
 }
 
 // DefaultToolCallTimeoutExemptTools returns the built-in exempt set (see

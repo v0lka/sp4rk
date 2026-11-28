@@ -444,7 +444,7 @@ func (c *Conductor) Run(
 	executor.SetFinishGuard(func(ctx context.Context) error {
 		if reg := delegationRegistryFromContext(ctx); reg != nil {
 			if pending := reg.ListPending(); len(pending) > 0 {
-				return fmt.Errorf("you have %d pending async delegation(s): %s. Call cancel_delegation for each if you no longer need them, or wait for them to complete via read_step_output before calling finish", len(pending), strings.Join(pending, ", "))
+				return pendingDelegationsGuardError(pending)
 			}
 		}
 		return nil
@@ -536,6 +536,9 @@ func (c *Conductor) Cleanup() {}
 
 // PendingDelegations is implemented by the host application's delegation
 // registry. The sp4rk Conductor uses it to check for pending async delegations.
+// Implementations MUST be safe for concurrent use: the finish guard and the
+// post-run note call ListPending while background delegates may be mutating
+// the registry.
 type PendingDelegations interface {
 	ListPending() []string
 }
@@ -553,6 +556,16 @@ func delegationRegistryFromContext(ctx context.Context) PendingDelegations {
 		return v
 	}
 	return nil
+}
+
+// pendingDelegationsGuardError renders the finish-join guard's rejection for
+// the pending async delegation ids. It is the model-facing recovery recipe:
+// the wait tools, when exposed, are the primary join path; otherwise use
+// read_step_output to check for completion. cancel_delegation is the explicit
+// opt-out. Kept as a function so the recipe is unit-testable without running
+// a conductor.
+func pendingDelegationsGuardError(pending []string) error {
+	return fmt.Errorf("you have %d pending async delegation(s): %s. If your toolset includes them, use wait_for_all(delegates=[...]) or wait_for_one(delegate_id) to wait for completion (they return the results inline). Otherwise use read_step_output to check for and collect completed results before calling finish. Call cancel_delegation for each if you no longer need them", len(pending), strings.Join(pending, ", "))
 }
 
 // setTaskOnContextManager sets the task on a ContextManager, preferring the

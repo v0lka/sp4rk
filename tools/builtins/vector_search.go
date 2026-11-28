@@ -134,7 +134,7 @@ func (t *VectorSearchTool) Execute(ctx context.Context, input json.RawMessage) (
 	}
 
 	if params.Query == "" {
-		return tools.ErrorResult("query is required"), nil
+		return tools.InvalidCallResult("query is required"), nil
 	}
 
 	// Apply defaults and caps.

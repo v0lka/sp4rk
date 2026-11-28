@@ -179,7 +179,7 @@ func (t *RipgrepTool) Execute(ctx context.Context, input json.RawMessage) (tools
 	}
 
 	if params.Pattern == "" {
-		return tools.ToolResult{Content: "validation error: pattern is required", IsError: true}, nil
+		return tools.InvalidCallResult("validation error: pattern is required"), nil
 	}
 
 	// Resolve the rg binary path. When unset (e.g. the struct was constructed
@@ -200,7 +200,7 @@ func (t *RipgrepTool) Execute(ctx context.Context, input json.RawMessage) (tools
 	if params.Path == "" {
 		params.Path = tools.WorkspacePathFrom(ctx)
 		if params.Path == "" {
-			return tools.ToolResult{Content: "path is required when no workspace is available", IsError: true}, nil
+			return tools.InvalidCallResult("path is required when no workspace is available"), nil
 		}
 	} else {
 		params.Path = resolvePath(ctx, params.Path)

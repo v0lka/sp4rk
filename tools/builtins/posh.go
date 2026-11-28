@@ -180,7 +180,7 @@ func (t *PoshExecTool) Execute(ctx context.Context, input json.RawMessage) (tool
 	}
 
 	if params.Command == "" {
-		return tools.ToolResult{Content: "validation error: command is required", IsError: true}, nil
+		return tools.InvalidCallResult("validation error: command is required"), nil
 	}
 
 	// Parse timeout (default 60s, max from config)
@@ -191,10 +191,7 @@ func (t *PoshExecTool) Execute(ctx context.Context, input json.RawMessage) (tool
 	}
 	timeout, err := time.ParseDuration(timeoutStr)
 	if err != nil {
-		return tools.ToolResult{
-			Content: fmt.Sprintf("invalid timeout duration: %v", err),
-			IsError: true,
-		}, nil
+		return tools.InvalidCallResult("invalid timeout duration: %v", err), nil
 	}
 	// Enforce maximum timeout from config
 	if timeout > t.timeouts.MaxTimeout {
@@ -259,6 +256,9 @@ func (t *PoshExecTool) Execute(ctx context.Context, input json.RawMessage) (tool
 	}
 	if workDir != "" {
 		if err := validateWorkDir(ctx, workDir, tools.SessionRoots(ctx)); err != nil {
+			// Containment refusal: the security layer refuses a well-formed
+			// request — zero class by the remedy rule (the fix is not a
+			// reshaped call; specs/domains/tool-system/builtins.md).
 			return tools.ToolResult{
 				Content: fmt.Sprintf("working_directory rejected: %v", err),
 				IsError: true,

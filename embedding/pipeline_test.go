@@ -173,8 +173,8 @@ func waitForAtomic(t *testing.T, value *atomic.Int64, want int64) {
 func waitForPipelineProduction[T any](t *testing.T, pipeline *oneAheadPipeline[T]) {
 	t.Helper()
 	select {
-	case <-pipeline.done:
-		t.Fatal("producer exited before cancellation while handoff was blocked")
+	case err := <-pipeline.done:
+		t.Fatalf("producer exited before cancellation while handoff was blocked (err=%v)", err)
 	case <-time.After(10 * time.Millisecond):
 	}
 }

@@ -69,7 +69,7 @@ func (t *CreateDirectoryTool) Execute(ctx context.Context, input json.RawMessage
 	}
 
 	if params.Path == "" {
-		return tools.ToolResult{Content: "validation error: path is required", IsError: true}, nil
+		return tools.InvalidCallResult("validation error: path is required"), nil
 	}
 
 	params.Path = resolvePath(ctx, params.Path)

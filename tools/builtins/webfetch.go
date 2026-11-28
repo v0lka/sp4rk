@@ -240,27 +240,27 @@ func (t *WebFetchTool) Execute(ctx context.Context, input json.RawMessage) (tool
 
 	// Validate URL
 	if params.URL == "" {
-		return tools.ToolResult{Content: "url parameter is required", IsError: true}, nil
+		return tools.InvalidCallResult("url parameter is required"), nil
 	}
 
 	if params.StartLine < 0 {
-		return tools.ToolResult{Content: fmt.Sprintf("validation error: start_line must be >= 1, got %d", params.StartLine), IsError: true}, nil
+		return tools.InvalidCallResult("validation error: start_line must be >= 1, got %d", params.StartLine), nil
 	}
 	if params.EndLine < 0 {
-		return tools.ToolResult{Content: fmt.Sprintf("validation error: end_line must be >= 1, got %d", params.EndLine), IsError: true}, nil
+		return tools.InvalidCallResult("validation error: end_line must be >= 1, got %d", params.EndLine), nil
 	}
 	if params.StartLine > 0 && params.EndLine > 0 && params.StartLine > params.EndLine {
-		return tools.ToolResult{Content: fmt.Sprintf("validation error: start_line (%d) must not exceed end_line (%d)", params.StartLine, params.EndLine), IsError: true}, nil
+		return tools.InvalidCallResult("validation error: start_line (%d) must not exceed end_line (%d)", params.StartLine, params.EndLine), nil
 	}
 
 	parsedURL, err := url.Parse(params.URL)
 	if err != nil {
-		return tools.ToolResult{Content: fmt.Sprintf("invalid URL: %v", err), IsError: true}, nil
+		return tools.InvalidCallResult("invalid URL: %v", err), nil
 	}
 
 	// Only allow HTTP and HTTPS
 	if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
-		return tools.ToolResult{Content: "only http and https URLs are supported", IsError: true}, nil
+		return tools.InvalidCallResult("only http and https URLs are supported"), nil
 	}
 
 	// Fetch the page

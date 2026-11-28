@@ -84,7 +84,7 @@ func (t *DeleteDirectoryTool) Execute(ctx context.Context, input json.RawMessage
 	}
 
 	if params.Path == "" {
-		return tools.ToolResult{Content: "validation error: path is required", IsError: true}, nil
+		return tools.InvalidCallResult("validation error: path is required"), nil
 	}
 
 	params.Path = resolvePathUnresolved(ctx, params.Path)
@@ -108,7 +108,7 @@ func (t *DeleteDirectoryTool) Execute(ctx context.Context, input json.RawMessage
 	}
 
 	if !info.IsDir() {
-		return tools.ToolResult{Content: "path is not a directory", IsError: true}, nil
+		return tools.InvalidCallResult("path is not a directory"), nil
 	}
 
 	if params.Recursive {

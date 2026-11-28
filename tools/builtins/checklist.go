@@ -128,10 +128,7 @@ func (t *UpdateChecklistTool) Execute(ctx context.Context, input json.RawMessage
 
 	result := parseAndValidateTodoList(params.TodoList)
 	if !result.Valid {
-		return tools.ToolResult{
-			Content: fmt.Sprintf("Invalid checklist format. %s.\n\nCorrect format example:\n- [ ] Analyze existing code\n- [ ] Implement core logic\n- [ ] Add tests\n\nRules:\n- Each line must start with '- [ ] ' or '- [x] ' (ASCII only)\n- No nested/indented lists\n- No Unicode checkboxes\n- At least one item required", result.Error),
-			IsError: true,
-		}, nil
+		return tools.InvalidCallResult("Invalid checklist format. %s.\n\nCorrect format example:\n- [ ] Analyze existing code\n- [ ] Implement core logic\n- [ ] Add tests\n\nRules:\n- Each line must start with '- [ ] ' or '- [x] ' (ASCII only)\n- No nested/indented lists\n- No Unicode checkboxes\n- At least one item required", result.Error), nil
 	}
 
 	stepID := params.StepID

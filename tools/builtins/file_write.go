@@ -75,7 +75,7 @@ func (t *WriteFileTool) Execute(ctx context.Context, input json.RawMessage) (too
 	}
 
 	if params.Path == "" {
-		return tools.ToolResult{Content: "validation error: path is required", IsError: true}, nil
+		return tools.InvalidCallResult("validation error: path is required"), nil
 	}
 
 	params.Path = resolvePath(ctx, params.Path)
@@ -92,10 +92,10 @@ func (t *WriteFileTool) Execute(ctx context.Context, input json.RawMessage) (too
 	// link to a regular file is written through, a link to a device is
 	// refused just like the device itself.
 	if info, statErr := os.Stat(params.Path); statErr == nil && !info.Mode().IsRegular() {
-		return tools.ToolResult{
-			Content: "refusing to write: target exists and is not a regular file (directory, device node, FIFO, or socket): " + params.Path,
-			IsError: true,
-		}, nil
+		// The target EXISTS but is the wrong kind for this tool — the model
+		// must correct its call, so this is the invalid_call class (mirrors
+		// delete_file's device-node refusal).
+		return tools.InvalidCallResult("refusing to write: target exists and is not a regular file (directory, device node, FIFO, or socket): %s", params.Path), nil
 	}
 
 	// Coherence check: block write if file was modified since this session's last read.
@@ -104,6 +104,9 @@ func (t *WriteFileTool) Execute(ctx context.Context, input json.RawMessage) (too
 		checker.Lock(params.Path)
 		if conflict := checker.CheckWrite(ctx, params.Path); conflict != nil {
 			checker.Unlock(params.Path)
+			// Coherence conflict: the world moved since the session's last
+			// read; the remedy (re-read, retry with unchanged arguments) is
+			// not a reshaped call — zero class by the remedy rule.
 			return tools.ToolResult{Content: formatWriteConflict(conflict), IsError: true}, nil
 		}
 		defer checker.Unlock(params.Path)

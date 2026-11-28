@@ -339,6 +339,43 @@ func TestExecuteNotFound(t *testing.T) {
 	if result.Content != "tool not found: ghost" {
 		t.Errorf("unexpected result content: %q", result.Content)
 	}
+	// An unknown name is an invalid call: the model must correct the name.
+	if result.ErrorKind != ToolErrorInvalidCall {
+		t.Errorf("ErrorKind = %q, want %q", result.ErrorKind, ToolErrorInvalidCall)
+	}
+}
+
+// TestExecute_SchemaRejectionIsInvalidCall pins the pre-dispatch validator's
+// result class: input the schema rejects is an invalid call (IsError=true,
+// ErrorKind=invalid_call, nil Go error) so the model learns to fix its
+// arguments rather than retry, and the tool's own Execute never runs.
+func TestExecute_SchemaRejectionIsInvalidCall(t *testing.T) {
+	reg := NewToolRegistry()
+	tool := newMockTool("strict", "strict schema tool")
+	tool.Schema = json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}`)
+	executions := 0
+	tool.execFn = func(context.Context, json.RawMessage) (ToolResult, error) {
+		executions++
+		return ToolResult{Content: "ok"}, nil
+	}
+	reg.Register(tool)
+
+	result, err := reg.Execute(context.Background(), "strict", json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("schema rejection must be a result, not a Go error: %v", err)
+	}
+	if !result.IsError {
+		t.Fatal("expected IsError=true for schema-rejected input")
+	}
+	if result.ErrorKind != ToolErrorInvalidCall {
+		t.Fatalf("ErrorKind = %q, want %q", result.ErrorKind, ToolErrorInvalidCall)
+	}
+	if !strings.Contains(result.Content, `input for "strict" is invalid`) {
+		t.Fatalf("rejection must carry the rendered schema error, got: %q", result.Content)
+	}
+	if executions != 0 {
+		t.Fatalf("schema-rejected input must never reach the tool, got %d executions", executions)
+	}
 }
 
 func TestExecuteToolError(t *testing.T) {

@@ -806,11 +806,12 @@ func (e *Executor) handleTruncationStopReason(ctx context.Context, resp *llm.Cha
 		// mutation gate from counting an unexecuted write_file/edit_file as a
 		// successful mutation (silent false success). Mirrors the HITL-reject path.
 		IsError:    true,
+		ErrorKind:  tools.ToolErrorExecution,
 		TokensUsed: resp.Usage.InputTokens + resp.Usage.OutputTokens,
 	}
 	state.allSteps = append(state.allSteps, step)
 	cw.AddStep(step)
-	e.emitter.ToolResult(state.stepNum, 0, len(truncObs), truncObs, true)
+	emitToolResultWithKind(e.emitter, state.stepNum, 0, len(truncObs), truncObs, true, tools.ToolErrorExecution)
 	e.emitter.StepComplete(state.stepNum, time.Since(state.stepStartTime))
 	return nil, actionContinue
 }
@@ -926,7 +927,7 @@ func (e *Executor) processSingleToolCall(
 		// flush it now while ctx is still live so a pause/cancel/step-limit at
 		// the next boundary cannot discard the verification result.
 		obs = e.runVerifyOnEditHook(ctx, action.Name, true, callIdx == len(toolCalls)-1, state, obs)
-		e.emitter.ToolResult(state.stepNum, callIdx, len(obs), obs, true)
+		emitToolResultWithKind(e.emitter, state.stepNum, callIdx, len(obs), obs, true, tools.ToolErrorExecution)
 		// The rejected first call's step materializes as groupSteps[0]: the
 		// response's reasoning (content and items — the encrypted chain a
 		// stateless Responses backend re-emits) and its signed thinking
@@ -951,6 +952,7 @@ func (e *Executor) processSingleToolCall(
 			Action:           action,
 			Observation:      obs,
 			IsError:          true,
+			ErrorKind:        tools.ToolErrorExecution,
 			TokensUsed:       resp.Usage.InputTokens + resp.Usage.OutputTokens,
 			ResponseGroup:    responseGroup,
 		}
@@ -1116,8 +1118,10 @@ func (e *Executor) processSingleToolCall(
 	// context see the verification output.
 	observation = e.runVerifyOnEditHook(ctx, action.Name, result.IsError, callIdx == len(toolCalls)-1, state, observation)
 
-	// Emit tool result
-	e.emitter.ToolResult(state.stepNum, callIdx, len(observation), observation, result.IsError)
+	// Emit tool result, carrying the result's typed error class (invalid_call
+	// for a schema/parse/lookup rejection, execution for a tool that ran and
+	// failed, "" for an unclassified error or a success).
+	emitToolResultWithKind(e.emitter, state.stepNum, callIdx, len(observation), observation, result.IsError, result.ErrorKind)
 
 	// Pre-compaction nudge: warn LLM when context pressure enters danger zone.
 	// NOTE: The nudge is appended AFTER ToolResult emission intentionally — it is
@@ -1175,6 +1179,7 @@ func (e *Executor) processSingleToolCall(
 		Observation:      observation,
 		IsUntrusted:      isUntrusted,
 		IsError:          result.IsError,
+		ErrorKind:        result.ErrorKind,
 		CacheHash:        cacheHash,
 		TokensUsed:       resp.Usage.InputTokens + resp.Usage.OutputTokens,
 		ResponseGroup:    responseGroup,
@@ -1409,7 +1414,8 @@ func (e *Executor) handleFinishCall(
 	// terminates the run, so it is always the last call of its response.
 	params.Answer = e.runVerifyOnEditHook(ctx, action.Name, false, true, state, params.Answer)
 
-	e.emitter.ToolResult(state.stepNum, emitIdx, len(params.Answer), params.Answer, false)
+	// finish is never an error result: no class to carry.
+	emitToolResultWithKind(e.emitter, state.stepNum, emitIdx, len(params.Answer), params.Answer, false, "")
 
 	// If mutation gate was triggered (nudge attempted) but still no mutation,
 	// mark as not finished so the orchestrator treats this as a failure.
@@ -1564,7 +1570,7 @@ func (e *Executor) processBatchTool(
 	if err := json.Unmarshal(action.Input, &batchInput); err != nil {
 		obs := fmt.Sprintf("batch parse error: %v", err)
 		e.emitter.ToolCall(state.stepNum, callIdx, action.Name, string(action.Input), e.tools.GetToolSource(action.Name))
-		e.emitter.ToolResult(state.stepNum, callIdx, len(obs), obs, true)
+		emitToolResultWithKind(e.emitter, state.stepNum, callIdx, len(obs), obs, true, tools.ToolErrorInvalidCall)
 		// The reasoning carry is deliberately UNGATED: safe whether or not
 		// this step ends up first — buildGroupedMessages reads items only
 		// from groupSteps[0] and ignores a non-first step's items, so a
@@ -1579,6 +1585,7 @@ func (e *Executor) processBatchTool(
 			Action:           action,
 			Observation:      obs,
 			IsError:          true,
+			ErrorKind:        tools.ToolErrorInvalidCall,
 			TokensUsed:       resp.Usage.InputTokens + resp.Usage.OutputTokens,
 			ResponseGroup:    responseGroup,
 		}
@@ -1591,7 +1598,9 @@ func (e *Executor) processBatchTool(
 	if len(batchInput.Calls) == 0 {
 		obs := "batch: no calls provided (empty calls array)"
 		e.emitter.ToolCall(state.stepNum, callIdx, action.Name, string(action.Input), e.tools.GetToolSource(action.Name))
-		e.emitter.ToolResult(state.stepNum, callIdx, len(obs), obs, true)
+		// An empty batch violates the meta-tool's own input contract before
+		// any sub-call runs — the same invalid-call class as a parse error.
+		emitToolResultWithKind(e.emitter, state.stepNum, callIdx, len(obs), obs, true, tools.ToolErrorInvalidCall)
 		// Ungated reasoning carry — same read-only-when-not-first rationale
 		// as the parse-error branch above: needed when this step is the
 		// group's first, inert otherwise.
@@ -1603,6 +1612,7 @@ func (e *Executor) processBatchTool(
 			Action:           action,
 			Observation:      obs,
 			IsError:          true,
+			ErrorKind:        tools.ToolErrorInvalidCall,
 			TokensUsed:       resp.Usage.InputTokens + resp.Usage.OutputTokens,
 			ResponseGroup:    responseGroup,
 		}
@@ -1664,8 +1674,11 @@ func (e *Executor) processBatchTool(
 			// batches are identical. The repeat tracker's error-lowering is
 			// deliberately NOT armed here — the validation breaker owns
 			// rejection escalation, keeping the batch rhythm at the
-			// configured nudge/abort counts.
-			obs, valAct, valResult, valErr := e.checkValidationErrors(ctx, action, callIdx, obs, tools.ToolResult{Content: obs, IsError: true}, state, cw)
+			// configured nudge/abort counts. It carries the invalid-call class
+			// because every sub-call was rejected on its input shape before
+			// anything ran.
+			rejection := tools.InvalidCallResult("%s", obs)
+			obs, valAct, valResult, valErr := e.checkValidationErrors(ctx, action, callIdx, obs, rejection, state, cw)
 			if valErr != nil {
 				return nil, actionNone, valErr
 			}
@@ -1675,7 +1688,7 @@ func (e *Executor) processBatchTool(
 			if valResult != nil {
 				return valResult, actionNone, nil
 			}
-			e.emitter.ToolResult(state.stepNum, callIdx, len(obs), obs, true)
+			emitToolResultWithKind(e.emitter, state.stepNum, callIdx, len(obs), obs, true, rejection.ErrorKind)
 			// Ungated reasoning carry — same read-only-when-not-first
 			// rationale as the parse-error branch above: needed when this
 			// step is the group's first, inert otherwise.
@@ -1687,6 +1700,7 @@ func (e *Executor) processBatchTool(
 				Action:           action,
 				Observation:      obs,
 				IsError:          true,
+				ErrorKind:        rejection.ErrorKind,
 				TokensUsed:       resp.Usage.InputTokens + resp.Usage.OutputTokens,
 				ResponseGroup:    responseGroup,
 			}
@@ -1724,7 +1738,7 @@ func (e *Executor) processBatchTool(
 			obs := "error: batch cannot be nested inside another batch call"
 			batchedName := "batch (batched)"
 			e.emitter.ToolCall(state.stepNum, effectiveIdx, batchedName, string(sub.Input), e.tools.GetToolSource(sub.Tool))
-			e.emitter.ToolResult(state.stepNum, effectiveIdx, len(obs), obs, true)
+			emitToolResultWithKind(e.emitter, state.stepNum, effectiveIdx, len(obs), obs, true, tools.ToolErrorInvalidCall)
 			// The first step of the batch group carries the response's
 			// thought and reasoning items (see the success path below) — a
 			// rejected FIRST sub-call still materializes as groupSteps[0],
@@ -1752,6 +1766,7 @@ func (e *Executor) processBatchTool(
 				Observation:      obs,
 				IsUntrusted:      false,
 				IsError:          true,
+				ErrorKind:        tools.ToolErrorInvalidCall,
 				TokensUsed:       resp.Usage.InputTokens + resp.Usage.OutputTokens,
 				ResponseGroup:    responseGroup,
 			}
@@ -1796,7 +1811,7 @@ func (e *Executor) processBatchTool(
 		var execErr error
 		subInput := subCall.Input
 		if decision, decErr := e.hitl.OnToolCall(ctx, subCall.Name, subInput); decErr != nil {
-			result = tools.ToolResult{Content: fmt.Sprintf("HITL handler error for tool %q: %v", subCall.Name, decErr), IsError: true}
+			result = tools.ToolResult{Content: fmt.Sprintf("HITL handler error for tool %q: %v", subCall.Name, decErr), IsError: true, ErrorKind: tools.ToolErrorExecution}
 		} else if decision != nil {
 			if !decision.Allow {
 				reason := decision.Reason
@@ -1809,7 +1824,7 @@ func (e *Executor) processBatchTool(
 				// before a terminal boundary can discard it.
 				lastCallInGroup := subIdx == len(batchInput.Calls)-1 && callIdx == len(toolCalls)-1
 				obs = e.runVerifyOnEditHook(ctx, subCall.Name, true, lastCallInGroup, state, obs)
-				e.emitter.ToolResult(state.stepNum, effectiveIdx, len(obs), obs, true)
+				emitToolResultWithKind(e.emitter, state.stepNum, effectiveIdx, len(obs), obs, true, tools.ToolErrorExecution)
 				// The first step of the batch group carries the response's
 				// thought and reasoning (see the success path below): a
 				// rejected FIRST sub-call still materializes as
@@ -1838,6 +1853,7 @@ func (e *Executor) processBatchTool(
 					Observation:      obs,
 					IsUntrusted:      false,
 					IsError:          true,
+					ErrorKind:        tools.ToolErrorExecution,
 					TokensUsed:       resp.Usage.InputTokens + resp.Usage.OutputTokens,
 					ResponseGroup:    responseGroup,
 				}
@@ -1892,7 +1908,7 @@ func (e *Executor) processBatchTool(
 				return nil, actionNone, execErr
 			}
 			// Infrastructure error — capture as error result, continue.
-			result = tools.ToolResult{Content: fmt.Sprintf("error executing %q: %v", subCall.Name, execErr), IsError: true}
+			result = tools.ToolResult{Content: fmt.Sprintf("error executing %q: %v", subCall.Name, execErr), IsError: true, ErrorKind: tools.ToolErrorExecution}
 		}
 
 		// Short-circuit cache bookkeeping for the completed sub-call — same
@@ -1953,8 +1969,8 @@ func (e *Executor) processBatchTool(
 		// Before emission so frontend + LLM context both see it.
 		observation = e.runVerifyOnEditHook(ctx, subCall.Name, result.IsError, subIdx == len(batchInput.Calls)-1 && callIdx == len(toolCalls)-1, state, observation)
 
-		// Emit tool result.
-		e.emitter.ToolResult(state.stepNum, effectiveIdx, len(observation), observation, result.IsError)
+		// Emit tool result, carrying the result's typed error class.
+		emitToolResultWithKind(e.emitter, state.stepNum, effectiveIdx, len(observation), observation, result.IsError, result.ErrorKind)
 
 		// Pre-compaction nudge for last sub-call (only for LLM context, after emission).
 		if subIdx == len(batchInput.Calls)-1 && callIdx == len(toolCalls)-1 && e.preWarningPercent > 0 && !state.preCompactionNudgeEmitted {
@@ -2002,6 +2018,7 @@ func (e *Executor) processBatchTool(
 			Observation:      observation,
 			IsUntrusted:      isUntrusted,
 			IsError:          result.IsError,
+			ErrorKind:        result.ErrorKind,
 			CacheHash:        batchCacheHash,
 			TokensUsed:       resp.Usage.InputTokens + resp.Usage.OutputTokens,
 			ResponseGroup:    responseGroup,
@@ -2158,6 +2175,44 @@ func (e *Executor) checkBatchRepeatIdentical(
 	return e.checkRepeatIdenticalTracked(ctx, action, callIdx, thought, resp, state, cw, &e.batchRepeat, emitToolCall)
 }
 
+// batchEnvelopeInput mirrors the batch meta-tool's input schema (the same
+// shape processBatchTool parses).
+type batchEnvelopeInput struct {
+	Calls []struct {
+		Tool string `json:"tool"`
+	} `json:"calls"`
+}
+
+// wholeBatchRepeatExempt reports whether action is a WHOLE batch meta-call
+// whose every sub-call targets a repeat-exempt tool (the wait pollers). A
+// batch re-issued with byte-identical input is the multi-delegation join
+// poll — the same healthy pattern the standalone exemption exists for — so
+// the batch namespace must not accumulate it either: the exemption keys on
+// the sub-call tool names, which the action.Name check in
+// checkRepeatIdenticalTracked cannot see for a batch (its name is "batch").
+// A batch mixing an exempt tool with any non-exempt tool stays breaker-armed
+// — the non-exempt sub-calls are what the detector exists for. An
+// unparseable or empty envelope is not exempt; the batch pre-flight rejects
+// it on its own path.
+func wholeBatchRepeatExempt(action llm.ToolCall) bool {
+	if action.Name != tools.ToolBatch {
+		return false
+	}
+	var env batchEnvelopeInput
+	if err := json.Unmarshal(action.Input, &env); err != nil {
+		return false
+	}
+	if len(env.Calls) == 0 {
+		return false
+	}
+	for _, call := range env.Calls {
+		if _, exempt := repeatExemptTools[call.Tool]; !exempt {
+			return false
+		}
+	}
+	return true
+}
+
 // checkRepeatIdenticalTracked is the shared repeat-breaker core behind
 // checkRepeatIdenticalTool and checkBatchRepeatIdentical, parameterized by
 // the tracking namespace and the optional lazy ToolCall emitter.
@@ -2173,6 +2228,21 @@ func (e *Executor) checkRepeatIdenticalTracked(
 	emitToolCall func(),
 ) (loopAction, *ExecutorResult, error) {
 	responseGroup := state.responseGroup
+	// Repeat-exempt tools (the wait pollers) never trip the identical-repeat
+	// breaker: re-issuing the same call IS their usage pattern. A WHOLE batch
+	// meta-call whose every sub-call is a wait poller is exempt too
+	// (wholeBatchRepeatExempt): the batch namespace keys the whole call on
+	// its own input, so an identical batch-of-waits join poll would otherwise
+	// accumulate here despite the per-name exemption. Reset the tracker so
+	// the next non-exempt identical call starts from a fresh count rather
+	// than inheriting the poll's — mirroring the same-tool exemption's reset
+	// in checkSameToolRepetition.
+	if _, exempt := repeatExemptTools[action.Name]; exempt || wholeBatchRepeatExempt(action) {
+		track.count = 0
+		track.lastKey = ""
+		track.lastIsError = false
+		return actionNone, nil, nil
+	}
 	toolKey := action.Name + ":" + compactJSON(action.Input)
 	if toolKey == track.lastKey {
 		track.count++
@@ -2235,7 +2305,7 @@ func (e *Executor) checkRepeatIdenticalTracked(
 			return actionBreak, nil, nil
 		}
 		abortMsg := fmt.Sprintf("Aborted: tool '%s' called %d times consecutively with identical arguments", action.Name, track.count)
-		e.emitter.ToolResult(state.stepNum, callIdx, len(abortMsg), abortMsg, true)
+		emitToolResultWithKind(e.emitter, state.stepNum, callIdx, len(abortMsg), abortMsg, true, tools.ToolErrorExecution)
 		return actionNone, &ExecutorResult{
 			Output:   abortMsg,
 			Steps:    state.allSteps,
@@ -2252,7 +2322,7 @@ func (e *Executor) checkRepeatIdenticalTracked(
 			nudgeMsg = repeatErrorNudgeMessage
 		}
 		e.emitter.ExecutorDiagnostic(state.stepNum, "repeated_tool_call_nudge", map[string]any{"tool": action.Name, "repeat_count": track.count})
-		e.emitter.ToolResult(state.stepNum, callIdx, len(nudgeMsg), nudgeMsg, true)
+		emitToolResultWithKind(e.emitter, state.stepNum, callIdx, len(nudgeMsg), nudgeMsg, true, tools.ToolErrorExecution)
 		stepThought := ""
 		stepReasoning := ""
 		var stepReasoningItems []llm.ReasoningItem
@@ -2281,6 +2351,7 @@ func (e *Executor) checkRepeatIdenticalTracked(
 			// prevents the mutation gate from counting an unexecuted mutating tool
 			// as a successful mutation. Mirrors the HITL-reject path.
 			IsError:       true,
+			ErrorKind:     tools.ToolErrorExecution,
 			TokensUsed:    resp.Usage.InputTokens + resp.Usage.OutputTokens,
 			ResponseGroup: responseGroup,
 		}
@@ -2318,7 +2389,7 @@ func (e *Executor) checkValidationErrors(
 
 		if e.circuitBreaker.ValidationErrorAbortThreshold > 0 && e.consecutiveValidationErrorCount >= e.circuitBreaker.ValidationErrorAbortThreshold {
 			e.emitter.ExecutorDiagnostic(state.stepNum, "validation_error_abort", map[string]any{"tool": action.Name, "consecutive_validation_errors": e.consecutiveValidationErrorCount})
-			e.emitter.ToolResult(state.stepNum, callIdx, len(observation), observation, true)
+			emitToolResultWithKind(e.emitter, state.stepNum, callIdx, len(observation), observation, true, tools.ToolErrorInvalidCall)
 			abortReason := fmt.Sprintf("Tool inputs failed schema validation %d times consecutively", e.consecutiveValidationErrorCount)
 			slResp, slErr := e.hitl.OnStepLimit(ctx, state.stepNum, state.effectiveMaxSteps, abortReason)
 			if slErr == nil {
@@ -2406,7 +2477,7 @@ func (e *Executor) checkFruitlessResult(
 	// Check fruitless thresholds (skip if threshold is 0 = disabled)
 	if e.circuitBreaker.FruitlessAbortThreshold > 0 && e.consecutiveFruitlessCount >= e.circuitBreaker.FruitlessAbortThreshold {
 		e.emitter.ExecutorDiagnostic(state.stepNum, "fruitless_abort", map[string]any{"consecutive": e.consecutiveFruitlessCount})
-		e.emitter.ToolResult(state.stepNum, callIdx, len(observation), observation, isError)
+		emitToolResultWithKind(e.emitter, state.stepNum, callIdx, len(observation), observation, isError, synthesizedErrorKind(isError, tools.ToolErrorExecution))
 		abortReason := fmt.Sprintf("%d consecutive tool calls returned empty or minimal results", e.consecutiveFruitlessCount)
 		slResp, slErr := e.hitl.OnStepLimit(ctx, state.stepNum, state.effectiveMaxSteps, abortReason)
 		if slErr == nil {
@@ -2453,7 +2524,7 @@ func (e *Executor) checkFruitlessResult(
 	if e.circuitBreaker.FruitlessNudgeThreshold > 0 && e.consecutiveFruitlessCount >= e.circuitBreaker.FruitlessNudgeThreshold && !e.fruitlessNudgeAttempted {
 		e.fruitlessNudgeAttempted = true
 		e.emitter.ExecutorDiagnostic(state.stepNum, "fruitless_nudge", map[string]any{"consecutive": e.consecutiveFruitlessCount})
-		e.emitter.ToolResult(state.stepNum, callIdx, len(observation), observation, false)
+		emitToolResultWithKind(e.emitter, state.stepNum, callIdx, len(observation), observation, false, "")
 		nudgeStep := Step{
 			UserNudge: fmt.Sprintf(executorFruitlessNudge, e.consecutiveFruitlessCount),
 		}
@@ -2529,7 +2600,13 @@ func (e *Executor) checkSameToolRepetition(
 	// Check same-tool thresholds (skip if threshold is 0 = disabled)
 	if e.circuitBreaker.SameToolRepeatAbortThreshold > 0 && e.sameToolConsecutiveCount >= e.circuitBreaker.SameToolRepeatAbortThreshold {
 		e.emitter.ExecutorDiagnostic(state.stepNum, "same_tool_repeat_abort", map[string]any{"tool": action.Name, "consecutive": e.sameToolConsecutiveCount})
-		e.emitter.ToolResult(state.stepNum, callIdx, len(observation), observation, result.IsError)
+		// The re-emitted observation is the tool's OWN result (the abort does
+		// not synthesise a new payload), so it carries that result's own
+		// class: invalid_call survives a same-tool abort of typed
+		// argument-contract errors (the remedy is still fix-the-arguments), a
+		// legacy zero-kind error stays "" (the host renders execution), a
+		// non-error result carries no class.
+		emitToolResultWithKind(e.emitter, state.stepNum, callIdx, len(observation), observation, result.IsError, result.ErrorKind)
 		abortReason := fmt.Sprintf("Tool '%s' called %d times in a row with different arguments but similar results", action.Name, e.sameToolConsecutiveCount)
 		slResp, slErr := e.hitl.OnStepLimit(ctx, state.stepNum, state.effectiveMaxSteps, abortReason)
 		if slErr == nil {
@@ -2576,7 +2653,7 @@ func (e *Executor) checkSameToolRepetition(
 	if e.circuitBreaker.SameToolRepeatNudgeThreshold > 0 && e.sameToolConsecutiveCount >= e.circuitBreaker.SameToolRepeatNudgeThreshold && !e.sameToolNudgeAttempted {
 		e.sameToolNudgeAttempted = true
 		e.emitter.ExecutorDiagnostic(state.stepNum, "same_tool_repeat_nudge", map[string]any{"tool": action.Name, "consecutive": e.sameToolConsecutiveCount})
-		e.emitter.ToolResult(state.stepNum, callIdx, len(observation), observation, false)
+		emitToolResultWithKind(e.emitter, state.stepNum, callIdx, len(observation), observation, false, "")
 		nudgeStep := Step{
 			UserNudge: fmt.Sprintf(executorSameToolRepeatNudge, action.Name, e.sameToolConsecutiveCount),
 		}
@@ -2624,7 +2701,7 @@ func (e *Executor) checkParseErrors(
 
 		if e.circuitBreaker.ParseErrorAbortThreshold > 0 && e.consecutiveParseErrorCount >= e.circuitBreaker.ParseErrorAbortThreshold {
 			e.emitter.ExecutorDiagnostic(state.stepNum, "parse_error_abort", map[string]any{"tool": action.Name, "consecutive_parse_errors": e.consecutiveParseErrorCount})
-			e.emitter.ToolResult(state.stepNum, callIdx, len(observation), observation, true)
+			emitToolResultWithKind(e.emitter, state.stepNum, callIdx, len(observation), observation, true, tools.ToolErrorInvalidCall)
 			abortReason := fmt.Sprintf("Tool '%s' failed to parse input %d times consecutively", action.Name, e.consecutiveParseErrorCount)
 			slResp, slErr := e.hitl.OnStepLimit(ctx, state.stepNum, state.effectiveMaxSteps, abortReason)
 			if slErr == nil {

@@ -448,7 +448,7 @@ func TestNewExecutor_ToolCallTimeoutExemptDefault(t *testing.T) {
 // TestDefaultToolCallTimeoutExemptTools_BuiltinSet pins the accessor's shape
 // (sorted, fresh copy) that host config surfaces use as their default.
 func TestDefaultToolCallTimeoutExemptTools_BuiltinSet(t *testing.T) {
-	want := []string{"ask_user", "declare_plan", "delegate", "execute_plan", "propose_goal"}
+	want := []string{"ask_user", "declare_plan", "delegate", "execute_plan", "propose_goal", "wait", "wait_for_all", "wait_for_one"}
 	got := DefaultToolCallTimeoutExemptTools()
 	if !slices.Equal(got, want) {
 		t.Fatalf("DefaultToolCallTimeoutExemptTools() = %v, want %v", got, want)
@@ -457,6 +457,21 @@ func TestDefaultToolCallTimeoutExemptTools_BuiltinSet(t *testing.T) {
 	got[0] = "mutated"
 	if again := DefaultToolCallTimeoutExemptTools(); !slices.Equal(again, want) {
 		t.Fatalf("mutating the returned slice changed the default set: %v", again)
+	}
+}
+
+// TestExecutor_WaitToolsCeilingExempt pins the wait tools' exemption from the
+// per-call ceiling by name: they block on the delegations they await by
+// design, so a ceiling would fail a healthy poll.
+func TestExecutor_WaitToolsCeilingExempt(t *testing.T) {
+	exec := NewExecutor(&mockLLMCaller{}, newMockToolExecutor(), 5)
+	for _, name := range []string{"wait", "wait_for_one", "wait_for_all"} {
+		if !exec.isToolCallTimeoutExempt(name) {
+			t.Errorf("isToolCallTimeoutExempt(%q) = false, want true", name)
+		}
+	}
+	if exec.isToolCallTimeoutExempt("wait_for_nothing") {
+		t.Error("a name outside the exempt set must not be exempt")
 	}
 }
 

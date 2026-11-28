@@ -1,6 +1,10 @@
 package agent
 
-import "time"
+import (
+	"time"
+
+	"github.com/v0lka/sp4rk/tools"
+)
 
 // Events defines universal agent lifecycle events.
 // Any agent system (not just the host application) can implement this interface.
@@ -64,6 +68,27 @@ func emitToolCallWithID(emitter Events, stepNum, callIdx int, toolName, argsPrev
 	}
 	emitter.ToolCall(stepNum, callIdx, toolName, argsPreview, source)
 	return ""
+}
+
+// ToolResultKindEvents optionally lets an emitter receive the typed error
+// class of a tool result (tools.ToolErrorKind — invalid_call vs execution,
+// "" for an unclassified/legacy error or a non-error) alongside the base
+// ToolResult payload, so a host can sort failures by stage without parsing
+// the preview prose. The executor routes EVERY tool-result emission through
+// emitToolResultWithKind: an Events implementation with this method receives
+// ONLY the kind-bearing call for a result, one with the base Events alone
+// keeps receiving the base ToolResult call exactly as before — the two are
+// never both invoked for the same result.
+type ToolResultKindEvents interface {
+	ToolResultWithKind(stepNum, callIdx, resultLen int, preview string, isError bool, kind tools.ToolErrorKind)
+}
+
+func emitToolResultWithKind(emitter Events, stepNum, callIdx, resultLen int, preview string, isError bool, kind tools.ToolErrorKind) {
+	if withKind, ok := emitter.(ToolResultKindEvents); ok {
+		withKind.ToolResultWithKind(stepNum, callIdx, resultLen, preview, isError, kind)
+		return
+	}
+	emitter.ToolResult(stepNum, callIdx, resultLen, preview, isError)
 }
 
 // NoopEvents is a no-op implementation of Events.

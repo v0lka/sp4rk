@@ -118,8 +118,13 @@ func shellDangerousCorpus() []shellCorpusCase {
 			wantFired: ReasonCodeCommandDownloadCradle, wantSev: JudgeSeverityHard, wantCanon: true},
 		{name: "fork bomb", tool: "bash_exec", cmd: ":(){ :|:& };:",
 			wantFired: ReasonCodeCommandUnboundedAnalysis, wantSev: JudgeSeverityHard, wantCanon: false},
+		// flowsh ≥ 0.8.1 escalates unbounded effect targets (the $HOME
+		// expansion is not statically resolvable, so the FSRead target cannot
+		// be bounded) to the hard C6 ⊤ criterion beside the named soft
+		// credential-access effect; severity beats priority, so C6 wins the
+		// outcome while credential_access still rides along in the digest.
 		{name: "read ssh key posh", tool: "posh_exec", cmd: `Get-Content $HOME\.ssh\id_rsa`,
-			wantFired: ReasonCodeCredentialAccess, wantSev: JudgeSeveritySoft, wantCanon: false},
+			wantFired: ReasonCodeCommandUnboundedAnalysis, wantSev: JudgeSeverityHard, wantCanon: false},
 		// Out-of-root READS of system / credential files must raise the scope
 		// reason (C9, soft): they are not writes, so C3 does not own them, and
 		// leaving them silent would reopen the gap the former shell-path
